@@ -46,8 +46,17 @@ func Contract(t *testing.T, newStore Harness) {
 		if got[0].SessionID != sessionID || got[0].Type != "session.message" {
 			t.Fatalf("first replayed event = %+v", got[0])
 		}
-		if string(got[1].Payload) != `{"n":2}` {
-			t.Fatalf("payload = %s, want {\"n\":2}", got[1].Payload)
+		if wantTime := time.UnixMilli(1764937200001); !got[0].Time.Equal(wantTime) {
+			t.Fatalf("first replayed event time = %s, want %s", got[0].Time, wantTime)
+		}
+		var payload struct {
+			N int `json:"n"`
+		}
+		if err := json.Unmarshal(got[1].Payload, &payload); err != nil {
+			t.Fatalf("payload is invalid JSON: %v", err)
+		}
+		if payload.N != 2 {
+			t.Fatalf("payload.n = %d, want 2", payload.N)
 		}
 	})
 
