@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/jackc/pgx/v5 v5.8.0
 	modernc.org/sqlite v1.52.0
+	nhooyr.io/websocket v1.8.17
 )
 
 require (
