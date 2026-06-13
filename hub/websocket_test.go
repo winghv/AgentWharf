@@ -2,6 +2,8 @@ package hub_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/winghv/agentwharf/auth"
 	"github.com/winghv/agentwharf/hub"
 	"github.com/winghv/agentwharf/protocol"
+	"github.com/winghv/agentwharf/store"
 	"nhooyr.io/websocket"
 )
 
@@ -36,6 +39,46 @@ func TestWebSocketServerAcceptsHelloAndPing(t *testing.T) {
 	pong := readFrame(t, conn).(*protocol.Pong)
 	if pong.Nonce != "n1" {
 		t.Fatalf("pong nonce = %q", pong.Nonce)
+	}
+}
+
+func TestWebSocketServerReplaysEventsAfterHelloAck(t *testing.T) {
+	t.Parallel()
+
+	events := fakeEventStore{
+		latest: map[string]int64{"ses_1": 4},
+		events: map[string][]store.Event{
+			"ses_1": {
+				{SessionID: "ses_1", Seq: 1, Type: "session.message", Time: time.UnixMilli(1001), Payload: json.RawMessage(`{"n":1}`)},
+				{SessionID: "ses_1", Seq: 3, Type: "session.message", Time: time.UnixMilli(1003), Payload: json.RawMessage(`{"n":3}`)},
+				{SessionID: "ses_1", Seq: 4, Type: "session.state", Time: time.UnixMilli(1004), Payload: json.RawMessage(`{"state":"ready"}`)},
+			},
+		},
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	conn := dialWebSocket(t, server.URL)
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, conn, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "client-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_1", LastSeq: 2}},
+	})
+	if ack := readFrame(t, conn).(*protocol.HelloAck); ack.Sessions[0].ReplayFrom != 3 {
+		t.Fatalf("hello ack = %+v", ack)
+	}
+	first := readFrame(t, conn).(*protocol.Event)
+	second := readFrame(t, conn).(*protocol.Event)
+	if first.SessionID != "ses_1" || first.Seq == nil || *first.Seq != 3 ||
+		first.Type != "session.message" || first.Time != 1003 || string(first.Payload) != `{"n":3}` {
+		t.Fatalf("first replay event = %+v payload=%s", first, string(first.Payload))
+	}
+	if second.SessionID != "ses_1" || second.Seq == nil || *second.Seq != 4 ||
+		second.Type != "session.state" || second.Time != 1004 {
+		t.Fatalf("second replay event = %+v", second)
 	}
 }
 
@@ -144,6 +187,10 @@ func readFrame(t *testing.T, conn *websocket.Conn) protocol.Frame {
 }
 
 func testHandshake() *hub.Handshake {
+	return testHandshakeWithStore(fakeEventStore{latest: map[string]int64{"ses_1": 7}})
+}
+
+func testHandshakeWithStore(events fakeEventStore) *hub.Handshake {
 	return hub.NewHandshake(hub.HandshakeConfig{
 		Authenticator: fakeAuth{
 			token: "client-token",
@@ -152,7 +199,32 @@ func testHandshake() *hub.Handshake {
 				Scopes:  []auth.Scope{auth.SessionView("ses_1")},
 			},
 		},
-		EventStore:    fakeStore{latest: map[string]int64{"ses_1": 7}},
+		EventStore:    events,
 		SessionLookup: fakeSessions{"ses_1": {State: "ready", Provider: "claude-code"}},
 	})
+}
+
+type fakeEventStore struct {
+	latest map[string]int64
+	events map[string][]store.Event
+}
+
+func (f fakeEventStore) Append(context.Context, string, []store.PendingEvent) (int64, error) {
+	return 0, errors.New("append is not implemented by fakeEventStore")
+}
+
+func (f fakeEventStore) LatestSeq(_ context.Context, sessionID string) (int64, error) {
+	return f.latest[sessionID], nil
+}
+
+func (f fakeEventStore) Replay(_ context.Context, sessionID string, afterSeq int64, fn func(store.Event) error) error {
+	for _, ev := range f.events[sessionID] {
+		if ev.Seq <= afterSeq {
+			continue
+		}
+		if err := fn(ev); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/winghv/agentwharf/auth"
 	"github.com/winghv/agentwharf/protocol"
+	"github.com/winghv/agentwharf/store"
 	"nhooyr.io/websocket"
 )
 
@@ -16,6 +17,7 @@ const defaultHandshakeTimeout = 10 * time.Second
 
 type WebSocketConfig struct {
 	Handshake        *Handshake
+	EventStore       store.EventStore
 	HandshakeTimeout time.Duration
 }
 
@@ -26,12 +28,14 @@ func NewWebSocketHandler(cfg WebSocketConfig) http.Handler {
 	}
 	return &webSocketHandler{
 		handshake:        cfg.Handshake,
+		events:           cfg.EventStore,
 		handshakeTimeout: timeout,
 	}
 }
 
 type webSocketHandler struct {
 	handshake        *Handshake
+	events           store.EventStore
 	handshakeTimeout time.Duration
 }
 
@@ -45,39 +49,46 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	ctx := r.Context()
-	if err := h.acceptPeer(ctx, conn); err != nil {
+	accepted, err := h.acceptPeer(ctx, conn)
+	if err != nil {
+		return
+	}
+	if err := h.replayAccepted(ctx, conn, accepted); err != nil {
 		return
 	}
 	h.readLoop(ctx, conn)
 }
 
-func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn) error {
+func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn) (AcceptedPeer, error) {
 	frame, err := h.readHelloFrame(ctx, conn)
 	if err != nil {
 		_ = writeProtocolError(context.Background(), conn, "timeout", "waiting for hello", true)
 		_ = conn.Close(websocket.StatusPolicyViolation, "hello timeout")
-		return err
+		return AcceptedPeer{}, err
 	}
 	hello, ok := frame.(*protocol.Hello)
 	if !ok {
 		_ = writeProtocolError(ctx, conn, "invalid_hello", "first frame must be hello", true)
 		_ = conn.Close(websocket.StatusPolicyViolation, "invalid hello")
-		return ErrInvalidHello
+		return AcceptedPeer{}, ErrInvalidHello
 	}
 	if h.handshake == nil {
 		err := errors.New("websocket handshake is not configured")
 		_ = writeProtocolError(ctx, conn, "internal_error", err.Error(), true)
 		_ = conn.Close(websocket.StatusInternalError, "handshake not configured")
-		return err
+		return AcceptedPeer{}, err
 	}
-	ack, _, err := h.handshake.HandleHello(ctx, hello)
+	ack, accepted, err := h.handshake.HandleHello(ctx, hello)
 	if err != nil {
 		code := protocolErrorCode(err)
 		_ = writeProtocolError(ctx, conn, code, err.Error(), true)
 		_ = conn.Close(websocket.StatusPolicyViolation, code)
-		return err
+		return AcceptedPeer{}, err
 	}
-	return writeProtocolFrame(ctx, conn, &ack)
+	if err := writeProtocolFrame(ctx, conn, &ack); err != nil {
+		return AcceptedPeer{}, err
+	}
+	return accepted, nil
 }
 
 func (h *webSocketHandler) readHelloFrame(ctx context.Context, conn *websocket.Conn) (protocol.Frame, error) {
@@ -121,6 +132,29 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn) {
 			_ = writeProtocolError(ctx, conn, "unsupported_frame", fmt.Sprintf("unsupported frame %s", typed.FrameName()), false)
 		}
 	}
+}
+
+func (h *webSocketHandler) replayAccepted(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer) error {
+	if h.events == nil || accepted.Role != protocol.RoleClient {
+		return nil
+	}
+	for _, sub := range accepted.Subscribed {
+		if err := h.events.Replay(ctx, sub.SessionID, sub.LastSeq, func(ev store.Event) error {
+			seq := ev.Seq
+			return writeProtocolFrame(ctx, conn, &protocol.Event{
+				Type:      ev.Type,
+				SessionID: ev.SessionID,
+				Seq:       &seq,
+				Time:      ev.Time.UnixMilli(),
+				Payload:   ev.Payload,
+			})
+		}); err != nil {
+			_ = writeProtocolError(ctx, conn, "replay_failed", err.Error(), true)
+			_ = conn.Close(websocket.StatusInternalError, "replay failed")
+			return err
+		}
+	}
+	return nil
 }
 
 func readProtocolFrame(ctx context.Context, conn *websocket.Conn) (protocol.Frame, error) {
