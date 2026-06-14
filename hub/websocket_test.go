@@ -450,6 +450,73 @@ func TestWebSocketServerDeduplicatesAcceptedClientCommands(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerReportsAcceptedClientCommandActivity(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	observer := &recordingCommandActivityObserver{}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+		cfg.CommandActivityObserver = observer
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_activity",
+		Type:      protocol.CommandSessionSend,
+		SessionID: "ses_1",
+		Payload:   json.RawMessage(`{"content":[{"kind":"text","text":"hello"}]}`),
+	})
+	ack := readCommandAckFor(t, client, "cmd_activity")
+	if ack.Status != protocol.AckAccepted {
+		t.Fatalf("ack = %+v", ack)
+	}
+	if len(observer.got) != 1 {
+		t.Fatalf("observed activity count = %d, want 1", len(observer.got))
+	}
+	got := observer.got[0]
+	if got.SessionID != "ses_1" || got.CommandID != "cmd_activity" || got.Type != protocol.CommandSessionSend ||
+		got.DurableSeq == nil || *got.DurableSeq != 1 || got.At.IsZero() {
+		t.Fatalf("observed activity = %+v", got)
+	}
+
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_rejected",
+		Type:      protocol.CommandSessionInterrupt,
+		SessionID: "ses_other",
+		Payload:   json.RawMessage(`{}`),
+	})
+	rejected := readCommandAckFor(t, client, "cmd_rejected")
+	if rejected.Status != protocol.AckRejected || rejected.Reason != "unauthorized" {
+		t.Fatalf("rejected ack = %+v", rejected)
+	}
+	if len(observer.got) != 1 {
+		t.Fatalf("observed rejected command activity = %+v", observer.got)
+	}
+
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_activity",
+		Type:      protocol.CommandSessionSend,
+		SessionID: "ses_1",
+		Payload:   json.RawMessage(`{"content":[{"kind":"text","text":"hello"}]}`),
+	})
+	duplicate := readCommandAckFor(t, client, "cmd_activity")
+	if duplicate.Status != protocol.AckDuplicate {
+		t.Fatalf("duplicate ack = %+v", duplicate)
+	}
+	if len(observer.got) != 1 {
+		t.Fatalf("observed duplicate command activity = %+v", observer.got)
+	}
+}
+
 func TestWebSocketServerBuffersSessionSendUntilAdapterReconnects(t *testing.T) {
 	t.Parallel()
 
@@ -712,6 +779,14 @@ func testHandshakeWithStore(events store.EventStore) *hub.Handshake {
 
 type websocketTestAuth struct {
 	principals map[string]auth.Principal
+}
+
+type recordingCommandActivityObserver struct {
+	got []hub.CommandActivity
+}
+
+func (o *recordingCommandActivityObserver) ObserveCommandActivity(_ context.Context, activity hub.CommandActivity) {
+	o.got = append(o.got, activity)
 }
 
 func (a websocketTestAuth) Authenticate(_ context.Context, token string) (auth.Principal, error) {

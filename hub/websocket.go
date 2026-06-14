@@ -27,9 +27,22 @@ const adapterEventBatchMaxEvents = 64
 var errReplayBufferOverflow = errors.New("replay buffer overflow")
 
 type WebSocketConfig struct {
-	Handshake        *Handshake
-	EventStore       store.EventStore
-	HandshakeTimeout time.Duration
+	Handshake               *Handshake
+	EventStore              store.EventStore
+	HandshakeTimeout        time.Duration
+	CommandActivityObserver CommandActivityObserver
+}
+
+type CommandActivity struct {
+	SessionID  string
+	CommandID  string
+	Type       protocol.CommandType
+	At         time.Time
+	DurableSeq *int64
+}
+
+type CommandActivityObserver interface {
+	ObserveCommandActivity(context.Context, CommandActivity)
 }
 
 func NewWebSocketHandler(cfg WebSocketConfig) http.Handler {
@@ -38,21 +51,23 @@ func NewWebSocketHandler(cfg WebSocketConfig) http.Handler {
 		timeout = defaultHandshakeTimeout
 	}
 	return &webSocketHandler{
-		handshake:        cfg.Handshake,
-		events:           cfg.EventStore,
-		handshakeTimeout: timeout,
-		subscribers:      make(map[string]map[*clientConnection]struct{}),
-		adapters:         make(map[string]*adapterConnection),
-		pendingCommands:  make(map[string][]queuedCommand),
-		acceptedCommands: make(map[string]struct{}),
-		decisions:        make(map[string]struct{}),
+		handshake:               cfg.Handshake,
+		events:                  cfg.EventStore,
+		handshakeTimeout:        timeout,
+		commandActivityObserver: cfg.CommandActivityObserver,
+		subscribers:             make(map[string]map[*clientConnection]struct{}),
+		adapters:                make(map[string]*adapterConnection),
+		pendingCommands:         make(map[string][]queuedCommand),
+		acceptedCommands:        make(map[string]struct{}),
+		decisions:               make(map[string]struct{}),
 	}
 }
 
 type webSocketHandler struct {
-	handshake        *Handshake
-	events           store.EventStore
-	handshakeTimeout time.Duration
+	handshake               *Handshake
+	events                  store.EventStore
+	handshakeTimeout        time.Duration
+	commandActivityObserver CommandActivityObserver
 
 	mu          sync.Mutex
 	subscribers map[string]map[*clientConnection]struct{}
@@ -385,7 +400,12 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websoc
 	}
 
 	h.commandMu.Lock()
-	defer h.commandMu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			h.commandMu.Unlock()
+		}
+	}()
 
 	if _, ok := h.acceptedCommands[cmd.CommandID]; ok {
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckDuplicate, "")
@@ -425,10 +445,42 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websoc
 	if requestID := permissionDecisionKey(cmd); requestID != "" {
 		h.markDecisionAcceptedLocked(requestID)
 	}
+	activity := commandActivity(cmd, persisted)
+	h.commandMu.Unlock()
+	locked = false
+	h.observeCommandActivity(ctx, activity)
 	if err := writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckAccepted, ""); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (h *webSocketHandler) observeCommandActivity(ctx context.Context, activity CommandActivity) {
+	if h.commandActivityObserver == nil {
+		return
+	}
+	h.commandActivityObserver.ObserveCommandActivity(ctx, activity)
+}
+
+func commandActivity(cmd *protocol.Command, persisted *protocol.Event) CommandActivity {
+	at := time.Now().UTC()
+	var durableSeq *int64
+	if persisted != nil {
+		if persisted.Time > 0 {
+			at = time.UnixMilli(persisted.Time).UTC()
+		}
+		if persisted.Seq != nil {
+			seq := *persisted.Seq
+			durableSeq = &seq
+		}
+	}
+	return CommandActivity{
+		SessionID:  cmd.SessionID,
+		CommandID:  cmd.CommandID,
+		Type:       cmd.Type,
+		At:         at,
+		DurableSeq: durableSeq,
+	}
 }
 
 func (h *webSocketHandler) persistCommandEvent(ctx context.Context, cmd *protocol.Command) (*protocol.Event, error) {
