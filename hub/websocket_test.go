@@ -116,6 +116,51 @@ func TestWebSocketServerPersistsAdapterDurableEventBeforeFanout(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerBatchesAdapterDurableEvents(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+	writeFrame(t, adapter, &protocol.Event{
+		Type:      "session.message",
+		SessionID: "ses_1",
+		Time:      2001,
+		Payload:   json.RawMessage(`{"n":1}`),
+	})
+	writeFrame(t, adapter, &protocol.Event{
+		Type:      "session.message",
+		SessionID: "ses_1",
+		Time:      2002,
+		Payload:   json.RawMessage(`{"n":2}`),
+	})
+
+	first := readFrame(t, client).(*protocol.Event)
+	second := readFrame(t, client).(*protocol.Event)
+	if first.Seq == nil || *first.Seq != 1 || string(first.Payload) != `{"n":1}` {
+		t.Fatalf("first fanout event = %+v payload=%s", first, string(first.Payload))
+	}
+	if second.Seq == nil || *second.Seq != 2 || string(second.Payload) != `{"n":2}` {
+		t.Fatalf("second fanout event = %+v payload=%s", second, string(second.Payload))
+	}
+
+	calls := events.appended()
+	if len(calls) != 1 || calls[0].sessionID != "ses_1" || len(calls[0].events) != 2 {
+		t.Fatalf("append calls = %+v, want one batch of two events", calls)
+	}
+}
+
 func TestWebSocketServerDoesNotFanoutDurableEventWhenPersistenceFails(t *testing.T) {
 	t.Parallel()
 

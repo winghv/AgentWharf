@@ -21,6 +21,8 @@ const maxPendingCommandsPerSession = 64
 const pendingCommandTTL = 10 * time.Minute
 const maxAcceptedCommandIDs = 4096
 const maxDecisionRequestIDs = 4096
+const adapterEventBatchWindow = 50 * time.Millisecond
+const adapterEventBatchMaxEvents = 64
 
 var errReplayBufferOverflow = errors.New("replay buffer overflow")
 
@@ -66,7 +68,9 @@ type webSocketHandler struct {
 
 type adapterConnection struct {
 	conn      *websocket.Conn
+	writeMu   sync.Mutex
 	sessionID string
+	events    *adapterEventBatcher
 }
 
 type queuedCommand struct {
@@ -94,6 +98,7 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	adapter := h.registerAdapter(conn, accepted)
 	if adapter != nil {
+		defer adapter.close()
 		defer h.unregisterAdapter(adapter)
 		if err := h.deliverPendingCommands(ctx, adapter); err != nil {
 			return
@@ -102,7 +107,7 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := h.replayAccepted(ctx, peer, accepted); err != nil {
 		return
 	}
-	h.readLoop(ctx, conn, accepted)
+	h.readLoop(ctx, conn, accepted, peer, adapter)
 }
 
 func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn) (AcceptedPeer, error) {
@@ -161,7 +166,7 @@ func (h *webSocketHandler) readHelloFrame(ctx context.Context, conn *websocket.C
 	}
 }
 
-func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer) {
+func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, peer *clientConnection, adapter *adapterConnection) {
 	for {
 		frame, err := readProtocolFrame(ctx, conn)
 		if err != nil {
@@ -169,7 +174,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 		}
 		switch typed := frame.(type) {
 		case *protocol.Ping:
-			if err := writeProtocolFrame(ctx, conn, &protocol.Pong{Nonce: typed.Nonce}); err != nil {
+			if err := writePongFrame(ctx, conn, peer, adapter, typed.Nonce); err != nil {
 				return
 			}
 		case *protocol.Pong:
@@ -179,7 +184,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 				_ = writeProtocolError(ctx, conn, "unsupported_frame", "client event frames are not accepted", false)
 				continue
 			}
-			if err := h.handleAdapterEvent(ctx, conn, accepted, typed); err != nil {
+			if err := h.handleAdapterEvent(ctx, adapter, accepted, typed); err != nil {
 				continue
 			}
 		case *protocol.Command:
@@ -199,6 +204,17 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			_ = writeProtocolError(ctx, conn, "unsupported_frame", fmt.Sprintf("unsupported frame %s", typed.FrameName()), false)
 		}
 	}
+}
+
+func writePongFrame(ctx context.Context, conn *websocket.Conn, peer *clientConnection, adapter *adapterConnection, nonce string) error {
+	pong := &protocol.Pong{Nonce: nonce}
+	if peer != nil {
+		return peer.writeFrame(ctx, pong)
+	}
+	if adapter != nil {
+		return adapter.writeFrame(ctx, pong)
+	}
+	return writeProtocolFrame(ctx, conn, pong)
 }
 
 func (h *webSocketHandler) replayAccepted(ctx context.Context, peer *clientConnection, accepted AcceptedPeer) error {
@@ -248,6 +264,21 @@ func (h *webSocketHandler) registerAdapter(conn *websocket.Conn, accepted Accept
 		return nil
 	}
 	adapter := &adapterConnection{conn: conn, sessionID: accepted.SessionID}
+	if h.events != nil {
+		adapter.events = newAdapterEventBatcher(adapterEventBatcherConfig{
+			Store:     h.events,
+			SessionID: accepted.SessionID,
+			Window:    adapterEventBatchWindow,
+			MaxEvents: adapterEventBatchMaxEvents,
+			Broadcast: h.broadcastEvent,
+			ReportError: func(ctx context.Context, err error) {
+				_ = adapter.writeFrame(ctx, &protocol.Error{
+					Code:    "persist_failed",
+					Message: err.Error(),
+				})
+			},
+		})
+	}
 	h.mu.Lock()
 	h.adapters[accepted.SessionID] = adapter
 	h.mu.Unlock()
@@ -273,20 +304,35 @@ func (h *webSocketHandler) unregisterAdapter(adapter *adapterConnection) {
 	}
 }
 
-func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, ev *protocol.Event) error {
+func (a *adapterConnection) writeFrame(ctx context.Context, frame protocol.Frame) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	return writeProtocolFrame(ctx, a.conn, frame)
+}
+
+func (a *adapterConnection) close() {
+	if a.events != nil {
+		a.events.Close()
+	}
+}
+
+func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adapterConnection, accepted AcceptedPeer, ev *protocol.Event) error {
+	if adapter == nil {
+		return errors.New("adapter connection is required")
+	}
 	if ev == nil || ev.Type == "" || ev.SessionID == "" {
 		err := errors.New("event type and session_id are required")
-		_ = writeProtocolError(ctx, conn, "invalid_event", err.Error(), false)
+		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 		return err
 	}
 	if ev.SessionID != accepted.SessionID {
 		err := fmt.Errorf("adapter is not authorized for session %s", ev.SessionID)
-		_ = writeProtocolError(ctx, conn, "unauthorized", err.Error(), false)
+		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "unauthorized", Message: err.Error()})
 		return err
 	}
 	if ev.Seq != nil {
 		err := errors.New("adapter events must not include seq")
-		_ = writeProtocolError(ctx, conn, "invalid_event", err.Error(), false)
+		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 		return err
 	}
 
@@ -303,22 +349,19 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, conn *websock
 	}
 	if h.events == nil {
 		err := errors.New("event store is not configured")
-		_ = writeProtocolError(ctx, conn, "persist_failed", err.Error(), false)
+		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "persist_failed", Message: err.Error()})
 		return err
 	}
-	firstSeq, err := h.events.Append(ctx, ev.SessionID, []store.PendingEvent{{
+	if adapter.events == nil {
+		err := errors.New("adapter event batcher is not configured")
+		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+		return err
+	}
+	return adapter.events.Enqueue(ctx, out, store.PendingEvent{
 		Type:    ev.Type,
 		Time:    eventTime,
 		Payload: clonePayload(ev.Payload),
-	}})
-	if err != nil {
-		err = fmt.Errorf("persist event: %w", err)
-		_ = writeProtocolError(ctx, conn, "persist_failed", err.Error(), false)
-		return err
-	}
-	out.Seq = &firstSeq
-	h.broadcastEvent(ctx, out)
-	return nil
+	})
 }
 
 func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, cmd *protocol.Command) error {
@@ -446,7 +489,7 @@ func (h *webSocketHandler) routeCommand(ctx context.Context, cmd *protocol.Comma
 		return errors.New("adapter_offline")
 	}
 	routed := cloneCommand(cmd)
-	if err := writeProtocolFrame(ctx, adapter.conn, &routed); err != nil {
+	if err := adapter.writeFrame(ctx, &routed); err != nil {
 		h.unregisterAdapter(adapter)
 		return fmt.Errorf("adapter_offline: %w", err)
 	}
@@ -502,7 +545,7 @@ func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *
 			continue
 		}
 		routed := cloneCommand(&queued.command)
-		if err := writeProtocolFrame(ctx, adapter.conn, &routed); err != nil {
+		if err := adapter.writeFrame(ctx, &routed); err != nil {
 			remaining = append(remaining, queued)
 			remaining = append(remaining, pending[i+1:]...)
 			h.pendingCommands[adapter.sessionID] = remaining
