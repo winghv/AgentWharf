@@ -137,12 +137,12 @@ func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
 
 func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	cfg := wrapConfig{
-		HubURL:       defaultWrapHubURL,
-		SessionID:    defaultSessionID,
-		Agent:        "claude",
-		Provider:     defaultProvider,
-		AdapterToken: defaultAdapterToken,
-		Format:       "jsonstream",
+		HubURL:       envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
+		SessionID:    envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
+		Agent:        envOrDefault("AGENTWHARF_AGENT", "claude"),
+		Provider:     envOrDefault("AGENTWHARF_PROVIDER", ""),
+		AdapterToken: envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
+		Format:       envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
 	}
 	var useACP bool
 	var useJSONStream bool
@@ -252,6 +252,13 @@ func providerForAgent(agent string) string {
 	default:
 		return agent
 	}
+}
+
+func envOrDefault(key string, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func randomToken() (string, error) {

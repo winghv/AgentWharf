@@ -109,6 +109,24 @@ func TestParseWrapConfigAcceptsClaudeACPFlag(t *testing.T) {
 	}
 }
 
+func TestParseWrapConfigUsesEnvironmentDefaults(t *testing.T) {
+	t.Setenv("AGENTWHARF_HUB_URL", "wss://hub.superwhv.example/ws")
+	t.Setenv("AGENTWHARF_SESSION_ID", "session_env")
+	t.Setenv("AGENTWHARF_ADAPTER_TOKEN", "adapter-env-token")
+	t.Setenv("AGENTWHARF_PROVIDER", "claude-code")
+
+	cfg, err := parseWrapConfig([]string{"--acp"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseWrapConfig() error = %v", err)
+	}
+	if cfg.HubURL != "wss://hub.superwhv.example/ws" ||
+		cfg.SessionID != "session_env" ||
+		cfg.AdapterToken != "adapter-env-token" ||
+		cfg.Provider != "claude-code" {
+		t.Fatalf("wrap config = %+v", cfg)
+	}
+}
+
 func TestRunWrapJSONStreamPublishesEventsToHub(t *testing.T) {
 	t.Parallel()
 
