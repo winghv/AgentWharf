@@ -211,6 +211,234 @@ func TestWebSocketServerBroadcastsEphemeralEventWithoutEventStore(t *testing.T) 
 	}
 }
 
+func TestWebSocketServerPersistsAndRoutesClientSessionSend(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	observer := dialWebSocket(t, server.URL)
+	defer observer.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeClientHello(t, observer, "client-token", 0)
+	_ = readFrame(t, observer).(*protocol.HelloAck)
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_send_1",
+		Type:      protocol.CommandSessionSend,
+		SessionID: "ses_1",
+		Payload:   json.RawMessage(`{"content":[{"kind":"text","text":"Continue"}]}`),
+	})
+
+	observerEvent := readFrame(t, observer).(*protocol.Event)
+	if observerEvent.Type != "session.message" || observerEvent.Seq == nil || *observerEvent.Seq != 1 {
+		t.Fatalf("observer event = %+v", observerEvent)
+	}
+	var message struct {
+		MessageID string `json:"message_id"`
+		Role      string `json:"role"`
+		Content   []struct {
+			Kind string `json:"kind"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(observerEvent.Payload, &message); err != nil {
+		t.Fatalf("decode session.message payload: %v", err)
+	}
+	if message.MessageID != "cmd_send_1" || message.Role != "user" ||
+		len(message.Content) != 1 || message.Content[0].Text != "Continue" {
+		t.Fatalf("session.message payload = %+v", message)
+	}
+
+	routed := readFrame(t, adapter).(*protocol.Command)
+	if routed.CommandID != "cmd_send_1" || routed.Type != protocol.CommandSessionSend ||
+		string(routed.Payload) != `{"content":[{"kind":"text","text":"Continue"}]}` {
+		t.Fatalf("routed command = %+v payload=%s", routed, string(routed.Payload))
+	}
+
+	ack := readCommandAckFor(t, client, "cmd_send_1")
+	if ack.Status != protocol.AckAccepted || ack.Reason != "" {
+		t.Fatalf("client ack = %+v", ack)
+	}
+	calls := events.appended()
+	if len(calls) != 1 || calls[0].sessionID != "ses_1" ||
+		calls[0].events[0].Type != "session.message" {
+		t.Fatalf("append calls = %+v", calls)
+	}
+}
+
+func TestWebSocketServerRejectsUnauthorizedClientCommand(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "view-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_unauthorized",
+		Type:      protocol.CommandSessionInterrupt,
+		SessionID: "ses_1",
+		Payload:   json.RawMessage(`{}`),
+	})
+
+	ack := readFrame(t, client).(*protocol.CommandAck)
+	if ack.CommandID != "cmd_unauthorized" || ack.Status != protocol.AckRejected || ack.Reason != "unauthorized" {
+		t.Fatalf("client ack = %+v", ack)
+	}
+}
+
+func TestWebSocketServerPersistsPermissionDecisionAndDeduplicatesRequest(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	observer := dialWebSocket(t, server.URL)
+	defer observer.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeClientHello(t, observer, "client-token", 0)
+	_ = readFrame(t, observer).(*protocol.HelloAck)
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+	decisionPayload := json.RawMessage(`{"request_id":"pr_1","decision":"approve","decided_by":"usr_1","note":""}`)
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_decide_1",
+		Type:      protocol.CommandPermissionRespond,
+		SessionID: "ses_1",
+		Payload:   decisionPayload,
+	})
+
+	decision := readFrame(t, observer).(*protocol.Event)
+	if decision.Type != "permission.decision" || decision.Seq == nil || *decision.Seq != 1 ||
+		string(decision.Payload) != string(decisionPayload) {
+		t.Fatalf("permission decision event = %+v payload=%s", decision, string(decision.Payload))
+	}
+	routed := readFrame(t, adapter).(*protocol.Command)
+	if routed.CommandID != "cmd_decide_1" || routed.Type != protocol.CommandPermissionRespond ||
+		string(routed.Payload) != string(decisionPayload) {
+		t.Fatalf("routed permission command = %+v payload=%s", routed, string(routed.Payload))
+	}
+	if ack := readCommandAckFor(t, client, "cmd_decide_1"); ack.Status != protocol.AckAccepted {
+		t.Fatalf("permission ack = %+v", ack)
+	}
+
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_decide_2",
+		Type:      protocol.CommandPermissionRespond,
+		SessionID: "ses_1",
+		Payload:   decisionPayload,
+	})
+	duplicate := readFrame(t, client).(*protocol.CommandAck)
+	if duplicate.CommandID != "cmd_decide_2" || duplicate.Status != protocol.AckDuplicate {
+		t.Fatalf("duplicate decision ack = %+v", duplicate)
+	}
+	if frame, err := readFrameWithin(adapter, 80*time.Millisecond); err == nil {
+		t.Fatalf("adapter unexpectedly received duplicate decision %+v", frame)
+	}
+	calls := events.appended()
+	if len(calls) != 1 || calls[0].events[0].Type != "permission.decision" {
+		t.Fatalf("append calls = %+v", calls)
+	}
+}
+
+func TestWebSocketServerDeduplicatesAcceptedClientCommands(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+	command := &protocol.Command{
+		CommandID: "cmd_duplicate",
+		Type:      protocol.CommandSessionInterrupt,
+		SessionID: "ses_1",
+		Payload:   json.RawMessage(`{}`),
+	}
+	writeFrame(t, client, command)
+	first := readFrame(t, adapter).(*protocol.Command)
+	if first.CommandID != "cmd_duplicate" {
+		t.Fatalf("first routed command = %+v", first)
+	}
+	if ack := readFrame(t, client).(*protocol.CommandAck); ack.Status != protocol.AckAccepted {
+		t.Fatalf("first ack = %+v", ack)
+	}
+
+	writeFrame(t, client, command)
+	duplicate := readFrame(t, client).(*protocol.CommandAck)
+	if duplicate.CommandID != "cmd_duplicate" || duplicate.Status != protocol.AckDuplicate {
+		t.Fatalf("duplicate ack = %+v", duplicate)
+	}
+	if frame, err := readFrameWithin(adapter, 80*time.Millisecond); err == nil {
+		t.Fatalf("adapter unexpectedly received duplicate frame %+v", frame)
+	}
+}
+
+func TestWebSocketServerBuffersSessionSendUntilAdapterReconnects(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_buffered",
+		Type:      protocol.CommandSessionSend,
+		SessionID: "ses_1",
+		Payload:   json.RawMessage(`{"content":[{"kind":"text","text":"Buffered"}]}`),
+	})
+
+	ack := readCommandAckFor(t, client, "cmd_buffered")
+	if ack.Status != protocol.AckAccepted {
+		t.Fatalf("client ack = %+v", ack)
+	}
+
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	routed := readFrame(t, adapter).(*protocol.Command)
+	if routed.CommandID != "cmd_buffered" || routed.Type != protocol.CommandSessionSend {
+		t.Fatalf("buffered command = %+v", routed)
+	}
+}
+
 func TestWebSocketServerBuffersLiveEventsUntilReplayCompletes(t *testing.T) {
 	t.Parallel()
 
@@ -393,6 +621,23 @@ func readFrameWithin(conn *websocket.Conn, timeout time.Duration) (protocol.Fram
 	return frame, nil
 }
 
+func readCommandAckFor(t *testing.T, conn *websocket.Conn, commandID string) *protocol.CommandAck {
+	t.Helper()
+
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for command ack %s", commandID)
+		default:
+		}
+		frame := readFrame(t, conn)
+		if ack, ok := frame.(*protocol.CommandAck); ok && ack.CommandID == commandID {
+			return ack
+		}
+	}
+}
+
 func testHandshake() *hub.Handshake {
 	return testHandshakeWithStore(newFakeEventStore(map[string]int64{"ses_1": 7}, nil))
 }
@@ -403,6 +648,10 @@ func testHandshakeWithStore(events store.EventStore) *hub.Handshake {
 			principals: map[string]auth.Principal{
 				"client-token": {
 					Subject: "client",
+					Scopes:  []auth.Scope{auth.SessionControl("ses_1")},
+				},
+				"view-token": {
+					Subject: "viewer",
 					Scopes:  []auth.Scope{auth.SessionView("ses_1")},
 				},
 				"adapter-token": {

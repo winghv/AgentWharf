@@ -17,6 +17,10 @@ import (
 
 const defaultHandshakeTimeout = 10 * time.Second
 const maxReplayBufferedEvents = 1024
+const maxPendingCommandsPerSession = 64
+const pendingCommandTTL = 10 * time.Minute
+const maxAcceptedCommandIDs = 4096
+const maxDecisionRequestIDs = 4096
 
 var errReplayBufferOverflow = errors.New("replay buffer overflow")
 
@@ -36,6 +40,10 @@ func NewWebSocketHandler(cfg WebSocketConfig) http.Handler {
 		events:           cfg.EventStore,
 		handshakeTimeout: timeout,
 		subscribers:      make(map[string]map[*clientConnection]struct{}),
+		adapters:         make(map[string]*adapterConnection),
+		pendingCommands:  make(map[string][]queuedCommand),
+		acceptedCommands: make(map[string]struct{}),
+		decisions:        make(map[string]struct{}),
 	}
 }
 
@@ -46,6 +54,24 @@ type webSocketHandler struct {
 
 	mu          sync.Mutex
 	subscribers map[string]map[*clientConnection]struct{}
+	adapters    map[string]*adapterConnection
+
+	commandMu            sync.Mutex
+	pendingCommands      map[string][]queuedCommand
+	acceptedCommands     map[string]struct{}
+	acceptedCommandOrder []string
+	decisions            map[string]struct{}
+	decisionOrder        []string
+}
+
+type adapterConnection struct {
+	conn      *websocket.Conn
+	sessionID string
+}
+
+type queuedCommand struct {
+	command   protocol.Command
+	expiresAt time.Time
 }
 
 func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -65,6 +91,13 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	peer := h.registerPeer(conn, accepted)
 	if peer != nil {
 		defer h.unregisterClient(peer)
+	}
+	adapter := h.registerAdapter(conn, accepted)
+	if adapter != nil {
+		defer h.unregisterAdapter(adapter)
+		if err := h.deliverPendingCommands(ctx, adapter); err != nil {
+			return
+		}
 	}
 	if err := h.replayAccepted(ctx, peer, accepted); err != nil {
 		return
@@ -149,6 +182,19 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			if err := h.handleAdapterEvent(ctx, conn, accepted, typed); err != nil {
 				continue
 			}
+		case *protocol.Command:
+			if accepted.Role != protocol.RoleClient {
+				_ = writeProtocolError(ctx, conn, "unsupported_frame", "adapter command frames are not accepted", false)
+				continue
+			}
+			if err := h.handleClientCommand(ctx, conn, accepted, typed); err != nil {
+				continue
+			}
+		case *protocol.CommandAck:
+			if accepted.Role != protocol.RoleAdapter {
+				_ = writeProtocolError(ctx, conn, "unsupported_frame", "client command ack frames are not accepted", false)
+			}
+			continue
 		default:
 			_ = writeProtocolError(ctx, conn, "unsupported_frame", fmt.Sprintf("unsupported frame %s", typed.FrameName()), false)
 		}
@@ -197,6 +243,17 @@ func (h *webSocketHandler) registerPeer(conn *websocket.Conn, accepted AcceptedP
 	return peer
 }
 
+func (h *webSocketHandler) registerAdapter(conn *websocket.Conn, accepted AcceptedPeer) *adapterConnection {
+	if accepted.Role != protocol.RoleAdapter {
+		return nil
+	}
+	adapter := &adapterConnection{conn: conn, sessionID: accepted.SessionID}
+	h.mu.Lock()
+	h.adapters[accepted.SessionID] = adapter
+	h.mu.Unlock()
+	return adapter
+}
+
 func (h *webSocketHandler) unregisterClient(peer *clientConnection) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -205,6 +262,14 @@ func (h *webSocketHandler) unregisterClient(peer *clientConnection) {
 		if len(h.subscribers[sessionID]) == 0 {
 			delete(h.subscribers, sessionID)
 		}
+	}
+}
+
+func (h *webSocketHandler) unregisterAdapter(adapter *adapterConnection) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if current := h.adapters[adapter.sessionID]; current == adapter {
+		delete(h.adapters, adapter.sessionID)
 	}
 }
 
@@ -256,6 +321,229 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, conn *websock
 	return nil
 }
 
+func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, cmd *protocol.Command) error {
+	if err := validateClientCommand(cmd); err != nil {
+		_ = writeCommandAck(ctx, conn, commandID(cmd), protocol.AckRejected, "invalid_command")
+		return err
+	}
+	if !subscribesTo(accepted.Subscribed, cmd.SessionID) {
+		err := fmt.Errorf("client is not subscribed to session %s", cmd.SessionID)
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
+		return err
+	}
+	if h.handshake == nil || h.handshake.authenticator == nil {
+		err := errors.New("hub authenticator is not configured")
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "internal_error")
+		return err
+	}
+	if err := h.handshake.authenticator.Authorize(ctx, accepted.Principal, auth.SessionControl(cmd.SessionID)); err != nil {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
+		return err
+	}
+
+	h.commandMu.Lock()
+	defer h.commandMu.Unlock()
+
+	if _, ok := h.acceptedCommands[cmd.CommandID]; ok {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckDuplicate, "")
+		return nil
+	}
+
+	if requestID := permissionDecisionKey(cmd); requestID != "" {
+		if _, ok := h.decisions[requestID]; ok {
+			_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckDuplicate, "")
+			return nil
+		}
+	}
+
+	if err := h.preflightCommandRouteLocked(cmd); err != nil {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, err.Error())
+		return err
+	}
+
+	var persisted *protocol.Event
+	if commandNeedsPersistence(cmd.Type) {
+		ev, err := h.persistCommandEvent(ctx, cmd)
+		if err != nil {
+			_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "persist_failed")
+			return err
+		}
+		persisted = ev
+	}
+
+	if persisted != nil {
+		h.broadcastEvent(ctx, *persisted)
+	}
+	if err := h.routeOrBufferCommand(ctx, cmd); err != nil {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, err.Error())
+		return err
+	}
+	h.markCommandAcceptedLocked(cmd.CommandID)
+	if requestID := permissionDecisionKey(cmd); requestID != "" {
+		h.markDecisionAcceptedLocked(requestID)
+	}
+	if err := writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckAccepted, ""); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *webSocketHandler) persistCommandEvent(ctx context.Context, cmd *protocol.Command) (*protocol.Event, error) {
+	if h.events == nil {
+		return nil, errors.New("event store is not configured")
+	}
+	eventType, payload, err := commandEventPayload(cmd)
+	if err != nil {
+		return nil, err
+	}
+	eventTime := time.Now().UTC()
+	firstSeq, err := h.events.Append(ctx, cmd.SessionID, []store.PendingEvent{{
+		Type:    eventType,
+		Time:    eventTime,
+		Payload: payload,
+	}})
+	if err != nil {
+		return nil, fmt.Errorf("persist command event: %w", err)
+	}
+	return &protocol.Event{
+		Type:      eventType,
+		SessionID: cmd.SessionID,
+		Seq:       &firstSeq,
+		Time:      eventTime.UnixMilli(),
+		Payload:   payload,
+	}, nil
+}
+
+func (h *webSocketHandler) preflightCommandRouteLocked(cmd *protocol.Command) error {
+	if commandCanBuffer(cmd.Type) {
+		pending := h.prunePendingCommandsLocked(cmd.SessionID, time.Now().UTC())
+		if len(pending) >= maxPendingCommandsPerSession {
+			return errors.New("command_buffer_full")
+		}
+		return nil
+	}
+	if !h.hasAdapter(cmd.SessionID) {
+		return errors.New("adapter_offline")
+	}
+	return nil
+}
+
+func (h *webSocketHandler) routeOrBufferCommand(ctx context.Context, cmd *protocol.Command) error {
+	if err := h.routeCommand(ctx, cmd); err == nil {
+		return nil
+	}
+	if !commandCanBuffer(cmd.Type) {
+		return errors.New("adapter_offline")
+	}
+	return h.bufferCommandLocked(cmd)
+}
+
+func (h *webSocketHandler) routeCommand(ctx context.Context, cmd *protocol.Command) error {
+	h.mu.Lock()
+	adapter := h.adapters[cmd.SessionID]
+	h.mu.Unlock()
+	if adapter == nil {
+		return errors.New("adapter_offline")
+	}
+	routed := cloneCommand(cmd)
+	if err := writeProtocolFrame(ctx, adapter.conn, &routed); err != nil {
+		h.unregisterAdapter(adapter)
+		return fmt.Errorf("adapter_offline: %w", err)
+	}
+	return nil
+}
+
+func (h *webSocketHandler) bufferCommandLocked(cmd *protocol.Command) error {
+	now := time.Now().UTC()
+	filtered := h.prunePendingCommandsLocked(cmd.SessionID, now)
+	if len(filtered) >= maxPendingCommandsPerSession {
+		h.pendingCommands[cmd.SessionID] = filtered
+		return errors.New("command_buffer_full")
+	}
+	filtered = append(filtered, queuedCommand{
+		command:   cloneCommand(cmd),
+		expiresAt: now.Add(pendingCommandTTL),
+	})
+	h.pendingCommands[cmd.SessionID] = filtered
+	return nil
+}
+
+func (h *webSocketHandler) prunePendingCommandsLocked(sessionID string, now time.Time) []queuedCommand {
+	pending := h.pendingCommands[sessionID]
+	filtered := pending[:0]
+	for _, queued := range pending {
+		if now.Before(queued.expiresAt) {
+			filtered = append(filtered, queued)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(h.pendingCommands, sessionID)
+		return nil
+	}
+	h.pendingCommands[sessionID] = filtered
+	return filtered
+}
+
+func (h *webSocketHandler) hasAdapter(sessionID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.adapters[sessionID] != nil
+}
+
+func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *adapterConnection) error {
+	h.commandMu.Lock()
+	defer h.commandMu.Unlock()
+
+	now := time.Now().UTC()
+	pending := h.pendingCommands[adapter.sessionID]
+	remaining := pending[:0]
+	for i, queued := range pending {
+		if !now.Before(queued.expiresAt) {
+			continue
+		}
+		routed := cloneCommand(&queued.command)
+		if err := writeProtocolFrame(ctx, adapter.conn, &routed); err != nil {
+			remaining = append(remaining, queued)
+			remaining = append(remaining, pending[i+1:]...)
+			h.pendingCommands[adapter.sessionID] = remaining
+			h.unregisterAdapter(adapter)
+			return fmt.Errorf("deliver pending command: %w", err)
+		}
+	}
+	if len(remaining) == 0 {
+		delete(h.pendingCommands, adapter.sessionID)
+		return nil
+	}
+	h.pendingCommands[adapter.sessionID] = remaining
+	return nil
+}
+
+func (h *webSocketHandler) markCommandAcceptedLocked(commandID string) {
+	if _, ok := h.acceptedCommands[commandID]; ok {
+		return
+	}
+	h.acceptedCommands[commandID] = struct{}{}
+	h.acceptedCommandOrder = append(h.acceptedCommandOrder, commandID)
+	for len(h.acceptedCommandOrder) > maxAcceptedCommandIDs {
+		oldest := h.acceptedCommandOrder[0]
+		h.acceptedCommandOrder = h.acceptedCommandOrder[1:]
+		delete(h.acceptedCommands, oldest)
+	}
+}
+
+func (h *webSocketHandler) markDecisionAcceptedLocked(requestID string) {
+	if _, ok := h.decisions[requestID]; ok {
+		return
+	}
+	h.decisions[requestID] = struct{}{}
+	h.decisionOrder = append(h.decisionOrder, requestID)
+	for len(h.decisionOrder) > maxDecisionRequestIDs {
+		oldest := h.decisionOrder[0]
+		h.decisionOrder = h.decisionOrder[1:]
+		delete(h.decisions, oldest)
+	}
+}
+
 func (h *webSocketHandler) broadcastEvent(ctx context.Context, ev protocol.Event) {
 	h.mu.Lock()
 	targets := make([]*clientConnection, 0, len(h.subscribers[ev.SessionID]))
@@ -271,6 +559,108 @@ func (h *webSocketHandler) broadcastEvent(ctx context.Context, ev protocol.Event
 				_ = client.close(websocket.StatusPolicyViolation, "replay buffer overflow")
 			}
 		}
+	}
+}
+
+func validateClientCommand(cmd *protocol.Command) error {
+	if cmd == nil || cmd.CommandID == "" || cmd.Type == "" || cmd.SessionID == "" {
+		return errors.New("command cmd_id, type, and session_id are required")
+	}
+	switch cmd.Type {
+	case protocol.CommandSessionSend, protocol.CommandPermissionRespond, protocol.CommandSessionInterrupt, protocol.CommandSessionStop:
+		return nil
+	default:
+		return fmt.Errorf("unsupported command type %q", cmd.Type)
+	}
+}
+
+func commandID(cmd *protocol.Command) string {
+	if cmd == nil {
+		return ""
+	}
+	return cmd.CommandID
+}
+
+func subscribesTo(subscriptions []protocol.Subscription, sessionID string) bool {
+	for _, sub := range subscriptions {
+		if sub.SessionID == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+func commandNeedsPersistence(commandType protocol.CommandType) bool {
+	return commandType == protocol.CommandSessionSend || commandType == protocol.CommandPermissionRespond
+}
+
+func commandCanBuffer(commandType protocol.CommandType) bool {
+	return commandType == protocol.CommandSessionSend || commandType == protocol.CommandPermissionRespond
+}
+
+func commandEventPayload(cmd *protocol.Command) (string, json.RawMessage, error) {
+	switch cmd.Type {
+	case protocol.CommandSessionSend:
+		payload, err := userMessagePayload(cmd)
+		return "session.message", payload, err
+	case protocol.CommandPermissionRespond:
+		if !json.Valid(cmd.Payload) {
+			return "", nil, errors.New("permission response payload is invalid JSON")
+		}
+		return "permission.decision", clonePayload(cmd.Payload), nil
+	default:
+		return "", nil, fmt.Errorf("command %q has no durable event", cmd.Type)
+	}
+}
+
+func userMessagePayload(cmd *protocol.Command) (json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if len(cmd.Payload) == 0 {
+		fields = make(map[string]json.RawMessage)
+	} else if err := json.Unmarshal(cmd.Payload, &fields); err != nil {
+		return nil, fmt.Errorf("decode session.send payload: %w", err)
+	}
+	if _, ok := fields["message_id"]; !ok {
+		encoded, err := json.Marshal(cmd.CommandID)
+		if err != nil {
+			return nil, fmt.Errorf("marshal message id: %w", err)
+		}
+		fields["message_id"] = encoded
+	}
+	role, err := json.Marshal("user")
+	if err != nil {
+		return nil, fmt.Errorf("marshal user role: %w", err)
+	}
+	fields["role"] = role
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("marshal session.message payload: %w", err)
+	}
+	return payload, nil
+}
+
+func permissionDecisionKey(cmd *protocol.Command) string {
+	if cmd == nil || cmd.Type != protocol.CommandPermissionRespond {
+		return ""
+	}
+	var payload struct {
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(cmd.Payload, &payload); err != nil || payload.RequestID == "" {
+		return ""
+	}
+	return cmd.SessionID + ":" + payload.RequestID
+}
+
+func cloneCommand(cmd *protocol.Command) protocol.Command {
+	if cmd == nil {
+		return protocol.Command{}
+	}
+	return protocol.Command{
+		CommandID: cmd.CommandID,
+		Type:      cmd.Type,
+		SessionID: cmd.SessionID,
+		Payload:   clonePayload(cmd.Payload),
 	}
 }
 
@@ -468,6 +858,14 @@ func writeProtocolError(ctx context.Context, conn *websocket.Conn, code string, 
 		Code:    code,
 		Message: message,
 		Fatal:   fatal,
+	})
+}
+
+func writeCommandAck(ctx context.Context, conn *websocket.Conn, commandID string, status protocol.AckStatus, reason string) error {
+	return writeProtocolFrame(ctx, conn, &protocol.CommandAck{
+		CommandID: commandID,
+		Status:    status,
+		Reason:    reason,
 	})
 }
 
