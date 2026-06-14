@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -14,6 +15,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -96,12 +99,13 @@ type serveConfig struct {
 }
 
 type wrapConfig struct {
-	HubURL       string
-	SessionID    string
-	Agent        string
-	Provider     string
-	AdapterToken string
-	Format       string
+	HubURL          string
+	SessionID       string
+	Agent           string
+	Provider        string
+	AdapterToken    string
+	Format          string
+	ProviderCommand []string
 }
 
 func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
@@ -156,9 +160,7 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
 	}
-	if flags.NArg() != 0 {
-		return wrapConfig{}, fmt.Errorf("unexpected wrap arguments: %v", flags.Args())
-	}
+	cfg.ProviderCommand = append([]string(nil), flags.Args()...)
 	if useACP && useJSONStream {
 		return wrapConfig{}, errors.New("wrap format flags are mutually exclusive")
 	}
@@ -328,6 +330,10 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader) error {
 		return err
 	}
 
+	if len(cfg.ProviderCommand) > 0 {
+		return runWrapProvider(ctx, cfg, conn)
+	}
+
 	events, err := translateWrapInput(ctx, cfg, stdin)
 	if err != nil {
 		return err
@@ -339,6 +345,91 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader) error {
 		}
 	}
 	return nil
+}
+
+func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn) error {
+	stdinReader, stdinWriter, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("create provider stdin pipe: %w", err)
+	}
+	defer stdinReader.Close()
+	defer stdinWriter.Close()
+	stdoutReader, stdoutWriter := io.Pipe()
+	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
+		Command: core.ProcessCommand{
+			Path:   cfg.ProviderCommand[0],
+			Args:   cfg.ProviderCommand[1:],
+			Stdin:  stdinReader,
+			Stdout: stdoutWriter,
+			Stderr: os.Stderr,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	processDone := make(chan error, 1)
+	outputDone := make(chan error, 1)
+	commandDone := make(chan error, 1)
+	var writeMu sync.Mutex
+	writeFrame := func(frame protocol.Frame) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeCLIProtocolFrame(runCtx, conn, frame)
+	}
+	go func() {
+		err := supervisor.Run(runCtx)
+		_ = stdoutWriter.Close()
+		processDone <- err
+	}()
+	go func() {
+		outputDone <- streamProviderOutput(runCtx, cfg, stdoutReader, func(event protocol.Event) error {
+			return writeFrame(&event)
+		})
+	}()
+	go func() {
+		commandDone <- forwardHubCommandsToProvider(runCtx, conn, stdinWriter, writeFrame)
+	}()
+
+	var processErr error
+	var outputErr error
+	processFinished := false
+	outputFinished := false
+	for {
+		if processFinished && outputFinished {
+			cancel()
+			_ = stdinWriter.Close()
+			if processErr != nil {
+				return processErr
+			}
+			return outputErr
+		}
+		select {
+		case err := <-processDone:
+			processFinished = true
+			processErr = ignoreContextError(err)
+			_ = stdinWriter.Close()
+		case err := <-outputDone:
+			outputFinished = true
+			outputErr = ignoreContextError(err)
+		case err := <-commandDone:
+			if err != nil {
+				cancel()
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = supervisor.Stop(stopCtx)
+				stopCancel()
+				return err
+			}
+		case <-ctx.Done():
+			cancel()
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = supervisor.Stop(stopCtx)
+			stopCancel()
+			return fmt.Errorf("wrap provider context done (process_done=%t output_done=%t): %w", processFinished, outputFinished, ctx.Err())
+		}
+	}
 }
 
 func translateWrapInput(ctx context.Context, cfg wrapConfig, stdin io.Reader) ([]protocol.Event, error) {
@@ -364,6 +455,104 @@ func translateWrapInput(ctx context.Context, cfg wrapConfig, stdin io.Reader) ([
 	default:
 		return nil, fmt.Errorf("unsupported wrap format %q", cfg.Format)
 	}
+}
+
+func streamProviderOutput(ctx context.Context, cfg wrapConfig, stdout io.Reader, send func(protocol.Event) error) error {
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		events, err := translateWrapLine(cfg, scanner.Bytes())
+		if err != nil {
+			return err
+		}
+		for _, event := range events {
+			if err := send(event); err != nil {
+				return fmt.Errorf("send provider event %s: %w", event.Type, err)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan provider stdout: %w", err)
+	}
+	return nil
+}
+
+func translateWrapLine(cfg wrapConfig, line []byte) ([]protocol.Event, error) {
+	switch cfg.Format {
+	case "jsonstream":
+		translator, err := jsonstream.NewTranslator(jsonstream.Config{
+			SessionID: cfg.SessionID,
+			Provider:  cfg.Provider,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return translator.TranslateLine(line)
+	case "acp":
+		mapper, err := acp.NewMapper(acp.Config{
+			SessionID: cfg.SessionID,
+			Provider:  cfg.Provider,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return mapper.MapLine(line)
+	default:
+		return nil, fmt.Errorf("unsupported wrap format %q", cfg.Format)
+	}
+}
+
+func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error) error {
+	defer stdin.Close()
+	for {
+		frame, err := readCLIProtocolFrame(ctx, conn)
+		if err != nil {
+			return ignoreContextError(err)
+		}
+		switch typed := frame.(type) {
+		case *protocol.Command:
+			if err := writeProviderCommand(stdin, typed); err != nil {
+				return err
+			}
+			ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
+			if err := writeFrame(&ack); err != nil {
+				return fmt.Errorf("ack provider command %s: %w", typed.CommandID, err)
+			}
+			if typed.Type == protocol.CommandSessionStop {
+				return nil
+			}
+		case *protocol.Ping:
+			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
+				return fmt.Errorf("send pong: %w", err)
+			}
+		case *protocol.Error:
+			return fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
+		}
+	}
+}
+
+func writeProviderCommand(stdin io.Writer, cmd *protocol.Command) error {
+	data, err := protocol.Encode(cmd)
+	if err != nil {
+		return fmt.Errorf("encode provider command %s: %w", cmd.CommandID, err)
+	}
+	if _, err := stdin.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("write provider command %s: %w", cmd.CommandID, err)
+	}
+	return nil
+}
+
+func ignoreContextError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context canceled") {
+		return nil
+	}
+	return err
 }
 
 func writeCLIProtocolFrame(ctx context.Context, conn *websocket.Conn, frame protocol.Frame) error {

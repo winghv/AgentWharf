@@ -1,10 +1,13 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -110,6 +113,36 @@ func TestProcessSupervisorStopsProviderWithInterrupt(t *testing.T) {
 	}
 	if err := <-runDone; err != nil {
 		t.Fatalf("Run() error after graceful stop = %v", err)
+	}
+}
+
+func TestProcessSupervisorConnectsProviderStdio(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	supervisor, err := NewProcessSupervisor(ProcessConfig{
+		Command: ProcessCommand{
+			Path:   os.Args[0],
+			Args:   []string{"-test.run=TestProcessSupervisorHelperProcess"},
+			Env:    []string{"AGENTWHARF_HELPER_PROCESS=echo"},
+			Stdin:  strings.NewReader("hello provider\n"),
+			Stdout: &stdout,
+		},
+		MaxRestarts: 1,
+		Backoff:     time.Millisecond,
+		GracePeriod: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewProcessSupervisor() error = %v", err)
+	}
+
+	if err := supervisor.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if stdout.String() != "hello provider\n" {
+		t.Fatalf("provider stdout = %q", stdout.String())
 	}
 }
 
@@ -291,6 +324,9 @@ func runHelperProcess(mode string) {
 		signals := make(chan os.Signal, 1)
 		signal.Notify(signals, os.Interrupt)
 		<-signals
+		os.Exit(0)
+	case "echo":
+		_, _ = io.Copy(os.Stdout, os.Stdin)
 		os.Exit(0)
 	case "ignore":
 		signal.Reset(os.Interrupt)

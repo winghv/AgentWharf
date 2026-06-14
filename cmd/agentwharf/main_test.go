@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"os"
@@ -225,6 +227,85 @@ func TestRunWrapACPPublishesEventsToHub(t *testing.T) {
 	}
 }
 
+func TestRunWrapProviderCommandWritesHubCommandsToProviderStdin(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	t.Setenv("AGENTWHARF_WRAP_HELPER", "1")
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_local",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("startServe() error = %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	client, _, err := websocket.Dial(ctx, running.wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "control-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_local"}},
+	})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runWithInput(ctx, []string{
+			"wrap",
+			"--hub", running.wsURL,
+			"--session-id", "ses_local",
+			"--adapter-token", "adapter-token",
+			"--agent", "claude",
+			"--jsonstream",
+			"--", os.Args[0],
+		}, nil, io.Discard, io.Discard)
+	}()
+
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_provider",
+		Type:      protocol.CommandSessionSend,
+		SessionID: "ses_local",
+		Payload:   []byte(`{"content":[{"kind":"text","text":"ping"}]}`),
+	})
+
+	ackSeen := false
+	replySeen := false
+	for deadline := time.Now().Add(4 * time.Second); time.Now().Before(deadline) && (!ackSeen || !replySeen); {
+		frame := readFrame(t, client)
+		switch typed := frame.(type) {
+		case *protocol.CommandAck:
+			if typed.CommandID == "cmd_provider" && typed.Status == protocol.AckAccepted {
+				ackSeen = true
+			}
+		case *protocol.Event:
+			if typed.Type == "session.message" && strings.Contains(string(typed.Payload), "provider saw cmd_provider") {
+				replySeen = true
+			}
+		}
+	}
+	if !ackSeen || !replySeen {
+		t.Fatalf("ackSeen=%v replySeen=%v", ackSeen, replySeen)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("run wrap error = %v", err)
+	}
+}
+
 func writeFrame(t *testing.T, conn *websocket.Conn, frame protocol.Frame) {
 	t.Helper()
 
@@ -256,4 +337,29 @@ func readFrame(t *testing.T, conn *websocket.Conn) protocol.Frame {
 		t.Fatalf("decode frame %s: %v", string(data), err)
 	}
 	return frame
+}
+
+func TestMain(m *testing.M) {
+	if os.Getenv("AGENTWHARF_WRAP_HELPER") == "1" {
+		runWrapProviderHelper()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func runWrapProviderHelper() {
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		os.Exit(2)
+	}
+	frame, err := protocol.Decode(scanner.Bytes())
+	if err != nil {
+		os.Exit(3)
+	}
+	cmd, ok := frame.(*protocol.Command)
+	if !ok {
+		os.Exit(4)
+	}
+	_, _ = fmt.Fprintf(os.Stdout, `{"type":"assistant","message":{"id":"reply_1","content":[{"type":"text","text":"provider saw %s"}]}}`+"\n", cmd.CommandID)
+	os.Exit(0)
 }

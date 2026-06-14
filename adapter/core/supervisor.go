@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -22,10 +23,13 @@ const (
 )
 
 type ProcessCommand struct {
-	Path string
-	Args []string
-	Env  []string
-	Dir  string
+	Path   string
+	Args   []string
+	Env    []string
+	Dir    string
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
 }
 
 type ProcessConfig struct {
@@ -304,6 +308,9 @@ func (execProcessRunner) Start(command ProcessCommand) (processHandle, error) {
 	cmd := exec.Command(command.Path, command.Args...)
 	cmd.Dir = command.Dir
 	cmd.Env = append(os.Environ(), command.Env...)
+	cmd.Stdin = command.Stdin
+	cmd.Stdout = command.Stdout
+	cmd.Stderr = command.Stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
