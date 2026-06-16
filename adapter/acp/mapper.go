@@ -84,7 +84,7 @@ func (m *Mapper) MapLine(line []byte) ([]protocol.Event, error) {
 	if err := decoder.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("%w: decode JSON line: %w", ErrInvalidACPEvent, err)
 	}
-	return m.mapFrame(raw, stringField(raw, "session_id")), nil
+	return m.mapFrame(raw, firstString(raw, "session_id", "sessionId")), nil
 }
 
 func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protocol.Event {
@@ -108,7 +108,7 @@ func (m *Mapper) mapSessionUpdate(raw map[string]any, providerSessionID string) 
 	if params := objectField(raw, "params"); params != nil {
 		source = params
 		if providerSessionID == "" {
-			providerSessionID = stringField(params, "session_id")
+			providerSessionID = firstString(params, "session_id", "sessionId")
 		}
 	}
 
@@ -125,17 +125,17 @@ func (m *Mapper) mapSessionUpdate(raw map[string]any, providerSessionID string) 
 func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []protocol.Event {
 	switch frameName(update) {
 	case "available_commands_update":
-		payload := copyWithout(update, "type", "subtype", "kind")
+		payload := copyWithout(update, "type", "subtype", "kind", "sessionUpdate")
 		payload["kind"] = "available_commands_update"
 		payload["provider_session_id"] = providerSessionID
 		return []protocol.Event{m.event("agent.activity", payload)}
 	case "usage_update":
-		payload := copyWithout(update, "type", "subtype", "kind")
+		payload := copyWithout(update, "type", "subtype", "kind", "sessionUpdate")
 		payload["kind"] = "usage_update"
 		payload["provider_session_id"] = providerSessionID
 		return []protocol.Event{m.event("agent.activity", payload)}
 	case "agent_thought_chunk":
-		text := firstString(update, "text", "chunk", "content")
+		text := updateText(update)
 		if text == "" {
 			return nil
 		}
@@ -145,18 +145,18 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 			"provider_session_id": providerSessionID,
 		})}
 	case "agent_message_chunk", "prompt_response":
-		text := firstString(update, "text", "chunk", "content")
+		text := updateText(update)
 		if text == "" {
 			return nil
 		}
-		messageID := firstString(update, "message_id", "id", "session_id")
+		messageID := firstString(update, "message_id", "messageId", "id", "session_id", "sessionId")
 		if messageID == "" {
 			messageID = providerSessionID
 		}
 		return []protocol.Event{m.messageEvent(messageID, text)}
 	case "tool_use", "tool_call":
 		return []protocol.Event{m.event("session.tool_call", map[string]any{
-			"tool_call_id": firstString(update, "tool_call_id", "id"),
+			"tool_call_id": firstString(update, "tool_call_id", "toolCallId", "id"),
 			"phase":        "start",
 			"name":         stringField(update, "name"),
 			"input":        objectOrNil(update["input"]),
@@ -164,12 +164,12 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		})}
 	case "permission_request":
 		return []protocol.Event{m.event("permission.request", map[string]any{
-			"request_id": firstString(update, "request_id", "id"),
+			"request_id": firstString(update, "request_id", "requestId", "id"),
 			"action":     stringField(update, "action"),
-			"risk_level": firstString(update, "risk_level", "risk"),
+			"risk_level": firstString(update, "risk_level", "riskLevel", "risk"),
 			"summary":    stringField(update, "summary"),
 			"detail":     objectOrEmpty(update["detail"]),
-			"expires_at": update["expires_at"],
+			"expires_at": firstAny(update, "expires_at", "expiresAt"),
 		})}
 	default:
 		return nil
@@ -230,7 +230,7 @@ func updateObjects(raw map[string]any, key string) []map[string]any {
 }
 
 func frameName(value map[string]any) string {
-	if name := firstString(value, "type", "subtype", "kind", "method", "event"); name != "" {
+	if name := firstString(value, "type", "subtype", "kind", "method", "event", "sessionUpdate"); name != "" {
 		return name
 	}
 	return ""
@@ -271,6 +271,25 @@ func firstString(value map[string]any, keys ...string) string {
 		if text := stringField(value, key); text != "" {
 			return text
 		}
+	}
+	return ""
+}
+
+func firstAny(value map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if item, ok := value[key]; ok {
+			return item
+		}
+	}
+	return nil
+}
+
+func updateText(value map[string]any) string {
+	if text := firstString(value, "text", "chunk", "content"); text != "" {
+		return text
+	}
+	if content := objectField(value, "content"); content != nil {
+		return firstString(content, "text", "chunk")
 	}
 	return ""
 }

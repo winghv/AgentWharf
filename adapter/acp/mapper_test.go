@@ -130,6 +130,43 @@ func TestMapperSupportsJSONRPCSessionUpdateEnvelope(t *testing.T) {
 	}
 }
 
+func TestMapperSupportsLiveACPCamelCaseSessionUpdate(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code", Now: func() time.Time {
+		return time.UnixMilli(1700000000456)
+	}})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+
+	events, err := mapper.MapReader(context.Background(), strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"verify"}]}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"pong"},"messageId":"resp_1"}}}`,
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("MapReader() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %+v, want two events", events)
+	}
+
+	assertEvent(t, events[0], "agent.activity")
+	activity := payloadMap(t, events[0])
+	if activity["kind"] != "available_commands_update" || activity["provider_session_id"] != "acp_ses_1" {
+		t.Fatalf("activity payload = %+v", activity)
+	}
+
+	assertEvent(t, events[1], "session.message")
+	message := payloadMap(t, events[1])
+	if message["message_id"] != "resp_1" {
+		t.Fatalf("message payload = %+v", message)
+	}
+	if got := message["content"].([]any); len(got) != 1 || got[0].(map[string]any)["text"] != "pong" {
+		t.Fatalf("message content = %+v", got)
+	}
+}
+
 func TestMapperRejectsInvalidConfig(t *testing.T) {
 	t.Parallel()
 
