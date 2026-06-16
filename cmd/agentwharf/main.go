@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -355,6 +356,10 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader) error {
 }
 
 func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn) error {
+	if cfg.Format == "acp" {
+		return runWrapACPProvider(ctx, cfg, conn)
+	}
+
 	stdinReader, stdinWriter, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("create provider stdin pipe: %w", err)
@@ -435,6 +440,139 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn) 
 			_ = supervisor.Stop(stopCtx)
 			stopCancel()
 			return fmt.Errorf("wrap provider context done (process_done=%t output_done=%t): %w", processFinished, outputFinished, ctx.Err())
+		}
+	}
+}
+
+func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn) error {
+	stdinReader, stdinWriter, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("create provider stdin pipe: %w", err)
+	}
+	defer stdinReader.Close()
+	defer stdinWriter.Close()
+	stdoutReader, stdoutWriter := io.Pipe()
+	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
+		Command: core.ProcessCommand{
+			Path:   cfg.ProviderCommand[0],
+			Args:   cfg.ProviderCommand[1:],
+			Stdin:  stdinReader,
+			Stdout: stdoutWriter,
+			Stderr: os.Stderr,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	processDone := make(chan error, 1)
+	go func() {
+		err := supervisor.Run(runCtx)
+		_ = stdoutWriter.Close()
+		processDone <- err
+	}()
+
+	scanner := bufio.NewScanner(stdoutReader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	if err := writeACPRequest(stdinWriter, 1, "initialize", map[string]any{
+		"protocolVersion": 1,
+		"clientInfo": map[string]any{
+			"name":    "agentwharf",
+			"version": "0.1.0",
+		},
+		"clientCapabilities": map[string]any{
+			"fs": map[string]any{
+				"readTextFile":  true,
+				"writeTextFile": true,
+			},
+			"terminal": false,
+		},
+	}); err != nil {
+		cancel()
+		return err
+	}
+	if _, err := readACPResponse(runCtx, scanner, 1); err != nil {
+		cancel()
+		return err
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("get provider cwd: %w", err)
+	}
+	if err := writeACPRequest(stdinWriter, 2, "session/new", map[string]any{
+		"cwd":        cwd,
+		"mcpServers": []any{},
+	}); err != nil {
+		cancel()
+		return err
+	}
+	sessionResult, err := readACPResponse(runCtx, scanner, 2)
+	if err != nil {
+		cancel()
+		return err
+	}
+	providerSessionID := stringFieldFromAny(sessionResult["sessionId"])
+	if providerSessionID == "" {
+		cancel()
+		return errors.New("acp session/new response missing sessionId")
+	}
+
+	outputDone := make(chan error, 1)
+	commandDone := make(chan error, 1)
+	var writeMu sync.Mutex
+	writeFrame := func(frame protocol.Frame) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeCLIProtocolFrame(runCtx, conn, frame)
+	}
+	go func() {
+		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, func(event protocol.Event) error {
+			return writeFrame(&event)
+		})
+	}()
+	go func() {
+		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, providerSessionID, 3)
+	}()
+
+	processFinished := false
+	outputFinished := false
+	var processErr error
+	var outputErr error
+	for {
+		if processFinished && outputFinished {
+			cancel()
+			_ = stdinWriter.Close()
+			if processErr != nil {
+				return processErr
+			}
+			return outputErr
+		}
+		select {
+		case err := <-processDone:
+			processFinished = true
+			processErr = ignoreContextError(err)
+			_ = stdinWriter.Close()
+		case err := <-outputDone:
+			outputFinished = true
+			outputErr = ignoreContextError(err)
+		case err := <-commandDone:
+			if err != nil {
+				cancel()
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = supervisor.Stop(stopCtx)
+				stopCancel()
+				return err
+			}
+		case <-ctx.Done():
+			cancel()
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = supervisor.Stop(stopCtx)
+			stopCancel()
+			return fmt.Errorf("wrap acp provider context done (process_done=%t output_done=%t): %w", processFinished, outputFinished, ctx.Err())
 		}
 	}
 }
@@ -550,6 +688,156 @@ func writeProviderCommand(stdin io.Writer, cmd *protocol.Command) error {
 		return fmt.Errorf("write provider command %s: %w", cmd.CommandID, err)
 	}
 	return nil
+}
+
+func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio.Scanner, send func(protocol.Event) error) error {
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		events, err := translateWrapLine(cfg, scanner.Bytes())
+		if err != nil {
+			return err
+		}
+		for _, event := range events {
+			if err := send(event); err != nil {
+				return fmt.Errorf("send acp provider event %s: %w", event.Type, err)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan acp provider stdout: %w", err)
+	}
+	return nil
+}
+
+func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, providerSessionID string, nextID int64) error {
+	defer stdin.Close()
+	for {
+		frame, err := readCLIProtocolFrame(ctx, conn)
+		if err != nil {
+			return ignoreContextError(err)
+		}
+		switch typed := frame.(type) {
+		case *protocol.Command:
+			switch typed.Type {
+			case protocol.CommandSessionSend:
+				prompt, err := acpPromptFromSessionSend(typed.Payload)
+				if err != nil {
+					ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: err.Error()}
+					if writeErr := writeFrame(&ack); writeErr != nil {
+						return fmt.Errorf("reject acp provider command %s: %w", typed.CommandID, writeErr)
+					}
+					continue
+				}
+				if err := writeACPRequest(stdin, nextID, "session/prompt", map[string]any{
+					"sessionId": providerSessionID,
+					"prompt":    prompt,
+				}); err != nil {
+					return fmt.Errorf("write acp provider prompt %s: %w", typed.CommandID, err)
+				}
+				nextID++
+				ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
+				if err := writeFrame(&ack); err != nil {
+					return fmt.Errorf("ack acp provider command %s: %w", typed.CommandID, err)
+				}
+			case protocol.CommandSessionStop:
+				ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
+				if err := writeFrame(&ack); err != nil {
+					return fmt.Errorf("ack acp provider stop %s: %w", typed.CommandID, err)
+				}
+				return nil
+			default:
+				ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: "unsupported acp provider command"}
+				if err := writeFrame(&ack); err != nil {
+					return fmt.Errorf("reject acp provider command %s: %w", typed.CommandID, err)
+				}
+			}
+		case *protocol.Ping:
+			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
+				return fmt.Errorf("send pong: %w", err)
+			}
+		case *protocol.Error:
+			return fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
+		}
+	}
+}
+
+func writeACPRequest(stdin io.Writer, id int64, method string, params map[string]any) error {
+	encoded, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		return fmt.Errorf("encode acp request %s: %w", method, err)
+	}
+	if _, err := stdin.Write(append(encoded, '\n')); err != nil {
+		return fmt.Errorf("write acp request %s: %w", method, err)
+	}
+	return nil
+}
+
+func readACPResponse(ctx context.Context, scanner *bufio.Scanner, id int64) (map[string]any, error) {
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var message map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
+			return nil, fmt.Errorf("decode acp response %d: %w", id, err)
+		}
+		if fmt.Sprint(message["id"]) != fmt.Sprint(id) {
+			continue
+		}
+		if errValue, ok := message["error"]; ok {
+			return nil, fmt.Errorf("acp request %d failed: %v", id, errValue)
+		}
+		result, ok := message["result"].(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("acp response %d missing result", id)
+		}
+		return result, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan acp response %d: %w", id, err)
+	}
+	return nil, fmt.Errorf("acp response %d not received", id)
+}
+
+func acpPromptFromSessionSend(payload []byte) ([]map[string]any, error) {
+	var decoded struct {
+		Content []struct {
+			Kind string `json:"kind"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return nil, fmt.Errorf("invalid session.send payload: %w", err)
+	}
+	prompt := make([]map[string]any, 0, len(decoded.Content))
+	for _, part := range decoded.Content {
+		if part.Kind != "text" || part.Text == "" {
+			continue
+		}
+		prompt = append(prompt, map[string]any{
+			"type": "text",
+			"text": part.Text,
+		})
+	}
+	if len(prompt) == 0 {
+		return nil, errors.New("session.send payload has no text content")
+	}
+	return prompt, nil
+}
+
+func stringFieldFromAny(value any) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return text
 }
 
 func ignoreContextError(err error) error {

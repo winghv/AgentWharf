@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -324,6 +325,85 @@ func TestRunWrapProviderCommandWritesHubCommandsToProviderStdin(t *testing.T) {
 	}
 }
 
+func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	t.Setenv("AGENTWHARF_ACP_HELPER", "1")
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_local",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("startServe() error = %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	client, _, err := websocket.Dial(ctx, running.wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "control-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_local"}},
+	})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runWithInput(ctx, []string{
+			"wrap",
+			"--hub", running.wsURL,
+			"--session-id", "ses_local",
+			"--adapter-token", "adapter-token",
+			"--agent", "claude",
+			"--acp",
+			"--", os.Args[0],
+		}, nil, io.Discard, io.Discard)
+	}()
+
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_acp_prompt",
+		Type:      protocol.CommandSessionSend,
+		SessionID: "ses_local",
+		Payload:   []byte(`{"content":[{"kind":"text","text":"ping"}]}`),
+	})
+
+	ackSeen := false
+	replySeen := false
+	for deadline := time.Now().Add(4 * time.Second); time.Now().Before(deadline) && (!ackSeen || !replySeen); {
+		frame := readFrame(t, client)
+		switch typed := frame.(type) {
+		case *protocol.CommandAck:
+			if typed.CommandID == "cmd_acp_prompt" && typed.Status == protocol.AckAccepted {
+				ackSeen = true
+			}
+		case *protocol.Event:
+			if typed.Type == "session.message" && strings.Contains(string(typed.Payload), "acp saw ping") {
+				replySeen = true
+			}
+		}
+	}
+	if !ackSeen || !replySeen {
+		t.Fatalf("ackSeen=%v replySeen=%v", ackSeen, replySeen)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("run wrap error = %v", err)
+	}
+}
+
 func writeFrame(t *testing.T, conn *websocket.Conn, frame protocol.Frame) {
 	t.Helper()
 
@@ -358,6 +438,10 @@ func readFrame(t *testing.T, conn *websocket.Conn) protocol.Frame {
 }
 
 func TestMain(m *testing.M) {
+	if os.Getenv("AGENTWHARF_ACP_HELPER") == "1" {
+		runWrapACPProviderHelper()
+		return
+	}
 	if os.Getenv("AGENTWHARF_WRAP_HELPER") == "1" {
 		runWrapProviderHelper()
 		return
@@ -380,4 +464,69 @@ func runWrapProviderHelper() {
 	}
 	_, _ = fmt.Fprintf(os.Stdout, `{"type":"assistant","message":{"id":"reply_1","content":[{"type":"text","text":"provider saw %s"}]}}`+"\n", cmd.CommandID)
 	os.Exit(0)
+}
+
+func runWrapACPProviderHelper() {
+	scanner := bufio.NewScanner(os.Stdin)
+	init := readACPRequest(scanner)
+	if init["method"] != "initialize" {
+		os.Exit(10)
+	}
+	writeACPResponse(init["id"], map[string]any{
+		"protocolVersion": 1,
+		"agentInfo": map[string]any{
+			"name":    "fake-acp",
+			"version": "0.0.0",
+		},
+	})
+
+	sessionNew := readACPRequest(scanner)
+	if sessionNew["method"] != "session/new" {
+		os.Exit(11)
+	}
+	writeACPResponse(sessionNew["id"], map[string]any{"sessionId": "acp_ses_1"})
+
+	prompt := readACPRequest(scanner)
+	if prompt["method"] != "session/prompt" {
+		os.Exit(12)
+	}
+	params, _ := prompt["params"].(map[string]any)
+	if params["sessionId"] != "acp_ses_1" {
+		os.Exit(13)
+	}
+	items, _ := params["prompt"].([]any)
+	if len(items) != 1 {
+		os.Exit(14)
+	}
+	textPart, _ := items[0].(map[string]any)
+	if textPart["text"] != "ping" {
+		os.Exit(15)
+	}
+
+	fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","messageId":"resp_1","content":{"type":"text","text":"acp saw ping"}}}}`)
+	writeACPResponse(prompt["id"], map[string]any{"stopReason": "end_turn"})
+	os.Exit(0)
+}
+
+func readACPRequest(scanner *bufio.Scanner) map[string]any {
+	if !scanner.Scan() {
+		os.Exit(20)
+	}
+	var message map[string]any
+	if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
+		os.Exit(21)
+	}
+	return message
+}
+
+func writeACPResponse(id any, result map[string]any) {
+	encoded, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	})
+	if err != nil {
+		os.Exit(22)
+	}
+	fmt.Fprintln(os.Stdout, string(encoded))
 }
