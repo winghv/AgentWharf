@@ -404,6 +404,104 @@ func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	}
 }
 
+func TestRunWrapACPProviderRoutesPermissionDecision(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	t.Setenv("AGENTWHARF_ACP_PERMISSION_HELPER", "1")
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_local",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("startServe() error = %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	client, _, err := websocket.Dial(ctx, running.wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "control-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_local"}},
+	})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runWithInput(ctx, []string{
+			"wrap",
+			"--hub", running.wsURL,
+			"--session-id", "ses_local",
+			"--adapter-token", "adapter-token",
+			"--agent", "claude",
+			"--acp",
+			"--", os.Args[0],
+		}, nil, io.Discard, io.Discard)
+	}()
+
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_permission_prompt",
+		Type:      protocol.CommandSessionSend,
+		SessionID: "ses_local",
+		Payload:   []byte(`{"content":[{"kind":"text","text":"needs permission"}]}`),
+	})
+
+	var requestID string
+	for deadline := time.Now().Add(4 * time.Second); time.Now().Before(deadline) && requestID == ""; {
+		frame := readFrame(t, client)
+		if event, ok := frame.(*protocol.Event); ok && event.Type == "permission.request" {
+			payload := payloadObject(t, event.Payload)
+			requestID, _ = payload["request_id"].(string)
+		}
+	}
+	if requestID == "" {
+		t.Fatal("permission.request not received")
+	}
+
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_permission_decision",
+		Type:      protocol.CommandPermissionRespond,
+		SessionID: "ses_local",
+		Payload:   []byte(`{"request_id":"` + requestID + `","decision":"deny","decided_by":"usr_1","note":""}`),
+	})
+
+	decisionAckSeen := false
+	replySeen := false
+	for deadline := time.Now().Add(4 * time.Second); time.Now().Before(deadline) && (!decisionAckSeen || !replySeen); {
+		frame := readFrame(t, client)
+		switch typed := frame.(type) {
+		case *protocol.CommandAck:
+			if typed.CommandID == "cmd_permission_decision" && typed.Status == protocol.AckAccepted {
+				decisionAckSeen = true
+			}
+		case *protocol.Event:
+			if typed.Type == "session.message" && strings.Contains(string(typed.Payload), "permission denied") {
+				replySeen = true
+			}
+		}
+	}
+	if !decisionAckSeen || !replySeen {
+		t.Fatalf("decisionAckSeen=%v replySeen=%v", decisionAckSeen, replySeen)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("run wrap error = %v", err)
+	}
+}
+
 func writeFrame(t *testing.T, conn *websocket.Conn, frame protocol.Frame) {
 	t.Helper()
 
@@ -438,6 +536,10 @@ func readFrame(t *testing.T, conn *websocket.Conn) protocol.Frame {
 }
 
 func TestMain(m *testing.M) {
+	if os.Getenv("AGENTWHARF_ACP_PERMISSION_HELPER") == "1" {
+		runWrapACPPermissionProviderHelper()
+		return
+	}
 	if os.Getenv("AGENTWHARF_ACP_HELPER") == "1" {
 		runWrapACPProviderHelper()
 		return
@@ -529,4 +631,48 @@ func writeACPResponse(id any, result map[string]any) {
 		os.Exit(22)
 	}
 	fmt.Fprintln(os.Stdout, string(encoded))
+}
+
+func runWrapACPPermissionProviderHelper() {
+	scanner := bufio.NewScanner(os.Stdin)
+	init := readACPRequest(scanner)
+	if init["method"] != "initialize" {
+		os.Exit(30)
+	}
+	writeACPResponse(init["id"], map[string]any{"protocolVersion": 1})
+
+	sessionNew := readACPRequest(scanner)
+	if sessionNew["method"] != "session/new" {
+		os.Exit(31)
+	}
+	writeACPResponse(sessionNew["id"], map[string]any{"sessionId": "acp_ses_1"})
+
+	prompt := readACPRequest(scanner)
+	if prompt["method"] != "session/prompt" {
+		os.Exit(32)
+	}
+	fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"acp_ses_1","action":"fs.write","riskLevel":"medium","summary":"Write a file","options":[{"kind":"reject","optionId":"reject_1"},{"kind":"allow","optionId":"allow_1"}]}}`)
+
+	permissionResponse := readACPRequest(scanner)
+	if fmt.Sprint(permissionResponse["id"]) != "99" {
+		os.Exit(33)
+	}
+	result, _ := permissionResponse["result"].(map[string]any)
+	outcome, _ := result["outcome"].(map[string]any)
+	if outcome["outcome"] != "selected" || outcome["optionId"] != "reject_1" {
+		os.Exit(34)
+	}
+
+	fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","messageId":"resp_1","content":{"type":"text","text":"permission denied"}}}}`)
+	writeACPResponse(prompt["id"], map[string]any{"stopReason": "end_turn"})
+	os.Exit(0)
+}
+
+func payloadObject(t *testing.T, payload []byte) map[string]any {
+	t.Helper()
+	var out map[string]any
+	if err := json.Unmarshal(payload, &out); err != nil {
+		t.Fatalf("decode payload %s: %v", string(payload), err)
+	}
+	return out
 }

@@ -524,18 +524,22 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	outputDone := make(chan error, 1)
 	commandDone := make(chan error, 1)
 	var writeMu sync.Mutex
+	var permissionMu sync.Mutex
+	pendingPermissions := make(map[string]acpPendingPermission)
 	writeFrame := func(frame protocol.Frame) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		return writeCLIProtocolFrame(runCtx, conn, frame)
 	}
 	go func() {
-		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, func(event protocol.Event) error {
+		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, func(line []byte) {
+			trackACPPermissionRequest(line, pendingPermissions, &permissionMu)
+		}, func(event protocol.Event) error {
 			return writeFrame(&event)
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, providerSessionID, 3)
+		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, providerSessionID, 3, pendingPermissions, &permissionMu)
 	}()
 
 	processFinished := false
@@ -690,12 +694,21 @@ func writeProviderCommand(stdin io.Writer, cmd *protocol.Command) error {
 	return nil
 }
 
-func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio.Scanner, send func(protocol.Event) error) error {
+type acpPendingPermission struct {
+	RPCID   any
+	Options []map[string]any
+}
+
+func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio.Scanner, observe func([]byte), send func(protocol.Event) error) error {
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		events, err := translateWrapLine(cfg, scanner.Bytes())
+		line := append([]byte(nil), scanner.Bytes()...)
+		if observe != nil {
+			observe(line)
+		}
+		events, err := translateWrapLine(cfg, line)
 		if err != nil {
 			return err
 		}
@@ -711,7 +724,7 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 	return nil
 }
 
-func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, providerSessionID string, nextID int64) error {
+func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex) error {
 	defer stdin.Close()
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
@@ -741,6 +754,22 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 				if err := writeFrame(&ack); err != nil {
 					return fmt.Errorf("ack acp provider command %s: %w", typed.CommandID, err)
 				}
+			case protocol.CommandPermissionRespond:
+				pending, result, err := acpPermissionResult(typed.Payload, pendingPermissions, permissionMu)
+				if err != nil {
+					ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: err.Error()}
+					if writeErr := writeFrame(&ack); writeErr != nil {
+						return fmt.Errorf("reject acp permission response %s: %w", typed.CommandID, writeErr)
+					}
+					continue
+				}
+				if err := writeACPResult(stdin, pending.RPCID, result); err != nil {
+					return fmt.Errorf("write acp permission response %s: %w", typed.CommandID, err)
+				}
+				ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
+				if err := writeFrame(&ack); err != nil {
+					return fmt.Errorf("ack acp permission response %s: %w", typed.CommandID, err)
+				}
 			case protocol.CommandSessionStop:
 				ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
 				if err := writeFrame(&ack); err != nil {
@@ -763,6 +792,88 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 	}
 }
 
+func trackACPPermissionRequest(line []byte, pending map[string]acpPendingPermission, mu *sync.Mutex) {
+	var message map[string]any
+	if err := json.Unmarshal(line, &message); err != nil {
+		return
+	}
+	if message["method"] != "session/request_permission" {
+		return
+	}
+	requestID := stringFieldFromAny(message["id"])
+	if requestID == "" {
+		return
+	}
+	params, _ := message["params"].(map[string]any)
+	mu.Lock()
+	pending[requestID] = acpPendingPermission{
+		RPCID:   message["id"],
+		Options: acpPermissionOptions(params["options"]),
+	}
+	mu.Unlock()
+}
+
+func acpPermissionResult(payload []byte, pending map[string]acpPendingPermission, mu *sync.Mutex) (acpPendingPermission, map[string]any, error) {
+	var decoded struct {
+		RequestID string `json:"request_id"`
+		Decision  string `json:"decision"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return acpPendingPermission{}, nil, fmt.Errorf("invalid permission response payload: %w", err)
+	}
+	if decoded.RequestID == "" {
+		return acpPendingPermission{}, nil, errors.New("permission response missing request_id")
+	}
+	mu.Lock()
+	pendingPermission, ok := pending[decoded.RequestID]
+	if ok {
+		delete(pending, decoded.RequestID)
+	}
+	mu.Unlock()
+	if !ok {
+		return acpPendingPermission{}, nil, fmt.Errorf("permission request %s not pending", decoded.RequestID)
+	}
+	return pendingPermission, map[string]any{
+		"outcome": acpPermissionOutcome(decoded.Decision, pendingPermission.Options),
+	}, nil
+}
+
+func acpPermissionOutcome(decision string, options []map[string]any) map[string]any {
+	preferReject := decision != "approve"
+	for _, option := range options {
+		kind := stringFieldFromAny(option["kind"])
+		optionID := stringFieldFromAny(option["optionId"])
+		if optionID == "" {
+			optionID = stringFieldFromAny(option["option_id"])
+		}
+		if optionID == "" {
+			continue
+		}
+		if preferReject && kind == "reject" {
+			return map[string]any{"outcome": "selected", "optionId": optionID}
+		}
+		if !preferReject && kind != "reject" {
+			return map[string]any{"outcome": "selected", "optionId": optionID}
+		}
+	}
+	return map[string]any{"outcome": "cancelled"}
+}
+
+func acpPermissionOptions(value any) []map[string]any {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	options := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		option, ok := item.(map[string]any)
+		if ok {
+			options = append(options, option)
+		}
+	}
+	return options
+}
+
 func writeACPRequest(stdin io.Writer, id int64, method string, params map[string]any) error {
 	encoded, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
@@ -775,6 +886,21 @@ func writeACPRequest(stdin io.Writer, id int64, method string, params map[string
 	}
 	if _, err := stdin.Write(append(encoded, '\n')); err != nil {
 		return fmt.Errorf("write acp request %s: %w", method, err)
+	}
+	return nil
+}
+
+func writeACPResult(stdin io.Writer, id any, result map[string]any) error {
+	encoded, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	})
+	if err != nil {
+		return fmt.Errorf("encode acp response %v: %w", id, err)
+	}
+	if _, err := stdin.Write(append(encoded, '\n')); err != nil {
+		return fmt.Errorf("write acp response %v: %w", id, err)
 	}
 	return nil
 }
@@ -833,11 +959,14 @@ func acpPromptFromSessionSend(payload []byte) ([]map[string]any, error) {
 }
 
 func stringFieldFromAny(value any) string {
-	text, ok := value.(string)
-	if !ok {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case nil:
 		return ""
+	default:
+		return fmt.Sprint(typed)
 	}
-	return text
 }
 
 func ignoreContextError(err error) error {

@@ -95,6 +95,8 @@ func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protoc
 		return []protocol.Event{m.stateEvent("ready", providerSessionID, copyWithout(raw, "type", "method", "session_id"))}
 	case "session/update":
 		return m.mapSessionUpdate(raw, providerSessionID)
+	case "session/request_permission":
+		return m.mapSessionPermissionRequest(raw, providerSessionID)
 	default:
 		return m.mapUpdate(raw, providerSessionID)
 	}
@@ -120,6 +122,21 @@ func (m *Mapper) mapSessionUpdate(raw map[string]any, providerSessionID string) 
 		out = append(out, m.mapUpdate(update, providerSessionID)...)
 	}
 	return out
+}
+
+func (m *Mapper) mapSessionPermissionRequest(raw map[string]any, providerSessionID string) []protocol.Event {
+	source := raw
+	if params := objectField(raw, "params"); params != nil {
+		source = params
+		if providerSessionID == "" {
+			providerSessionID = firstString(params, "session_id", "sessionId")
+		}
+	}
+	requestID := firstString(source, "request_id", "requestId", "id")
+	if requestID == "" {
+		requestID = stringFromAny(raw["id"])
+	}
+	return m.permissionRequestEvent(source, requestID, providerSessionID)
 }
 
 func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []protocol.Event {
@@ -163,17 +180,33 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 			"result":       nil,
 		})}
 	case "permission_request":
-		return []protocol.Event{m.event("permission.request", map[string]any{
-			"request_id": firstString(update, "request_id", "requestId", "id"),
-			"action":     stringField(update, "action"),
-			"risk_level": firstString(update, "risk_level", "riskLevel", "risk"),
-			"summary":    stringField(update, "summary"),
-			"detail":     objectOrEmpty(update["detail"]),
-			"expires_at": firstAny(update, "expires_at", "expiresAt"),
-		})}
+		return m.permissionRequestEvent(update, firstString(update, "request_id", "requestId", "id"), providerSessionID)
 	default:
 		return nil
 	}
+}
+
+func (m *Mapper) permissionRequestEvent(source map[string]any, requestID string, providerSessionID string) []protocol.Event {
+	detail := map[string]any{}
+	if existing, ok := objectOrNil(source["detail"]).(map[string]any); ok {
+		for key, value := range existing {
+			detail[key] = value
+		}
+	}
+	if options, ok := source["options"]; ok {
+		detail["options"] = options
+	}
+	if providerSessionID != "" {
+		detail["provider_session_id"] = providerSessionID
+	}
+	return []protocol.Event{m.event("permission.request", map[string]any{
+		"request_id": requestID,
+		"action":     stringField(source, "action"),
+		"risk_level": firstString(source, "risk_level", "riskLevel", "risk"),
+		"summary":    stringField(source, "summary"),
+		"detail":     detail,
+		"expires_at": firstAny(source, "expires_at", "expiresAt"),
+	})}
 }
 
 func (m *Mapper) stateEvent(state string, providerSessionID string, metadata map[string]any) protocol.Event {
@@ -282,6 +315,17 @@ func firstAny(value map[string]any, keys ...string) any {
 		}
 	}
 	return nil
+}
+
+func stringFromAny(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(typed)
+	}
 }
 
 func updateText(value map[string]any) string {

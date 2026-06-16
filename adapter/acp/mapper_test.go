@@ -167,6 +167,35 @@ func TestMapperSupportsLiveACPCamelCaseSessionUpdate(t *testing.T) {
 	}
 }
 
+func TestMapperMapsACPPermissionRequest(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code", Now: func() time.Time {
+		return time.UnixMilli(1700000000456)
+	}})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+
+	events, err := mapper.MapLine([]byte(`{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"acp_ses_1","action":"fs.write","riskLevel":"medium","summary":"Write a file","options":[{"kind":"reject","optionId":"reject_1"}]}}`))
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %+v, want one permission request", events)
+	}
+	assertEvent(t, events[0], "permission.request")
+	payload := payloadMap(t, events[0])
+	if payload["request_id"] != "7" || payload["action"] != "fs.write" ||
+		payload["risk_level"] != "medium" || payload["summary"] != "Write a file" {
+		t.Fatalf("permission payload = %+v", payload)
+	}
+	detail := payload["detail"].(map[string]any)
+	if detail["provider_session_id"] != "acp_ses_1" || len(detail["options"].([]any)) != 1 {
+		t.Fatalf("permission detail = %+v", detail)
+	}
+}
+
 func TestMapperRejectsInvalidConfig(t *testing.T) {
 	t.Parallel()
 
