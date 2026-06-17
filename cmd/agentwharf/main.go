@@ -106,6 +106,7 @@ type wrapConfig struct {
 	Provider        string
 	AdapterToken    string
 	Format          string
+	SecretDir       string
 	ProviderCommand []string
 }
 
@@ -144,6 +145,7 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 		Provider:     envOrDefault("AGENTWHARF_PROVIDER", ""),
 		AdapterToken: envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
 		Format:       envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
+		SecretDir:    envOrDefault("AGENTWHARF_SECRET_DIR", ""),
 	}
 	var useACP bool
 	var useJSONStream bool
@@ -156,6 +158,7 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	flags.StringVar(&cfg.Provider, "provider", "", "provider name override")
 	flags.StringVar(&cfg.AdapterToken, "adapter-token", cfg.AdapterToken, "adapter token")
 	flags.StringVar(&cfg.Format, "format", cfg.Format, "input format: jsonstream or acp")
+	flags.StringVar(&cfg.SecretDir, "secret-dir", cfg.SecretDir, "directory containing injected secret files for masking")
 	flags.BoolVar(&useACP, "acp", false, "read ACP JSON frames from stdin")
 	flags.BoolVar(&useJSONStream, "jsonstream", false, "read Claude stream-json lines from stdin")
 	if err := flags.Parse(args); err != nil {
@@ -242,6 +245,10 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	}
 	if cfg.AdapterToken == defaultAdapterToken && !isLoopbackURL(cfg.HubURL) {
 		return wrapConfig{}, errUnsafeDefaultToken
+	}
+	cfg.SecretDir = filepath.Clean(cfg.SecretDir)
+	if cfg.SecretDir == "." {
+		cfg.SecretDir = ""
 	}
 	return cfg, nil
 }
@@ -337,9 +344,13 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader) error {
 	if _, err := state.MarkAccepted(*ack); err != nil {
 		return err
 	}
+	masker, err := eventMaskerFromSecretDir(cfg.SecretDir)
+	if err != nil {
+		return err
+	}
 
 	if len(cfg.ProviderCommand) > 0 {
-		return runWrapProvider(ctx, cfg, conn)
+		return runWrapProvider(ctx, cfg, conn, masker)
 	}
 
 	events, err := translateWrapInput(ctx, cfg, stdin)
@@ -347,7 +358,10 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader) error {
 		return err
 	}
 	for _, ev := range events {
-		event := ev
+		event, err := maskEvent(masker, ev)
+		if err != nil {
+			return err
+		}
 		if err := writeCLIProtocolFrame(ctx, conn, &event); err != nil {
 			return fmt.Errorf("send event %s: %w", event.Type, err)
 		}
@@ -355,9 +369,9 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader) error {
 	return nil
 }
 
-func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn) error {
+func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker) error {
 	if cfg.Format == "acp" {
-		return runWrapACPProvider(ctx, cfg, conn)
+		return runWrapACPProvider(ctx, cfg, conn, masker)
 	}
 
 	stdinReader, stdinWriter, err := os.Pipe()
@@ -398,7 +412,11 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn) 
 	}()
 	go func() {
 		outputDone <- streamProviderOutput(runCtx, cfg, stdoutReader, func(event protocol.Event) error {
-			return writeFrame(&event)
+			masked, err := maskEvent(masker, event)
+			if err != nil {
+				return err
+			}
+			return writeFrame(&masked)
 		})
 	}()
 	go func() {
@@ -444,7 +462,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn) 
 	}
 }
 
-func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn) error {
+func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker) error {
 	stdinReader, stdinWriter, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("create provider stdin pipe: %w", err)
@@ -520,7 +538,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		cancel()
 		return errors.New("acp session/new response missing sessionId")
 	}
-	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID); err != nil {
+	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID, masker); err != nil {
 		cancel()
 		return err
 	}
@@ -539,7 +557,11 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, func(line []byte) {
 			trackACPPermissionRequest(line, pendingPermissions, &permissionMu)
 		}, func(event protocol.Event) error {
-			return writeFrame(&event)
+			masked, err := maskEvent(masker, event)
+			if err != nil {
+				return err
+			}
+			return writeFrame(&masked)
 		})
 	}()
 	go func() {
@@ -585,7 +607,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	}
 }
 
-func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, providerSessionID string) error {
+func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, providerSessionID string, masker *core.EventMasker) error {
 	payload, err := json.Marshal(map[string]any{
 		"state":               "ready",
 		"provider":            cfg.Provider,
@@ -602,10 +624,57 @@ func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wr
 		Time:      time.Now().UTC().UnixMilli(),
 		Payload:   payload,
 	}
+	event, err = maskEvent(masker, event)
+	if err != nil {
+		return err
+	}
 	if err := writeCLIProtocolFrame(ctx, conn, &event); err != nil {
 		return fmt.Errorf("send acp ready event: %w", err)
 	}
 	return nil
+}
+
+func eventMaskerFromSecretDir(dir string) (*core.EventMasker, error) {
+	if dir == "" {
+		return core.NewEventMasker(nil), nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read secret dir: %w", err)
+	}
+	secrets := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("stat secret file %s: %w", entry.Name(), err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read secret file %s: %w", entry.Name(), err)
+		}
+		if len(data) > 0 {
+			secrets = append(secrets, string(data))
+		}
+	}
+	return core.NewEventMasker(secrets), nil
+}
+
+func maskEvent(masker *core.EventMasker, event protocol.Event) (protocol.Event, error) {
+	if masker == nil {
+		return event, nil
+	}
+	masked, err := masker.MaskEvent(event)
+	if err != nil {
+		return protocol.Event{}, fmt.Errorf("mask event %s: %w", event.Type, err)
+	}
+	return masked, nil
 }
 
 func translateWrapInput(ctx context.Context, cfg wrapConfig, stdin io.Reader) ([]protocol.Event, error) {

@@ -191,6 +191,69 @@ func TestRunWrapJSONStreamPublishesEventsToHub(t *testing.T) {
 	}
 }
 
+func TestRunWrapMasksEventsWithSecretDir(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	secretDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secretDir, "provider_api"), []byte("secret-token"), 0o400); err != nil {
+		t.Fatalf("write secret file: %v", err)
+	}
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_local",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("startServe() error = %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	client, _, err := websocket.Dial(ctx, running.wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "control-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_local"}},
+	})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+
+	stdin := strings.NewReader(`{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"use secret-token carefully"}]}}`)
+	if err := runWithInput(ctx, []string{
+		"wrap",
+		"--hub", running.wsURL,
+		"--session-id", "ses_local",
+		"--adapter-token", "adapter-token",
+		"--agent", "claude",
+		"--jsonstream",
+		"--secret-dir", secretDir,
+	}, stdin, io.Discard, io.Discard); err != nil {
+		t.Fatalf("run wrap error = %v", err)
+	}
+
+	ev := readFrame(t, client).(*protocol.Event)
+	if ev.Type != "session.message" {
+		t.Fatalf("event type = %s, want session.message", ev.Type)
+	}
+	if strings.Contains(string(ev.Payload), "secret-token") || !strings.Contains(string(ev.Payload), "[MASKED]") {
+		t.Fatalf("masked payload = %s", string(ev.Payload))
+	}
+}
+
 func TestRunWrapACPPublishesEventsToHub(t *testing.T) {
 	t.Parallel()
 
