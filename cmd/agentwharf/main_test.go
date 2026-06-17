@@ -374,6 +374,15 @@ func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 		}, nil, io.Discard, io.Discard)
 	}()
 
+	ready := readFrame(t, client).(*protocol.Event)
+	if ready.Type != "session.state" {
+		t.Fatalf("ready event type = %s", ready.Type)
+	}
+	readyPayload := payloadObject(t, ready.Payload)
+	if readyPayload["state"] != "ready" || readyPayload["provider_session_id"] != "acp_ses_1" {
+		t.Fatalf("ready payload = %+v", readyPayload)
+	}
+
 	writeFrame(t, client, &protocol.Command{
 		CommandID: "cmd_acp_prompt",
 		Type:      protocol.CommandSessionSend,

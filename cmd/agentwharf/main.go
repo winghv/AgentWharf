@@ -520,6 +520,10 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		cancel()
 		return errors.New("acp session/new response missing sessionId")
 	}
+	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID); err != nil {
+		cancel()
+		return err
+	}
 
 	outputDone := make(chan error, 1)
 	commandDone := make(chan error, 1)
@@ -579,6 +583,29 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 			return fmt.Errorf("wrap acp provider context done (process_done=%t output_done=%t): %w", processFinished, outputFinished, ctx.Err())
 		}
 	}
+}
+
+func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, providerSessionID string) error {
+	payload, err := json.Marshal(map[string]any{
+		"state":               "ready",
+		"provider":            cfg.Provider,
+		"provider_session_id": providerSessionID,
+		"metadata":            map[string]any{},
+		"source":              "acp",
+	})
+	if err != nil {
+		return fmt.Errorf("marshal acp ready event: %w", err)
+	}
+	event := protocol.Event{
+		Type:      "session.state",
+		SessionID: cfg.SessionID,
+		Time:      time.Now().UTC().UnixMilli(),
+		Payload:   payload,
+	}
+	if err := writeCLIProtocolFrame(ctx, conn, &event); err != nil {
+		return fmt.Errorf("send acp ready event: %w", err)
+	}
+	return nil
 }
 
 func translateWrapInput(ctx context.Context, cfg wrapConfig, stdin io.Reader) ([]protocol.Event, error) {
