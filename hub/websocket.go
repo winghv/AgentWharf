@@ -31,6 +31,7 @@ type WebSocketConfig struct {
 	EventStore              store.EventStore
 	HandshakeTimeout        time.Duration
 	CommandActivityObserver CommandActivityObserver
+	AdapterActivityObserver AdapterActivityObserver
 }
 
 type CommandActivity struct {
@@ -45,6 +46,15 @@ type CommandActivityObserver interface {
 	ObserveCommandActivity(context.Context, CommandActivity)
 }
 
+type AdapterActivity struct {
+	SessionID string
+	At        time.Time
+}
+
+type AdapterActivityObserver interface {
+	ObserveAdapterActivity(context.Context, AdapterActivity)
+}
+
 func NewWebSocketHandler(cfg WebSocketConfig) http.Handler {
 	timeout := cfg.HandshakeTimeout
 	if timeout <= 0 {
@@ -55,6 +65,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) http.Handler {
 		events:                  cfg.EventStore,
 		handshakeTimeout:        timeout,
 		commandActivityObserver: cfg.CommandActivityObserver,
+		adapterActivityObserver: cfg.AdapterActivityObserver,
 		subscribers:             make(map[string]map[*clientConnection]struct{}),
 		adapters:                make(map[string]*adapterConnection),
 		pendingCommands:         make(map[string][]queuedCommand),
@@ -68,6 +79,7 @@ type webSocketHandler struct {
 	events                  store.EventStore
 	handshakeTimeout        time.Duration
 	commandActivityObserver CommandActivityObserver
+	adapterActivityObserver AdapterActivityObserver
 
 	mu          sync.Mutex
 	subscribers map[string]map[*clientConnection]struct{}
@@ -113,6 +125,7 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	adapter := h.registerAdapter(conn, accepted)
 	if adapter != nil {
+		h.observeAdapterActivity(ctx, accepted.SessionID, time.Now().UTC())
 		defer adapter.close()
 		defer h.unregisterAdapter(adapter)
 		if err := h.deliverPendingCommands(ctx, adapter); err != nil {
@@ -192,6 +205,9 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			if err := writePongFrame(ctx, conn, peer, adapter, typed.Nonce); err != nil {
 				return
 			}
+			if accepted.Role == protocol.RoleAdapter {
+				h.observeAdapterActivity(ctx, accepted.SessionID, time.Now().UTC())
+			}
 		case *protocol.Pong:
 			continue
 		case *protocol.Event:
@@ -202,6 +218,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			if err := h.handleAdapterEvent(ctx, adapter, accepted, typed); err != nil {
 				continue
 			}
+			h.observeAdapterActivity(ctx, accepted.SessionID, time.Now().UTC())
 		case *protocol.Command:
 			if accepted.Role != protocol.RoleClient {
 				_ = writeProtocolError(ctx, conn, "unsupported_frame", "adapter command frames are not accepted", false)
@@ -460,6 +477,16 @@ func (h *webSocketHandler) observeCommandActivity(ctx context.Context, activity 
 		return
 	}
 	h.commandActivityObserver.ObserveCommandActivity(ctx, activity)
+}
+
+func (h *webSocketHandler) observeAdapterActivity(ctx context.Context, sessionID string, at time.Time) {
+	if h.adapterActivityObserver == nil || sessionID == "" || at.IsZero() {
+		return
+	}
+	h.adapterActivityObserver.ObserveAdapterActivity(ctx, AdapterActivity{
+		SessionID: sessionID,
+		At:        at.UTC(),
+	})
 }
 
 func commandActivity(cmd *protocol.Command, persisted *protocol.Event) CommandActivity {

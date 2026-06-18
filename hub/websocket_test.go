@@ -517,6 +517,41 @@ func TestWebSocketServerReportsAcceptedClientCommandActivity(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerReportsAdapterActivity(t *testing.T) {
+	t.Parallel()
+
+	observer := &recordingAdapterActivityObserver{}
+	server := newWebSocketTestServer(t, testHandshake(), func(cfg *hub.WebSocketConfig) {
+		cfg.AdapterActivityObserver = observer
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	if got := observer.activities(); len(got) != 1 || got[0].SessionID != "ses_1" || got[0].At.IsZero() {
+		t.Fatalf("hello adapter activity = %+v", got)
+	}
+
+	writeFrame(t, adapter, &protocol.Ping{Nonce: "adapter-ping"})
+	pong := readFrame(t, adapter).(*protocol.Pong)
+	if pong.Nonce != "adapter-ping" {
+		t.Fatalf("pong nonce = %q", pong.Nonce)
+	}
+	if got := observer.activities(); len(got) != 2 || got[1].SessionID != "ses_1" || got[1].At.IsZero() {
+		t.Fatalf("ping adapter activity = %+v", got)
+	}
+
+	writeFrame(t, adapter, &protocol.Event{
+		Type:      "log.tail",
+		SessionID: "ses_1",
+		Payload:   json.RawMessage(`{"line":"ready"}`),
+	})
+	if got := waitAdapterActivityCount(t, observer, 3); got[2].SessionID != "ses_1" || got[2].At.IsZero() {
+		t.Fatalf("event adapter activity = %+v", got)
+	}
+}
+
 func TestWebSocketServerBuffersSessionSendUntilAdapterReconnects(t *testing.T) {
 	t.Parallel()
 
@@ -787,6 +822,36 @@ type recordingCommandActivityObserver struct {
 
 func (o *recordingCommandActivityObserver) ObserveCommandActivity(_ context.Context, activity hub.CommandActivity) {
 	o.got = append(o.got, activity)
+}
+
+type recordingAdapterActivityObserver struct {
+	mu  sync.Mutex
+	got []hub.AdapterActivity
+}
+
+func (o *recordingAdapterActivityObserver) ObserveAdapterActivity(_ context.Context, activity hub.AdapterActivity) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.got = append(o.got, activity)
+}
+
+func (o *recordingAdapterActivityObserver) activities() []hub.AdapterActivity {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]hub.AdapterActivity(nil), o.got...)
+}
+
+func waitAdapterActivityCount(t *testing.T, observer *recordingAdapterActivityObserver, want int) []hub.AdapterActivity {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		got := observer.activities()
+		if len(got) >= want {
+			return got
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return observer.activities()
 }
 
 func (a websocketTestAuth) Authenticate(_ context.Context, token string) (auth.Principal, error) {
