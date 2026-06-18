@@ -37,7 +37,7 @@ $ agentwharf wrap --agent claude --acp
 
 ```console
 $ agentwharf wrap --agent claude --acp --pair --control-plane https://cloud.example/v1
-# enter the displayed code in the managed console
+# enter the displayed device code and user code in the managed console
 ```
 
 `--pair` creates a device pairing code, waits for confirmation, exchanges the

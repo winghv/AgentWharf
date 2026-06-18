@@ -458,7 +458,7 @@ func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wra
 		return cfg, errors.New("machine pairing response missing codes")
 	}
 	if output != nil {
-		_, _ = fmt.Fprintf(output, "Pair this machine at %s with code %s\n", pairing.Data.VerificationURI, pairing.Data.UserCode)
+		_, _ = fmt.Fprintf(output, "Pair this machine at %s with device code %s and user code %s\n", pairing.Data.VerificationURI, pairing.Data.DeviceCode, pairing.Data.UserCode)
 	}
 
 	machineToken, err := exchangeMachineToken(ctx, client, cfg.ControlPlaneURL, pairing)

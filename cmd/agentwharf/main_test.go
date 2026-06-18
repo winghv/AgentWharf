@@ -243,7 +243,8 @@ func TestRunWrapPairingCreatesMachineSessionAndPublishesEvents(t *testing.T) {
 	}, stdin, io.Discard, stderr); err != nil {
 		t.Fatalf("run wrap pair error = %v", err)
 	}
-	if !strings.Contains(stderr.String(), "ABCD-E") || strings.Contains(stderr.String(), "machine-token") ||
+	if !strings.Contains(stderr.String(), "device-code-1") || !strings.Contains(stderr.String(), "ABCD-E") ||
+		strings.Contains(stderr.String(), "machine-token") ||
 		strings.Contains(stderr.String(), "paired-adapter-token") {
 		t.Fatalf("pairing output leaked or missed data: %s", stderr.String())
 	}
