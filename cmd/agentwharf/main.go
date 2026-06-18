@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -80,10 +82,11 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		if err != nil {
 			return err
 		}
-		if err := runWrap(ctx, cfg, stdin); err != nil {
+		effective, err := runWrap(ctx, cfg, stdin, stderr)
+		if err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(stdout, "agentwharf wrap sent events for session_id=%s provider=%s\n", cfg.SessionID, cfg.Provider)
+		_, _ = fmt.Fprintf(stdout, "agentwharf wrap sent events for session_id=%s provider=%s\n", effective.SessionID, effective.Provider)
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -107,7 +110,57 @@ type wrapConfig struct {
 	AdapterToken    string
 	Format          string
 	SecretDir       string
+	Pair            bool
+	ControlPlaneURL string
 	ProviderCommand []string
+}
+
+type machinePairingCreateRequest struct {
+	Platform string `json:"platform"`
+}
+
+type machinePairingCodeResponse struct {
+	Data struct {
+		DeviceCode      string `json:"device_code"`
+		UserCode        string `json:"user_code"`
+		VerificationURI string `json:"verification_uri"`
+		ExpiresAt       string `json:"expires_at"`
+		IntervalSeconds int    `json:"interval_seconds"`
+	} `json:"data"`
+}
+
+type machinePairingTokenRequest struct {
+	DeviceCode string `json:"device_code"`
+}
+
+type machineTokenResponse struct {
+	Data struct {
+		Machine struct {
+			ID string `json:"id"`
+		} `json:"machine"`
+		MachineToken string `json:"machine_token"`
+		HubWSURL     string `json:"hub_ws_url"`
+		ExpiresAt    string `json:"expires_at"`
+	} `json:"data"`
+}
+
+type machineSessionCreateRequest struct {
+	Provider string `json:"provider"`
+}
+
+type machineSessionResponse struct {
+	Data struct {
+		Session struct {
+			ID       string `json:"id"`
+			HostType string `json:"host_type"`
+			HostID   string `json:"host_id"`
+			Provider string `json:"provider"`
+			Status   string `json:"status"`
+		} `json:"session"`
+		HubWSURL     string `json:"hub_ws_url"`
+		AdapterToken string `json:"adapter_token"`
+		ExpiresAt    string `json:"expires_at"`
+	} `json:"data"`
 }
 
 func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
@@ -139,13 +192,14 @@ func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
 
 func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	cfg := wrapConfig{
-		HubURL:       envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
-		SessionID:    envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
-		Agent:        envOrDefault("AGENTWHARF_AGENT", "claude"),
-		Provider:     envOrDefault("AGENTWHARF_PROVIDER", ""),
-		AdapterToken: envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
-		Format:       envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
-		SecretDir:    envOrDefault("AGENTWHARF_SECRET_DIR", ""),
+		HubURL:          envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
+		SessionID:       envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
+		Agent:           envOrDefault("AGENTWHARF_AGENT", "claude"),
+		Provider:        envOrDefault("AGENTWHARF_PROVIDER", ""),
+		AdapterToken:    envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
+		Format:          envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
+		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
+		ControlPlaneURL: envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", ""),
 	}
 	var useACP bool
 	var useJSONStream bool
@@ -159,6 +213,8 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	flags.StringVar(&cfg.AdapterToken, "adapter-token", cfg.AdapterToken, "adapter token")
 	flags.StringVar(&cfg.Format, "format", cfg.Format, "input format: jsonstream or acp")
 	flags.StringVar(&cfg.SecretDir, "secret-dir", cfg.SecretDir, "directory containing injected secret files for masking")
+	flags.BoolVar(&cfg.Pair, "pair", false, "pair this machine with a Control Plane before connecting")
+	flags.StringVar(&cfg.ControlPlaneURL, "control-plane", cfg.ControlPlaneURL, "Control Plane API base URL, usually ending in /v1")
 	flags.BoolVar(&useACP, "acp", false, "read ACP JSON frames from stdin")
 	flags.BoolVar(&useJSONStream, "jsonstream", false, "read Claude stream-json lines from stdin")
 	if err := flags.Parse(args); err != nil {
@@ -222,6 +278,10 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	if cfg.HubURL == "" {
 		cfg.HubURL = defaultWrapHubURL
 	}
+	cfg.ControlPlaneURL = strings.TrimSpace(cfg.ControlPlaneURL)
+	if cfg.Pair && cfg.ControlPlaneURL == "" {
+		return wrapConfig{}, errors.New("wrap --pair requires --control-plane or AGENTWHARF_CONTROL_PLANE_URL")
+	}
 	if cfg.SessionID == "" {
 		cfg.SessionID = defaultSessionID
 	}
@@ -231,7 +291,7 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	if cfg.Provider == "" {
 		cfg.Provider = providerForAgent(cfg.Agent)
 	}
-	if cfg.AdapterToken == "" {
+	if cfg.AdapterToken == "" && !cfg.Pair {
 		token, err := randomToken()
 		if err != nil {
 			return wrapConfig{}, err
@@ -243,7 +303,7 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	default:
 		return wrapConfig{}, fmt.Errorf("unsupported wrap format %q", cfg.Format)
 	}
-	if cfg.AdapterToken == defaultAdapterToken && !isLoopbackURL(cfg.HubURL) {
+	if !cfg.Pair && cfg.AdapterToken == defaultAdapterToken && !isLoopbackURL(cfg.HubURL) {
 		return wrapConfig{}, errUnsafeDefaultToken
 	}
 	cfg.SecretDir = filepath.Clean(cfg.SecretDir)
@@ -306,18 +366,24 @@ func isLoopbackURL(raw string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader) error {
+func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io.Writer) (wrapConfig, error) {
 	cfg, err := normalizeWrapConfig(cfg)
 	if err != nil {
-		return err
+		return cfg, err
 	}
 	if stdin == nil {
 		stdin = io.Reader(os.Stdin)
 	}
+	if cfg.Pair {
+		cfg, err = pairWrapSession(ctx, cfg, pairOutput)
+		if err != nil {
+			return cfg, err
+		}
+	}
 
 	conn, _, err := websocket.Dial(ctx, cfg.HubURL, nil)
 	if err != nil {
-		return fmt.Errorf("connect hub: %w", err)
+		return cfg, fmt.Errorf("connect hub: %w", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
@@ -327,46 +393,202 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader) error {
 		Token:     cfg.AdapterToken,
 	})
 	if err != nil {
-		return err
+		return cfg, err
 	}
 	hello := state.Hello()
 	if err := writeCLIProtocolFrame(ctx, conn, &hello); err != nil {
-		return fmt.Errorf("send adapter hello: %w", err)
+		return cfg, fmt.Errorf("send adapter hello: %w", err)
 	}
 	frame, err := readCLIProtocolFrame(ctx, conn)
 	if err != nil {
-		return fmt.Errorf("read hello ack: %w", err)
+		return cfg, fmt.Errorf("read hello ack: %w", err)
 	}
 	ack, ok := frame.(*protocol.HelloAck)
 	if !ok {
-		return fmt.Errorf("read hello ack: got %T", frame)
+		return cfg, fmt.Errorf("read hello ack: got %T", frame)
 	}
 	if _, err := state.MarkAccepted(*ack); err != nil {
-		return err
+		return cfg, err
 	}
 	masker, err := eventMaskerFromSecretDir(cfg.SecretDir)
 	if err != nil {
-		return err
+		return cfg, err
 	}
 
 	if len(cfg.ProviderCommand) > 0 {
-		return runWrapProvider(ctx, cfg, conn, masker)
+		return cfg, runWrapProvider(ctx, cfg, conn, masker)
 	}
 
 	events, err := translateWrapInput(ctx, cfg, stdin)
 	if err != nil {
-		return err
+		return cfg, err
 	}
 	for _, ev := range events {
 		event, err := maskEvent(masker, ev)
 		if err != nil {
-			return err
+			return cfg, err
 		}
 		if err := writeCLIProtocolFrame(ctx, conn, &event); err != nil {
-			return fmt.Errorf("send event %s: %w", event.Type, err)
+			return cfg, fmt.Errorf("send event %s: %w", event.Type, err)
 		}
 	}
+	return cfg, nil
+}
+
+func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	createURL, err := controlPlaneEndpoint(cfg.ControlPlaneURL, "/machine-pairing-codes")
+	if err != nil {
+		return cfg, err
+	}
+	var pairing machinePairingCodeResponse
+	status, body, err := postControlPlaneJSON(ctx, client, createURL, "", machinePairingCreateRequest{
+		Platform: runtime.GOOS + "-" + runtime.GOARCH,
+	})
+	if err != nil {
+		return cfg, err
+	}
+	if status != http.StatusCreated {
+		return cfg, fmt.Errorf("create machine pairing code: control plane returned status %d", status)
+	}
+	if err := decodeControlPlaneJSON(body, &pairing); err != nil {
+		return cfg, fmt.Errorf("decode machine pairing response: %w", err)
+	}
+	if pairing.Data.DeviceCode == "" || pairing.Data.UserCode == "" {
+		return cfg, errors.New("machine pairing response missing codes")
+	}
+	if output != nil {
+		_, _ = fmt.Fprintf(output, "Pair this machine at %s with code %s\n", pairing.Data.VerificationURI, pairing.Data.UserCode)
+	}
+
+	machineToken, err := exchangeMachineToken(ctx, client, cfg.ControlPlaneURL, pairing)
+	if err != nil {
+		return cfg, err
+	}
+	session, err := createMachineSession(ctx, client, cfg.ControlPlaneURL, machineToken.Data.MachineToken, cfg.Provider)
+	if err != nil {
+		return cfg, err
+	}
+	if session.Data.Session.ID == "" || session.Data.HubWSURL == "" || session.Data.AdapterToken == "" {
+		return cfg, errors.New("machine session response missing session, hub url, or adapter token")
+	}
+	cfg.SessionID = session.Data.Session.ID
+	cfg.HubURL = session.Data.HubWSURL
+	cfg.AdapterToken = session.Data.AdapterToken
+	return cfg, nil
+}
+
+func exchangeMachineToken(ctx context.Context, client *http.Client, baseURL string, pairing machinePairingCodeResponse) (machineTokenResponse, error) {
+	exchangeURL, err := controlPlaneEndpoint(baseURL, "/machine-pairing-codes/token")
+	if err != nil {
+		return machineTokenResponse{}, err
+	}
+	interval := time.Duration(pairing.Data.IntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = time.Second
+	}
+	deadline := time.NewTimer(10 * time.Minute)
+	defer deadline.Stop()
+	for {
+		status, body, err := postControlPlaneJSON(ctx, client, exchangeURL, "", machinePairingTokenRequest{
+			DeviceCode: pairing.Data.DeviceCode,
+		})
+		if err != nil {
+			return machineTokenResponse{}, err
+		}
+		switch status {
+		case http.StatusOK:
+			var response machineTokenResponse
+			if err := decodeControlPlaneJSON(body, &response); err != nil {
+				return machineTokenResponse{}, fmt.Errorf("decode machine token response: %w", err)
+			}
+			if response.Data.MachineToken == "" {
+				return machineTokenResponse{}, errors.New("machine token response missing token")
+			}
+			return response, nil
+		case http.StatusPreconditionRequired:
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return machineTokenResponse{}, ctx.Err()
+			case <-deadline.C:
+				timer.Stop()
+				return machineTokenResponse{}, errors.New("machine pairing timed out")
+			case <-timer.C:
+			}
+		default:
+			return machineTokenResponse{}, fmt.Errorf("exchange machine pairing token: control plane returned status %d", status)
+		}
+	}
+}
+
+func createMachineSession(ctx context.Context, client *http.Client, baseURL string, machineToken string, provider string) (machineSessionResponse, error) {
+	sessionURL, err := controlPlaneEndpoint(baseURL, "/machine-sessions")
+	if err != nil {
+		return machineSessionResponse{}, err
+	}
+	status, body, err := postControlPlaneJSON(ctx, client, sessionURL, machineToken, machineSessionCreateRequest{
+		Provider: provider,
+	})
+	if err != nil {
+		return machineSessionResponse{}, err
+	}
+	if status != http.StatusCreated {
+		return machineSessionResponse{}, fmt.Errorf("create machine session: control plane returned status %d", status)
+	}
+	var response machineSessionResponse
+	if err := decodeControlPlaneJSON(body, &response); err != nil {
+		return machineSessionResponse{}, fmt.Errorf("decode machine session response: %w", err)
+	}
+	return response, nil
+}
+
+func postControlPlaneJSON(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any) (int, []byte, error) {
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, fmt.Errorf("marshal control plane request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return 0, nil, fmt.Errorf("create control plane request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("post control plane request: %w", err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, nil, fmt.Errorf("read control plane response: %w", err)
+	}
+	return resp.StatusCode, data, nil
+}
+
+func decodeControlPlaneJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
 	return nil
+}
+
+func controlPlaneEndpoint(baseURL string, path string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return "", fmt.Errorf("parse control plane url: %w", err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", errors.New("control plane url must include scheme and host")
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/" + strings.TrimLeft(path, "/")
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
 }
 
 func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker) error {

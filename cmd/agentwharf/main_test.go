@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -125,6 +127,129 @@ func TestParseWrapConfigUsesEnvironmentDefaults(t *testing.T) {
 		cfg.AdapterToken != "adapter-env-token" ||
 		cfg.Provider != "claude-code" {
 		t.Fatalf("wrap config = %+v", cfg)
+	}
+}
+
+func TestParseWrapConfigAcceptsPairing(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseWrapConfig([]string{
+		"--pair",
+		"--control-plane", "https://cloud.superwhv.example/v1",
+		"--agent", "claude",
+		"--acp",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseWrapConfig() error = %v", err)
+	}
+	if !cfg.Pair || cfg.ControlPlaneURL != "https://cloud.superwhv.example/v1" ||
+		cfg.Provider != "claude-code" || cfg.Format != "acp" {
+		t.Fatalf("wrap config = %+v", cfg)
+	}
+}
+
+func TestRunWrapPairingCreatesMachineSessionAndPublishesEvents(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_machine",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "paired-adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("startServe() error = %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/machine-pairing-codes":
+			if r.Method != http.MethodPost {
+				t.Fatalf("pairing method = %s", r.Method)
+			}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"data":{"device_code":"device-code-1","user_code":"ABCD-E","verification_uri":"https://cloud.example/pair","expires_at":"2026-06-18T10:10:00Z","interval_seconds":1}}`)
+		case "/machine-pairing-codes/token":
+			if r.Method != http.MethodPost {
+				t.Fatalf("exchange method = %s", r.Method)
+			}
+			var body struct {
+				DeviceCode string `json:"device_code"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode exchange request: %v", err)
+			}
+			if body.DeviceCode != "device-code-1" {
+				t.Fatalf("device code = %q", body.DeviceCode)
+			}
+			fmt.Fprint(w, `{"data":{"machine":{"id":"machine_1"},"machine_token":"machine-token","hub_ws_url":"wss://ignored.example/ws","expires_at":"2026-06-19T10:00:00Z"}}`)
+		case "/machine-sessions":
+			if r.Method != http.MethodPost {
+				t.Fatalf("machine session method = %s", r.Method)
+			}
+			if r.Header.Get("Authorization") != "Bearer machine-token" {
+				t.Fatalf("machine session authorization = %q", r.Header.Get("Authorization"))
+			}
+			var body struct {
+				Provider string `json:"provider"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode machine session request: %v", err)
+			}
+			if body.Provider != "claude-code" {
+				t.Fatalf("provider = %q", body.Provider)
+			}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"data":{"session":{"id":"ses_machine","host_type":"machine","host_id":"machine_1","provider":"claude-code","status":"starting","started_at":"2026-06-18T10:00:00Z"},"hub_ws_url":%q,"adapter_token":"paired-adapter-token","expires_at":"2026-06-18T10:15:00Z"}}`, running.wsURL)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer controlPlane.Close()
+
+	client, _, err := websocket.Dial(ctx, running.wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "control-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_machine"}},
+	})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+
+	stderr := new(strings.Builder)
+	stdin := strings.NewReader(`{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"paired pong"}]}}`)
+	if err := runWithInput(ctx, []string{
+		"wrap",
+		"--pair",
+		"--control-plane", controlPlane.URL,
+		"--agent", "claude",
+		"--jsonstream",
+	}, stdin, io.Discard, stderr); err != nil {
+		t.Fatalf("run wrap pair error = %v", err)
+	}
+	if !strings.Contains(stderr.String(), "ABCD-E") || strings.Contains(stderr.String(), "machine-token") ||
+		strings.Contains(stderr.String(), "paired-adapter-token") {
+		t.Fatalf("pairing output leaked or missed data: %s", stderr.String())
+	}
+	event := readFrame(t, client).(*protocol.Event)
+	if event.Type != "session.message" || !strings.Contains(string(event.Payload), "paired pong") {
+		t.Fatalf("paired event = %+v payload=%s", event, string(event.Payload))
 	}
 }
 
