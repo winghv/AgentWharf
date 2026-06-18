@@ -33,6 +33,17 @@ $ agentwharf wrap --agent claude --acp
 # open the local URL from browser/phone: observe and control your local agent remotely
 ```
 
+## Managed BYOM Pairing
+
+```console
+$ agentwharf wrap --agent claude --acp --pair --control-plane https://cloud.example/v1
+# enter the displayed code in the managed console
+```
+
+`--pair` creates a device pairing code, waits for confirmation, exchanges the
+machine token for a session-bound adapter token, and then connects to the Hub.
+Tokens are kept in memory and are not printed or written by the CLI.
+
 ## License
 
 Apache-2.0
