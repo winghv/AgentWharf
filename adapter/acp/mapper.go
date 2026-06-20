@@ -136,7 +136,8 @@ func (m *Mapper) mapSessionPermissionRequest(raw map[string]any, providerSession
 	if requestID == "" {
 		requestID = stringFromAny(raw["id"])
 	}
-	return m.permissionRequestEvent(source, requestID, providerSessionID)
+	events := []protocol.Event{m.permissionToolCallEvent(source, requestID)}
+	return append(events, m.permissionRequestEvent(source, requestID, providerSessionID)...)
 }
 
 func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []protocol.Event {
@@ -207,6 +208,33 @@ func (m *Mapper) permissionRequestEvent(source map[string]any, requestID string,
 		"detail":     detail,
 		"expires_at": firstAny(source, "expires_at", "expiresAt"),
 	})}
+}
+
+func (m *Mapper) permissionToolCallEvent(source map[string]any, requestID string) protocol.Event {
+	toolCallID := "permission"
+	if requestID != "" {
+		toolCallID = "permission:" + requestID
+	}
+	action := stringField(source, "action")
+	name := action
+	if name == "" {
+		name = "permission"
+	}
+	input := map[string]any{
+		"action":     action,
+		"risk_level": firstString(source, "risk_level", "riskLevel", "risk"),
+		"summary":    stringField(source, "summary"),
+	}
+	if options, ok := source["options"]; ok {
+		input["options"] = options
+	}
+	return m.event("session.tool_call", map[string]any{
+		"tool_call_id": toolCallID,
+		"phase":        "start",
+		"name":         name,
+		"input":        input,
+		"result":       nil,
+	})
 }
 
 func (m *Mapper) stateEvent(state string, providerSessionID string, metadata map[string]any) protocol.Event {

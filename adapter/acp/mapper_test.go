@@ -181,11 +181,23 @@ func TestMapperMapsACPPermissionRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MapLine() error = %v", err)
 	}
-	if len(events) != 1 {
-		t.Fatalf("events = %+v, want one permission request", events)
+	if len(events) != 2 {
+		t.Fatalf("events = %+v, want tool call plus permission request", events)
 	}
-	assertEvent(t, events[0], "permission.request")
-	payload := payloadMap(t, events[0])
+	assertEvent(t, events[0], "session.tool_call")
+	tool := payloadMap(t, events[0])
+	if tool["tool_call_id"] != "permission:7" || tool["phase"] != "start" ||
+		tool["name"] != "fs.write" || tool["result"] != nil {
+		t.Fatalf("tool payload = %+v", tool)
+	}
+	input := tool["input"].(map[string]any)
+	if input["action"] != "fs.write" || input["risk_level"] != "medium" ||
+		input["summary"] != "Write a file" || len(input["options"].([]any)) != 1 {
+		t.Fatalf("tool input = %+v", input)
+	}
+
+	assertEvent(t, events[1], "permission.request")
+	payload := payloadMap(t, events[1])
 	if payload["request_id"] != "7" || payload["action"] != "fs.write" ||
 		payload["risk_level"] != "medium" || payload["summary"] != "Write a file" {
 		t.Fatalf("permission payload = %+v", payload)
