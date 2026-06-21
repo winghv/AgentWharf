@@ -34,6 +34,11 @@ type WebSocketConfig struct {
 	AdapterActivityObserver AdapterActivityObserver
 }
 
+type EphemeralBroadcaster interface {
+	http.Handler
+	EmitEphemeralEvent(context.Context, protocol.Event) error
+}
+
 type CommandActivity struct {
 	SessionID  string
 	CommandID  string
@@ -55,7 +60,7 @@ type AdapterActivityObserver interface {
 	ObserveAdapterActivity(context.Context, AdapterActivity)
 }
 
-func NewWebSocketHandler(cfg WebSocketConfig) http.Handler {
+func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 	timeout := cfg.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = defaultHandshakeTimeout
@@ -72,6 +77,26 @@ func NewWebSocketHandler(cfg WebSocketConfig) http.Handler {
 		acceptedCommands:        make(map[string]struct{}),
 		decisions:               make(map[string]struct{}),
 	}
+}
+
+func (h *webSocketHandler) EmitEphemeralEvent(ctx context.Context, ev protocol.Event) error {
+	if ev.Type == "" || ev.SessionID == "" {
+		return errors.New("event type and session_id are required")
+	}
+	if ev.Seq != nil {
+		return errors.New("ephemeral event must not include seq")
+	}
+	if !isEphemeralEvent(ev.Type) {
+		return fmt.Errorf("event type %q is not ephemeral", ev.Type)
+	}
+	eventTime := normalizedEventTime(ev.Time)
+	h.broadcastEvent(ctx, protocol.Event{
+		Type:      ev.Type,
+		SessionID: ev.SessionID,
+		Time:      eventTime.UnixMilli(),
+		Payload:   clonePayload(ev.Payload),
+	})
+	return nil
 }
 
 type webSocketHandler struct {
@@ -799,7 +824,7 @@ func clonePayload(payload json.RawMessage) json.RawMessage {
 
 func isEphemeralEvent(eventType string) bool {
 	switch eventType {
-	case "presence", "agent.activity", "log.tail", "resource.sample":
+	case "presence", "agent.activity", "log.tail", "resource.sample", "session.idle_warning":
 		return true
 	default:
 		return false

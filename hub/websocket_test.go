@@ -228,6 +228,46 @@ func TestWebSocketServerBroadcastsEphemeralEventWithoutPersistence(t *testing.T)
 	}
 }
 
+func TestWebSocketServerEmitsIdleWarningFromHostWithoutPersistence(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{
+		Handshake:  testHandshakeWithStore(events),
+		EventStore: events,
+	})
+	broadcaster, ok := handler.(hub.EphemeralBroadcaster)
+	if !ok {
+		t.Fatalf("handler does not implement EphemeralBroadcaster")
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+
+	payload := json.RawMessage(`{"vm_id":"vm_1","seconds_until_suspend":600,"suspend_at":"2026-06-21T12:30:00Z","message":"This VM will pause soon because it has been idle."}`)
+	if err := broadcaster.EmitEphemeralEvent(context.Background(), protocol.Event{
+		Type:      "session.idle_warning",
+		SessionID: "ses_1",
+		Time:      2003,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("emit idle warning: %v", err)
+	}
+
+	ev := readFrame(t, client).(*protocol.Event)
+	if ev.Seq != nil || ev.Type != "session.idle_warning" || ev.Time != 2003 ||
+		string(ev.Payload) != string(payload) {
+		t.Fatalf("idle warning event = %+v payload=%s", ev, string(ev.Payload))
+	}
+	if calls := events.appended(); len(calls) != 0 {
+		t.Fatalf("idle warning event was persisted: %+v", calls)
+	}
+}
+
 func TestWebSocketServerBroadcastsEphemeralEventWithoutEventStore(t *testing.T) {
 	t.Parallel()
 
