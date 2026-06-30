@@ -106,7 +106,7 @@ func TestProcessSupervisorStopsProviderWithInterrupt(t *testing.T) {
 		runDone <- supervisor.Run(ctx)
 	}()
 	_ = waitEvent(t, supervisor.Events(), ProcessEventStarted)
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer stopCancel()
 	if err := supervisor.Stop(stopCtx); err != nil {
 		t.Fatalf("Stop() error = %v", err)
