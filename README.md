@@ -52,7 +52,7 @@ appears in Console and can be reopened from the browser or another client.
 
 ## Why AgentWharf
 
-- **Bring your own model**: keep your local provider login, quota, and secrets.
+- **Connect your own machine**: keep your local provider login, quota, and secrets.
 - **Durable sessions**: Hub-issued `seq` lets clients reconnect and replay missed
   events in order.
 - **Multi-client control**: the same agent session can be viewed and controlled
