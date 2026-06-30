@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AgentWharf Session</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>AgentWharf Session</h1>
+          <p id="status">Disconnected</p>
+        </div>
+        <div class="stats">
+          <span>seq</span>
+          <strong id="last-seq">0</strong>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <form id="connect-form" class="panel">
+          <label>
+            Hub URL
+            <input id="hub-url" name="hub-url" value="ws://127.0.0.1:8765/ws" autocomplete="off" />
+          </label>
+          <label>
+            Token
+            <input id="token" name="token" value="control-token" autocomplete="off" />
+          </label>
+          <label>
+            Session
+            <input id="session-id" name="session-id" value="ses_local" autocomplete="off" />
+          </label>
+          <div class="actions">
+            <button id="connect" type="submit">Connect</button>
+            <button id="disconnect" type="button">Disconnect</button>
+          </div>
+        </form>
+
+        <section class="panel stream" aria-label="Session events">
+          <div id="events" class="events"></div>
+        </section>
+      </section>
+
+      <form id="message-form" class="composer">
+        <input id="message" name="message" placeholder="Message" autocomplete="off" />
+        <button id="send" type="submit">Send</button>
+      </form>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
