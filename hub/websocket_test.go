@@ -569,7 +569,7 @@ func TestWebSocketServerReportsAdapterActivity(t *testing.T) {
 
 	writeAdapterHello(t, adapter, "adapter-token")
 	_ = readFrame(t, adapter).(*protocol.HelloAck)
-	if got := observer.activities(); len(got) != 1 || got[0].SessionID != "ses_1" || got[0].At.IsZero() {
+	if got := waitAdapterActivityCount(t, observer, 1); len(got) != 1 || got[0].SessionID != "ses_1" || got[0].At.IsZero() {
 		t.Fatalf("hello adapter activity = %+v", got)
 	}
 
@@ -578,7 +578,7 @@ func TestWebSocketServerReportsAdapterActivity(t *testing.T) {
 	if pong.Nonce != "adapter-ping" {
 		t.Fatalf("pong nonce = %q", pong.Nonce)
 	}
-	if got := observer.activities(); len(got) != 2 || got[1].SessionID != "ses_1" || got[1].At.IsZero() {
+	if got := waitAdapterActivityCount(t, observer, 2); len(got) != 2 || got[1].SessionID != "ses_1" || got[1].At.IsZero() {
 		t.Fatalf("ping adapter activity = %+v", got)
 	}
 
