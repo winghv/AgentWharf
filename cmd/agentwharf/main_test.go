@@ -135,14 +135,14 @@ func TestParseWrapConfigAcceptsPairing(t *testing.T) {
 
 	cfg, err := parseWrapConfig([]string{
 		"--pair",
-		"--control-plane", "https://cloud.superwhv.example/v1",
+		"--cloud", "https://cloud.superwhv.example/v1",
 		"--agent", "claude",
 		"--acp",
 	}, io.Discard)
 	if err != nil {
 		t.Fatalf("parseWrapConfig() error = %v", err)
 	}
-	if !cfg.Pair || cfg.ControlPlaneURL != "https://cloud.superwhv.example/v1" ||
+	if !cfg.Pair || cfg.CloudAPIURL != "https://cloud.superwhv.example/v1" ||
 		cfg.Provider != "claude-code" || cfg.Format != "acp" {
 		t.Fatalf("wrap config = %+v", cfg)
 	}
@@ -157,7 +157,7 @@ func TestParseAgentEntrypointDefaultsToManagedClaudePairing(t *testing.T) {
 		cfg.Provider != "claude-code" ||
 		cfg.Format != "acp" ||
 		!cfg.Pair ||
-		cfg.ControlPlaneURL != defaultManagedControlPlaneURL ||
+		cfg.CloudAPIURL != defaultManagedCloudAPIURL ||
 		strings.Join(cfg.ProviderCommand, " ") != "claude-agent-acp" {
 		t.Fatalf("agent entrypoint config = %+v", cfg)
 	}
@@ -176,7 +176,7 @@ func TestParseAgentEntrypointUsesInjectedSessionWithoutPairing(t *testing.T) {
 		cfg.Provider != "codex" ||
 		cfg.Format != "acp" ||
 		cfg.Pair ||
-		cfg.ControlPlaneURL != "" ||
+		cfg.CloudAPIURL != "" ||
 		cfg.HubURL != "wss://hub.superwhv.example/hub" ||
 		cfg.SessionID != "ses_vm" ||
 		cfg.AdapterToken != "adapter-token" ||
@@ -194,7 +194,7 @@ func TestParseAgentEntrypointTreatsEmptyInjectedSessionAsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
 	}
-	if !cfg.Pair || cfg.ControlPlaneURL != defaultManagedControlPlaneURL {
+	if !cfg.Pair || cfg.CloudAPIURL != defaultManagedCloudAPIURL {
 		t.Fatalf("agent entrypoint config = %+v, want managed pairing", cfg)
 	}
 }
@@ -288,7 +288,7 @@ func TestRunWrapPairingCreatesMachineSessionAndPublishesEvents(t *testing.T) {
 	if err := runWithInput(ctx, []string{
 		"wrap",
 		"--pair",
-		"--control-plane", controlPlane.URL,
+		"--cloud", controlPlane.URL,
 		"--agent", "claude",
 		"--jsonstream",
 	}, stdin, io.Discard, stderr); err != nil {

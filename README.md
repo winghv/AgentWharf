@@ -98,7 +98,7 @@ $ agentwharf wrap --agent claude --acp
 Advanced and test harnesses can still use the explicit managed pairing form:
 
 ```console
-$ agentwharf wrap --agent claude --acp --pair --control-plane https://cloud.superwhv.me/v1
+$ agentwharf wrap --agent claude --acp --pair --cloud https://cloud.superwhv.me/v1
 ```
 
 Most users should start with `wharf claude` or `wharf codex`.

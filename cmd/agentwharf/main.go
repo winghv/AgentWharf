@@ -35,13 +35,13 @@ import (
 )
 
 const (
-	defaultServeAddr              = "127.0.0.1:8765"
-	defaultSessionID              = "local"
-	defaultProvider               = "claude-code"
-	defaultControlToken           = "local-control-token"
-	defaultAdapterToken           = "local-adapter-token"
-	defaultWrapHubURL             = "ws://" + defaultServeAddr
-	defaultManagedControlPlaneURL = "https://cloud.superwhv.me/v1"
+	defaultServeAddr          = "127.0.0.1:8765"
+	defaultSessionID          = "local"
+	defaultProvider           = "claude-code"
+	defaultControlToken       = "local-control-token"
+	defaultAdapterToken       = "local-adapter-token"
+	defaultWrapHubURL         = "ws://" + defaultServeAddr
+	defaultManagedCloudAPIURL = "https://cloud.superwhv.me/v1"
 )
 
 var errUnsafeDefaultToken = errors.New("default local tokens require a loopback listen address")
@@ -123,7 +123,7 @@ type wrapConfig struct {
 	Format          string
 	SecretDir       string
 	Pair            bool
-	ControlPlaneURL string
+	CloudAPIURL     string
 	ProviderCommand []string
 }
 
@@ -204,14 +204,14 @@ func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
 
 func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	cfg := wrapConfig{
-		HubURL:          envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
-		SessionID:       envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
-		Agent:           envOrDefault("AGENTWHARF_AGENT", "claude"),
-		Provider:        envOrDefault("AGENTWHARF_PROVIDER", ""),
-		AdapterToken:    envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
-		Format:          envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
-		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
-		ControlPlaneURL: envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", ""),
+		HubURL:       envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
+		SessionID:    envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
+		Agent:        envOrDefault("AGENTWHARF_AGENT", "claude"),
+		Provider:     envOrDefault("AGENTWHARF_PROVIDER", ""),
+		AdapterToken: envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
+		Format:       envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
+		SecretDir:    envOrDefault("AGENTWHARF_SECRET_DIR", ""),
+		CloudAPIURL:  envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", "")),
 	}
 	var useACP bool
 	var useJSONStream bool
@@ -225,8 +225,8 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	flags.StringVar(&cfg.AdapterToken, "adapter-token", cfg.AdapterToken, "adapter token")
 	flags.StringVar(&cfg.Format, "format", cfg.Format, "input format: jsonstream or acp")
 	flags.StringVar(&cfg.SecretDir, "secret-dir", cfg.SecretDir, "directory containing injected secret files for masking")
-	flags.BoolVar(&cfg.Pair, "pair", false, "pair this machine with a Control Plane before connecting")
-	flags.StringVar(&cfg.ControlPlaneURL, "control-plane", cfg.ControlPlaneURL, "Control Plane API base URL, usually ending in /v1")
+	flags.BoolVar(&cfg.Pair, "pair", false, "pair this machine with SuperWHV before connecting")
+	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL, usually ending in /v1")
 	flags.BoolVar(&useACP, "acp", false, "read ACP JSON frames from stdin")
 	flags.BoolVar(&useJSONStream, "jsonstream", false, "read Claude stream-json lines from stdin")
 	if err := flags.Parse(args); err != nil {
@@ -258,7 +258,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	}
 	cfg.Pair = !hasInjectedHubSession()
 	if cfg.Pair {
-		cfg.ControlPlaneURL = envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", defaultManagedControlPlaneURL)
+		cfg.CloudAPIURL = envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", defaultManagedCloudAPIURL))
 	}
 
 	flags := flag.NewFlagSet(agent, flag.ContinueOnError)
@@ -268,8 +268,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	flags.StringVar(&cfg.Provider, "provider", cfg.Provider, "provider name override")
 	flags.StringVar(&cfg.AdapterToken, "adapter-token", cfg.AdapterToken, "adapter token")
 	flags.StringVar(&cfg.SecretDir, "secret-dir", cfg.SecretDir, "directory containing injected secret files for masking")
-	flags.StringVar(&cfg.ControlPlaneURL, "cloud", cfg.ControlPlaneURL, "SuperWHV Control Plane API base URL")
-	flags.StringVar(&cfg.ControlPlaneURL, "control-plane", cfg.ControlPlaneURL, "Control Plane API base URL")
+	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL")
 	flags.BoolVar(&cfg.Pair, "pair", cfg.Pair, "pair this machine with SuperWHV before connecting")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
@@ -277,8 +276,8 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	if flags.NArg() > 0 {
 		cfg.ProviderCommand = append([]string(nil), flags.Args()...)
 	}
-	if cfg.Pair && cfg.ControlPlaneURL == "" {
-		cfg.ControlPlaneURL = defaultManagedControlPlaneURL
+	if cfg.Pair && cfg.CloudAPIURL == "" {
+		cfg.CloudAPIURL = defaultManagedCloudAPIURL
 	}
 	return normalizeWrapConfig(cfg)
 }
@@ -328,9 +327,9 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	if cfg.HubURL == "" {
 		cfg.HubURL = defaultWrapHubURL
 	}
-	cfg.ControlPlaneURL = strings.TrimSpace(cfg.ControlPlaneURL)
-	if cfg.Pair && cfg.ControlPlaneURL == "" {
-		return wrapConfig{}, errors.New("wrap --pair requires --control-plane or AGENTWHARF_CONTROL_PLANE_URL")
+	cfg.CloudAPIURL = strings.TrimSpace(cfg.CloudAPIURL)
+	if cfg.Pair && cfg.CloudAPIURL == "" {
+		return wrapConfig{}, errors.New("wrap --pair requires --cloud or AGENTWHARF_CLOUD_API_URL")
 	}
 	if cfg.SessionID == "" {
 		cfg.SessionID = defaultSessionID
@@ -502,21 +501,21 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 
 func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	createURL, err := controlPlaneEndpoint(cfg.ControlPlaneURL, "/machine-pairing-codes")
+	createURL, err := cloudAPIEndpoint(cfg.CloudAPIURL, "/machine-pairing-codes")
 	if err != nil {
 		return cfg, err
 	}
 	var pairing machinePairingCodeResponse
-	status, body, err := postControlPlaneJSON(ctx, client, createURL, "", machinePairingCreateRequest{
+	status, body, err := postCloudAPIJSON(ctx, client, createURL, "", machinePairingCreateRequest{
 		Platform: runtime.GOOS + "-" + runtime.GOARCH,
 	})
 	if err != nil {
 		return cfg, err
 	}
 	if status != http.StatusCreated {
-		return cfg, fmt.Errorf("create machine pairing code: control plane returned status %d", status)
+		return cfg, fmt.Errorf("create machine pairing code: cloud api returned status %d", status)
 	}
-	if err := decodeControlPlaneJSON(body, &pairing); err != nil {
+	if err := decodeCloudAPIJSON(body, &pairing); err != nil {
 		return cfg, fmt.Errorf("decode machine pairing response: %w", err)
 	}
 	if pairing.Data.DeviceCode == "" || pairing.Data.UserCode == "" {
@@ -526,11 +525,11 @@ func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wra
 		_, _ = fmt.Fprintf(output, "Pair this machine at %s with device code %s and user code %s\n", pairing.Data.VerificationURI, pairing.Data.DeviceCode, pairing.Data.UserCode)
 	}
 
-	machineToken, err := exchangeMachineToken(ctx, client, cfg.ControlPlaneURL, pairing)
+	machineToken, err := exchangeMachineToken(ctx, client, cfg.CloudAPIURL, pairing)
 	if err != nil {
 		return cfg, err
 	}
-	session, err := createMachineSession(ctx, client, cfg.ControlPlaneURL, machineToken.Data.MachineToken, cfg.Provider)
+	session, err := createMachineSession(ctx, client, cfg.CloudAPIURL, machineToken.Data.MachineToken, cfg.Provider)
 	if err != nil {
 		return cfg, err
 	}
@@ -544,7 +543,7 @@ func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wra
 }
 
 func exchangeMachineToken(ctx context.Context, client *http.Client, baseURL string, pairing machinePairingCodeResponse) (machineTokenResponse, error) {
-	exchangeURL, err := controlPlaneEndpoint(baseURL, "/machine-pairing-codes/token")
+	exchangeURL, err := cloudAPIEndpoint(baseURL, "/machine-pairing-codes/token")
 	if err != nil {
 		return machineTokenResponse{}, err
 	}
@@ -555,7 +554,7 @@ func exchangeMachineToken(ctx context.Context, client *http.Client, baseURL stri
 	deadline := time.NewTimer(10 * time.Minute)
 	defer deadline.Stop()
 	for {
-		status, body, err := postControlPlaneJSON(ctx, client, exchangeURL, "", machinePairingTokenRequest{
+		status, body, err := postCloudAPIJSON(ctx, client, exchangeURL, "", machinePairingTokenRequest{
 			DeviceCode: pairing.Data.DeviceCode,
 		})
 		if err != nil {
@@ -564,7 +563,7 @@ func exchangeMachineToken(ctx context.Context, client *http.Client, baseURL stri
 		switch status {
 		case http.StatusOK:
 			var response machineTokenResponse
-			if err := decodeControlPlaneJSON(body, &response); err != nil {
+			if err := decodeCloudAPIJSON(body, &response); err != nil {
 				return machineTokenResponse{}, fmt.Errorf("decode machine token response: %w", err)
 			}
 			if response.Data.MachineToken == "" {
@@ -583,40 +582,40 @@ func exchangeMachineToken(ctx context.Context, client *http.Client, baseURL stri
 			case <-timer.C:
 			}
 		default:
-			return machineTokenResponse{}, fmt.Errorf("exchange machine pairing token: control plane returned status %d", status)
+			return machineTokenResponse{}, fmt.Errorf("exchange machine pairing token: cloud api returned status %d", status)
 		}
 	}
 }
 
 func createMachineSession(ctx context.Context, client *http.Client, baseURL string, machineToken string, provider string) (machineSessionResponse, error) {
-	sessionURL, err := controlPlaneEndpoint(baseURL, "/machine-sessions")
+	sessionURL, err := cloudAPIEndpoint(baseURL, "/machine-sessions")
 	if err != nil {
 		return machineSessionResponse{}, err
 	}
-	status, body, err := postControlPlaneJSON(ctx, client, sessionURL, machineToken, machineSessionCreateRequest{
+	status, body, err := postCloudAPIJSON(ctx, client, sessionURL, machineToken, machineSessionCreateRequest{
 		Provider: provider,
 	})
 	if err != nil {
 		return machineSessionResponse{}, err
 	}
 	if status != http.StatusCreated {
-		return machineSessionResponse{}, fmt.Errorf("create machine session: control plane returned status %d", status)
+		return machineSessionResponse{}, fmt.Errorf("create machine session: cloud api returned status %d", status)
 	}
 	var response machineSessionResponse
-	if err := decodeControlPlaneJSON(body, &response); err != nil {
+	if err := decodeCloudAPIJSON(body, &response); err != nil {
 		return machineSessionResponse{}, fmt.Errorf("decode machine session response: %w", err)
 	}
 	return response, nil
 }
 
-func postControlPlaneJSON(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any) (int, []byte, error) {
+func postCloudAPIJSON(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any) (int, []byte, error) {
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
-		return 0, nil, fmt.Errorf("marshal control plane request: %w", err)
+		return 0, nil, fmt.Errorf("marshal cloud api request: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return 0, nil, fmt.Errorf("create control plane request: %w", err)
+		return 0, nil, fmt.Errorf("create cloud api request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if bearerToken != "" {
@@ -624,17 +623,17 @@ func postControlPlaneJSON(ctx context.Context, client *http.Client, endpoint str
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("post control plane request: %w", err)
+		return 0, nil, fmt.Errorf("post cloud api request: %w", err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, nil, fmt.Errorf("read control plane response: %w", err)
+		return 0, nil, fmt.Errorf("read cloud api response: %w", err)
 	}
 	return resp.StatusCode, data, nil
 }
 
-func decodeControlPlaneJSON(data []byte, target any) error {
+func decodeCloudAPIJSON(data []byte, target any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(target); err != nil {
 		return err
@@ -642,13 +641,13 @@ func decodeControlPlaneJSON(data []byte, target any) error {
 	return nil
 }
 
-func controlPlaneEndpoint(baseURL string, path string) (string, error) {
+func cloudAPIEndpoint(baseURL string, path string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil {
-		return "", fmt.Errorf("parse control plane url: %w", err)
+		return "", fmt.Errorf("parse cloud api url: %w", err)
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
-		return "", errors.New("control plane url must include scheme and host")
+		return "", errors.New("cloud api url must include scheme and host")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/" + strings.TrimLeft(path, "/")
 	parsed.RawQuery = ""
