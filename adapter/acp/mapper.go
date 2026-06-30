@@ -312,13 +312,6 @@ func objectOrNil(value any) any {
 	return nil
 }
 
-func objectOrEmpty(value any) any {
-	if object := objectOrNil(value); object != nil {
-		return object
-	}
-	return map[string]any{}
-}
-
 func stringField(value map[string]any, key string) string {
 	text, ok := value[key].(string)
 	if !ok {
