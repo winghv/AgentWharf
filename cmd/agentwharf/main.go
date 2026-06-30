@@ -35,12 +35,13 @@ import (
 )
 
 const (
-	defaultServeAddr    = "127.0.0.1:8765"
-	defaultSessionID    = "local"
-	defaultProvider     = "claude-code"
-	defaultControlToken = "local-control-token"
-	defaultAdapterToken = "local-adapter-token"
-	defaultWrapHubURL   = "ws://" + defaultServeAddr
+	defaultServeAddr              = "127.0.0.1:8765"
+	defaultSessionID              = "local"
+	defaultProvider               = "claude-code"
+	defaultControlToken           = "local-control-token"
+	defaultAdapterToken           = "local-adapter-token"
+	defaultWrapHubURL             = "ws://" + defaultServeAddr
+	defaultManagedControlPlaneURL = "https://cloud.superwhv.me/v1"
 )
 
 var errUnsafeDefaultToken = errors.New("default local tokens require a loopback listen address")
@@ -61,7 +62,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentwharf serve|wrap [options]")
+		return errors.New("usage: agentwharf serve|wrap|claude|codex|gemini [options]")
 	}
 
 	switch args[0] {
@@ -87,6 +88,17 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 			return err
 		}
 		_, _ = fmt.Fprintf(stdout, "agentwharf wrap sent events for session_id=%s provider=%s\n", effective.SessionID, effective.Provider)
+		return nil
+	case "claude", "codex", "gemini":
+		cfg, err := parseAgentEntrypointConfig(args[0], args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		effective, err := runWrap(ctx, cfg, stdin, stderr)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(stdout, "wharf %s ended session_id=%s provider=%s\n", args[0], effective.SessionID, effective.Provider)
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -233,6 +245,44 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	return normalizeWrapConfig(cfg)
 }
 
+func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (wrapConfig, error) {
+	cfg := wrapConfig{
+		HubURL:          envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
+		SessionID:       envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
+		Agent:           agent,
+		Provider:        envOrDefault("AGENTWHARF_PROVIDER", ""),
+		AdapterToken:    envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
+		Format:          "acp",
+		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
+		ProviderCommand: defaultProviderCommand(agent),
+	}
+	cfg.Pair = !hasInjectedHubSession()
+	if cfg.Pair {
+		cfg.ControlPlaneURL = envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", defaultManagedControlPlaneURL)
+	}
+
+	flags := flag.NewFlagSet(agent, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.StringVar(&cfg.HubURL, "hub", cfg.HubURL, "Hub WebSocket URL")
+	flags.StringVar(&cfg.SessionID, "session-id", cfg.SessionID, "session id")
+	flags.StringVar(&cfg.Provider, "provider", cfg.Provider, "provider name override")
+	flags.StringVar(&cfg.AdapterToken, "adapter-token", cfg.AdapterToken, "adapter token")
+	flags.StringVar(&cfg.SecretDir, "secret-dir", cfg.SecretDir, "directory containing injected secret files for masking")
+	flags.StringVar(&cfg.ControlPlaneURL, "cloud", cfg.ControlPlaneURL, "SuperWHV Control Plane API base URL")
+	flags.StringVar(&cfg.ControlPlaneURL, "control-plane", cfg.ControlPlaneURL, "Control Plane API base URL")
+	flags.BoolVar(&cfg.Pair, "pair", cfg.Pair, "pair this machine with SuperWHV before connecting")
+	if err := flags.Parse(args); err != nil {
+		return wrapConfig{}, err
+	}
+	if flags.NArg() > 0 {
+		cfg.ProviderCommand = append([]string(nil), flags.Args()...)
+	}
+	if cfg.Pair && cfg.ControlPlaneURL == "" {
+		cfg.ControlPlaneURL = defaultManagedControlPlaneURL
+	}
+	return normalizeWrapConfig(cfg)
+}
+
 func defaultDBPath() string {
 	dir, err := os.UserConfigDir()
 	if err != nil || dir == "" {
@@ -320,6 +370,21 @@ func providerForAgent(agent string) string {
 	default:
 		return agent
 	}
+}
+
+func defaultProviderCommand(agent string) []string {
+	switch agent {
+	case "claude", "claude-code":
+		return []string{"claude-agent-acp"}
+	default:
+		return []string{agent}
+	}
+}
+
+func hasInjectedHubSession() bool {
+	return os.Getenv("AGENTWHARF_HUB_URL") != "" &&
+		os.Getenv("AGENTWHARF_SESSION_ID") != "" &&
+		os.Getenv("AGENTWHARF_ADAPTER_TOKEN") != ""
 }
 
 func envOrDefault(key string, fallback string) string {

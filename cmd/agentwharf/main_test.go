@@ -148,6 +148,57 @@ func TestParseWrapConfigAcceptsPairing(t *testing.T) {
 	}
 }
 
+func TestParseAgentEntrypointDefaultsToManagedClaudePairing(t *testing.T) {
+	cfg, err := parseAgentEntrypointConfig("claude", nil, io.Discard)
+	if err != nil {
+		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
+	}
+	if cfg.Agent != "claude" ||
+		cfg.Provider != "claude-code" ||
+		cfg.Format != "acp" ||
+		!cfg.Pair ||
+		cfg.ControlPlaneURL != defaultManagedControlPlaneURL ||
+		strings.Join(cfg.ProviderCommand, " ") != "claude-agent-acp" {
+		t.Fatalf("agent entrypoint config = %+v", cfg)
+	}
+}
+
+func TestParseAgentEntrypointUsesInjectedSessionWithoutPairing(t *testing.T) {
+	t.Setenv("AGENTWHARF_HUB_URL", "wss://hub.superwhv.example/hub")
+	t.Setenv("AGENTWHARF_SESSION_ID", "ses_vm")
+	t.Setenv("AGENTWHARF_ADAPTER_TOKEN", "adapter-token")
+
+	cfg, err := parseAgentEntrypointConfig("codex", nil, io.Discard)
+	if err != nil {
+		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
+	}
+	if cfg.Agent != "codex" ||
+		cfg.Provider != "codex" ||
+		cfg.Format != "acp" ||
+		cfg.Pair ||
+		cfg.ControlPlaneURL != "" ||
+		cfg.HubURL != "wss://hub.superwhv.example/hub" ||
+		cfg.SessionID != "ses_vm" ||
+		cfg.AdapterToken != "adapter-token" ||
+		strings.Join(cfg.ProviderCommand, " ") != "codex" {
+		t.Fatalf("agent entrypoint config = %+v", cfg)
+	}
+}
+
+func TestParseAgentEntrypointTreatsEmptyInjectedSessionAsMissing(t *testing.T) {
+	t.Setenv("AGENTWHARF_HUB_URL", "")
+	t.Setenv("AGENTWHARF_SESSION_ID", "ses_vm")
+	t.Setenv("AGENTWHARF_ADAPTER_TOKEN", "adapter-token")
+
+	cfg, err := parseAgentEntrypointConfig("claude", nil, io.Discard)
+	if err != nil {
+		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
+	}
+	if !cfg.Pair || cfg.ControlPlaneURL != defaultManagedControlPlaneURL {
+		t.Fatalf("agent entrypoint config = %+v, want managed pairing", cfg)
+	}
+}
+
 func TestRunWrapPairingCreatesMachineSessionAndPublishesEvents(t *testing.T) {
 	t.Parallel()
 
