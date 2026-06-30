@@ -1,48 +1,127 @@
 # AgentWharf
 
-Durable session gateway for AI agents: durable per-session event log with hub-issued `seq`, multi-client fanout, reconnect replay, permission sync, and an ACP-first provider bridge.
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)](#status)
+[![Website](https://img.shields.io/badge/website-cloud.superwhv.me-black.svg)](https://cloud.superwhv.me/agentwharf)
+[![Console](https://img.shields.io/badge/console-cloud.superwhv.me-0f766e.svg)](https://cloud.superwhv.me/app/machines)
+[![Protocol](https://img.shields.io/badge/protocol-v1-2563eb.svg)](spec/v1.md)
 
-> Status: pre-release. Protocol spec and implementation are under active development; public release follows internal validation.
+Open-source session gateway for coding agents. AgentWharf lets you run Claude,
+Codex, Gemini, or another ACP-compatible agent on your own machine, then control
+the session from SuperWHV Console with durable replay, multi-client fanout, and
+permission sync.
 
-## What It Is
+Links: [Website](https://cloud.superwhv.me/agentwharf) |
+[SuperWHV Console](https://cloud.superwhv.me/app/machines) |
+[Protocol spec](spec/v1.md) | [TypeScript client](client-ts/)
 
-- **AgentWharf Hub**: the single authority for a session's event stream — assigns `seq`, persists durable events (SQLite by default, pluggable `EventStore`), fans out to any number of clients, replays gaps on reconnect.
-- **Adapter**: bridges a coding agent (Claude Code, Codex, Gemini, ...) into the AgentWharf Hub protocol. ACP (Agent Client Protocol) first; PTY/stdio fallback for providers without ACP support.
-- **Protocol**: versioned WebSocket spec (`spec/v1.md`) — frames, durable/ephemeral events, commands with idempotency, scopes, replay semantics.
+## Quickstart: Connect Your Own Machine
 
-## Planned layout
+Prerequisites:
 
-```text
-spec/        # protocol spec (authoritative)
-protocol/    # frame & event types, codecs, version negotiation
-hub/         # hub library: connections, seq, fanout, replay
-store/       # EventStore implementations (sqlite, postgres)
-auth/        # Authenticator implementations (static)
-masking/     # streaming secret masking
-adapter/     # core, acp bridge, fallback runners
-client-ts/   # TypeScript client SDK
-examples/    # minimal web UI
-cmd/agentwharf/  # single binary: serve / wrap
+- Access to [SuperWHV Console](https://cloud.superwhv.me/app/machines).
+- The agent you want to run is installed and authenticated on this machine.
+  `wharf claude` uses the Claude ACP bridge command when available;
+  `wharf codex` uses the Codex CLI.
+
+Install Wharf:
+
+```console
+$ curl -fsSL get.superwhv.dev | sh
 ```
 
-## Self-Host Goal
+Start the agent you want to use:
+
+```console
+$ wharf claude
+# or:
+$ wharf codex
+```
+
+The CLI prints a pairing prompt:
+
+```text
+Pair this machine at https://cloud.superwhv.me/app/machines
+device_code: dev_xxxxx
+user_code: ABCD-EFGH
+```
+
+Then open [Console Machines](https://cloud.superwhv.me/app/machines), paste the
+`device_code` and `user_code`, give the machine a name, and confirm. The session
+appears in Console and can be reopened from the browser or another client.
+
+## Why AgentWharf
+
+- **Bring your own model**: keep your local provider login, quota, and secrets.
+- **Durable sessions**: Hub-issued `seq` lets clients reconnect and replay missed
+  events in order.
+- **Multi-client control**: the same agent session can be viewed and controlled
+  from CLI, browser, editor, or phone.
+- **Permission sync**: approval requests are normalized and broadcast through the
+  same session protocol.
+- **ACP first**: providers should connect through Agent Client Protocol; stdio
+  and structured-stream fallbacks are available for advanced adapters.
+
+## How It Works
+
+```text
+wharf claude / wharf codex
+  -> creates a device pairing code
+  -> waits for Console confirmation
+  -> exchanges the machine token for a session-bound adapter token
+  -> starts the provider adapter
+  -> connects to the AgentWharf Hub
+```
+
+Tokens are kept in memory. They are not printed by the CLI and are not written
+to disk.
+
+Core pieces:
+
+- **AgentWharf Hub**: the single authority for a session event stream. It assigns
+  `seq`, persists durable events, fans out live events, and replays gaps.
+- **Adapter**: bridges Claude, Codex, Gemini, or another provider into the
+  AgentWharf session protocol.
+- **Protocol**: versioned WebSocket frames, durable and ephemeral events,
+  commands with idempotency, scopes, and replay semantics.
+
+## Advanced: Local Self-Host
+
+Use this path when you want to run a local Hub without SuperWHV Console pairing:
 
 ```console
 $ agentwharf serve
 $ agentwharf wrap --agent claude --acp
-# open the local URL from browser/phone: observe and control your local agent remotely
+# open the local URL from a browser or phone to observe and control the session
 ```
 
-## Managed BYOM Pairing
+Advanced and test harnesses can still use the explicit managed pairing form:
 
 ```console
-$ agentwharf wrap --agent claude --acp --pair --control-plane https://cloud.example/v1
-# enter the displayed device code and user code in the managed console
+$ agentwharf wrap --agent claude --acp --pair --control-plane https://cloud.superwhv.me/v1
 ```
 
-`--pair` creates a device pairing code, waits for confirmation, exchanges the
-machine token for a session-bound adapter token, and then connects to the Hub.
-Tokens are kept in memory and are not printed or written by the CLI.
+Most users should start with `wharf claude` or `wharf codex`.
+
+## Repository Layout
+
+```text
+spec/             # protocol spec (authoritative)
+protocol/         # frame and event types, codecs, version negotiation
+hub/              # hub library: connections, seq, fanout, replay
+store/            # EventStore implementations (SQLite, Postgres)
+auth/             # Authenticator implementations
+masking/          # streaming secret masking
+adapter/          # core adapter, ACP bridge, fallback runners
+client-ts/        # TypeScript client SDK
+examples/         # minimal web UI
+cmd/agentwharf/   # CLI: serve / wrap / claude / codex / gemini
+```
+
+## Status
+
+Pre-release. The protocol spec and implementation are under active development;
+public release follows internal validation. The project is Apache-2.0 licensed.
 
 ## License
 
