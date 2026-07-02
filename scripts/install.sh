@@ -3,13 +3,12 @@ set -eu
 
 repo=${AGENTWHARF_REPO:-winghv/agentwharf}
 version=${AGENTWHARF_VERSION:-latest}
-install_dir=${AGENTWHARF_INSTALL_DIR:-/usr/local/bin}
 provider_dir=${AGENTWHARF_PROVIDER_DIR:-${HOME:-}/.agentwharf/providers}
 claude_acp_package=${AGENTWHARF_CLAUDE_ACP_PACKAGE:-@agentclientprotocol/claude-agent-acp@0.54.1}
 codex_acp_package=${AGENTWHARF_CODEX_ACP_PACKAGE:-@agentclientprotocol/codex-acp@1.0.2}
 
 say() {
-  printf 'agentwharf: %s\n' "$*" >&2
+  printf 'wharf: %s\n' "$*" >&2
 }
 
 fail() {
@@ -20,6 +19,45 @@ fail() {
 need() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
+
+command_path() {
+  path=$(command -v "$1" 2>/dev/null || true)
+  case "$path" in
+    */*) printf '%s\n' "$path" ;;
+    *) ;;
+  esac
+}
+
+command_dir() {
+  path="$1"
+  dir=$(dirname "$path")
+  (CDPATH= cd -- "$dir" 2>/dev/null && pwd -P) || return 1
+}
+
+detect_existing_install_dir() {
+  path=$(command_path wharf)
+  if [ -z "$path" ]; then
+    path=$(command_path agentwharf)
+  fi
+  [ -n "$path" ] || return 1
+  command_dir "$path"
+}
+
+existing_wharf=$(command_path wharf)
+existing_agentwharf=$(command_path agentwharf)
+existing_install_dir=$(detect_existing_install_dir || true)
+if [ "${AGENTWHARF_INSTALL_DIR+x}" = "x" ]; then
+  install_dir=$AGENTWHARF_INSTALL_DIR
+elif [ -n "$existing_install_dir" ]; then
+  install_dir=$existing_install_dir
+else
+  install_dir=/usr/local/bin
+fi
+
+install_mode=install
+if [ -n "$existing_install_dir" ] && [ "$install_dir" = "$existing_install_dir" ]; then
+  install_mode=upgrade
+fi
 
 detect_os() {
   case "$(uname -s)" in
@@ -51,14 +89,20 @@ if [ "$version" = "latest" ]; then
 else
   release_base="https://github.com/$repo/releases/download/$version"
 fi
+release_base=${AGENTWHARF_RELEASE_BASE:-$release_base}
 asset_url="$release_base/$asset"
 checksum_url="$release_base/checksums.txt"
 
 if [ "${AGENTWHARF_INSTALL_DRY_RUN:-}" = "1" ]; then
   printf 'asset_url=%s\n' "$asset_url"
   printf 'checksum_url=%s\n' "$checksum_url"
-  printf 'install_agentwharf=%s\n' "$install_dir/agentwharf"
+  printf 'install_mode=%s\n' "$install_mode"
+  [ -n "$existing_wharf" ] && printf 'existing_wharf=%s\n' "$existing_wharf"
+  [ -n "$existing_agentwharf" ] && printf 'existing_agentwharf=%s\n' "$existing_agentwharf"
   printf 'install_wharf=%s\n' "$install_dir/wharf"
+  if [ -e "$install_dir/agentwharf" ] || [ -L "$install_dir/agentwharf" ]; then
+    printf 'cleanup_legacy_agentwharf=%s\n' "$install_dir/agentwharf"
+  fi
   printf 'provider_dir=%s\n' "$provider_dir"
   printf 'provider_package=%s\n' "$claude_acp_package"
   printf 'provider_package=%s\n' "$codex_acp_package"
@@ -67,6 +111,15 @@ fi
 
 need curl
 need tar
+
+if [ "$install_mode" = "upgrade" ]; then
+  say "upgrading existing Wharf in $install_dir"
+else
+  say "installing Wharf in $install_dir"
+  if [ -n "$existing_install_dir" ] && [ "$install_dir" != "$existing_install_dir" ]; then
+    say "existing Wharf found in $existing_install_dir; AGENTWHARF_INSTALL_DIR overrides the upgrade target"
+  fi
+fi
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentwharf.XXXXXX")
 cleanup() {
@@ -146,15 +199,19 @@ install_provider_bridges() {
 
 install_provider_bridges
 run_install mkdir -p "$install_dir"
-run_install cp "$tmp_dir/agentwharf" "$install_dir/agentwharf"
-run_install chmod 0755 "$install_dir/agentwharf"
-run_install ln -sf agentwharf "$install_dir/wharf"
+if [ -e "$install_dir/wharf" ] || [ -L "$install_dir/wharf" ]; then
+  run_install rm -f "$install_dir/wharf"
+fi
+run_install cp "$tmp_dir/agentwharf" "$install_dir/wharf"
+run_install chmod 0755 "$install_dir/wharf"
+if [ -e "$install_dir/agentwharf" ] || [ -L "$install_dir/agentwharf" ]; then
+  run_install rm -f "$install_dir/agentwharf"
+fi
 if [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
   run_install cp "$tmp_dir/claude-agent-acp" "$install_dir/claude-agent-acp"
   run_install cp "$tmp_dir/codex-acp" "$install_dir/codex-acp"
 fi
 
-say "installed $install_dir/agentwharf"
 say "installed $install_dir/wharf"
 if [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
   say "installed $install_dir/claude-agent-acp"

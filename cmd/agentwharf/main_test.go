@@ -94,6 +94,18 @@ func TestRunServeRejectsNonLocalDefaultToken(t *testing.T) {
 	}
 }
 
+func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
+	t.Parallel()
+
+	err := run(context.Background(), nil, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini [options]") {
+		t.Fatalf("run() error = %v, want wharf usage", err)
+	}
+	if strings.Contains(err.Error(), "usage: agentwharf") {
+		t.Fatalf("run() error = %v, must not mention legacy agentwharf entrypoint", err)
+	}
+}
+
 func TestParseWrapConfigAcceptsClaudeACPFlag(t *testing.T) {
 	t.Parallel()
 

@@ -31,8 +31,15 @@ $ curl -fsSL https://github.com/winghv/agentwharf/releases/latest/download/insta
 ```
 
 The script downloads the matching prebuilt binary from GitHub Releases,
-installs both `agentwharf` and the short `wharf` onboarding command, and
-installs the `claude-agent-acp` / `codex-acp` provider bridge wrappers.
+installs the `wharf` command, and installs the `claude-agent-acp` /
+`codex-acp` provider bridge wrappers.
+
+Run the same install command again to upgrade. When `wharf` already exists on
+`PATH`, the installer upgrades that existing directory in place so the active
+command is replaced instead of installing a second copy behind an older binary.
+It also removes the legacy `agentwharf` command from that directory. Set
+`AGENTWHARF_INSTALL_DIR` only when you explicitly want to override the target
+directory.
 
 Start the agent you want to use:
 
@@ -94,15 +101,15 @@ Core pieces:
 Use this path when you want to run a local Hub without SuperWHV Console pairing:
 
 ```console
-$ agentwharf serve
-$ agentwharf wrap --agent claude --acp
+$ wharf serve
+$ wharf wrap --agent claude --acp
 # open the local URL from a browser or phone to observe and control the session
 ```
 
 Advanced and test harnesses can still use the explicit managed pairing form:
 
 ```console
-$ agentwharf wrap --agent claude --acp --pair --cloud https://cloud.superwhv.me/v1
+$ wharf wrap --agent claude --acp --pair --cloud https://cloud.superwhv.me/v1
 ```
 
 Most users should start with `wharf claude` or `wharf codex`.

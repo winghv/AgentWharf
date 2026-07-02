@@ -63,7 +63,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: agentwharf serve|wrap|claude|codex|gemini [options]")
+		return errors.New("usage: wharf serve|wrap|claude|codex|gemini [options]")
 	}
 
 	switch args[0] {
@@ -76,7 +76,7 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		if err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(stdout, "agentwharf serve listening on %s\n", running.wsURL)
+		_, _ = fmt.Fprintf(stdout, "wharf serve listening on %s\n", running.wsURL)
 		_, _ = fmt.Fprintf(stdout, "session_id=%s provider=%s\n", cfg.SessionID, cfg.Provider)
 		return running.wait()
 	case "wrap":
@@ -88,7 +88,7 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		if err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(stdout, "agentwharf wrap sent events for session_id=%s provider=%s\n", effective.SessionID, effective.Provider)
+		_, _ = fmt.Fprintf(stdout, "wharf wrap sent events for session_id=%s provider=%s\n", effective.SessionID, effective.Provider)
 		return nil
 	case "claude", "codex", "gemini":
 		cfg, err := parseAgentEntrypointConfig(args[0], args[1:], stderr)
