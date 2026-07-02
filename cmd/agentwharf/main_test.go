@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -98,7 +99,7 @@ func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	t.Parallel()
 
 	err := run(context.Background(), nil, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini [options]") {
+	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini|logout|machine [options]") {
 		t.Fatalf("run() error = %v, want wharf usage", err)
 	}
 	if strings.Contains(err.Error(), "usage: agentwharf") {
@@ -160,7 +161,7 @@ func TestParseWrapConfigAcceptsPairing(t *testing.T) {
 	}
 }
 
-func TestParseAgentEntrypointDefaultsToManagedClaudePairing(t *testing.T) {
+func TestParseAgentEntrypointDefaultsToManagedClaudeSession(t *testing.T) {
 	cfg, err := parseAgentEntrypointConfig("claude", nil, io.Discard)
 	if err != nil {
 		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
@@ -168,7 +169,8 @@ func TestParseAgentEntrypointDefaultsToManagedClaudePairing(t *testing.T) {
 	if cfg.Agent != "claude" ||
 		cfg.Provider != "claude-code" ||
 		cfg.Format != "acp" ||
-		!cfg.Pair ||
+		!cfg.Managed ||
+		cfg.Pair ||
 		cfg.CloudAPIURL != defaultManagedCloudAPIURL ||
 		strings.Join(cfg.ProviderCommand, " ") != "claude-agent-acp" {
 		t.Fatalf("agent entrypoint config = %+v", cfg)
@@ -187,6 +189,7 @@ func TestParseAgentEntrypointUsesInjectedSessionWithoutPairing(t *testing.T) {
 	if cfg.Agent != "codex" ||
 		cfg.Provider != "codex" ||
 		cfg.Format != "acp" ||
+		cfg.Managed ||
 		cfg.Pair ||
 		cfg.CloudAPIURL != "" ||
 		cfg.HubURL != "wss://hub.superwhv.example/hub" ||
@@ -234,16 +237,81 @@ func TestParseAgentEntrypointTreatsEmptyInjectedSessionAsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
 	}
-	if !cfg.Pair || cfg.CloudAPIURL != defaultManagedCloudAPIURL {
-		t.Fatalf("agent entrypoint config = %+v, want managed pairing", cfg)
+	if !cfg.Managed || cfg.Pair || cfg.CloudAPIURL != defaultManagedCloudAPIURL {
+		t.Fatalf("agent entrypoint config = %+v, want managed session", cfg)
+	}
+}
+
+func TestMachineCredentialStoreSavesLoadsAndDeletes(t *testing.T) {
+	credentialFile := filepath.Join(t.TempDir(), "state", "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+
+	credential := machineCredential{
+		MachineID:    "machine_1",
+		MachineToken: "machine-token",
+		CloudAPIURL:  "https://cloud.superwhv.example/v1",
+		HubWSURL:     "wss://hub.superwhv.example/ws",
+		ExpiresAt:    "2026-06-19T10:00:00Z",
+	}
+	if err := saveMachineCredential(credential); err != nil {
+		t.Fatalf("saveMachineCredential() error = %v", err)
+	}
+
+	loaded, err := loadMachineCredential()
+	if err != nil {
+		t.Fatalf("loadMachineCredential() error = %v", err)
+	}
+	if loaded.MachineID != credential.MachineID ||
+		loaded.MachineToken != credential.MachineToken ||
+		loaded.CloudAPIURL != credential.CloudAPIURL ||
+		loaded.HubWSURL != credential.HubWSURL ||
+		loaded.ExpiresAt != credential.ExpiresAt ||
+		loaded.CreatedAt == "" {
+		t.Fatalf("loaded credential = %+v", loaded)
+	}
+	if runtime.GOOS != "windows" {
+		dirInfo, err := os.Stat(filepath.Dir(credentialFile))
+		if err != nil {
+			t.Fatalf("stat credential dir: %v", err)
+		}
+		if dirInfo.Mode().Perm() != 0o700 {
+			t.Fatalf("credential dir mode = %o, want 0700", dirInfo.Mode().Perm())
+		}
+		fileInfo, err := os.Stat(credentialFile)
+		if err != nil {
+			t.Fatalf("stat credential file: %v", err)
+		}
+		if fileInfo.Mode().Perm() != 0o600 {
+			t.Fatalf("credential file mode = %o, want 0600", fileInfo.Mode().Perm())
+		}
+	}
+
+	if err := deleteMachineCredential(); err != nil {
+		t.Fatalf("deleteMachineCredential() error = %v", err)
+	}
+	if _, err := loadMachineCredential(); !errors.Is(err, errMachineCredentialNotFound) {
+		t.Fatalf("load deleted credential error = %v, want errMachineCredentialNotFound", err)
+	}
+}
+
+func TestMachineCredentialStoreRejectsMalformedCredential(t *testing.T) {
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+	if err := os.WriteFile(credentialFile, []byte(`{"machine_id":"machine_1"}`), 0o600); err != nil {
+		t.Fatalf("write malformed credential: %v", err)
+	}
+
+	_, err := loadMachineCredential()
+	if err == nil || errors.Is(err, errMachineCredentialNotFound) {
+		t.Fatalf("loadMachineCredential() error = %v, want malformed credential error", err)
 	}
 }
 
 func TestRunWrapPairingCreatesMachineSessionAndPublishesEvents(t *testing.T) {
-	t.Parallel()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
 
 	running, err := startServe(ctx, serveConfig{
 		Addr:         "127.0.0.1:0",
@@ -271,7 +339,7 @@ func TestRunWrapPairingCreatesMachineSessionAndPublishesEvents(t *testing.T) {
 				t.Fatalf("pairing method = %s", r.Method)
 			}
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprint(w, `{"data":{"device_code":"device-code-1","user_code":"ABCD-E","verification_uri":"https://cloud.example/pair","expires_at":"2026-06-18T10:10:00Z","interval_seconds":1}}`)
+			fmt.Fprint(w, `{"data":{"device_code":"device-code-1","user_code":"ABCD-E","verification_uri":"https://cloud.example/machines/pair","expires_at":"2026-06-18T10:10:00Z","interval_seconds":1}}`)
 		case "/machine-pairing-codes/token":
 			if r.Method != http.MethodPost {
 				t.Fatalf("exchange method = %s", r.Method)
@@ -334,14 +402,423 @@ func TestRunWrapPairingCreatesMachineSessionAndPublishesEvents(t *testing.T) {
 	}, stdin, io.Discard, stderr); err != nil {
 		t.Fatalf("run wrap pair error = %v", err)
 	}
-	if !strings.Contains(stderr.String(), "device-code-1") || !strings.Contains(stderr.String(), "ABCD-E") ||
+	if !strings.Contains(stderr.String(), "https://cloud.example/app/machines") ||
+		!strings.Contains(stderr.String(), "device-code-1") ||
+		!strings.Contains(stderr.String(), "ABCD-E") ||
 		strings.Contains(stderr.String(), "machine-token") ||
 		strings.Contains(stderr.String(), "paired-adapter-token") {
 		t.Fatalf("pairing output leaked or missed data: %s", stderr.String())
 	}
+	credential, err := loadMachineCredential()
+	if err != nil {
+		t.Fatalf("load stored machine credential: %v", err)
+	}
+	if credential.MachineID != "machine_1" ||
+		credential.MachineToken != "machine-token" ||
+		credential.CloudAPIURL != controlPlane.URL ||
+		credential.HubWSURL != "wss://ignored.example/ws" ||
+		credential.ExpiresAt != "2026-06-19T10:00:00Z" {
+		t.Fatalf("stored machine credential = %+v", credential)
+	}
 	event := readFrame(t, client).(*protocol.Event)
 	if event.Type != "session.message" || !strings.Contains(string(event.Payload), "paired pong") {
 		t.Fatalf("paired event = %+v payload=%s", event, string(event.Payload))
+	}
+}
+
+func TestManagedWrapPairsAndStoresMachineCredential(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_managed",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "paired-adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("startServe() error = %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	var pairingRequests int
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/machine-pairing-codes":
+			pairingRequests++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"data":{"device_code":"device-code-managed","user_code":"MNGD-1","verification_uri":"https://cloud.superwhv.me/machines/pair","expires_at":"2026-06-18T10:10:00Z","interval_seconds":1}}`)
+		case "/machine-pairing-codes/token":
+			fmt.Fprint(w, `{"data":{"machine":{"id":"machine_managed"},"machine_token":"machine-token-managed","hub_ws_url":"wss://ignored.example/ws","expires_at":"2026-06-19T10:00:00Z"}}`)
+		case "/machine-sessions":
+			if r.Header.Get("Authorization") != "Bearer machine-token-managed" {
+				t.Fatalf("machine session authorization = %q", r.Header.Get("Authorization"))
+			}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"data":{"session":{"id":"ses_managed","host_type":"machine","host_id":"machine_managed","provider":"claude-code","status":"starting"},"hub_ws_url":%q,"adapter_token":"paired-adapter-token","expires_at":"2026-06-18T10:15:00Z"}}`, running.wsURL)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer controlPlane.Close()
+
+	stderr := new(strings.Builder)
+	stdin := strings.NewReader(`{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"managed pong"}]}}`)
+	_, err = runWrap(ctx, wrapConfig{
+		Managed:     true,
+		CloudAPIURL: controlPlane.URL,
+		Agent:       "claude",
+		Provider:    "claude-code",
+		Format:      "jsonstream",
+	}, stdin, stderr)
+	if err != nil {
+		t.Fatalf("runWrap() error = %v", err)
+	}
+	if pairingRequests != 1 {
+		t.Fatalf("pairing requests = %d, want 1", pairingRequests)
+	}
+	if !strings.Contains(stderr.String(), "https://cloud.superwhv.me/app/machines") ||
+		strings.Contains(stderr.String(), "machine-token-managed") ||
+		strings.Contains(stderr.String(), "paired-adapter-token") {
+		t.Fatalf("managed pairing output leaked or missed data: %s", stderr.String())
+	}
+	credential, err := loadMachineCredential()
+	if err != nil {
+		t.Fatalf("load stored machine credential: %v", err)
+	}
+	if credential.MachineID != "machine_managed" ||
+		credential.MachineToken != "machine-token-managed" ||
+		credential.CloudAPIURL != controlPlane.URL {
+		t.Fatalf("stored machine credential = %+v", credential)
+	}
+}
+
+func TestManagedWrapReusesStoredMachineCredential(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_reused",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "reused-adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("startServe() error = %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	var sessionRequests int
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/machine-sessions" {
+			t.Fatalf("unexpected cloud api path %s", r.URL.Path)
+		}
+		sessionRequests++
+		if r.Header.Get("Authorization") != "Bearer stored-machine-token" {
+			t.Fatalf("machine session authorization = %q", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, `{"data":{"session":{"id":"ses_reused","host_type":"machine","host_id":"machine_reused","provider":"claude-code","status":"starting"},"hub_ws_url":%q,"adapter_token":"reused-adapter-token","expires_at":"2026-06-18T10:15:00Z"}}`, running.wsURL)
+	}))
+	defer controlPlane.Close()
+
+	if err := saveMachineCredential(machineCredential{
+		MachineID:    "machine_reused",
+		MachineToken: "stored-machine-token",
+		CloudAPIURL:  controlPlane.URL,
+	}); err != nil {
+		t.Fatalf("saveMachineCredential() error = %v", err)
+	}
+
+	stderr := new(strings.Builder)
+	stdin := strings.NewReader(`{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"reused pong"}]}}`)
+	_, err = runWrap(ctx, wrapConfig{
+		Managed:     true,
+		CloudAPIURL: controlPlane.URL,
+		Agent:       "claude",
+		Provider:    "claude-code",
+		Format:      "jsonstream",
+	}, stdin, stderr)
+	if err != nil {
+		t.Fatalf("runWrap() error = %v", err)
+	}
+	if sessionRequests != 1 {
+		t.Fatalf("machine session requests = %d, want 1", sessionRequests)
+	}
+	if strings.Contains(stderr.String(), "Pair this machine") ||
+		strings.Contains(stderr.String(), "device_code") ||
+		strings.Contains(stderr.String(), "user_code") {
+		t.Fatalf("reuse path printed pairing prompt: %s", stderr.String())
+	}
+}
+
+func TestManagedWrapForcePairOverwritesStoredMachineCredential(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_repaired",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "new-adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("startServe() error = %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	if err := saveMachineCredential(machineCredential{
+		MachineID:    "machine_old",
+		MachineToken: "old-machine-token",
+		CloudAPIURL:  "https://old-cloud.example/v1",
+	}); err != nil {
+		t.Fatalf("saveMachineCredential() error = %v", err)
+	}
+
+	var pairingRequests int
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/machine-pairing-codes":
+			pairingRequests++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"data":{"device_code":"device-code-new","user_code":"NEW1-PAIR","verification_uri":"https://cloud.example/machines/pair","expires_at":"2026-06-18T10:10:00Z","interval_seconds":1}}`)
+		case "/machine-pairing-codes/token":
+			fmt.Fprint(w, `{"data":{"machine":{"id":"machine_new"},"machine_token":"new-machine-token","hub_ws_url":"wss://ignored.example/ws","expires_at":"2026-06-19T10:00:00Z"}}`)
+		case "/machine-sessions":
+			if r.Header.Get("Authorization") != "Bearer new-machine-token" {
+				t.Fatalf("machine session authorization = %q", r.Header.Get("Authorization"))
+			}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"data":{"session":{"id":"ses_repaired","host_type":"machine","host_id":"machine_new","provider":"claude-code","status":"starting"},"hub_ws_url":%q,"adapter_token":"new-adapter-token","expires_at":"2026-06-18T10:15:00Z"}}`, running.wsURL)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer controlPlane.Close()
+
+	_, err = runWrap(ctx, wrapConfig{
+		Managed:     true,
+		Pair:        true,
+		CloudAPIURL: controlPlane.URL,
+		Agent:       "claude",
+		Provider:    "claude-code",
+		Format:      "jsonstream",
+	}, strings.NewReader(`{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"new pong"}]}}`), io.Discard)
+	if err != nil {
+		t.Fatalf("runWrap() error = %v", err)
+	}
+	if pairingRequests != 1 {
+		t.Fatalf("pairing requests = %d, want 1", pairingRequests)
+	}
+	credential, err := loadMachineCredential()
+	if err != nil {
+		t.Fatalf("load stored machine credential: %v", err)
+	}
+	if credential.MachineID != "machine_new" ||
+		credential.MachineToken != "new-machine-token" ||
+		credential.CloudAPIURL != controlPlane.URL {
+		t.Fatalf("stored machine credential = %+v", credential)
+	}
+}
+
+func TestManagedWrapRepairsRevokedMachineCredential(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_repaired",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "repaired-adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("startServe() error = %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	controlPlaneURL := ""
+	var sessionRequests int
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/machine-sessions":
+			sessionRequests++
+			switch sessionRequests {
+			case 1:
+				if r.Header.Get("Authorization") != "Bearer stale-machine-token" {
+					t.Fatalf("first machine session authorization = %q", r.Header.Get("Authorization"))
+				}
+				http.Error(w, `{"error":"machine revoked"}`, http.StatusUnauthorized)
+			case 2:
+				if r.Header.Get("Authorization") != "Bearer repaired-machine-token" {
+					t.Fatalf("second machine session authorization = %q", r.Header.Get("Authorization"))
+				}
+				w.WriteHeader(http.StatusCreated)
+				fmt.Fprintf(w, `{"data":{"session":{"id":"ses_repaired","host_type":"machine","host_id":"machine_repaired","provider":"claude-code","status":"starting"},"hub_ws_url":%q,"adapter_token":"repaired-adapter-token","expires_at":"2026-06-18T10:15:00Z"}}`, running.wsURL)
+			default:
+				t.Fatalf("unexpected machine session request %d", sessionRequests)
+			}
+		case "/machine-pairing-codes":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"data":{"device_code":"device-code-repair","user_code":"RPR1-PAIR","verification_uri":"https://cloud.example/machines/pair","expires_at":"2026-06-18T10:10:00Z","interval_seconds":1}}`)
+		case "/machine-pairing-codes/token":
+			fmt.Fprint(w, `{"data":{"machine":{"id":"machine_repaired"},"machine_token":"repaired-machine-token","hub_ws_url":"wss://ignored.example/ws","expires_at":"2026-06-19T10:00:00Z"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer controlPlane.Close()
+	controlPlaneURL = controlPlane.URL
+
+	if err := saveMachineCredential(machineCredential{
+		MachineID:    "machine_stale",
+		MachineToken: "stale-machine-token",
+		CloudAPIURL:  controlPlaneURL,
+	}); err != nil {
+		t.Fatalf("saveMachineCredential() error = %v", err)
+	}
+
+	stderr := new(strings.Builder)
+	_, err = runWrap(ctx, wrapConfig{
+		Managed:     true,
+		CloudAPIURL: controlPlaneURL,
+		Agent:       "claude",
+		Provider:    "claude-code",
+		Format:      "jsonstream",
+	}, strings.NewReader(`{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"repaired pong"}]}}`), stderr)
+	if err != nil {
+		t.Fatalf("runWrap() error = %v", err)
+	}
+	if sessionRequests != 2 {
+		t.Fatalf("machine session requests = %d, want 2", sessionRequests)
+	}
+	if !strings.Contains(stderr.String(), "Local machine pairing is no longer valid; pairing again.") ||
+		!strings.Contains(stderr.String(), "device-code-repair") {
+		t.Fatalf("repair output = %s", stderr.String())
+	}
+	credential, err := loadMachineCredential()
+	if err != nil {
+		t.Fatalf("load stored machine credential: %v", err)
+	}
+	if credential.MachineID != "machine_repaired" ||
+		credential.MachineToken != "repaired-machine-token" {
+		t.Fatalf("stored machine credential = %+v", credential)
+	}
+}
+
+func TestManagedWrapDoesNotRepairAccessError(t *testing.T) {
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+
+	var sessionRequests int
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/machine-sessions" {
+			t.Fatalf("unexpected cloud api path %s", r.URL.Path)
+		}
+		sessionRequests++
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"error":{"code":"forbidden","message":"machine access required"}}`)
+	}))
+	defer controlPlane.Close()
+
+	if err := saveMachineCredential(machineCredential{
+		MachineID:    "machine_no_access",
+		MachineToken: "stored-machine-token",
+		CloudAPIURL:  controlPlane.URL,
+	}); err != nil {
+		t.Fatalf("saveMachineCredential() error = %v", err)
+	}
+
+	_, err := runWrap(context.Background(), wrapConfig{
+		Managed:     true,
+		CloudAPIURL: controlPlane.URL,
+		Agent:       "claude",
+		Provider:    "claude-code",
+		Format:      "jsonstream",
+	}, strings.NewReader(""), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "machine access required") {
+		t.Fatalf("runWrap() error = %v, want machine access required", err)
+	}
+	if sessionRequests != 1 {
+		t.Fatalf("machine session requests = %d, want 1", sessionRequests)
+	}
+	credential, err := loadMachineCredential()
+	if err != nil {
+		t.Fatalf("load stored machine credential: %v", err)
+	}
+	if credential.MachineToken != "stored-machine-token" {
+		t.Fatalf("stored machine credential = %+v", credential)
+	}
+}
+
+func TestRunLogoutRemovesMachineCredential(t *testing.T) {
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+	if err := saveMachineCredential(machineCredential{
+		MachineID:    "machine_1",
+		MachineToken: "machine-token",
+		CloudAPIURL:  "https://cloud.superwhv.example/v1",
+	}); err != nil {
+		t.Fatalf("saveMachineCredential() error = %v", err)
+	}
+
+	stdout := new(strings.Builder)
+	if err := runWithInput(context.Background(), []string{"logout"}, nil, stdout, io.Discard); err != nil {
+		t.Fatalf("run logout error = %v", err)
+	}
+	if _, err := loadMachineCredential(); !errors.Is(err, errMachineCredentialNotFound) {
+		t.Fatalf("load deleted credential error = %v, want errMachineCredentialNotFound", err)
+	}
+	if !strings.Contains(stdout.String(), "local machine pairing removed") {
+		t.Fatalf("logout output = %s", stdout.String())
+	}
+
+	stdout.Reset()
+	if err := runWithInput(context.Background(), []string{"machine", "unlink"}, nil, stdout, io.Discard); err != nil {
+		t.Fatalf("run machine unlink error = %v", err)
+	}
+	if !strings.Contains(stdout.String(), "no local machine pairing found") {
+		t.Fatalf("machine unlink output = %s", stdout.String())
 	}
 }
 

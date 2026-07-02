@@ -63,7 +63,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: wharf serve|wrap|claude|codex|gemini [options]")
+		return errors.New("usage: wharf serve|wrap|claude|codex|gemini|logout|machine [options]")
 	}
 
 	switch args[0] {
@@ -101,9 +101,38 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		}
 		_, _ = fmt.Fprintf(stdout, "wharf %s ended session_id=%s provider=%s\n", args[0], effective.SessionID, effective.Provider)
 		return nil
+	case "logout":
+		if len(args) != 1 {
+			return fmt.Errorf("unexpected logout arguments: %v", args[1:])
+		}
+		return runMachineLogout(stdout)
+	case "machine":
+		if len(args) == 2 && args[1] == "unlink" {
+			return runMachineLogout(stdout)
+		}
+		return errors.New("usage: wharf machine unlink")
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runMachineLogout(stdout io.Writer) error {
+	existed, err := machineCredentialExists()
+	if err != nil {
+		return err
+	}
+	if err := deleteMachineCredential(); err != nil {
+		return err
+	}
+	if stdout == nil {
+		return nil
+	}
+	if existed {
+		_, _ = fmt.Fprintln(stdout, "wharf: local machine pairing removed")
+	} else {
+		_, _ = fmt.Fprintln(stdout, "wharf: no local machine pairing found")
+	}
+	return nil
 }
 
 type serveConfig struct {
@@ -123,6 +152,7 @@ type wrapConfig struct {
 	AdapterToken    string
 	Format          string
 	SecretDir       string
+	Managed         bool
 	Pair            bool
 	CloudAPIURL     string
 	ProviderCommand []string
@@ -247,6 +277,7 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 }
 
 func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (wrapConfig, error) {
+	managed := !hasInjectedHubSession()
 	cfg := wrapConfig{
 		HubURL:          envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
 		SessionID:       envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
@@ -255,10 +286,10 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 		AdapterToken:    envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
 		Format:          "acp",
 		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
+		Managed:         managed,
 		ProviderCommand: defaultProviderCommand(agent),
 	}
-	cfg.Pair = !hasInjectedHubSession()
-	if cfg.Pair {
+	if cfg.Managed {
 		cfg.CloudAPIURL = envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", defaultManagedCloudAPIURL))
 	}
 
@@ -277,7 +308,10 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	if flags.NArg() > 0 {
 		cfg.ProviderCommand = append([]string(nil), flags.Args()...)
 	}
-	if cfg.Pair && cfg.CloudAPIURL == "" {
+	if cfg.Pair {
+		cfg.Managed = true
+	}
+	if cfg.Managed && cfg.CloudAPIURL == "" {
 		cfg.CloudAPIURL = defaultManagedCloudAPIURL
 	}
 	return normalizeWrapConfig(cfg)
@@ -329,6 +363,9 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 		cfg.HubURL = defaultWrapHubURL
 	}
 	cfg.CloudAPIURL = strings.TrimSpace(cfg.CloudAPIURL)
+	if cfg.Managed && cfg.CloudAPIURL == "" {
+		cfg.CloudAPIURL = defaultManagedCloudAPIURL
+	}
 	if cfg.Pair && cfg.CloudAPIURL == "" {
 		return wrapConfig{}, errors.New("wrap --pair requires --cloud or AGENTWHARF_CLOUD_API_URL")
 	}
@@ -341,7 +378,7 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	if cfg.Provider == "" {
 		cfg.Provider = providerForAgent(cfg.Agent)
 	}
-	if cfg.AdapterToken == "" && !cfg.Pair {
+	if cfg.AdapterToken == "" && !cfg.Pair && !cfg.Managed {
 		token, err := randomToken()
 		if err != nil {
 			return wrapConfig{}, err
@@ -353,7 +390,7 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	default:
 		return wrapConfig{}, fmt.Errorf("unsupported wrap format %q", cfg.Format)
 	}
-	if !cfg.Pair && cfg.AdapterToken == defaultAdapterToken && !isLoopbackURL(cfg.HubURL) {
+	if !cfg.Pair && !cfg.Managed && cfg.AdapterToken == defaultAdapterToken && !isLoopbackURL(cfg.HubURL) {
 		return wrapConfig{}, errUnsafeDefaultToken
 	}
 	cfg.SecretDir = filepath.Clean(cfg.SecretDir)
@@ -461,7 +498,12 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	if err := validateProviderCommand(cfg); err != nil {
 		return cfg, err
 	}
-	if cfg.Pair {
+	if cfg.Managed {
+		cfg, err = prepareManagedWrapSession(ctx, cfg, pairOutput)
+		if err != nil {
+			return cfg, err
+		}
+	} else if cfg.Pair {
 		cfg, err = pairWrapSession(ctx, cfg, pairOutput)
 		if err != nil {
 			return cfg, err
@@ -522,8 +564,49 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	return cfg, nil
 }
 
+func prepareManagedWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	if !cfg.Pair {
+		credential, err := loadMachineCredential()
+		switch {
+		case err == nil && sameCloudAPIURL(credential.CloudAPIURL, cfg.CloudAPIURL):
+			session, err := createMachineSession(ctx, client, cfg.CloudAPIURL, credential.MachineToken, cfg.Provider)
+			if err == nil {
+				return applyMachineSession(cfg, session)
+			}
+			if isInvalidMachineCredentialError(err) {
+				if deleteErr := deleteMachineCredential(); deleteErr != nil {
+					return cfg, deleteErr
+				}
+				if output != nil {
+					_, _ = fmt.Fprintln(output, "Local machine pairing is no longer valid; pairing again.")
+				}
+				return pairWrapSessionWithClient(ctx, client, cfg, output)
+			}
+			return cfg, err
+		case err == nil:
+			return pairWrapSessionWithClient(ctx, client, cfg, output)
+		case errors.Is(err, errMachineCredentialNotFound):
+			return pairWrapSessionWithClient(ctx, client, cfg, output)
+		default:
+			if deleteErr := deleteMachineCredential(); deleteErr != nil {
+				return cfg, deleteErr
+			}
+			if output != nil {
+				_, _ = fmt.Fprintln(output, "Local machine pairing is unreadable; pairing again.")
+			}
+			return pairWrapSessionWithClient(ctx, client, cfg, output)
+		}
+	}
+	return pairWrapSessionWithClient(ctx, client, cfg, output)
+}
+
 func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
+	return pairWrapSessionWithClient(ctx, client, cfg, output)
+}
+
+func pairWrapSessionWithClient(ctx context.Context, client *http.Client, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
 	createURL, err := cloudAPIEndpoint(cfg.CloudAPIURL, "/machine-pairing-codes")
 	if err != nil {
 		return cfg, err
@@ -536,7 +619,7 @@ func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wra
 		return cfg, err
 	}
 	if status != http.StatusCreated {
-		return cfg, fmt.Errorf("create machine pairing code: cloud api returned status %d", status)
+		return cfg, newCloudStatusError("create machine pairing code", status, body)
 	}
 	if err := decodeCloudAPIJSON(body, &pairing); err != nil {
 		return cfg, fmt.Errorf("decode machine pairing response: %w", err)
@@ -545,17 +628,33 @@ func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wra
 		return cfg, errors.New("machine pairing response missing codes")
 	}
 	if output != nil {
-		_, _ = fmt.Fprintf(output, "Pair this machine at %s with device code %s and user code %s\n", pairing.Data.VerificationURI, pairing.Data.DeviceCode, pairing.Data.UserCode)
+		_, _ = fmt.Fprintf(output, "Pair this machine at %s\ndevice_code: %s\nuser_code: %s\n",
+			machinePairingDisplayURL(cfg.CloudAPIURL, pairing.Data.VerificationURI),
+			pairing.Data.DeviceCode,
+			pairing.Data.UserCode)
 	}
 
 	machineToken, err := exchangeMachineToken(ctx, client, cfg.CloudAPIURL, pairing)
 	if err != nil {
 		return cfg, err
 	}
+	if err := saveMachineCredential(machineCredential{
+		MachineID:    machineToken.Data.Machine.ID,
+		MachineToken: machineToken.Data.MachineToken,
+		CloudAPIURL:  cfg.CloudAPIURL,
+		HubWSURL:     machineToken.Data.HubWSURL,
+		ExpiresAt:    machineToken.Data.ExpiresAt,
+	}); err != nil {
+		return cfg, err
+	}
 	session, err := createMachineSession(ctx, client, cfg.CloudAPIURL, machineToken.Data.MachineToken, cfg.Provider)
 	if err != nil {
 		return cfg, err
 	}
+	return applyMachineSession(cfg, session)
+}
+
+func applyMachineSession(cfg wrapConfig, session machineSessionResponse) (wrapConfig, error) {
 	if session.Data.Session.ID == "" || session.Data.HubWSURL == "" || session.Data.AdapterToken == "" {
 		return cfg, errors.New("machine session response missing session, hub url, or adapter token")
 	}
@@ -605,7 +704,7 @@ func exchangeMachineToken(ctx context.Context, client *http.Client, baseURL stri
 			case <-timer.C:
 			}
 		default:
-			return machineTokenResponse{}, fmt.Errorf("exchange machine pairing token: cloud api returned status %d", status)
+			return machineTokenResponse{}, newCloudStatusError("exchange machine pairing token", status, body)
 		}
 	}
 }
@@ -622,13 +721,71 @@ func createMachineSession(ctx context.Context, client *http.Client, baseURL stri
 		return machineSessionResponse{}, err
 	}
 	if status != http.StatusCreated {
-		return machineSessionResponse{}, fmt.Errorf("create machine session: cloud api returned status %d", status)
+		return machineSessionResponse{}, newCloudStatusError("create machine session", status, body)
 	}
 	var response machineSessionResponse
 	if err := decodeCloudAPIJSON(body, &response); err != nil {
 		return machineSessionResponse{}, fmt.Errorf("decode machine session response: %w", err)
 	}
 	return response, nil
+}
+
+type cloudStatusError struct {
+	Operation string
+	Status    int
+	Message   string
+}
+
+func (err cloudStatusError) Error() string {
+	if err.Message != "" {
+		return fmt.Sprintf("%s: cloud api returned status %d: %s", err.Operation, err.Status, err.Message)
+	}
+	return fmt.Sprintf("%s: cloud api returned status %d", err.Operation, err.Status)
+}
+
+func newCloudStatusError(operation string, status int, body []byte) cloudStatusError {
+	return cloudStatusError{
+		Operation: operation,
+		Status:    status,
+		Message:   cloudAPIErrorMessage(body),
+	}
+}
+
+func isInvalidMachineCredentialError(err error) bool {
+	var statusErr cloudStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	if statusErr.Status == http.StatusUnauthorized {
+		return true
+	}
+	if statusErr.Status != http.StatusForbidden {
+		return false
+	}
+	message := strings.ToLower(statusErr.Message)
+	return strings.Contains(message, "invalid") ||
+		strings.Contains(message, "revoked") ||
+		strings.Contains(message, "expired")
+}
+
+func cloudAPIErrorMessage(body []byte) string {
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err == nil {
+		if message := strings.TrimSpace(envelope.Error.Message); message != "" {
+			return message
+		}
+	}
+	var legacy struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &legacy); err == nil {
+		return strings.TrimSpace(legacy.Error)
+	}
+	return ""
 }
 
 func postCloudAPIJSON(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any) (int, []byte, error) {
@@ -676,6 +833,24 @@ func cloudAPIEndpoint(baseURL string, path string) (string, error) {
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return parsed.String(), nil
+}
+
+func machinePairingDisplayURL(baseURL string, verificationURI string) string {
+	for _, raw := range []string{verificationURI, baseURL} {
+		parsed, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			continue
+		}
+		parsed.Path = "/app/machines"
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		return parsed.String()
+	}
+	return strings.TrimSpace(verificationURI)
+}
+
+func sameCloudAPIURL(left string, right string) bool {
+	return strings.TrimRight(strings.TrimSpace(left), "/") == strings.TrimRight(strings.TrimSpace(right), "/")
 }
 
 func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker) error {

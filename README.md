@@ -61,6 +61,22 @@ Then open [Console Machines](https://cloud.superwhv.me/app/machines), paste the
 `device_code` and `user_code`, give the machine a name, and confirm. The session
 appears in Console and can be reopened from the browser or another client.
 
+After the first successful pairing, Wharf stores a local machine credential in
+`~/.agentwharf/machine.json` with file mode `0600`. Later `wharf claude` or
+`wharf codex` runs reuse that machine identity and create a fresh session
+without showing another pairing code.
+
+To switch accounts or organizations, remove the local pairing and pair again:
+
+```console
+$ wharf logout
+$ wharf claude --pair
+```
+
+`wharf machine unlink` is an alias for `wharf logout`. If the machine is
+released from Console, the next Wharf run clears the stale local credential and
+prompts you to pair again.
+
 ## Why AgentWharf
 
 - **Connect your own machine**: keep your local provider login, quota, and secrets.
@@ -77,15 +93,15 @@ appears in Console and can be reopened from the browser or another client.
 
 ```text
 wharf claude / wharf codex
-  -> creates a device pairing code
-  -> waits for Console confirmation
+  -> reuses the local machine token, or creates a device pairing code on first use
   -> exchanges the machine token for a session-bound adapter token
   -> starts the provider adapter
   -> connects to the AgentWharf Hub
 ```
 
-Tokens are kept in memory. They are not printed by the CLI and are not written
-to disk.
+The machine token is stored locally so the machine can create future sessions.
+Session-bound adapter tokens stay in memory only and are never printed by the
+CLI.
 
 Core pieces:
 
