@@ -27,8 +27,11 @@ Prerequisites:
 Install Wharf:
 
 ```console
-$ curl -fsSL get.superwhv.dev | sh
+$ curl -fsSL https://github.com/winghv/agentwharf/releases/latest/download/install.sh | sh
 ```
+
+The script downloads the matching prebuilt binary from GitHub Releases and
+installs both `agentwharf` and the short `wharf` onboarding command.
 
 Start the agent you want to use:
 

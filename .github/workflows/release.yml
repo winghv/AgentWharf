@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Build release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          build_unix() {
+            local os="$1"
+            local arch="$2"
+            local work="dist/agentwharf-$os-$arch"
+
+            rm -rf "$work"
+            mkdir -p "$work"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" -o "$work/agentwharf" ./cmd/agentwharf
+            tar -C "$work" -czf "dist/agentwharf-$os-$arch.tar.gz" agentwharf
+          }
+
+          build_windows() {
+            local arch="$1"
+            local work="dist/agentwharf-windows-$arch"
+
+            rm -rf "$work"
+            mkdir -p "$work"
+            GOOS=windows GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" -o "$work/agentwharf.exe" ./cmd/agentwharf
+            (cd "$work" && zip -q "../agentwharf-windows-$arch.zip" agentwharf.exe)
+          }
+
+          build_unix linux amd64
+          build_unix linux arm64
+          build_unix darwin amd64
+          build_unix darwin arm64
+          build_windows amd64
+          build_windows arm64
+
+          cp scripts/install.sh dist/install.sh
+          chmod 0755 dist/install.sh
+
+          (cd dist && shasum -a 256 \
+            agentwharf-darwin-amd64.tar.gz \
+            agentwharf-darwin-arm64.tar.gz \
+            agentwharf-linux-amd64.tar.gz \
+            agentwharf-linux-arm64.tar.gz \
+            agentwharf-windows-amd64.zip \
+            agentwharf-windows-arm64.zip \
+            install.sh > checksums.txt)
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/* --clobber
+          else
+            gh release create "$TAG_NAME" dist/* --title "$TAG_NAME" --generate-notes
+          fi

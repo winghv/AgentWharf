@@ -33,6 +33,9 @@ jobs:
       - name: Boundary check
         run: ./scripts/check-boundary.sh
 
+      - name: Install script check
+        run: ./scripts/install-static.test.sh
+
       - name: Test
         run: go test -race ./...
 
