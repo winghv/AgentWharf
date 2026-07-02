@@ -30,6 +30,8 @@ test -f .github/workflows/release.yml || {
 grep -F "agentwharf-linux-amd64.tar.gz" .github/workflows/release.yml >/dev/null
 grep -F "scripts/install.sh" .github/workflows/release.yml >/dev/null
 grep -F "curl -fsSL https://github.com/winghv/agentwharf/releases/latest/download/install.sh | sh" README.md >/dev/null
+grep -F "@agentclientprotocol/claude-agent-acp" scripts/install.sh >/dev/null
+grep -F "@agentclientprotocol/codex-acp" scripts/install.sh >/dev/null
 
 if grep -F "go install github.com/winghv/agentwharf/cmd/agentwharf" README.md >/dev/null; then
   echo "README quickstart must not require Go module installation" >&2

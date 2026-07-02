@@ -4,6 +4,9 @@ set -eu
 repo=${AGENTWHARF_REPO:-winghv/agentwharf}
 version=${AGENTWHARF_VERSION:-latest}
 install_dir=${AGENTWHARF_INSTALL_DIR:-/usr/local/bin}
+provider_dir=${AGENTWHARF_PROVIDER_DIR:-${HOME:-}/.agentwharf/providers}
+claude_acp_package=${AGENTWHARF_CLAUDE_ACP_PACKAGE:-@agentclientprotocol/claude-agent-acp@0.54.1}
+codex_acp_package=${AGENTWHARF_CODEX_ACP_PACKAGE:-@agentclientprotocol/codex-acp@1.0.2}
 
 say() {
   printf 'agentwharf: %s\n' "$*" >&2
@@ -56,6 +59,9 @@ if [ "${AGENTWHARF_INSTALL_DRY_RUN:-}" = "1" ]; then
   printf 'checksum_url=%s\n' "$checksum_url"
   printf 'install_agentwharf=%s\n' "$install_dir/agentwharf"
   printf 'install_wharf=%s\n' "$install_dir/wharf"
+  printf 'provider_dir=%s\n' "$provider_dir"
+  printf 'provider_package=%s\n' "$claude_acp_package"
+  printf 'provider_package=%s\n' "$codex_acp_package"
   exit 0
 fi
 
@@ -102,13 +108,58 @@ run_install() {
   sudo "$@"
 }
 
+quote_sh() {
+  printf "%s" "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/"
+}
+
+write_provider_wrapper() {
+  wrapper="$1"
+  target="$2"
+  quoted_target=$(quote_sh "$target")
+  {
+    printf '#!/bin/sh\n'
+    printf 'exec %s "$@"\n' "$quoted_target"
+  } >"$wrapper"
+  chmod 0755 "$wrapper"
+}
+
+install_provider_bridges() {
+  if [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" = "1" ]; then
+    say "skipping ACP provider bridge installation"
+    return 0
+  fi
+  [ -n "$provider_dir" ] || fail "AGENTWHARF_PROVIDER_DIR is empty"
+  need npm
+
+  say "installing ACP provider bridges in $provider_dir"
+  mkdir -p "$provider_dir"
+  npm install --prefix "$provider_dir" --omit=dev "$claude_acp_package" "$codex_acp_package" >/dev/null
+
+  claude_bridge="$provider_dir/node_modules/.bin/claude-agent-acp"
+  codex_bridge="$provider_dir/node_modules/.bin/codex-acp"
+  [ -x "$claude_bridge" ] || fail "claude-agent-acp was not installed"
+  [ -x "$codex_bridge" ] || fail "codex-acp was not installed"
+
+  write_provider_wrapper "$tmp_dir/claude-agent-acp" "$claude_bridge"
+  write_provider_wrapper "$tmp_dir/codex-acp" "$codex_bridge"
+}
+
+install_provider_bridges
 run_install mkdir -p "$install_dir"
 run_install cp "$tmp_dir/agentwharf" "$install_dir/agentwharf"
 run_install chmod 0755 "$install_dir/agentwharf"
 run_install ln -sf agentwharf "$install_dir/wharf"
+if [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
+  run_install cp "$tmp_dir/claude-agent-acp" "$install_dir/claude-agent-acp"
+  run_install cp "$tmp_dir/codex-acp" "$install_dir/codex-acp"
+fi
 
 say "installed $install_dir/agentwharf"
 say "installed $install_dir/wharf"
+if [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
+  say "installed $install_dir/claude-agent-acp"
+  say "installed $install_dir/codex-acp"
+fi
 
 case ":$PATH:" in
   *":$install_dir:"*) ;;

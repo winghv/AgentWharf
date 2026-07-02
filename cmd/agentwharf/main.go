@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -375,9 +376,28 @@ func defaultProviderCommand(agent string) []string {
 	switch agent {
 	case "claude", "claude-code":
 		return []string{"claude-agent-acp"}
+	case "codex":
+		return []string{"codex-acp"}
 	default:
 		return []string{agent}
 	}
+}
+
+func validateProviderCommand(cfg wrapConfig) error {
+	if len(cfg.ProviderCommand) == 0 {
+		return nil
+	}
+	command := strings.TrimSpace(cfg.ProviderCommand[0])
+	if command == "" {
+		return errors.New("provider command is empty")
+	}
+	if _, err := exec.LookPath(command); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return fmt.Errorf("provider command %s not found in PATH; install the Agent Client Protocol bridge or pass an explicit provider command", command)
+		}
+		return fmt.Errorf("check provider command %s: %w", command, err)
+	}
+	return nil
 }
 
 func hasInjectedHubSession() bool {
@@ -437,6 +457,9 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	}
 	if stdin == nil {
 		stdin = io.Reader(os.Stdin)
+	}
+	if err := validateProviderCommand(cfg); err != nil {
+		return cfg, err
 	}
 	if cfg.Pair {
 		cfg, err = pairWrapSession(ctx, cfg, pairOutput)

@@ -180,8 +180,36 @@ func TestParseAgentEntrypointUsesInjectedSessionWithoutPairing(t *testing.T) {
 		cfg.HubURL != "wss://hub.superwhv.example/hub" ||
 		cfg.SessionID != "ses_vm" ||
 		cfg.AdapterToken != "adapter-token" ||
-		strings.Join(cfg.ProviderCommand, " ") != "codex" {
+		strings.Join(cfg.ProviderCommand, " ") != "codex-acp" {
 		t.Fatalf("agent entrypoint config = %+v", cfg)
+	}
+}
+
+func TestRunWrapChecksProviderCommandBeforePairing(t *testing.T) {
+	t.Parallel()
+
+	var requests int
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		http.Error(w, "unexpected pairing request", http.StatusInternalServerError)
+	}))
+	defer controlPlane.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := runWrap(ctx, wrapConfig{
+		Agent:           "claude",
+		Provider:        "claude-code",
+		Format:          "acp",
+		Pair:            true,
+		CloudAPIURL:     controlPlane.URL,
+		ProviderCommand: []string{"definitely-missing-agentwharf-provider-command"},
+	}, strings.NewReader(""), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "provider command definitely-missing-agentwharf-provider-command not found") {
+		t.Fatalf("runWrap() error = %v, want missing provider command", err)
+	}
+	if requests != 0 {
+		t.Fatalf("pairing requests = %d, want 0 before provider command is available", requests)
 	}
 }
 

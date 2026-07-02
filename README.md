@@ -21,8 +21,8 @@ Prerequisites:
 
 - Access to [SuperWHV Console](https://cloud.superwhv.me/app/machines).
 - The agent you want to run is installed and authenticated on this machine.
-  `wharf claude` uses the Claude ACP bridge command when available;
-  `wharf codex` uses the Codex CLI.
+- `npm` is available so the installer can install the Claude and Codex ACP
+  bridge wrappers used by `wharf claude` and `wharf codex`.
 
 Install Wharf:
 
@@ -30,8 +30,9 @@ Install Wharf:
 $ curl -fsSL https://github.com/winghv/agentwharf/releases/latest/download/install.sh | sh
 ```
 
-The script downloads the matching prebuilt binary from GitHub Releases and
-installs both `agentwharf` and the short `wharf` onboarding command.
+The script downloads the matching prebuilt binary from GitHub Releases,
+installs both `agentwharf` and the short `wharf` onboarding command, and
+installs the `claude-agent-acp` / `codex-acp` provider bridge wrappers.
 
 Start the agent you want to use:
 
