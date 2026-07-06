@@ -107,6 +107,15 @@ func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	}
 }
 
+func TestMachinePairingDisplayURLUsesConsoleMachinesRoute(t *testing.T) {
+	t.Parallel()
+
+	got := machinePairingDisplayURL("https://api.cloud.example/v1", "https://cloud.superwhv.me/machines/pair?device=debug#step")
+	if got != "https://cloud.superwhv.me/app/machines" {
+		t.Fatalf("machinePairingDisplayURL() = %q, want Console machines route", got)
+	}
+}
+
 func TestParseWrapConfigAcceptsClaudeACPFlag(t *testing.T) {
 	t.Parallel()
 
