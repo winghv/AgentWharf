@@ -512,6 +512,157 @@ func TestManagedWrapPairsAndStoresMachineCredential(t *testing.T) {
 	}
 }
 
+func TestManagedWrapRetriesTransientPairingCreateFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+
+	var pairingRequests int
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/machine-pairing-codes":
+			pairingRequests++
+			if pairingRequests == 1 {
+				http.Error(w, `{"error":{"message":"temporarily unavailable"}}`, http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"data":{"device_code":"device-code-retry","user_code":"RETRY-1","verification_uri":"https://cloud.superwhv.me/machines/pair","expires_at":"2026-06-18T10:10:00Z","interval_seconds":1}}`)
+		case "/machine-pairing-codes/token":
+			fmt.Fprint(w, `{"data":{"machine":{"id":"machine_retry"},"machine_token":"retry-machine-token","hub_ws_url":"wss://ignored.example/ws","expires_at":"2026-06-19T10:00:00Z"}}`)
+		case "/machine-sessions":
+			if r.Header.Get("Authorization") != "Bearer retry-machine-token" {
+				t.Fatalf("machine session authorization = %q", r.Header.Get("Authorization"))
+			}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"data":{"session":{"id":"ses_retry","host_type":"machine","host_id":"machine_retry","provider":"claude-code","status":"starting"},"hub_ws_url":"wss://hub.example/ws","adapter_token":"retry-adapter-token","expires_at":"2026-06-18T10:15:00Z"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer controlPlane.Close()
+
+	cfg, err := prepareManagedWrapSession(ctx, wrapConfig{
+		Managed:     true,
+		CloudAPIURL: controlPlane.URL,
+		Agent:       "claude",
+		Provider:    "claude-code",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("prepareManagedWrapSession() error = %v", err)
+	}
+	if pairingRequests != 2 {
+		t.Fatalf("pairing requests = %d, want 2", pairingRequests)
+	}
+	if cfg.SessionID != "ses_retry" || cfg.HubURL != "wss://hub.example/ws" || cfg.AdapterToken != "retry-adapter-token" {
+		t.Fatalf("managed config = %+v", cfg)
+	}
+}
+
+func TestManagedWrapPersistentTransientStatusMentionsProxyRecovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+	t.Setenv("http_proxy", "http://127.0.0.1:1082")
+
+	var pairingRequests int
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/machine-pairing-codes" {
+			t.Fatalf("unexpected cloud api path %s", r.URL.Path)
+		}
+		pairingRequests++
+		http.Error(w, `{"error":{"message":"Service Unavailable"}}`, http.StatusServiceUnavailable)
+	}))
+	defer controlPlane.Close()
+
+	_, err := prepareManagedWrapSession(ctx, wrapConfig{
+		Managed:     true,
+		CloudAPIURL: controlPlane.URL,
+		Agent:       "claude",
+		Provider:    "claude-code",
+	}, io.Discard)
+	if err == nil {
+		t.Fatal("prepareManagedWrapSession() error = nil, want transient status error")
+	}
+	if pairingRequests < 2 {
+		t.Fatalf("pairing requests = %d, want retry before failing", pairingRequests)
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"create machine pairing code: cloud api returned status 503",
+		"http_proxy",
+		"env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY wharf claude",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error = %q, want substring %q", message, want)
+		}
+	}
+	if strings.Contains(message, "127.0.0.1:1082") {
+		t.Fatalf("error leaked proxy endpoint: %q", message)
+	}
+}
+
+func TestPostCloudAPIJSONWithRetryRetriesNetworkFailureAndMentionsProxyRecovery(t *testing.T) {
+	t.Setenv("https_proxy", "http://127.0.0.1:1082")
+
+	var attempts int
+	client := &http.Client{
+		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			attempts++
+			return nil, errors.New("synthetic service unavailable")
+		}),
+	}
+
+	_, _, err := postCloudAPIJSONWithRetry(context.Background(), client, "https://cloud.superwhv.example/v1/machine-pairing-codes", "secret-token", map[string]string{
+		"platform": "darwin-arm64",
+	})
+	if err == nil {
+		t.Fatal("postCloudAPIJSONWithRetry() error = nil, want network error")
+	}
+	if attempts < 2 {
+		t.Fatalf("attempts = %d, want retry before failing", attempts)
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"post cloud api request",
+		"https_proxy",
+		"env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY wharf claude",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error = %q, want substring %q", message, want)
+		}
+	}
+	for _, leaked := range []string{"secret-token", "127.0.0.1:1082"} {
+		if strings.Contains(message, leaked) {
+			t.Fatalf("error leaked %q: %q", leaked, message)
+		}
+	}
+}
+
+func TestPostCloudAPIJSONDoesNotRetryByDefault(t *testing.T) {
+	var attempts int
+	client := &http.Client{
+		Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			attempts++
+			return nil, errors.New("synthetic network error")
+		}),
+	}
+
+	_, _, err := postCloudAPIJSON(context.Background(), client, "https://cloud.superwhv.example/v1/machine-sessions", "secret-token", map[string]string{
+		"provider": "claude-code",
+	})
+	if err == nil {
+		t.Fatal("postCloudAPIJSON() error = nil, want network error")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 for default Cloud API POST", attempts)
+	}
+}
+
 func TestManagedWrapReusesStoredMachineCredential(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1560,6 +1711,12 @@ func writeACPResponse(id any, result map[string]any) {
 		os.Exit(22)
 	}
 	fmt.Fprintln(os.Stdout, string(encoded))
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
 }
 
 func runWrapACPPermissionProviderHelper() {
