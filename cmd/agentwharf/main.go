@@ -45,6 +45,7 @@ const (
 	defaultManagedCloudAPIURL = "https://cloud.superwhv.me/v1"
 	defaultHeartbeatInterval  = 20 * time.Second
 	defaultHeartbeatTimeout   = 60 * time.Second
+	cloudAPIMaxAttempts       = 3
 )
 
 var errUnsafeDefaultToken = errors.New("default local tokens require a loopback listen address")
@@ -641,7 +642,7 @@ func pairWrapSessionWithClient(ctx context.Context, client *http.Client, cfg wra
 		return cfg, err
 	}
 	var pairing machinePairingCodeResponse
-	status, body, err := postCloudAPIJSON(ctx, client, createURL, "", machinePairingCreateRequest{
+	status, body, err := postCloudAPIJSONWithRetry(ctx, client, createURL, "", machinePairingCreateRequest{
 		Platform: runtime.GOOS + "-" + runtime.GOARCH,
 	})
 	if err != nil {
@@ -773,10 +774,14 @@ func (err cloudStatusError) Error() string {
 }
 
 func newCloudStatusError(operation string, status int, body []byte) cloudStatusError {
+	message := cloudAPIErrorMessage(body)
+	if hint := cloudAPIProxyHintForStatus(status); hint != "" {
+		message = appendCloudAPIDiagnostic(message, hint)
+	}
 	return cloudStatusError{
 		Operation: operation,
 		Status:    status,
-		Message:   cloudAPIErrorMessage(body),
+		Message:   message,
 	}
 }
 
@@ -818,6 +823,36 @@ func cloudAPIErrorMessage(body []byte) string {
 }
 
 func postCloudAPIJSON(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any) (int, []byte, error) {
+	return postCloudAPIJSONOnce(ctx, client, endpoint, bearerToken, payload, true)
+}
+
+func postCloudAPIJSONWithRetry(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any) (int, []byte, error) {
+	for attempt := 1; attempt <= cloudAPIMaxAttempts; attempt++ {
+		status, body, err := postCloudAPIJSONOnce(ctx, client, endpoint, bearerToken, payload, attempt == cloudAPIMaxAttempts)
+		if err != nil {
+			if ctx.Err() != nil {
+				return 0, nil, fmt.Errorf("post cloud api request: %w", ctx.Err())
+			}
+			if attempt < cloudAPIMaxAttempts {
+				if err := waitCloudAPIRetry(ctx, attempt); err != nil {
+					return 0, nil, err
+				}
+				continue
+			}
+			return 0, nil, err
+		}
+		if isTransientCloudAPIStatus(status) && attempt < cloudAPIMaxAttempts {
+			if err := waitCloudAPIRetry(ctx, attempt); err != nil {
+				return 0, nil, err
+			}
+			continue
+		}
+		return status, body, nil
+	}
+	return 0, nil, errors.New("cloud api request exhausted retries")
+}
+
+func postCloudAPIJSONOnce(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any, includeProxyHint bool) (int, []byte, error) {
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
 		return 0, nil, fmt.Errorf("marshal cloud api request: %w", err)
@@ -832,14 +867,78 @@ func postCloudAPIJSON(ctx context.Context, client *http.Client, endpoint string,
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("post cloud api request: %w", err)
+		hint := ""
+		if includeProxyHint {
+			hint = cloudAPIProxyHint()
+		}
+		return 0, nil, fmt.Errorf("post cloud api request: %w%s", err, hint)
 	}
-	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	closeErr := resp.Body.Close()
 	if err != nil {
 		return 0, nil, fmt.Errorf("read cloud api response: %w", err)
 	}
+	if closeErr != nil {
+		return 0, nil, fmt.Errorf("close cloud api response: %w", closeErr)
+	}
 	return resp.StatusCode, data, nil
+}
+
+func isTransientCloudAPIStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func waitCloudAPIRetry(ctx context.Context, attempt int) error {
+	delay := time.Duration(attempt*attempt) * 100 * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("cloud api retry canceled: %w", ctx.Err())
+	case <-timer.C:
+		return nil
+	}
+}
+
+func cloudAPIProxyHintForStatus(status int) string {
+	if !isTransientCloudAPIStatus(status) {
+		return ""
+	}
+	return cloudAPIProxyHint()
+}
+
+func cloudAPIProxyHint() string {
+	names := activeProxyEnvNames()
+	if len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(". Proxy environment variables are set (%s). If pairing fails through the proxy, retry with: env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY wharf claude", strings.Join(names, ", "))
+}
+
+func activeProxyEnvNames() []string {
+	proxyEnvNames := []string{"http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}
+	names := make([]string, 0, len(proxyEnvNames))
+	for _, name := range proxyEnvNames {
+		if os.Getenv(name) != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func appendCloudAPIDiagnostic(message string, diagnostic string) string {
+	if diagnostic == "" {
+		return message
+	}
+	if strings.TrimSpace(message) == "" {
+		return strings.TrimPrefix(diagnostic, ". ")
+	}
+	return message + diagnostic
 }
 
 func decodeCloudAPIJSON(data []byte, target any) error {
