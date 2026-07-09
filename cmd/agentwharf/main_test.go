@@ -1179,6 +1179,111 @@ func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	}
 }
 
+func TestRunWrapACPProviderSendsIdleHeartbeat(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	t.Setenv("AGENTWHARF_ACP_IDLE_HELPER", "1")
+	t.Setenv("AGENTWHARF_HEARTBEAT_INTERVAL", "25ms")
+	t.Setenv("AGENTWHARF_HEARTBEAT_TIMEOUT", "1s")
+
+	helloSeen := make(chan struct{}, 1)
+	readySeen := make(chan struct{}, 1)
+	pingSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			CompressionMode: websocket.CompressionDisabled,
+		})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		frame, err := readFrameFromConn(ctx, conn)
+		if err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		hello, ok := frame.(*protocol.Hello)
+		if !ok || hello.Role != protocol.RoleAdapter || hello.SessionID != "ses_idle" {
+			t.Errorf("hello frame = %+v", frame)
+			return
+		}
+		helloSeen <- struct{}{}
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{
+			ProtocolVersion: protocol.ProtocolVersion,
+			Sessions:        []protocol.SessionSummary{{SessionID: "ses_idle", State: "starting", Provider: "claude-code", ReplayFrom: 1}},
+		}); err != nil {
+			t.Errorf("write hello ack: %v", err)
+			return
+		}
+
+		for {
+			frame, err := readFrameFromConn(ctx, conn)
+			if err != nil {
+				return
+			}
+			switch typed := frame.(type) {
+			case *protocol.Event:
+				if typed.Type == "session.state" {
+					readySeen <- struct{}{}
+				}
+			case *protocol.Ping:
+				if typed.Nonce == "" {
+					t.Errorf("heartbeat ping nonce is empty")
+					return
+				}
+				pingSeen <- struct{}{}
+				_ = writeFrameToConn(ctx, conn, &protocol.Pong{Nonce: typed.Nonce})
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runWithInput(ctx, []string{
+			"wrap",
+			"--hub", wsURL,
+			"--session-id", "ses_idle",
+			"--adapter-token", "adapter-token",
+			"--agent", "claude",
+			"--acp",
+			"--", os.Args[0],
+		}, nil, io.Discard, io.Discard)
+	}()
+
+	assertSignal(t, helloSeen, "adapter hello")
+	assertSignal(t, readySeen, "provider ready event")
+	assertSignal(t, pingSeen, "adapter heartbeat ping")
+	cancel()
+	if err := <-runDone; err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("run wrap error = %v", err)
+	}
+}
+
+func TestAdapterHeartbeatTimesOutWithoutPong(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done, _ := startAdapterHeartbeat(ctx, heartbeatConfig{
+		Interval: time.Millisecond,
+		Timeout:  10 * time.Millisecond,
+	}, func(protocol.Frame) error {
+		return nil
+	})
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "hub heartbeat timed out") {
+			t.Fatalf("heartbeat error = %v, want timeout", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for heartbeat timeout")
+	}
+}
+
 func TestRunWrapACPProviderRoutesPermissionDecision(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1296,23 +1401,53 @@ func readFrame(t *testing.T, conn *websocket.Conn) protocol.Frame {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	typ, data, err := conn.Read(ctx)
+	frame, err := readFrameFromConn(ctx, conn)
 	if err != nil {
 		t.Fatalf("read frame: %v", err)
 	}
+	return frame
+}
+
+func writeFrameToConn(ctx context.Context, conn *websocket.Conn, frame protocol.Frame) error {
+	data, err := protocol.Encode(frame)
+	if err != nil {
+		return fmt.Errorf("encode frame: %w", err)
+	}
+	return conn.Write(ctx, websocket.MessageText, data)
+}
+
+func readFrameFromConn(ctx context.Context, conn *websocket.Conn) (protocol.Frame, error) {
+	typ, data, err := conn.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if typ != websocket.MessageText {
-		t.Fatalf("websocket message type = %v, want text", typ)
+		return nil, fmt.Errorf("websocket message type = %v, want text", typ)
 	}
 	frame, err := protocol.Decode(data)
 	if err != nil {
-		t.Fatalf("decode frame %s: %v", string(data), err)
+		return nil, fmt.Errorf("decode frame %s: %w", string(data), err)
 	}
-	return frame
+	return frame, nil
+}
+
+func assertSignal(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
 }
 
 func TestMain(m *testing.M) {
 	if os.Getenv("AGENTWHARF_ACP_PERMISSION_HELPER") == "1" {
 		runWrapACPPermissionProviderHelper()
+		return
+	}
+	if os.Getenv("AGENTWHARF_ACP_IDLE_HELPER") == "1" {
+		runWrapACPIdleProviderHelper()
 		return
 	}
 	if os.Getenv("AGENTWHARF_ACP_HELPER") == "1" {
@@ -1383,6 +1518,25 @@ func runWrapACPProviderHelper() {
 	fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","messageId":"resp_1","content":{"type":"text","text":"acp saw ping"}}}}`)
 	writeACPResponse(prompt["id"], map[string]any{"stopReason": "end_turn"})
 	os.Exit(0)
+}
+
+func runWrapACPIdleProviderHelper() {
+	scanner := bufio.NewScanner(os.Stdin)
+	init := readACPRequest(scanner)
+	if init["method"] != "initialize" {
+		os.Exit(40)
+	}
+	writeACPResponse(init["id"], map[string]any{"protocolVersion": 1})
+
+	sessionNew := readACPRequest(scanner)
+	if sessionNew["method"] != "session/new" {
+		os.Exit(41)
+	}
+	writeACPResponse(sessionNew["id"], map[string]any{"sessionId": "acp_ses_idle"})
+
+	for {
+		time.Sleep(time.Hour)
+	}
 }
 
 func readACPRequest(scanner *bufio.Scanner) map[string]any {

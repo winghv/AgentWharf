@@ -43,6 +43,8 @@ const (
 	defaultAdapterToken       = "local-adapter-token"
 	defaultWrapHubURL         = "ws://" + defaultServeAddr
 	defaultManagedCloudAPIURL = "https://cloud.superwhv.me/v1"
+	defaultHeartbeatInterval  = 20 * time.Second
+	defaultHeartbeatTimeout   = 60 * time.Second
 )
 
 var errUnsafeDefaultToken = errors.New("default local tokens require a loopback listen address")
@@ -155,7 +157,13 @@ type wrapConfig struct {
 	Managed         bool
 	Pair            bool
 	CloudAPIURL     string
+	Heartbeat       heartbeatConfig
 	ProviderCommand []string
+}
+
+type heartbeatConfig struct {
+	Interval time.Duration
+	Timeout  time.Duration
 }
 
 type machinePairingCreateRequest struct {
@@ -362,6 +370,15 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	if cfg.HubURL == "" {
 		cfg.HubURL = defaultWrapHubURL
 	}
+	if cfg.Heartbeat.Interval <= 0 {
+		cfg.Heartbeat.Interval = durationEnvOrDefault("AGENTWHARF_HEARTBEAT_INTERVAL", defaultHeartbeatInterval)
+	}
+	if cfg.Heartbeat.Timeout <= 0 {
+		cfg.Heartbeat.Timeout = durationEnvOrDefault("AGENTWHARF_HEARTBEAT_TIMEOUT", defaultHeartbeatTimeout)
+	}
+	if cfg.Heartbeat.Timeout < cfg.Heartbeat.Interval {
+		cfg.Heartbeat.Timeout = cfg.Heartbeat.Interval
+	}
 	cfg.CloudAPIURL = strings.TrimSpace(cfg.CloudAPIURL)
 	if cfg.Managed && cfg.CloudAPIURL == "" {
 		cfg.CloudAPIURL = defaultManagedCloudAPIURL
@@ -448,6 +465,18 @@ func envOrDefault(key string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func durationEnvOrDefault(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return fallback
+	}
+	return duration
 }
 
 func randomToken() (string, error) {
@@ -889,6 +918,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		defer writeMu.Unlock()
 		return writeCLIProtocolFrame(runCtx, conn, frame)
 	}
+	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
 	go func() {
 		err := supervisor.Run(runCtx)
 		_ = stdoutWriter.Close()
@@ -904,7 +934,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToProvider(runCtx, conn, stdinWriter, writeFrame)
+		commandDone <- forwardHubCommandsToProvider(runCtx, conn, stdinWriter, writeFrame, observePong)
 	}()
 
 	var processErr error
@@ -930,6 +960,14 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 			outputErr = ignoreContextError(err)
 		case err := <-commandDone:
 			if err != nil {
+				cancel()
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = supervisor.Stop(stopCtx)
+				stopCancel()
+				return err
+			}
+		case err, ok := <-heartbeatDone:
+			if ok && err != nil {
 				cancel()
 				stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
 				_ = supervisor.Stop(stopCtx)
@@ -1037,6 +1075,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		defer writeMu.Unlock()
 		return writeCLIProtocolFrame(runCtx, conn, frame)
 	}
+	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
 	go func() {
 		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, func(line []byte) {
 			trackACPPermissionRequest(line, pendingPermissions, &permissionMu)
@@ -1049,7 +1088,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, providerSessionID, 3, pendingPermissions, &permissionMu)
+		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, observePong, providerSessionID, 3, pendingPermissions, &permissionMu)
 	}()
 
 	processFinished := false
@@ -1075,6 +1114,14 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 			outputErr = ignoreContextError(err)
 		case err := <-commandDone:
 			if err != nil {
+				cancel()
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = supervisor.Stop(stopCtx)
+				stopCancel()
+				return err
+			}
+		case err, ok := <-heartbeatDone:
+			if ok && err != nil {
 				cancel()
 				stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
 				_ = supervisor.Stop(stopCtx)
@@ -1234,7 +1281,7 @@ func translateWrapLine(cfg wrapConfig, line []byte) ([]protocol.Event, error) {
 	}
 }
 
-func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error) error {
+func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string)) error {
 	defer stdin.Close()
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
@@ -1257,6 +1304,8 @@ func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, std
 			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
 				return fmt.Errorf("send pong: %w", err)
 			}
+		case *protocol.Pong:
+			observePong(typed.Nonce)
 		case *protocol.Error:
 			return fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
 		}
@@ -1304,7 +1353,7 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 	return nil
 }
 
-func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex) error {
+func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex) error {
 	defer stdin.Close()
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
@@ -1366,6 +1415,8 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
 				return fmt.Errorf("send pong: %w", err)
 			}
+		case *protocol.Pong:
+			observePong(typed.Nonce)
 		case *protocol.Error:
 			return fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
 		}
@@ -1557,6 +1608,60 @@ func ignoreContextError(err error) error {
 		return nil
 	}
 	return err
+}
+
+func startAdapterHeartbeat(ctx context.Context, cfg heartbeatConfig, writeFrame func(protocol.Frame) error) (<-chan error, func(string)) {
+	done := make(chan error, 1)
+	pongs := make(chan string, 1)
+	observePong := func(nonce string) {
+		select {
+		case pongs <- nonce:
+		default:
+		}
+	}
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(cfg.Interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			nonce, err := randomToken()
+			if err != nil {
+				done <- fmt.Errorf("generate heartbeat nonce: %w", err)
+				return
+			}
+			if err := writeFrame(&protocol.Ping{Nonce: nonce}); err != nil {
+				done <- fmt.Errorf("send heartbeat ping: %w", err)
+				return
+			}
+
+			timeout := time.NewTimer(cfg.Timeout)
+			for {
+				select {
+				case <-ctx.Done():
+					timeout.Stop()
+					return
+				case got := <-pongs:
+					if got == nonce {
+						timeout.Stop()
+						goto next
+					}
+				case <-timeout.C:
+					done <- errors.New("hub heartbeat timed out")
+					return
+				}
+			}
+		next:
+		}
+	}()
+
+	return done, observePong
 }
 
 func writeCLIProtocolFrame(ctx context.Context, conn *websocket.Conn, frame protocol.Frame) error {
