@@ -111,10 +111,22 @@ func (decision SessionAdmissionDecision) Allows(action SessionAdmissionAction) b
 	case SessionAdmissionAttachOnly:
 		return action == SessionAdmissionAttach || action == SessionAdmissionStatus
 	case SessionAdmissionCurrent:
-		return decision.MayMutate && action != ""
-	default:
-		return false
+		if !decision.MayMutate {
+			return false
+		}
+		switch action {
+		case SessionAdmissionAttach,
+			SessionAdmissionStatus,
+			SessionAdmissionHistory,
+			SessionAdmissionSend,
+			SessionAdmissionSettings,
+			SessionAdmissionRunControl,
+			SessionAdmissionPermission,
+			SessionAdmissionRotation:
+			return true
+		}
 	}
+	return false
 }
 
 func hasExactSessionControl(principal Principal, sessionID string) bool {

@@ -26,6 +26,23 @@ func TestSessionAdmissionContract(t *testing.T) {
 	if err != nil || decision.Mode != SessionAdmissionCurrent || !decision.MayMutate {
 		t.Fatalf("existing admission = %+v, %v", decision, err)
 	}
+	for _, action := range []SessionAdmissionAction{
+		SessionAdmissionAttach,
+		SessionAdmissionStatus,
+		SessionAdmissionHistory,
+		SessionAdmissionSend,
+		SessionAdmissionSettings,
+		SessionAdmissionRunControl,
+		SessionAdmissionPermission,
+		SessionAdmissionRotation,
+	} {
+		if !decision.Allows(action) {
+			t.Fatalf("current admission unexpectedly rejected %s", action)
+		}
+	}
+	if decision.Allows(SessionAdmissionAction("future_sensitive_action")) {
+		t.Fatal("current admission unexpectedly allowed an unknown action")
+	}
 	for _, truth := range []store.SessionAdmissionTruth{
 		{SessionID: claim.SessionID, Exists: true},
 		{SessionID: claim.SessionID, Exists: true, Complete: true, Terminal: true},
