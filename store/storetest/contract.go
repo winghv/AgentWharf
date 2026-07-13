@@ -219,6 +219,9 @@ func HistoryContract(t *testing.T, harness HistoryHarness) {
 		harness.PruneBefore(t, st, sessionID, 4)
 		page := historyPage(t, st, sessionID, nil, 100)
 		assertHistoryPage(t, page, []int64{4, 5}, 5, nil, store.RetentionGap)
+		beforeRetainedHistory := int64(4)
+		page = historyPage(t, st, sessionID, &beforeRetainedHistory, 100)
+		assertHistoryPage(t, page, nil, 5, nil, store.RetentionGap)
 	})
 
 	t.Run("concurrent append remains sequenced and pageable", func(t *testing.T) {
