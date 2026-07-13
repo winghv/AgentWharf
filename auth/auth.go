@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 var (
@@ -44,6 +45,45 @@ type Principal struct {
 type Authenticator interface {
 	Authenticate(ctx context.Context, token string) (Principal, error)
 	Authorize(ctx context.Context, principal Principal, scope Scope) error
+}
+
+type SessionCredentialLineageKind string
+
+const (
+	SessionCredentialBootstrapInitial SessionCredentialLineageKind = "bootstrap_initial"
+	SessionCredentialTargetAttach     SessionCredentialLineageKind = "target_attach"
+)
+
+type SessionCredentialLineage struct {
+	Kind     SessionCredentialLineageKind
+	AttachID string
+	JTI      string
+}
+
+type SessionCredentialRequest struct {
+	SessionID    string
+	Lineage      SessionCredentialLineage
+	Generation   int64
+	RotationID   string
+	RevocationID string
+	ExpiresAt    time.Time
+}
+
+type PreparedSessionCredential struct {
+	Bearer       string
+	SessionID    string
+	Lineage      SessionCredentialLineage
+	Generation   int64
+	RotationID   string
+	RevocationID string
+	ExpiresAt    time.Time
+	Scope        Scope
+}
+
+// SessionCredentialIssuer prepares one in-memory Adapter bearer. It makes no
+// persistent side effect; the caller must discard the result on transaction failure.
+type SessionCredentialIssuer interface {
+	PrepareSessionCredential(ctx context.Context, request SessionCredentialRequest) (PreparedSessionCredential, error)
 }
 
 func ParseScope(raw string) (Scope, error) {
