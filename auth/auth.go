@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/winghv/agentwharf/store"
 )
 
 var (
@@ -45,6 +47,83 @@ type Principal struct {
 type Authenticator interface {
 	Authenticate(ctx context.Context, token string) (Principal, error)
 	Authorize(ctx context.Context, principal Principal, scope Scope) error
+}
+
+type SessionAdmissionMode string
+
+const (
+	SessionAdmissionAttachOnly SessionAdmissionMode = "attach_only"
+	SessionAdmissionCurrent    SessionAdmissionMode = "current"
+)
+
+type SessionAdmissionAction string
+
+const (
+	SessionAdmissionAttach     SessionAdmissionAction = "attach"
+	SessionAdmissionStatus     SessionAdmissionAction = "status"
+	SessionAdmissionHistory    SessionAdmissionAction = "history"
+	SessionAdmissionSend       SessionAdmissionAction = "send"
+	SessionAdmissionSettings   SessionAdmissionAction = "settings"
+	SessionAdmissionRunControl SessionAdmissionAction = "run_control"
+	SessionAdmissionPermission SessionAdmissionAction = "permission"
+	SessionAdmissionRotation   SessionAdmissionAction = "rotation"
+)
+
+type SessionAdmissionClaim struct {
+	SessionID string
+	Provider  string
+	ExpiresAt time.Time
+}
+
+type SessionAdmissionRequest struct {
+	Principal Principal
+	Claim     SessionAdmissionClaim
+	Truth     store.SessionAdmissionTruth
+}
+
+type SessionAdmissionDecision struct {
+	Mode      SessionAdmissionMode
+	MayMutate bool
+}
+
+// EvaluateSessionAdmission is limited to exact control scope, provider-bound
+// Auth claim, and Store-owned Session truth. It never consults platform state.
+func EvaluateSessionAdmission(request SessionAdmissionRequest) (SessionAdmissionDecision, error) {
+	claim := request.Claim
+	truth := request.Truth
+	if claim.SessionID == "" || claim.Provider == "" || !claim.ExpiresAt.After(time.Now()) || claim.ExpiresAt.After(time.Now().Add(5*time.Minute)) || truth.SessionID != claim.SessionID || !hasExactSessionControl(request.Principal, claim.SessionID) {
+		return SessionAdmissionDecision{}, ErrUnauthorized
+	}
+	if !truth.Exists {
+		if truth.Complete || truth.Terminal || truth.Conflicting || truth.Live {
+			return SessionAdmissionDecision{}, ErrUnauthorized
+		}
+		return SessionAdmissionDecision{Mode: SessionAdmissionAttachOnly}, nil
+	}
+	if !truth.Complete || truth.Terminal || truth.Conflicting || !truth.Live {
+		return SessionAdmissionDecision{}, ErrUnauthorized
+	}
+	return SessionAdmissionDecision{Mode: SessionAdmissionCurrent, MayMutate: true}, nil
+}
+
+func (decision SessionAdmissionDecision) Allows(action SessionAdmissionAction) bool {
+	switch decision.Mode {
+	case SessionAdmissionAttachOnly:
+		return action == SessionAdmissionAttach || action == SessionAdmissionStatus
+	case SessionAdmissionCurrent:
+		return decision.MayMutate && action != ""
+	default:
+		return false
+	}
+}
+
+func hasExactSessionControl(principal Principal, sessionID string) bool {
+	for _, scope := range principal.Scopes {
+		if scope.Kind == KindSession && scope.ID == sessionID && scope.Access == AccessControl {
+			return true
+		}
+	}
+	return false
 }
 
 type SessionCredentialLineageKind string

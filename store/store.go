@@ -26,6 +26,22 @@ type EventStore interface {
 	LatestSeq(ctx context.Context, sessionID string) (int64, error)
 }
 
+// SessionAdmissionTruth is the Store-owned summary used to distinguish a
+// fresh target from existing complete Session truth without platform lookup.
+type SessionAdmissionTruth struct {
+	SessionID   string
+	Exists      bool
+	Complete    bool
+	Terminal    bool
+	Conflicting bool
+	Live        bool
+}
+
+type SessionAdmissionTruthStore interface {
+	EventStore
+	SessionAdmissionTruth(ctx context.Context, sessionID string) (SessionAdmissionTruth, error)
+}
+
 // HistoryStore is the optional v2 extension for bounded historical backfill.
 // EventStore remains the v1-compatible minimum used by replay-only callers.
 type HistoryStore interface {
