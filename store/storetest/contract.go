@@ -14,6 +14,12 @@ import (
 
 type Harness func(t *testing.T) store.EventStore
 
+type HistoryHarness struct {
+	Open        func(t *testing.T) store.HistoryStore
+	Reopen      func(t *testing.T, current store.HistoryStore) store.HistoryStore
+	PruneBefore func(t *testing.T, current store.HistoryStore, sessionID string, beforeSeq int64)
+}
+
 func Contract(t *testing.T, newStore Harness) {
 	t.Helper()
 
@@ -174,6 +180,143 @@ func Contract(t *testing.T, newStore Harness) {
 			t.Fatalf("callback calls = %d, want 1", calls)
 		}
 	})
+}
+
+func HistoryContract(t *testing.T, harness HistoryHarness) {
+	t.Helper()
+	if harness.Open == nil || harness.Reopen == nil || harness.PruneBefore == nil {
+		t.Fatal("history contract harness must provide open, reopen, and prune callbacks")
+	}
+
+	t.Run("empty page and limit bounds", func(t *testing.T) {
+		st := harness.Open(t)
+		page := historyPage(t, st, "ses_history_empty", nil, 1)
+		assertHistoryPage(t, page, nil, 0, nil, store.RetentionComplete)
+		for _, limit := range []int{0, 101} {
+			if _, err := st.History(context.Background(), "ses_history_empty", nil, limit); err == nil {
+				t.Fatalf("History(limit=%d) unexpectedly succeeded", limit)
+			}
+		}
+	})
+
+	t.Run("exclusive cursor preserves ascending bounded order", func(t *testing.T) {
+		st := harness.Open(t)
+		const sessionID = "ses_history_cursor"
+		appendHistoryEvents(t, st, sessionID, 5)
+
+		page := historyPage(t, st, sessionID, nil, 2)
+		assertHistoryPage(t, page, []int64{4, 5}, 5, int64Pointer(4), store.RetentionComplete)
+		page = historyPage(t, st, sessionID, page.NextBeforeSeq, 2)
+		assertHistoryPage(t, page, []int64{2, 3}, 5, int64Pointer(2), store.RetentionComplete)
+		page = historyPage(t, st, sessionID, page.NextBeforeSeq, 2)
+		assertHistoryPage(t, page, []int64{1}, 5, nil, store.RetentionComplete)
+	})
+
+	t.Run("retention gap remains explicit after prune", func(t *testing.T) {
+		st := harness.Open(t)
+		const sessionID = "ses_history_gap"
+		appendHistoryEvents(t, st, sessionID, 5)
+		harness.PruneBefore(t, st, sessionID, 4)
+		page := historyPage(t, st, sessionID, nil, 100)
+		assertHistoryPage(t, page, []int64{4, 5}, 5, nil, store.RetentionGap)
+	})
+
+	t.Run("concurrent append remains sequenced and pageable", func(t *testing.T) {
+		st := harness.Open(t)
+		const (
+			sessionID = "ses_history_concurrent"
+			writers   = 8
+			batchSize = 4
+		)
+		start := make(chan struct{})
+		errs := make(chan error, writers)
+		var wg sync.WaitGroup
+		for writer := range writers {
+			wg.Add(1)
+			go func(writer int) {
+				defer wg.Done()
+				<-start
+				events := make([]store.PendingEvent, 0, batchSize)
+				for index := range batchSize {
+					events = append(events, pending("session.message", writer*batchSize+index))
+				}
+				_, err := st.Append(context.Background(), sessionID, events)
+				errs <- err
+			}(writer)
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent Append() error = %v", err)
+			}
+		}
+
+		page := historyPage(t, st, sessionID, nil, writers*batchSize)
+		want := make([]int64, writers*batchSize)
+		for index := range want {
+			want[index] = int64(index + 1)
+		}
+		assertHistoryPage(t, page, want, int64(writers*batchSize), nil, store.RetentionComplete)
+	})
+
+	t.Run("reopen retains the same historical truth", func(t *testing.T) {
+		st := harness.Open(t)
+		const sessionID = "ses_history_reopen"
+		appendHistoryEvents(t, st, sessionID, 3)
+		st = harness.Reopen(t, st)
+		page := historyPage(t, st, sessionID, nil, 100)
+		assertHistoryPage(t, page, []int64{1, 2, 3}, 3, nil, store.RetentionComplete)
+	})
+}
+
+func appendHistoryEvents(t *testing.T, st store.EventStore, sessionID string, count int) {
+	t.Helper()
+	events := make([]store.PendingEvent, 0, count)
+	for index := range count {
+		events = append(events, pending("session.message", index))
+	}
+	if _, err := st.Append(context.Background(), sessionID, events); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+}
+
+func historyPage(t *testing.T, st store.HistoryStore, sessionID string, beforeSeq *int64, limit int) store.HistoryPage {
+	t.Helper()
+	page, err := st.History(context.Background(), sessionID, beforeSeq, limit)
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	return page
+}
+
+func assertHistoryPage(t *testing.T, page store.HistoryPage, wantSeqs []int64, latestSeq int64, nextBeforeSeq *int64, retentionState string) {
+	t.Helper()
+	if page.LatestSeq != latestSeq {
+		t.Fatalf("page latest seq = %d, want %d", page.LatestSeq, latestSeq)
+	}
+	if page.RetentionState != retentionState {
+		t.Fatalf("page retention state = %q, want %q", page.RetentionState, retentionState)
+	}
+	if (page.NextBeforeSeq == nil) != (nextBeforeSeq == nil) || (page.NextBeforeSeq != nil && *page.NextBeforeSeq != *nextBeforeSeq) {
+		t.Fatalf("page next before seq = %v, want %v", page.NextBeforeSeq, nextBeforeSeq)
+	}
+	if len(page.Events) != len(wantSeqs) {
+		t.Fatalf("page event count = %d, want %d", len(page.Events), len(wantSeqs))
+	}
+	for index, event := range page.Events {
+		if event.Seq != wantSeqs[index] {
+			t.Fatalf("page event[%d] seq = %d, want %d", index, event.Seq, wantSeqs[index])
+		}
+		if index > 0 && page.Events[index-1].Seq >= event.Seq {
+			t.Fatalf("page events are not strictly ascending: %d then %d", page.Events[index-1].Seq, event.Seq)
+		}
+	}
+}
+
+func int64Pointer(value int64) *int64 {
+	return &value
 }
 
 func pending(eventType string, n int) store.PendingEvent {
