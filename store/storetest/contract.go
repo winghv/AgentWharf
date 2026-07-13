@@ -28,6 +28,11 @@ type PendingCommandHarness struct {
 	Invalidate func(t *testing.T, ledger store.CommandLedgerStore, kind CommandAuthorityFailure)
 }
 
+type AttachmentHarness struct {
+	Open   func(t *testing.T) store.AttachmentStore
+	Reopen func(t *testing.T, current store.AttachmentStore) store.AttachmentStore
+}
+
 type CommandAuthorityFailure string
 
 const (
@@ -508,6 +513,306 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 			})
 		}
 	})
+}
+
+func AttachmentContract(t *testing.T, harness AttachmentHarness) {
+	t.Helper()
+	if harness.Open == nil || harness.Reopen == nil {
+		t.Fatal("attachment contract harness must provide open and reopen callbacks")
+	}
+
+	t.Run("creates stable identity and looks up by attachment or target", func(t *testing.T) {
+		ledger := harness.Open(t)
+		request := attachmentCreate("attach_contract_lookup", "ses_bootstrap_lookup", "ses_target_lookup")
+		commit, err := ledger.CreateAttachment(context.Background(), request)
+		if err != nil || commit.Noop {
+			t.Fatalf("CreateAttachment() = %+v, %v; want new attachment", commit, err)
+		}
+		assertAttachment(t, commit.Attachment, request.Identity, store.AttachmentJoinPending, store.AttachmentDeliveryPending, 0, nil, &request.ExpiresAt, nil)
+		assertAttachmentSummary(t, commit.Summary, commit.Attachment, nil)
+
+		byID, err := ledger.Attachment(context.Background(), request.Identity.AttachID)
+		if err != nil {
+			t.Fatalf("Attachment() error = %v", err)
+		}
+		byTarget, err := ledger.AttachmentForTarget(context.Background(), request.Identity.TargetSessionID)
+		if err != nil {
+			t.Fatalf("AttachmentForTarget() error = %v", err)
+		}
+		assertSameAttachment(t, byID, commit.Attachment)
+		assertSameAttachment(t, byTarget, commit.Attachment)
+		for _, mutate := range []func(*store.AttachmentIdentity){
+			func(identity *store.AttachmentIdentity) { identity.BootstrapSessionID = "ses_bootstrap_rewrite" },
+			func(identity *store.AttachmentIdentity) { identity.TargetSessionID = "ses_target_rewrite" },
+			func(identity *store.AttachmentIdentity) { identity.TargetCredentialLineageRef = "lineage_rewrite" },
+		} {
+			retry := request
+			mutate(&retry.Identity)
+			if _, err := ledger.CreateAttachment(context.Background(), retry); err == nil {
+				t.Fatal("identity-rewriting attachment retry unexpectedly succeeded")
+			}
+		}
+		afterConflict, err := ledger.Attachment(context.Background(), request.Identity.AttachID)
+		if err != nil {
+			t.Fatalf("Attachment() after immutable-identity conflicts: %v", err)
+		}
+		assertSameAttachment(t, afterConflict, commit.Attachment)
+	})
+
+	t.Run("versioned mutations return their committed blocker summary", func(t *testing.T) {
+		ledger := harness.Open(t)
+		request := attachmentCreate("attach_contract_mutation", "ses_bootstrap_mutation", "ses_target_mutation")
+		_, err := ledger.CreateAttachment(context.Background(), request)
+		if err != nil {
+			t.Fatalf("CreateAttachment() error = %v", err)
+		}
+		reason := "capacity"
+		blockerSessionID := "ses_blocker_mutation"
+		queued := store.AttachmentUpdate{
+			Status:            store.AttachmentQueued,
+			DeliveryState:     store.AttachmentDeliveryPending,
+			QueueReason:       &reason,
+			ExpiresAt:         &request.ExpiresAt,
+			BlockingSessionID: &blockerSessionID,
+			Blocker: &store.AttachmentBlocker{
+				Kind:              store.AttachmentBlockerQueued,
+				Reason:            &reason,
+				ExpiresAt:         &request.ExpiresAt,
+				BlockingSessionID: &blockerSessionID,
+			},
+		}
+		mutation, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, queued)
+		if err != nil {
+			t.Fatalf("queued UpdateAttachment() error = %v", err)
+		}
+		assertAttachment(t, mutation.Attachment, request.Identity, store.AttachmentQueued, store.AttachmentDeliveryPending, 1, &reason, &request.ExpiresAt, &blockerSessionID)
+		assertAttachmentSummary(t, mutation.Summary, mutation.Attachment, queued.Blocker)
+		if _, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, queued); err == nil {
+			t.Fatal("stale UpdateAttachment() unexpectedly succeeded")
+		}
+
+		started := store.AttachmentUpdate{Status: store.AttachmentStartReceived, DeliveryState: store.AttachmentDeliveryReceived}
+		mutation, err = ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 1, started)
+		if err != nil {
+			t.Fatalf("start-received UpdateAttachment() error = %v", err)
+		}
+		assertAttachment(t, mutation.Attachment, request.Identity, store.AttachmentStartReceived, store.AttachmentDeliveryReceived, 2, nil, nil, nil)
+		assertAttachmentSummary(t, mutation.Summary, mutation.Attachment, nil)
+	})
+	t.Run("reconnect, canceled, and unknown outcomes remain bounded ledger truth", func(t *testing.T) {
+		ledger := harness.Open(t)
+		request := attachmentCreate("attach_contract_reconnect", "ses_bootstrap_reconnect", "ses_target_reconnect")
+		if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+			t.Fatalf("CreateAttachment() error = %v", err)
+		}
+		reauthorize := store.AttachmentUpdate{
+			Status:        store.AttachmentReauthorizationRequired,
+			DeliveryState: store.AttachmentDeliveryPending,
+			Blocker:       &store.AttachmentBlocker{Kind: store.AttachmentBlockerReauthorizationRequired},
+		}
+		mutation, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, reauthorize)
+		if err != nil {
+			t.Fatalf("reauthorization UpdateAttachment() error = %v", err)
+		}
+		assertAttachmentSummary(t, mutation.Summary, mutation.Attachment, reauthorize.Blocker)
+		cancel := store.AttachmentUpdate{
+			Status:        store.AttachmentCanceled,
+			DeliveryState: store.AttachmentDeliveryPending,
+			Blocker:       &store.AttachmentBlocker{Kind: store.AttachmentBlockerNewRunRequired},
+		}
+		mutation, err = ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 1, cancel)
+		if err != nil {
+			t.Fatalf("canceled UpdateAttachment() error = %v", err)
+		}
+		if mutation.Attachment.CanceledAt == nil {
+			t.Fatal("canceled attachment omitted Store-clock canceled_at")
+		}
+		assertAttachmentSummary(t, mutation.Summary, mutation.Attachment, cancel.Blocker)
+		if _, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 2, reauthorize); err == nil {
+			t.Fatal("canceled attachment was resurrected")
+		}
+	})
+	t.Run("healthy target attach retry is a no-op", func(t *testing.T) {
+		ledger := harness.Open(t)
+		request := attachmentCreate("attach_contract_healthy", "ses_bootstrap_healthy", "ses_target_healthy")
+		if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+			t.Fatalf("CreateAttachment() error = %v", err)
+		}
+		started := store.AttachmentUpdate{Status: store.AttachmentStartReceived, DeliveryState: store.AttachmentDeliveryReceived}
+		mutation, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, started)
+		if err != nil {
+			t.Fatalf("start-received UpdateAttachment() error = %v", err)
+		}
+		duplicate, err := ledger.CreateAttachment(context.Background(), request)
+		if err != nil || !duplicate.Noop {
+			t.Fatalf("healthy CreateAttachment() = %+v, %v; want no-op", duplicate, err)
+		}
+		assertSameAttachment(t, duplicate.Attachment, mutation.Attachment)
+	})
+	t.Run("outcome unknown is bounded and terminal status cannot rebind", func(t *testing.T) {
+		ledger := harness.Open(t)
+		request := attachmentCreate("attach_contract_outcome", "ses_bootstrap_outcome", "ses_target_outcome")
+		if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+			t.Fatalf("CreateAttachment() error = %v", err)
+		}
+		operation := "start"
+		unknown := store.AttachmentUpdate{
+			Status:        store.AttachmentStartReceived,
+			DeliveryState: store.AttachmentDeliveryOutcomeUnknown,
+			Blocker:       &store.AttachmentBlocker{Kind: store.AttachmentBlockerOutcomeUnknown, Operation: &operation},
+		}
+		mutation, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, unknown)
+		if err != nil {
+			t.Fatalf("outcome unknown UpdateAttachment() error = %v", err)
+		}
+		assertAttachmentSummary(t, mutation.Summary, mutation.Attachment, unknown.Blocker)
+		other := attachmentCreate("attach_contract_rebind", "ses_bootstrap_replacement", request.Identity.TargetSessionID)
+		if _, err := ledger.CreateAttachment(context.Background(), other); err == nil {
+			t.Fatal("replacement bootstrap rebound target attachment")
+		}
+		stored, err := ledger.AttachmentForTarget(context.Background(), request.Identity.TargetSessionID)
+		if err != nil {
+			t.Fatalf("AttachmentForTarget() after rebind rejection: %v", err)
+		}
+		if stored.Identity.BootstrapSessionID != request.Identity.BootstrapSessionID {
+			t.Fatalf("bootstrap rebinding = %q, want %q", stored.Identity.BootstrapSessionID, request.Identity.BootstrapSessionID)
+		}
+	})
+	t.Run("expiry is bounded and cannot be extended", func(t *testing.T) {
+		ledger := harness.Open(t)
+		expired := attachmentCreate("attach_contract_expired", "ses_bootstrap_expired", "ses_target_expired")
+		expired.ExpiresAt = time.Now().Add(-time.Second)
+		if _, err := ledger.CreateAttachment(context.Background(), expired); err == nil {
+			t.Fatal("expired attachment create unexpectedly succeeded")
+		}
+		long := attachmentCreate("attach_contract_long", "ses_bootstrap_long", "ses_target_long")
+		long.ExpiresAt = time.Now().Add(31 * time.Second)
+		if _, err := ledger.CreateAttachment(context.Background(), long); err == nil {
+			t.Fatal("unbounded attachment create unexpectedly succeeded")
+		}
+		request := attachmentCreate("attach_contract_expiry", "ses_bootstrap_expiry", "ses_target_expiry")
+		if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+			t.Fatalf("CreateAttachment() error = %v", err)
+		}
+		reason := "capacity"
+		blocker := "ses_blocker_expiry"
+		extended := request.ExpiresAt.Add(time.Second)
+		update := store.AttachmentUpdate{
+			Status:            store.AttachmentQueued,
+			DeliveryState:     store.AttachmentDeliveryPending,
+			QueueReason:       &reason,
+			ExpiresAt:         &extended,
+			BlockingSessionID: &blocker,
+			Blocker:           &store.AttachmentBlocker{Kind: store.AttachmentBlockerQueued, Reason: &reason, ExpiresAt: &extended, BlockingSessionID: &blocker},
+		}
+		if _, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, update); err == nil {
+			t.Fatal("attachment expiry extension unexpectedly succeeded")
+		}
+		if _, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, store.AttachmentUpdate{Status: store.AttachmentStatus("starting"), DeliveryState: store.AttachmentDeliveryPending}); err == nil {
+			t.Fatal("Hub-synthesized starting attachment state unexpectedly succeeded")
+		}
+	})
+	t.Run("concurrent exact-version updates allow one winner", func(t *testing.T) {
+		ledger := harness.Open(t)
+		request := attachmentCreate("attach_contract_concurrent", "ses_bootstrap_concurrent", "ses_target_concurrent")
+		if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+			t.Fatalf("CreateAttachment() error = %v", err)
+		}
+		update := store.AttachmentUpdate{
+			Status:        store.AttachmentReauthorizationRequired,
+			DeliveryState: store.AttachmentDeliveryPending,
+			Blocker:       &store.AttachmentBlocker{Kind: store.AttachmentBlockerReauthorizationRequired},
+		}
+		start := make(chan struct{})
+		results := make(chan error, 8)
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, update)
+				results <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		var successes int
+		for err := range results {
+			if err == nil {
+				successes++
+			}
+		}
+		if successes != 1 {
+			t.Fatalf("concurrent attachment updates = %d successes, want 1", successes)
+		}
+	})
+	t.Run("reopen preserves versioned attachment truth", func(t *testing.T) {
+		ledger := harness.Open(t)
+		request := attachmentCreate("attach_contract_reopen", "ses_bootstrap_reopen", "ses_target_reopen")
+		if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+			t.Fatalf("CreateAttachment() error = %v", err)
+		}
+		reauthorize := store.AttachmentUpdate{
+			Status:        store.AttachmentReauthorizationRequired,
+			DeliveryState: store.AttachmentDeliveryPending,
+			Blocker:       &store.AttachmentBlocker{Kind: store.AttachmentBlockerReauthorizationRequired},
+		}
+		if _, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, reauthorize); err != nil {
+			t.Fatalf("UpdateAttachment() before reopen: %v", err)
+		}
+		ledger = harness.Reopen(t, ledger)
+		stored, err := ledger.Attachment(context.Background(), request.Identity.AttachID)
+		if err != nil {
+			t.Fatalf("reopened Attachment() error = %v", err)
+		}
+		assertAttachment(t, stored, request.Identity, store.AttachmentReauthorizationRequired, store.AttachmentDeliveryPending, 1, nil, nil, nil)
+	})
+}
+func attachmentCreate(attachID, bootstrapSessionID, targetSessionID string) store.AttachmentCreate {
+	return store.AttachmentCreate{
+		Identity: store.AttachmentIdentity{
+			AttachID:                   attachID,
+			BootstrapSessionID:         bootstrapSessionID,
+			TargetSessionID:            targetSessionID,
+			TargetCredentialLineageRef: "lineage_" + attachID,
+		},
+		ExpiresAt: time.Now().Add(20 * time.Second),
+	}
+}
+
+func assertAttachment(t *testing.T, attachment store.Attachment, identity store.AttachmentIdentity, status store.AttachmentStatus, deliveryState store.AttachmentDeliveryState, version int64, reason *string, expiresAt *time.Time, blockingSessionID *string) {
+	t.Helper()
+	if attachment.Identity != identity || attachment.Status != status || attachment.DeliveryState != deliveryState || attachment.DeliveryVersion != version || !sameString(attachment.QueueReason, reason) || !sameTime(attachment.ExpiresAt, expiresAt) || !sameString(attachment.BlockingSessionID, blockingSessionID) {
+		t.Fatalf("attachment = %+v, want identity=%+v status=%s delivery=%s version=%d reason=%v expiry=%v blocker=%v", attachment, identity, status, deliveryState, version, reason, expiresAt, blockingSessionID)
+	}
+}
+
+func assertAttachmentSummary(t *testing.T, summary store.AttachmentSummary, attachment store.Attachment, blocker *store.AttachmentBlocker) {
+	t.Helper()
+	if summary.AttachID != attachment.Identity.AttachID || summary.TargetSessionID != attachment.Identity.TargetSessionID || summary.DeliveryVersion != attachment.DeliveryVersion || !sameTime(summary.ExpiresAt, attachment.ExpiresAt) || !sameBlocker(summary.Blocker, blocker) {
+		t.Fatalf("attachment summary = %+v, want attachment=%+v blocker=%+v", summary, attachment, blocker)
+	}
+}
+
+func assertSameAttachment(t *testing.T, got, want store.Attachment) {
+	t.Helper()
+	if got.Identity != want.Identity || got.Status != want.Status || got.DeliveryState != want.DeliveryState || got.DeliveryVersion != want.DeliveryVersion || !sameString(got.QueueReason, want.QueueReason) || !sameTime(got.ExpiresAt, want.ExpiresAt) || !sameTime(got.CanceledAt, want.CanceledAt) || !sameString(got.BlockingSessionID, want.BlockingSessionID) {
+		t.Fatalf("attachment = %+v, want %+v", got, want)
+	}
+}
+
+func sameBlocker(left, right *store.AttachmentBlocker) bool {
+	return (left == nil && right == nil) || (left != nil && right != nil && left.Kind == right.Kind && sameString(left.Reason, right.Reason) && sameTime(left.ExpiresAt, right.ExpiresAt) && sameString(left.BlockingSessionID, right.BlockingSessionID) && sameString(left.Operation, right.Operation))
+}
+
+func sameString(left, right *string) bool {
+	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
+}
+
+func sameTime(left, right *time.Time) bool {
+	return (left == nil && right == nil) || (left != nil && right != nil && left.Equal(*right))
 }
 
 func userCommandEvent(n int) store.PendingEvent {
