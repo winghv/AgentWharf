@@ -329,6 +329,9 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 			t.Fatalf("ResolvePendingCommand() error = %v", err)
 		}
 		assertPendingCommand(t, resolved, "ses_command_claim", request, 1, store.PendingCommandCompleted)
+		if _, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_claim", request.CommandID, store.PendingCommandPending); err == nil {
+			t.Fatal("ResolvePendingCommand(pending) unexpectedly succeeded")
+		}
 	})
 
 	t.Run("invalid references and expiry are rejected", func(t *testing.T) {
@@ -339,8 +342,10 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 			request store.PendingCommandRequest
 		}{
 			{"expired", userCommandEvent(1), store.PendingCommandRequest{CommandID: "cmd_contract_expired", Type: "session.send", ExpiresAt: time.Now().Add(-time.Second)}},
+			{"unbounded expiry", userCommandEvent(1), store.PendingCommandRequest{CommandID: "cmd_contract_unbounded", Type: "session.send", ExpiresAt: time.Now().Add(31 * time.Second)}},
 			{"wrong type", userCommandEvent(1), store.PendingCommandRequest{CommandID: "cmd_contract_type", Type: "session.interrupt", ExpiresAt: time.Now().Add(time.Second)}},
 			{"wrong event", pending("session.state", 1), store.PendingCommandRequest{CommandID: "cmd_contract_event", Type: "session.send", ExpiresAt: time.Now().Add(time.Second)}},
+			{"non-user message", nonUserCommandEvent(1), store.PendingCommandRequest{CommandID: "cmd_contract_agent", Type: "session.send", ExpiresAt: time.Now().Add(time.Second)}},
 		}
 		for _, test := range invalid {
 			t.Run(test.name, func(t *testing.T) {
@@ -355,6 +360,12 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 func userCommandEvent(n int) store.PendingEvent {
 	event := pending("session.message", n)
 	event.Payload = json.RawMessage(`{"role":"user"}`)
+	return event
+}
+
+func nonUserCommandEvent(n int) store.PendingEvent {
+	event := pending("session.message", n)
+	event.Payload = json.RawMessage(`{"role":"agent"}`)
 	return event
 }
 

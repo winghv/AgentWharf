@@ -2,6 +2,7 @@ package storetest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -47,7 +48,10 @@ func (s *memoryCommandLedger) LatestSeq(_ context.Context, sessionID string) (in
 func (s *memoryCommandLedger) CommitPendingCommand(_ context.Context, sessionID string, event store.PendingEvent, request store.PendingCommandRequest) (store.PendingCommandCommit, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if request.Type != "session.send" || event.Type != "session.message" || !request.ExpiresAt.After(time.Now()) {
+	var payload struct {
+		Role string `json:"role"`
+	}
+	if request.Type != "session.send" || event.Type != "session.message" || json.Unmarshal(event.Payload, &payload) != nil || payload.Role != "user" || !request.ExpiresAt.After(time.Now()) || request.ExpiresAt.After(time.Now().Add(30*time.Second)) {
 		return store.PendingCommandCommit{}, errors.New("invalid pending command")
 	}
 	key := sessionID + "\x00" + request.CommandID
@@ -86,6 +90,9 @@ func (s *memoryCommandLedger) ResolvePendingCommand(_ context.Context, sessionID
 	command, ok := s.commands[key]
 	if !ok {
 		return store.PendingCommand{}, errors.New("pending command not found")
+	}
+	if status != store.PendingCommandCompleted && status != store.PendingCommandOutcomeUnknown {
+		return store.PendingCommand{}, errors.New("invalid pending command outcome")
 	}
 	command.Status = status
 	s.commands[key] = command
