@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -38,6 +39,322 @@ type ProposalHarness struct {
 	Reopen     func(t *testing.T, current store.ProposedEventStore) store.ProposedEventStore
 	Authority  func(t *testing.T, proposals store.ProposedEventStore) store.CommandAuthority
 	Invalidate func(t *testing.T, proposals store.ProposedEventStore, kind CommandAuthorityFailure)
+}
+
+type ConnectionHarness struct {
+	Open       func(t *testing.T) store.AdapterConnectionStore
+	Invalidate func(t *testing.T, connections store.AdapterConnectionStore, terminal bool)
+}
+
+func ConnectionContract(t *testing.T, harness ConnectionHarness) {
+	t.Helper()
+	if harness.Open == nil || harness.Invalidate == nil {
+		t.Fatal("connection contract harness must provide open and invalidate")
+	}
+	connections := harness.Open(t)
+	transactions, ok := connections.(store.AdapterConnectionTransactor)
+	if !ok {
+		t.Fatal("connection store does not expose transaction-bound initialization")
+	}
+	rollback := errors.New("rollback connection initialization")
+	transactionalInit := store.AdapterConnectionInitialize{SessionID: "ses_connection_transaction", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	if err := transactions.WithAdapterConnectionTransaction(context.Background(), func(tx store.AdapterConnectionStore) error {
+		if _, err := tx.InitializeAdapterConnection(context.Background(), transactionalInit); err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatalf("rollback transaction error = %v, want %v", err, rollback)
+	}
+	if _, err := connections.AdapterConnection(context.Background(), transactionalInit.SessionID); err == nil {
+		t.Fatal("rolled back initializer left connection lineage")
+	}
+	if err := transactions.WithAdapterConnectionTransaction(context.Background(), func(tx store.AdapterConnectionStore) error {
+		_, err := tx.InitializeAdapterConnection(context.Background(), transactionalInit)
+		return err
+	}); err != nil {
+		t.Fatalf("commit transaction initialization: %v", err)
+	}
+	if record, err := connections.AdapterConnection(context.Background(), transactionalInit.SessionID); err != nil || record.ConnectionEpoch != 0 || record.AcceptedFence != 0 {
+		t.Fatalf("transactional initialize = %+v, %v", record, err)
+	}
+	init := store.AdapterConnectionInitialize{SessionID: "ses_connection", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	record, err := connections.InitializeAdapterConnection(context.Background(), init)
+	if err != nil || record.ConnectionEpoch != 0 || record.AcceptedFence != 0 {
+		t.Fatalf("initialize = %+v, %v", record, err)
+	}
+	record, err = connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil || record.ConnectionEpoch != 1 || record.AcceptedFence < 1 {
+		t.Fatalf("hello = %+v, %v", record, err)
+	}
+	firstHello := record
+	record, err = connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil || record.ConnectionEpoch != firstHello.ConnectionEpoch+1 || record.AcceptedFence <= firstHello.AcceptedFence {
+		t.Fatalf("second hello = %+v, %v", record, err)
+	}
+	admission := store.AdapterConnectionAdmission{CredentialGeneration: record.ActiveCredentialGeneration, ConnectionEpoch: record.ConnectionEpoch, AcceptedFence: record.AcceptedFence, GrantFence: record.AcceptedFence + 1}
+	if _, err := connections.ValidateAdapterAdmission(context.Background(), init.SessionID, admission); err != nil {
+		t.Fatalf("validate current admission: %v", err)
+	}
+	rotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_connection"}
+	record, err = connections.PrepareAdapterCredentialRotation(context.Background(), init.SessionID, rotation)
+	if err != nil || record.PendingCredentialGeneration == nil || *record.PendingCredentialGeneration != 2 {
+		t.Fatalf("prepare rotation = %+v, %v", record, err)
+	}
+	prepared := record
+	record, err = connections.ActivateAdapterCredential(context.Background(), init.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: 2, PendingGeneration: 2, RotationID: "rot_connection"})
+	if err != nil || record.ActiveCredentialGeneration != 2 || record.PriorRecoveryGeneration == nil || *record.PriorRecoveryGeneration != 1 || record.ConnectionEpoch != prepared.ConnectionEpoch+1 || record.AcceptedFence <= prepared.AcceptedFence {
+		t.Fatalf("activate = %+v, %v", record, err)
+	}
+	if _, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1}); err == nil {
+		t.Fatal("prior recovery normal hello unexpectedly succeeded")
+	}
+	if _, err := connections.ValidateAdapterAdmission(context.Background(), init.SessionID, admission); err == nil {
+		t.Fatal("activation failed to fence prior grant admission")
+	}
+	currentAdmission := store.AdapterConnectionAdmission{CredentialGeneration: record.ActiveCredentialGeneration, ConnectionEpoch: record.ConnectionEpoch, AcceptedFence: record.AcceptedFence, GrantFence: record.AcceptedFence + 1}
+	if _, err := connections.ValidateAdapterAdmission(context.Background(), init.SessionID, currentAdmission); err != nil {
+		t.Fatalf("validate post-activation admission: %v", err)
+	}
+	connections = harness.Open(t)
+	if _, err := connections.InitializeAdapterConnection(context.Background(), init); err != nil {
+		t.Fatalf("initialize stale activation: %v", err)
+	}
+	if _, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1}); err != nil {
+		t.Fatalf("hello stale activation: %v", err)
+	}
+	staleRotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: 1, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_connection"}
+	if _, err := connections.PrepareAdapterCredentialRotation(context.Background(), init.SessionID, staleRotation); err != nil {
+		t.Fatalf("prepare stale activation: %v", err)
+	}
+	if _, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1}); err != nil {
+		t.Fatalf("second hello stale activation: %v", err)
+	}
+	if _, err := connections.ActivateAdapterCredential(context.Background(), init.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: 1, PendingGeneration: 2, RotationID: "rot_connection"}); err == nil {
+		t.Fatal("stale activation unexpectedly succeeded")
+	}
+	if record, err := connections.AdapterConnection(context.Background(), init.SessionID); err != nil || record.ActiveCredentialGeneration != 1 {
+		t.Fatalf("stale activation mutated active generation = %+v, %v", record, err)
+	}
+	if record, err := connections.AdapterConnection(context.Background(), init.SessionID); err != nil || record.PendingCredentialGeneration == nil || *record.PendingCredentialGeneration != 2 {
+		t.Fatalf("stale activation mutated pending lineage = %+v, %v", record, err)
+	}
+	connections = harness.Open(t)
+	expiringInit := store.AdapterConnectionInitialize{SessionID: "ses_connection_expired", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Millisecond)}
+	if _, err := connections.InitializeAdapterConnection(context.Background(), expiringInit); err != nil {
+		t.Fatalf("initialize expiring connection: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if _, err := connections.AcceptAdapterHello(context.Background(), expiringInit.SessionID, store.AdapterHello{CredentialGeneration: 1}); err == nil {
+		t.Fatal("expired hello unexpectedly succeeded")
+	}
+	if record, err := connections.AdapterConnection(context.Background(), expiringInit.SessionID); err != nil || record.ConnectionEpoch != 0 || record.AcceptedFence != 0 {
+		t.Fatalf("expired hello mutated connection = %+v, %v", record, err)
+	}
+	expired := mustAdapterConnection(t, connections, expiringInit.SessionID)
+	expiredAdmission := store.AdapterConnectionAdmission{CredentialGeneration: expired.ActiveCredentialGeneration, ConnectionEpoch: expired.ConnectionEpoch, AcceptedFence: expired.AcceptedFence, GrantFence: expired.AcceptedFence + 1}
+	assertConnectionNoWrite(t, connections, expiringInit.SessionID, expired, func() error {
+		_, err := connections.ValidateAdapterAdmission(context.Background(), expiringInit.SessionID, expiredAdmission)
+		return err
+	})
+	expiredRotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: expired.ActiveCredentialGeneration, ExpectedEpoch: expired.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_active_expired"}
+	assertConnectionNoWrite(t, connections, expiringInit.SessionID, expired, func() error {
+		_, err := connections.PrepareAdapterCredentialRotation(context.Background(), expiringInit.SessionID, expiredRotation)
+		return err
+	})
+	connections = harness.Open(t)
+	activeExpiryInit := store.AdapterConnectionInitialize{SessionID: "ses_connection_active_expiry", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(50 * time.Millisecond)}
+	record = initializeAndHello(t, connections, activeExpiryInit)
+	activeExpiryRotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_active_expiry"}
+	if _, err := connections.PrepareAdapterCredentialRotation(context.Background(), activeExpiryInit.SessionID, activeExpiryRotation); err != nil {
+		t.Fatalf("prepare active expiry rotation: %v", err)
+	}
+	time.Sleep(75 * time.Millisecond)
+	expired = mustAdapterConnection(t, connections, activeExpiryInit.SessionID)
+	assertConnectionNoWrite(t, connections, activeExpiryInit.SessionID, expired, func() error {
+		_, err := connections.ActivateAdapterCredential(context.Background(), activeExpiryInit.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, RotationID: activeExpiryRotation.RotationID})
+		return err
+	})
+	connections = harness.Open(t)
+	if _, err := connections.InitializeAdapterConnection(context.Background(), init); err != nil {
+		t.Fatalf("initialize pending expiry: %v", err)
+	}
+	record, err = connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("hello pending expiry: %v", err)
+	}
+	expiringRotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Millisecond), RotationID: "rot_expired"}
+	if _, err := connections.PrepareAdapterCredentialRotation(context.Background(), init.SessionID, expiringRotation); err != nil {
+		t.Fatalf("prepare expiring rotation: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if _, err := connections.ActivateAdapterCredential(context.Background(), init.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, RotationID: "rot_expired"}); err == nil {
+		t.Fatal("expired pending credential unexpectedly activated")
+	}
+	if current, err := connections.AdapterConnection(context.Background(), init.SessionID); err != nil || current.ActiveCredentialGeneration != 1 || current.PendingCredentialGeneration == nil || *current.PendingCredentialGeneration != 2 || current.ConnectionEpoch != record.ConnectionEpoch || current.AcceptedFence != record.AcceptedFence {
+		t.Fatalf("expired activation mutated connection = %+v, %v", current, err)
+	}
+	connections = harness.Open(t)
+	if _, err := connections.InitializeAdapterConnection(context.Background(), init); err != nil {
+		t.Fatalf("initialize hello admission race: %v", err)
+	}
+	record, err = connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("hello admission race: %v", err)
+	}
+	admission = store.AdapterConnectionAdmission{CredentialGeneration: record.ActiveCredentialGeneration, ConnectionEpoch: record.ConnectionEpoch, AcceptedFence: record.AcceptedFence, GrantFence: record.AcceptedFence + 1}
+	assertAdmissionFenceRace(t, connections, init.SessionID, admission, func() error {
+		_, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+		return err
+	})
+	if _, err := connections.ValidateAdapterAdmission(context.Background(), init.SessionID, admission); err == nil {
+		t.Fatal("post-hello stale admission unexpectedly succeeded")
+	}
+	connections = harness.Open(t)
+	if _, err := connections.InitializeAdapterConnection(context.Background(), init); err != nil {
+		t.Fatalf("initialize activation admission race: %v", err)
+	}
+	record, err = connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("hello activation race: %v", err)
+	}
+	rotation = store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_admission_race"}
+	if _, err := connections.PrepareAdapterCredentialRotation(context.Background(), init.SessionID, rotation); err != nil {
+		t.Fatalf("prepare activation admission race: %v", err)
+	}
+	admission = store.AdapterConnectionAdmission{CredentialGeneration: record.ActiveCredentialGeneration, ConnectionEpoch: record.ConnectionEpoch, AcceptedFence: record.AcceptedFence, GrantFence: record.AcceptedFence + 1}
+	assertAdmissionFenceRace(t, connections, init.SessionID, admission, func() error {
+		_, err := connections.ActivateAdapterCredential(context.Background(), init.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, RotationID: rotation.RotationID})
+		return err
+	})
+	if _, err := connections.ValidateAdapterAdmission(context.Background(), init.SessionID, admission); err == nil {
+		t.Fatal("post-activation stale admission unexpectedly succeeded")
+	}
+	connections = harness.Open(t)
+	if _, err := connections.InitializeAdapterConnection(context.Background(), init); err != nil {
+		t.Fatalf("initialize concurrent hello: %v", err)
+	}
+	start := make(chan struct{})
+	epochs := make(chan int64, 8)
+	errs := make(chan error, 8)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			record, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+			epochs <- record.ConnectionEpoch
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(epochs)
+	close(errs)
+	seen := make(map[int64]bool)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent hello error = %v", err)
+		}
+	}
+	for epoch := range epochs {
+		if epoch < 1 || seen[epoch] {
+			t.Fatalf("duplicate or invalid hello epoch %d", epoch)
+		}
+		seen[epoch] = true
+	}
+	if len(seen) != 8 {
+		t.Fatalf("hello epochs = %v", seen)
+	}
+	for _, terminal := range []bool{false, true} {
+		connections = harness.Open(t)
+		record = initializeAndHello(t, connections, init)
+		admission = store.AdapterConnectionAdmission{CredentialGeneration: record.ActiveCredentialGeneration, ConnectionEpoch: record.ConnectionEpoch, AcceptedFence: record.AcceptedFence, GrantFence: record.AcceptedFence + 1}
+		rotation = store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_invalidated"}
+		harness.Invalidate(t, connections, terminal)
+		invalidated := mustAdapterConnection(t, connections, init.SessionID)
+		assertConnectionNoWrite(t, connections, init.SessionID, invalidated, func() error {
+			_, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+			return err
+		})
+		assertConnectionNoWrite(t, connections, init.SessionID, invalidated, func() error {
+			_, err := connections.ValidateAdapterAdmission(context.Background(), init.SessionID, admission)
+			return err
+		})
+		assertConnectionNoWrite(t, connections, init.SessionID, invalidated, func() error {
+			_, err := connections.PrepareAdapterCredentialRotation(context.Background(), init.SessionID, rotation)
+			return err
+		})
+		connections = harness.Open(t)
+		record = initializeAndHello(t, connections, init)
+		rotation = store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_invalidated_activation"}
+		if _, err := connections.PrepareAdapterCredentialRotation(context.Background(), init.SessionID, rotation); err != nil {
+			t.Fatalf("prepare invalidation activation: %v", err)
+		}
+		harness.Invalidate(t, connections, terminal)
+		invalidated = mustAdapterConnection(t, connections, init.SessionID)
+		assertConnectionNoWrite(t, connections, init.SessionID, invalidated, func() error {
+			_, err := connections.ActivateAdapterCredential(context.Background(), init.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, RotationID: rotation.RotationID})
+			return err
+		})
+	}
+}
+func initializeAndHello(t *testing.T, connections store.AdapterConnectionStore, init store.AdapterConnectionInitialize) store.AdapterConnection {
+	if _, err := connections.InitializeAdapterConnection(context.Background(), init); err != nil {
+		t.Fatalf("initialize connection: %v", err)
+	}
+	record, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: init.ActiveCredentialGeneration})
+	if err != nil {
+		t.Fatalf("hello connection: %v", err)
+	}
+	return record
+}
+func mustAdapterConnection(t *testing.T, connections store.AdapterConnectionStore, sessionID string) store.AdapterConnection {
+	record, err := connections.AdapterConnection(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("read connection: %v", err)
+	}
+	return record
+}
+func assertConnectionNoWrite(t *testing.T, connections store.AdapterConnectionStore, sessionID string, want store.AdapterConnection, operation func() error) {
+	if err := operation(); err == nil {
+		t.Fatal("invalid connection operation unexpectedly succeeded")
+	}
+	if got := mustAdapterConnection(t, connections, sessionID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("invalid connection operation mutated record = %+v, want %+v", got, want)
+	}
+}
+
+func assertAdmissionFenceRace(t *testing.T, connections store.AdapterConnectionStore, sessionID string, admission store.AdapterConnectionAdmission, advance func() error) {
+	t.Helper()
+	start := make(chan struct{})
+	results := make(chan error, 8)
+	advanceResult := make(chan error, 1)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := connections.ValidateAdapterAdmission(context.Background(), sessionID, admission)
+			results <- err
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		advanceResult <- advance()
+	}()
+	close(start)
+	wg.Wait()
+	close(results)
+	for range results {
+	}
+	if err := <-advanceResult; err != nil {
+		t.Fatalf("fence mutation: %v", err)
+	}
 }
 
 type CommandAuthorityFailure string

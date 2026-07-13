@@ -183,6 +183,86 @@ type CommandAuthority struct {
 	CredentialGeneration int64
 }
 
+type AdapterConnectionCredentialState string
+
+const (
+	AdapterConnectionCredentialActive        AdapterConnectionCredentialState = "active"
+	AdapterConnectionCredentialPending       AdapterConnectionCredentialState = "pending"
+	AdapterConnectionCredentialPriorRecovery AdapterConnectionCredentialState = "prior_recovery"
+)
+
+type AdapterConnection struct {
+	SessionID                         string
+	ConnectionEpoch                   int64
+	AcceptedFence                     int64
+	ActiveCredentialGeneration        int64
+	CredentialGenerationHighWatermark int64
+	ActiveCredentialExpiresAt         time.Time
+	PendingCredentialGeneration       *int64
+	PendingCredentialExpiresAt        *time.Time
+	PriorRecoveryGeneration           *int64
+	RotationID                        *string
+	RevokedAt                         *time.Time
+	TerminalAt                        *time.Time
+}
+
+type AdapterConnectionInitialize struct {
+	SessionID                  string
+	ActiveCredentialGeneration int64
+	ActiveCredentialExpiresAt  time.Time
+}
+
+type AdapterHello struct {
+	CredentialGeneration int64
+}
+
+// AdapterConnectionAdmission binds an opaque grant fence to the exact live
+// Adapter connection. A caller cannot use a tuple that hello or activation has
+// already fenced.
+type AdapterConnectionAdmission struct {
+	CredentialGeneration int64
+	ConnectionEpoch      int64
+	AcceptedFence        int64
+	GrantFence           int64
+}
+
+type AdapterCredentialRotation struct {
+	ExpectedActiveCredentialGeneration int64
+	ExpectedEpoch                      int64
+	PendingGeneration                  int64
+	ExpiresAt                          time.Time
+	RotationID                         string
+}
+
+type AdapterCredentialActivation struct {
+	ExpectedActiveCredentialGeneration int64
+	ExpectedEpoch                      int64
+	PendingGeneration                  int64
+	RotationID                         string
+}
+
+// AdapterConnectionStore owns opaque Session connection fencing and credential
+// lineage truth. Normal hello and pending activation each advance the epoch and
+// accepted fence atomically against current Store-owned revocation, expiry, and
+// terminal state; callers cannot allocate epochs or accepted fences.
+type AdapterConnectionStore interface {
+	EventStore
+	InitializeAdapterConnection(ctx context.Context, request AdapterConnectionInitialize) (AdapterConnection, error)
+	AcceptAdapterHello(ctx context.Context, sessionID string, hello AdapterHello) (AdapterConnection, error)
+	ValidateAdapterAdmission(ctx context.Context, sessionID string, admission AdapterConnectionAdmission) (AdapterConnection, error)
+	PrepareAdapterCredentialRotation(ctx context.Context, sessionID string, rotation AdapterCredentialRotation) (AdapterConnection, error)
+	ActivateAdapterCredential(ctx context.Context, sessionID string, activation AdapterCredentialActivation) (AdapterConnection, error)
+	AdapterConnection(ctx context.Context, sessionID string) (AdapterConnection, error)
+}
+
+// AdapterConnectionTransactor is optional. Implementations use their native
+// transaction primitive, while callbacks depend only on Store interfaces. A
+// failed callback leaves connection initialization and admission state intact.
+type AdapterConnectionTransactor interface {
+	AdapterConnectionStore
+	WithAdapterConnectionTransaction(ctx context.Context, fn func(AdapterConnectionStore) error) error
+}
+
 type ProposedEventStatus string
 
 const ProposedEventAccepted ProposedEventStatus = "accepted"
