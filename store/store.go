@@ -44,3 +44,48 @@ type HistoryPage struct {
 	NextBeforeSeq  *int64
 	RetentionState string
 }
+
+type PendingCommandStatus string
+
+const (
+	PendingCommandPending        PendingCommandStatus = "pending"
+	PendingCommandReceived       PendingCommandStatus = "received"
+	PendingCommandCompleted      PendingCommandStatus = "completed"
+	PendingCommandOutcomeUnknown PendingCommandStatus = "outcome_unknown"
+)
+
+type PendingCommandRequest struct {
+	CommandID string
+	Type      string
+	ExpiresAt time.Time
+}
+
+// PendingCommand is a reference-only delivery ledger record. The referenced
+// durable event, rather than this record, owns any command body.
+type PendingCommand struct {
+	SessionID string
+	CommandID string
+	Type      string
+	EventSeq  int64
+	Status    PendingCommandStatus
+	ExpiresAt time.Time
+}
+
+type PendingCommandCommit struct {
+	Command   PendingCommand
+	Duplicate bool
+}
+
+type PendingCommandClaim struct {
+	Command PendingCommand
+	Claimed bool
+}
+
+// CommandLedgerStore is the optional durable delivery extension. It appends
+// the user event and its reference-only command ledger entry atomically.
+type CommandLedgerStore interface {
+	EventStore
+	CommitPendingCommand(ctx context.Context, sessionID string, event PendingEvent, request PendingCommandRequest) (PendingCommandCommit, error)
+	ClaimPendingCommand(ctx context.Context, sessionID string, commandID string) (PendingCommandClaim, error)
+	ResolvePendingCommand(ctx context.Context, sessionID string, commandID string, status PendingCommandStatus) (PendingCommand, error)
+}

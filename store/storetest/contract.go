@@ -20,6 +20,10 @@ type HistoryHarness struct {
 	PruneBefore func(t *testing.T, current store.HistoryStore, sessionID string, beforeSeq int64)
 }
 
+type PendingCommandHarness struct {
+	Open func(t *testing.T) store.CommandLedgerStore
+}
+
 func Contract(t *testing.T, newStore Harness) {
 	t.Helper()
 
@@ -272,6 +276,93 @@ func HistoryContract(t *testing.T, harness HistoryHarness) {
 		page := historyPage(t, st, sessionID, nil, 100)
 		assertHistoryPage(t, page, []int64{1, 2, 3}, 3, nil, store.RetentionComplete)
 	})
+}
+
+func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
+	t.Helper()
+	if harness.Open == nil {
+		t.Fatal("pending command contract harness must provide open")
+	}
+
+	t.Run("commit deduplicates one reference-only command", func(t *testing.T) {
+		ledger := harness.Open(t)
+		request := store.PendingCommandRequest{
+			CommandID: "cmd_contract_1",
+			Type:      "session.send",
+			ExpiresAt: time.Now().Add(10 * time.Second),
+		}
+		result, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", userCommandEvent(1), request)
+		if err != nil {
+			t.Fatalf("CommitPendingCommand() error = %v", err)
+		}
+		assertPendingCommand(t, result.Command, "ses_command_1", request, 1, store.PendingCommandPending)
+		if result.Duplicate {
+			t.Fatal("initial pending command commit was duplicate")
+		}
+		duplicate, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", userCommandEvent(2), request)
+		if err != nil {
+			t.Fatalf("duplicate CommitPendingCommand() error = %v", err)
+		}
+		if !duplicate.Duplicate {
+			t.Fatal("duplicate pending command commit was not marked duplicate")
+		}
+		assertPendingCommand(t, duplicate.Command, "ses_command_1", request, 1, store.PendingCommandPending)
+	})
+
+	t.Run("only one claimant advances pending delivery", func(t *testing.T) {
+		ledger := harness.Open(t)
+		request := store.PendingCommandRequest{CommandID: "cmd_contract_claim", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+		if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_claim", userCommandEvent(1), request); err != nil {
+			t.Fatalf("CommitPendingCommand() error = %v", err)
+		}
+		claim, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_claim", request.CommandID)
+		if err != nil || !claim.Claimed {
+			t.Fatalf("first ClaimPendingCommand() = %+v, %v; want claimed", claim, err)
+		}
+		assertPendingCommand(t, claim.Command, "ses_command_claim", request, 1, store.PendingCommandReceived)
+		claim, err = ledger.ClaimPendingCommand(context.Background(), "ses_command_claim", request.CommandID)
+		if err != nil || claim.Claimed {
+			t.Fatalf("second ClaimPendingCommand() = %+v, %v; want not claimed", claim, err)
+		}
+		resolved, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_claim", request.CommandID, store.PendingCommandCompleted)
+		if err != nil {
+			t.Fatalf("ResolvePendingCommand() error = %v", err)
+		}
+		assertPendingCommand(t, resolved, "ses_command_claim", request, 1, store.PendingCommandCompleted)
+	})
+
+	t.Run("invalid references and expiry are rejected", func(t *testing.T) {
+		ledger := harness.Open(t)
+		invalid := []struct {
+			name    string
+			event   store.PendingEvent
+			request store.PendingCommandRequest
+		}{
+			{"expired", userCommandEvent(1), store.PendingCommandRequest{CommandID: "cmd_contract_expired", Type: "session.send", ExpiresAt: time.Now().Add(-time.Second)}},
+			{"wrong type", userCommandEvent(1), store.PendingCommandRequest{CommandID: "cmd_contract_type", Type: "session.interrupt", ExpiresAt: time.Now().Add(time.Second)}},
+			{"wrong event", pending("session.state", 1), store.PendingCommandRequest{CommandID: "cmd_contract_event", Type: "session.send", ExpiresAt: time.Now().Add(time.Second)}},
+		}
+		for _, test := range invalid {
+			t.Run(test.name, func(t *testing.T) {
+				if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_invalid", test.event, test.request); err == nil {
+					t.Fatal("CommitPendingCommand() unexpectedly succeeded")
+				}
+			})
+		}
+	})
+}
+
+func userCommandEvent(n int) store.PendingEvent {
+	event := pending("session.message", n)
+	event.Payload = json.RawMessage(`{"role":"user"}`)
+	return event
+}
+
+func assertPendingCommand(t *testing.T, command store.PendingCommand, sessionID string, request store.PendingCommandRequest, eventSeq int64, status store.PendingCommandStatus) {
+	t.Helper()
+	if command.SessionID != sessionID || command.CommandID != request.CommandID || command.Type != request.Type || command.EventSeq != eventSeq || command.Status != status || !command.ExpiresAt.Equal(request.ExpiresAt) {
+		t.Fatalf("pending command = %+v, want session=%s command=%s type=%s event=%d status=%s expiry=%s", command, sessionID, request.CommandID, request.Type, eventSeq, status, request.ExpiresAt)
+	}
 }
 
 func appendHistoryEvents(t *testing.T, st store.EventStore, sessionID string, count int) {
