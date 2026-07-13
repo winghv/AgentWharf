@@ -81,11 +81,19 @@ type PendingCommandClaim struct {
 	Claimed bool
 }
 
+// CommandAuthority identifies the exact Adapter connection that may mutate a
+// delivery record. The Store validates current generation, revocation, expiry,
+// and terminal state from its own durable truth in the same transaction.
+type CommandAuthority struct {
+	ConnectionEpoch      int64
+	CredentialGeneration int64
+}
+
 // CommandLedgerStore is the optional durable delivery extension. It appends
 // the user event and its reference-only command ledger entry atomically.
 type CommandLedgerStore interface {
 	EventStore
-	CommitPendingCommand(ctx context.Context, sessionID string, event PendingEvent, request PendingCommandRequest) (PendingCommandCommit, error)
-	ClaimPendingCommand(ctx context.Context, sessionID string, commandID string) (PendingCommandClaim, error)
-	ResolvePendingCommand(ctx context.Context, sessionID string, commandID string, status PendingCommandStatus) (PendingCommand, error)
+	CommitPendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, event PendingEvent, request PendingCommandRequest) (PendingCommandCommit, error)
+	ClaimPendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, commandID string) (PendingCommandClaim, error)
+	ResolvePendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, commandID string, status PendingCommandStatus) (PendingCommand, error)
 }

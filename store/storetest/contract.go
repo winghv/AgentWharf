@@ -1,6 +1,7 @@
 package storetest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,8 +22,19 @@ type HistoryHarness struct {
 }
 
 type PendingCommandHarness struct {
-	Open func(t *testing.T) store.CommandLedgerStore
+	Open       func(t *testing.T) store.CommandLedgerStore
+	Authority  func(t *testing.T, ledger store.CommandLedgerStore) store.CommandAuthority
+	Invalidate func(t *testing.T, ledger store.CommandLedgerStore, kind CommandAuthorityFailure)
 }
+
+type CommandAuthorityFailure string
+
+const (
+	CommandAuthoritySuperseded CommandAuthorityFailure = "superseded"
+	CommandAuthorityRevoked    CommandAuthorityFailure = "revoked"
+	CommandAuthorityExpired    CommandAuthorityFailure = "expired"
+	CommandAuthorityTerminal   CommandAuthorityFailure = "terminal"
+)
 
 func Contract(t *testing.T, newStore Harness) {
 	t.Helper()
@@ -280,18 +292,19 @@ func HistoryContract(t *testing.T, harness HistoryHarness) {
 
 func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 	t.Helper()
-	if harness.Open == nil {
-		t.Fatal("pending command contract harness must provide open")
+	if harness.Open == nil || harness.Authority == nil || harness.Invalidate == nil {
+		t.Fatal("pending command contract harness must provide open, authority, and invalidate callbacks")
 	}
 
 	t.Run("commit deduplicates one reference-only command", func(t *testing.T) {
 		ledger := harness.Open(t)
+		authority := harness.Authority(t, ledger)
 		request := store.PendingCommandRequest{
 			CommandID: "cmd_contract_1",
 			Type:      "session.send",
 			ExpiresAt: time.Now().Add(10 * time.Second),
 		}
-		result, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", userCommandEvent(1), request)
+		result, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, userCommandEvent(1), request)
 		if err != nil {
 			t.Fatalf("CommitPendingCommand() error = %v", err)
 		}
@@ -299,7 +312,7 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 		if result.Duplicate {
 			t.Fatal("initial pending command commit was duplicate")
 		}
-		duplicate, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", userCommandEvent(2), request)
+		duplicate, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, userCommandEvent(2), request)
 		if err != nil {
 			t.Fatalf("duplicate CommitPendingCommand() error = %v", err)
 		}
@@ -307,35 +320,139 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 			t.Fatal("duplicate pending command commit was not marked duplicate")
 		}
 		assertPendingCommand(t, duplicate.Command, "ses_command_1", request, 1, store.PendingCommandPending)
+		var events []store.Event
+		if err := ledger.Replay(context.Background(), "ses_command_1", 0, func(event store.Event) error {
+			events = append(events, event)
+			return nil
+		}); err != nil {
+			t.Fatalf("Replay() error = %v", err)
+		}
+		if len(events) != 1 || events[0].Seq != result.Command.EventSeq || events[0].Type != "session.message" || !bytes.Contains(events[0].Payload, []byte(`"role":"user"`)) {
+			t.Fatalf("atomic pending-command event reference = %+v", events)
+		}
 	})
 
 	t.Run("only one claimant advances pending delivery", func(t *testing.T) {
 		ledger := harness.Open(t)
+		authority := harness.Authority(t, ledger)
 		request := store.PendingCommandRequest{CommandID: "cmd_contract_claim", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
-		if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_claim", userCommandEvent(1), request); err != nil {
+		if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_claim", authority, userCommandEvent(1), request); err != nil {
 			t.Fatalf("CommitPendingCommand() error = %v", err)
 		}
-		claim, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_claim", request.CommandID)
-		if err != nil || !claim.Claimed {
-			t.Fatalf("first ClaimPendingCommand() = %+v, %v; want claimed", claim, err)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		claims := make(chan store.PendingCommandClaim, 8)
+		errs := make(chan error, 8)
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				claim, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_claim", authority, request.CommandID)
+				claims <- claim
+				errs <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(claims)
+		close(errs)
+		var claimed int
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent ClaimPendingCommand() error = %v", err)
+			}
+		}
+		for claim := range claims {
+			if claim.Claimed {
+				claimed++
+				assertPendingCommand(t, claim.Command, "ses_command_claim", request, 1, store.PendingCommandReceived)
+			}
+		}
+		if claimed != 1 {
+			t.Fatalf("successful concurrent claims = %d, want 1", claimed)
+		}
+		claim, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_claim", authority, request.CommandID)
+		if err != nil || claim.Claimed {
+			t.Fatalf("post-claim ClaimPendingCommand() = %+v, %v; want not claimed", claim, err)
 		}
 		assertPendingCommand(t, claim.Command, "ses_command_claim", request, 1, store.PendingCommandReceived)
-		claim, err = ledger.ClaimPendingCommand(context.Background(), "ses_command_claim", request.CommandID)
+		claim, err = ledger.ClaimPendingCommand(context.Background(), "ses_command_claim", authority, request.CommandID)
 		if err != nil || claim.Claimed {
 			t.Fatalf("second ClaimPendingCommand() = %+v, %v; want not claimed", claim, err)
 		}
-		resolved, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_claim", request.CommandID, store.PendingCommandCompleted)
+		resolved, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_claim", authority, request.CommandID, store.PendingCommandCompleted)
 		if err != nil {
 			t.Fatalf("ResolvePendingCommand() error = %v", err)
 		}
 		assertPendingCommand(t, resolved, "ses_command_claim", request, 1, store.PendingCommandCompleted)
-		if _, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_claim", request.CommandID, store.PendingCommandPending); err == nil {
+		if _, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_claim", authority, request.CommandID, store.PendingCommandPending); err == nil {
 			t.Fatal("ResolvePendingCommand(pending) unexpectedly succeeded")
+		}
+		if _, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_claim", authority, request.CommandID, store.PendingCommandOutcomeUnknown); err == nil {
+			t.Fatal("ResolvePendingCommand() rewrote a terminal outcome")
+		}
+	})
+
+	t.Run("authority loss rejects every mutation without new event", func(t *testing.T) {
+		for _, kind := range []CommandAuthorityFailure{CommandAuthoritySuperseded, CommandAuthorityRevoked, CommandAuthorityExpired, CommandAuthorityTerminal} {
+			t.Run(string(kind), func(t *testing.T) {
+				ledger := harness.Open(t)
+				authority := harness.Authority(t, ledger)
+				harness.Invalidate(t, ledger, kind)
+				request := store.PendingCommandRequest{CommandID: "cmd_contract_stale_" + string(kind), Type: "session.send", ExpiresAt: time.Now().Add(time.Second)}
+				if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_stale", authority, userCommandEvent(1), request); err == nil {
+					t.Fatal("stale CommitPendingCommand() unexpectedly succeeded")
+				}
+				latest, err := ledger.LatestSeq(context.Background(), "ses_command_stale")
+				if err != nil || latest != 0 {
+					t.Fatalf("stale commit latest seq = %d, %v; want 0, nil", latest, err)
+				}
+
+				ledger = harness.Open(t)
+				authority = harness.Authority(t, ledger)
+				request.CommandID = "cmd_contract_stale_claim_" + string(kind)
+				if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_stale", authority, userCommandEvent(1), request); err != nil {
+					t.Fatalf("prepare stale claim: %v", err)
+				}
+				harness.Invalidate(t, ledger, kind)
+				if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_stale", authority, request.CommandID); err == nil {
+					t.Fatal("stale ClaimPendingCommand() unexpectedly succeeded")
+				}
+
+				ledger = harness.Open(t)
+				authority = harness.Authority(t, ledger)
+				request.CommandID = "cmd_contract_stale_resolve_" + string(kind)
+				if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_stale", authority, userCommandEvent(1), request); err != nil {
+					t.Fatalf("prepare stale resolve: %v", err)
+				}
+				if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_stale", authority, request.CommandID); err != nil {
+					t.Fatalf("prepare resolve claim: %v", err)
+				}
+				harness.Invalidate(t, ledger, kind)
+				if _, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_stale", authority, request.CommandID, store.PendingCommandCompleted); err == nil {
+					t.Fatal("stale ResolvePendingCommand() unexpectedly succeeded")
+				}
+			})
+		}
+	})
+
+	t.Run("expired pending command cannot be claimed", func(t *testing.T) {
+		ledger := harness.Open(t)
+		authority := harness.Authority(t, ledger)
+		request := store.PendingCommandRequest{CommandID: "cmd_contract_claim_expired", Type: "session.send", ExpiresAt: time.Now().Add(20 * time.Millisecond)}
+		if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_expired", authority, userCommandEvent(1), request); err != nil {
+			t.Fatalf("prepare expiry claim: %v", err)
+		}
+		time.Sleep(40 * time.Millisecond)
+		if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_expired", authority, request.CommandID); err == nil {
+			t.Fatal("expired ClaimPendingCommand() unexpectedly succeeded")
 		}
 	})
 
 	t.Run("invalid references and expiry are rejected", func(t *testing.T) {
 		ledger := harness.Open(t)
+		authority := harness.Authority(t, ledger)
 		invalid := []struct {
 			name    string
 			event   store.PendingEvent
@@ -349,7 +466,7 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 		}
 		for _, test := range invalid {
 			t.Run(test.name, func(t *testing.T) {
-				if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_invalid", test.event, test.request); err == nil {
+				if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_invalid", authority, test.event, test.request); err == nil {
 					t.Fatal("CommitPendingCommand() unexpectedly succeeded")
 				}
 			})

@@ -12,16 +12,33 @@ import (
 )
 
 func TestPendingCommandContract(t *testing.T) {
-	PendingCommandContract(t, PendingCommandHarness{Open: func(t *testing.T) store.CommandLedgerStore {
-		t.Helper()
-		return &memoryCommandLedger{commands: make(map[string]store.PendingCommand)}
-	}})
+	PendingCommandContract(t, PendingCommandHarness{
+		Open: func(t *testing.T) store.CommandLedgerStore {
+			t.Helper()
+			return &memoryCommandLedger{
+				commands:  make(map[string]store.PendingCommand),
+				events:    make(map[string][]store.Event),
+				authority: store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+			}
+		},
+		Authority: func(t *testing.T, ledger store.CommandLedgerStore) store.CommandAuthority {
+			t.Helper()
+			return ledger.(*memoryCommandLedger).authority
+		},
+		Invalidate: func(t *testing.T, ledger store.CommandLedgerStore, kind CommandAuthorityFailure) {
+			t.Helper()
+			ledger.(*memoryCommandLedger).failure = kind
+		},
+	})
 }
 
 type memoryCommandLedger struct {
-	mu       sync.Mutex
-	commands map[string]store.PendingCommand
-	latest   map[string]int64
+	mu        sync.Mutex
+	commands  map[string]store.PendingCommand
+	latest    map[string]int64
+	events    map[string][]store.Event
+	authority store.CommandAuthority
+	failure   CommandAuthorityFailure
 }
 
 func (s *memoryCommandLedger) Append(_ context.Context, sessionID string, events []store.PendingEvent) (int64, error) {
@@ -35,7 +52,17 @@ func (s *memoryCommandLedger) Append(_ context.Context, sessionID string, events
 	return first, nil
 }
 
-func (s *memoryCommandLedger) Replay(context.Context, string, int64, func(store.Event) error) error {
+func (s *memoryCommandLedger) Replay(_ context.Context, sessionID string, afterSeq int64, visit func(store.Event) error) error {
+	s.mu.Lock()
+	events := append([]store.Event(nil), s.events[sessionID]...)
+	s.mu.Unlock()
+	for _, event := range events {
+		if event.Seq > afterSeq {
+			if err := visit(event); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -45,9 +72,12 @@ func (s *memoryCommandLedger) LatestSeq(_ context.Context, sessionID string) (in
 	return s.latest[sessionID], nil
 }
 
-func (s *memoryCommandLedger) CommitPendingCommand(_ context.Context, sessionID string, event store.PendingEvent, request store.PendingCommandRequest) (store.PendingCommandCommit, error) {
+func (s *memoryCommandLedger) CommitPendingCommand(_ context.Context, sessionID string, authority store.CommandAuthority, event store.PendingEvent, request store.PendingCommandRequest) (store.PendingCommandCommit, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.authorized(authority) {
+		return store.PendingCommandCommit{}, errors.New("stale command authority")
+	}
 	var payload struct {
 		Role string `json:"role"`
 	}
@@ -64,16 +94,23 @@ func (s *memoryCommandLedger) CommitPendingCommand(_ context.Context, sessionID 
 	s.latest[sessionID]++
 	command := store.PendingCommand{SessionID: sessionID, CommandID: request.CommandID, Type: request.Type, EventSeq: s.latest[sessionID], Status: store.PendingCommandPending, ExpiresAt: request.ExpiresAt}
 	s.commands[key] = command
+	s.events[sessionID] = append(s.events[sessionID], store.Event{SessionID: sessionID, Seq: command.EventSeq, Type: event.Type, Time: event.Time, Payload: append([]byte(nil), event.Payload...)})
 	return store.PendingCommandCommit{Command: command}, nil
 }
 
-func (s *memoryCommandLedger) ClaimPendingCommand(_ context.Context, sessionID string, commandID string) (store.PendingCommandClaim, error) {
+func (s *memoryCommandLedger) ClaimPendingCommand(_ context.Context, sessionID string, authority store.CommandAuthority, commandID string) (store.PendingCommandClaim, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.authorized(authority) {
+		return store.PendingCommandClaim{}, errors.New("stale command authority")
+	}
 	key := sessionID + "\x00" + commandID
 	command, ok := s.commands[key]
 	if !ok {
 		return store.PendingCommandClaim{}, errors.New("pending command not found")
+	}
+	if !command.ExpiresAt.After(time.Now()) {
+		return store.PendingCommandClaim{}, errors.New("pending command expired")
 	}
 	if command.Status != store.PendingCommandPending {
 		return store.PendingCommandClaim{Command: command}, nil
@@ -83,18 +120,25 @@ func (s *memoryCommandLedger) ClaimPendingCommand(_ context.Context, sessionID s
 	return store.PendingCommandClaim{Command: command, Claimed: true}, nil
 }
 
-func (s *memoryCommandLedger) ResolvePendingCommand(_ context.Context, sessionID string, commandID string, status store.PendingCommandStatus) (store.PendingCommand, error) {
+func (s *memoryCommandLedger) ResolvePendingCommand(_ context.Context, sessionID string, authority store.CommandAuthority, commandID string, status store.PendingCommandStatus) (store.PendingCommand, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.authorized(authority) {
+		return store.PendingCommand{}, errors.New("stale command authority")
+	}
 	key := sessionID + "\x00" + commandID
 	command, ok := s.commands[key]
 	if !ok {
 		return store.PendingCommand{}, errors.New("pending command not found")
 	}
-	if status != store.PendingCommandCompleted && status != store.PendingCommandOutcomeUnknown {
+	if command.Status != store.PendingCommandReceived || (status != store.PendingCommandCompleted && status != store.PendingCommandOutcomeUnknown) {
 		return store.PendingCommand{}, errors.New("invalid pending command outcome")
 	}
 	command.Status = status
 	s.commands[key] = command
 	return command, nil
+}
+
+func (s *memoryCommandLedger) authorized(authority store.CommandAuthority) bool {
+	return s.failure == "" && authority == s.authority
 }
