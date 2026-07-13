@@ -461,11 +461,13 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 		}
 		ledger = harness.Reopen(t, ledger)
 		authority = harness.Authority(t, ledger)
+		assertPendingCommandEvent(t, ledger, "ses_command_reopen", committed.Command.EventSeq)
 		duplicate, err := ledger.CommitPendingCommand(context.Background(), "ses_command_reopen", authority, userCommandEvent(2), request)
 		if err != nil || !duplicate.Duplicate {
 			t.Fatalf("reopened duplicate = %+v, %v; want original duplicate", duplicate, err)
 		}
 		assertPendingCommand(t, duplicate.Command, "ses_command_reopen", request, committed.Command.EventSeq, store.PendingCommandPending)
+		assertPendingCommandEvent(t, ledger, "ses_command_reopen", committed.Command.EventSeq)
 		claim, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_reopen", authority, request.CommandID)
 		if err != nil || !claim.Claimed {
 			t.Fatalf("reopened claim = %+v, %v; want claimed", claim, err)
@@ -524,6 +526,20 @@ func assertPendingCommand(t *testing.T, command store.PendingCommand, sessionID 
 	t.Helper()
 	if command.SessionID != sessionID || command.CommandID != request.CommandID || command.Type != request.Type || command.EventSeq != eventSeq || command.Status != status || !command.ExpiresAt.Equal(request.ExpiresAt) {
 		t.Fatalf("pending command = %+v, want session=%s command=%s type=%s event=%d status=%s expiry=%s", command, sessionID, request.CommandID, request.Type, eventSeq, status, request.ExpiresAt)
+	}
+}
+
+func assertPendingCommandEvent(t *testing.T, ledger store.EventStore, sessionID string, eventSeq int64) {
+	t.Helper()
+	var events []store.Event
+	if err := ledger.Replay(context.Background(), sessionID, 0, func(event store.Event) error {
+		events = append(events, event)
+		return nil
+	}); err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if len(events) != 1 || events[0].Seq != eventSeq || events[0].Type != "session.message" || !bytes.Contains(events[0].Payload, []byte(`"role":"user"`)) {
+		t.Fatalf("reopened pending-command event reference = %+v", events)
 	}
 }
 
