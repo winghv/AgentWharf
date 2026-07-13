@@ -21,6 +21,10 @@ func TestPendingCommandContract(t *testing.T) {
 				authority: store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
 			}
 		},
+		Reopen: func(t *testing.T, current store.CommandLedgerStore) store.CommandLedgerStore {
+			t.Helper()
+			return current
+		},
 		Authority: func(t *testing.T, ledger store.CommandLedgerStore) store.CommandAuthority {
 			t.Helper()
 			return ledger.(*memoryCommandLedger).authority

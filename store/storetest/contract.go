@@ -23,6 +23,7 @@ type HistoryHarness struct {
 
 type PendingCommandHarness struct {
 	Open       func(t *testing.T) store.CommandLedgerStore
+	Reopen     func(t *testing.T, current store.CommandLedgerStore) store.CommandLedgerStore
 	Authority  func(t *testing.T, ledger store.CommandLedgerStore) store.CommandAuthority
 	Invalidate func(t *testing.T, ledger store.CommandLedgerStore, kind CommandAuthorityFailure)
 }
@@ -292,8 +293,8 @@ func HistoryContract(t *testing.T, harness HistoryHarness) {
 
 func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 	t.Helper()
-	if harness.Open == nil || harness.Authority == nil || harness.Invalidate == nil {
-		t.Fatal("pending command contract harness must provide open, authority, and invalidate callbacks")
+	if harness.Open == nil || harness.Reopen == nil || harness.Authority == nil || harness.Invalidate == nil {
+		t.Fatal("pending command contract harness must provide open, reopen, authority, and invalidate callbacks")
 	}
 
 	t.Run("commit deduplicates one reference-only command", func(t *testing.T) {
@@ -447,6 +448,39 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 		time.Sleep(40 * time.Millisecond)
 		if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_expired", authority, request.CommandID); err == nil {
 			t.Fatal("expired ClaimPendingCommand() unexpectedly succeeded")
+		}
+	})
+
+	t.Run("reopen preserves queued and terminal ledger truth", func(t *testing.T) {
+		ledger := harness.Open(t)
+		authority := harness.Authority(t, ledger)
+		request := store.PendingCommandRequest{CommandID: "cmd_contract_reopen", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+		committed, err := ledger.CommitPendingCommand(context.Background(), "ses_command_reopen", authority, userCommandEvent(1), request)
+		if err != nil || committed.Duplicate {
+			t.Fatalf("CommitPendingCommand() = %+v, %v; want new command", committed, err)
+		}
+		ledger = harness.Reopen(t, ledger)
+		authority = harness.Authority(t, ledger)
+		duplicate, err := ledger.CommitPendingCommand(context.Background(), "ses_command_reopen", authority, userCommandEvent(2), request)
+		if err != nil || !duplicate.Duplicate {
+			t.Fatalf("reopened duplicate = %+v, %v; want original duplicate", duplicate, err)
+		}
+		assertPendingCommand(t, duplicate.Command, "ses_command_reopen", request, committed.Command.EventSeq, store.PendingCommandPending)
+		claim, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_reopen", authority, request.CommandID)
+		if err != nil || !claim.Claimed {
+			t.Fatalf("reopened claim = %+v, %v; want claimed", claim, err)
+		}
+		if _, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_reopen", authority, request.CommandID, store.PendingCommandCompleted); err != nil {
+			t.Fatalf("reopened resolve: %v", err)
+		}
+		ledger = harness.Reopen(t, ledger)
+		authority = harness.Authority(t, ledger)
+		claim, err = ledger.ClaimPendingCommand(context.Background(), "ses_command_reopen", authority, request.CommandID)
+		if err != nil || claim.Claimed || claim.Command.Status != store.PendingCommandCompleted {
+			t.Fatalf("terminal reopened claim = %+v, %v; want completed non-claim", claim, err)
+		}
+		if _, err := ledger.ResolvePendingCommand(context.Background(), "ses_command_reopen", authority, request.CommandID, store.PendingCommandOutcomeUnknown); err == nil {
+			t.Fatal("reopened terminal outcome was rewritten")
 		}
 	})
 
