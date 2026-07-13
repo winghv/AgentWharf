@@ -183,6 +183,32 @@ type CommandAuthority struct {
 	CredentialGeneration int64
 }
 
+type ProposedEventStatus string
+
+const ProposedEventAccepted ProposedEventStatus = "accepted"
+
+type ProposedEventRequest struct {
+	ProposalID string
+	Event      PendingEvent
+}
+
+// ProposedEventReceipt is reference-only acknowledgement truth. The durable
+// EventStore event, not the receipt, owns the proposed event payload.
+type ProposedEventReceipt struct {
+	SessionID  string
+	ProposalID string
+	Seq        int64
+	Status     ProposedEventStatus
+}
+
+// ProposedEventStore is the optional Adapter proposal extension. The Store
+// atomically verifies current authority, persists one durable event, and maps a
+// proposal ID to its authoritative sequence without duplicating event content.
+type ProposedEventStore interface {
+	EventStore
+	CommitProposedEvent(ctx context.Context, sessionID string, authority CommandAuthority, proposal ProposedEventRequest) (ProposedEventReceipt, error)
+}
+
 // CommandLedgerStore is the optional durable delivery extension. It appends
 // the user event and its reference-only command ledger entry atomically.
 type CommandLedgerStore interface {

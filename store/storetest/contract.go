@@ -33,6 +33,13 @@ type AttachmentHarness struct {
 	Reopen func(t *testing.T, current store.AttachmentStore) store.AttachmentStore
 }
 
+type ProposalHarness struct {
+	Open       func(t *testing.T) store.ProposedEventStore
+	Reopen     func(t *testing.T, current store.ProposedEventStore) store.ProposedEventStore
+	Authority  func(t *testing.T, proposals store.ProposedEventStore) store.CommandAuthority
+	Invalidate func(t *testing.T, proposals store.ProposedEventStore, kind CommandAuthorityFailure)
+}
+
 type CommandAuthorityFailure string
 
 const (
@@ -513,6 +520,133 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 			})
 		}
 	})
+}
+
+func ProposalContract(t *testing.T, harness ProposalHarness) {
+	t.Helper()
+	if harness.Open == nil || harness.Reopen == nil || harness.Authority == nil || harness.Invalidate == nil {
+		t.Fatal("proposal contract harness must provide open, reopen, authority, and invalidate callbacks")
+	}
+
+	t.Run("commit deduplicates one durable event and receipt", func(t *testing.T) {
+		proposals := harness.Open(t)
+		authority := harness.Authority(t, proposals)
+		request := store.ProposedEventRequest{ProposalID: "proposal_contract_1", Event: pending("session.state", 1)}
+		receipt, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_1", authority, request)
+		if err != nil {
+			t.Fatalf("CommitProposedEvent() error = %v", err)
+		}
+		assertProposalReceipt(t, receipt, "ses_proposal_1", request.ProposalID, 1)
+		duplicate, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_1", authority, request)
+		if err != nil {
+			t.Fatalf("duplicate CommitProposedEvent() error = %v", err)
+		}
+		assertProposalReceipt(t, duplicate, "ses_proposal_1", request.ProposalID, 1)
+		events := replayAll(t, proposals, "ses_proposal_1", 0)
+		if len(events) != 1 || events[0].Seq != receipt.Seq || events[0].Type != request.Event.Type || !bytes.Equal(events[0].Payload, request.Event.Payload) {
+			t.Fatalf("proposal durable event = %+v", events)
+		}
+	})
+
+	t.Run("conflicting retry changes no durable truth", func(t *testing.T) {
+		proposals := harness.Open(t)
+		authority := harness.Authority(t, proposals)
+		request := store.ProposedEventRequest{ProposalID: "proposal_contract_conflict", Event: pending("session.state", 1)}
+		if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_conflict", authority, request); err != nil {
+			t.Fatalf("CommitProposedEvent() error = %v", err)
+		}
+		for _, conflict := range []store.ProposedEventRequest{
+			{ProposalID: request.ProposalID, Event: pending("session.message", 1)},
+			{ProposalID: request.ProposalID, Event: pending("session.state", 2)},
+		} {
+			if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_conflict", authority, conflict); err == nil {
+				t.Fatal("conflicting proposal retry unexpectedly succeeded")
+			}
+		}
+		if latest, err := proposals.LatestSeq(context.Background(), "ses_proposal_conflict"); err != nil || latest != 1 {
+			t.Fatalf("latest seq after conflict = %d, %v; want 1, nil", latest, err)
+		}
+	})
+
+	t.Run("input mutation cannot rewrite proposal truth", func(t *testing.T) {
+		proposals := harness.Open(t)
+		authority := harness.Authority(t, proposals)
+		request := store.ProposedEventRequest{ProposalID: "proposal_contract_snapshot", Event: pending("session.state", 1)}
+		originalPayload := append([]byte(nil), request.Event.Payload...)
+		if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_snapshot", authority, request); err != nil {
+			t.Fatalf("CommitProposedEvent() error = %v", err)
+		}
+		request.Event.Payload[0] = 'x'
+		if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_snapshot", authority, request); err == nil {
+			t.Fatal("mutated proposal retry unexpectedly succeeded")
+		}
+		events := replayAll(t, proposals, "ses_proposal_snapshot", 0)
+		if len(events) != 1 || !bytes.Equal(events[0].Payload, originalPayload) {
+			t.Fatalf("durable event after input mutation = %+v", events)
+		}
+	})
+
+	t.Run("authority loss rejects before append", func(t *testing.T) {
+		for _, kind := range []CommandAuthorityFailure{CommandAuthoritySuperseded, CommandAuthorityRevoked, CommandAuthorityExpired, CommandAuthorityTerminal} {
+			t.Run(string(kind), func(t *testing.T) {
+				proposals := harness.Open(t)
+				authority := harness.Authority(t, proposals)
+				harness.Invalidate(t, proposals, kind)
+				if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_stale", authority, store.ProposedEventRequest{ProposalID: "proposal_" + string(kind), Event: pending("session.state", 1)}); err == nil {
+					t.Fatal("stale proposal unexpectedly succeeded")
+				}
+				if latest, err := proposals.LatestSeq(context.Background(), "ses_proposal_stale"); err != nil || latest != 0 {
+					t.Fatalf("latest seq after stale proposal = %d, %v; want 0, nil", latest, err)
+				}
+			})
+		}
+	})
+
+	t.Run("concurrent retry and reopen preserve one receipt", func(t *testing.T) {
+		proposals := harness.Open(t)
+		authority := harness.Authority(t, proposals)
+		request := store.ProposedEventRequest{ProposalID: "proposal_contract_reopen", Event: pending("session.state", 1)}
+		start := make(chan struct{})
+		receipts := make(chan store.ProposedEventReceipt, 8)
+		errs := make(chan error, 8)
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				receipt, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_reopen", authority, request)
+				receipts <- receipt
+				errs <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(receipts)
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("concurrent proposal error = %v", err)
+			}
+		}
+		for receipt := range receipts {
+			assertProposalReceipt(t, receipt, "ses_proposal_reopen", request.ProposalID, 1)
+		}
+		proposals = harness.Reopen(t, proposals)
+		authority = harness.Authority(t, proposals)
+		receipt, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_reopen", authority, request)
+		if err != nil {
+			t.Fatalf("reopened duplicate proposal: %v", err)
+		}
+		assertProposalReceipt(t, receipt, "ses_proposal_reopen", request.ProposalID, 1)
+	})
+}
+
+func assertProposalReceipt(t *testing.T, receipt store.ProposedEventReceipt, sessionID, proposalID string, seq int64) {
+	t.Helper()
+	if receipt.SessionID != sessionID || receipt.ProposalID != proposalID || receipt.Seq != seq || receipt.Status != store.ProposedEventAccepted {
+		t.Fatalf("proposal receipt = %+v, want session=%s proposal=%s seq=%d accepted", receipt, sessionID, proposalID, seq)
+	}
 }
 
 func AttachmentContract(t *testing.T, harness AttachmentHarness) {
