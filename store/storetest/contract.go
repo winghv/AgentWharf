@@ -46,6 +46,161 @@ type ConnectionHarness struct {
 	Invalidate func(t *testing.T, connections store.AdapterConnectionStore, terminal bool)
 }
 
+type AttachAttemptHarness struct {
+	Open   func(t *testing.T) store.AttachAttemptStore
+	Reopen func(t *testing.T, current store.AttachAttemptStore) store.AttachAttemptStore
+}
+
+func AttachAttemptContract(t *testing.T, harness AttachAttemptHarness) {
+	t.Helper()
+	if harness.Open == nil || harness.Reopen == nil {
+		t.Fatal("attach-attempt harness must provide open and reopen")
+	}
+	ctx := context.Background()
+	attempts := harness.Open(t)
+	request := store.AttachAttemptRequest{
+		Identity:    store.AttachAttemptIdentity{JTIHash: [32]byte{1}, AttachID: "att_contract", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code"},
+		Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{2}, KeyVersion: 1},
+		ExpiresAt:   time.Now().Add(time.Minute), Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: attachAttemptInt64(1),
+	}
+	committed, err := attempts.CommitAttachAttempt(ctx, request)
+	if err != nil || committed.Duplicate {
+		t.Fatalf("commit attach attempt = %+v, %v", committed, err)
+	}
+	assertAttachAttempt(t, committed.Attempt, request)
+	retry, err := attempts.CommitAttachAttempt(ctx, request)
+	if err != nil || !retry.Duplicate {
+		t.Fatalf("exact retry = %+v, %v", retry, err)
+	}
+	assertAttachAttempt(t, retry.Attempt, request)
+	for _, mutate := range []func(*store.AttachAttemptRequest){
+		func(item *store.AttachAttemptRequest) { item.Identity.JTIHash = [32]byte{} },
+		func(item *store.AttachAttemptRequest) { item.Fingerprint.Domain = "wrong-domain" },
+		func(item *store.AttachAttemptRequest) { item.Fingerprint.Version++ },
+		func(item *store.AttachAttemptRequest) { item.Fingerprint.KeyVersion = 0 },
+		func(item *store.AttachAttemptRequest) { item.ExpiresAt = time.Now() },
+		func(item *store.AttachAttemptRequest) { item.ExpiresAt = time.Now().Add(6 * time.Minute) },
+		func(item *store.AttachAttemptRequest) { item.IssuedCredentialGeneration = nil },
+		func(item *store.AttachAttemptRequest) { item.Outcome = store.AttachAttemptRejected },
+	} {
+		invalid := request
+		invalid.IssuedCredentialGeneration = attachAttemptInt64(*request.IssuedCredentialGeneration)
+		mutate(&invalid)
+		if _, err := attempts.CommitAttachAttempt(ctx, invalid); err == nil {
+			t.Fatal("invalid attach attempt unexpectedly succeeded")
+		}
+		current, err := attempts.AttachAttempt(ctx, request.Identity.JTIHash)
+		if err != nil {
+			t.Fatalf("invalid attempt mutated result = %+v, %v", current, err)
+		}
+		assertAttachAttempt(t, current, request)
+	}
+	for _, shape := range []reflect.Type{reflect.TypeOf(store.AttachAttemptIdentity{}), reflect.TypeOf(store.AttachAttemptRequest{}), reflect.TypeOf(store.AttachAttempt{})} {
+		for _, forbidden := range []string{"JTI", "Grant", "Bearer", "Token", "RawKey", "Content", "Payload", "Credential"} {
+			if _, found := shape.FieldByName(forbidden); found {
+				t.Fatalf("attach-attempt type %s leaks %s", shape.Name(), forbidden)
+			}
+		}
+	}
+	for _, mutate := range []func(*store.AttachAttemptRequest){
+		func(item *store.AttachAttemptRequest) { item.Identity.AttachID = "att_other" },
+		func(item *store.AttachAttemptRequest) { item.Identity.BootstrapSessionID = "ses_other" },
+		func(item *store.AttachAttemptRequest) { item.Identity.TargetSessionID = "ses_other" },
+		func(item *store.AttachAttemptRequest) { item.Identity.Provider = "other" },
+		func(item *store.AttachAttemptRequest) { item.Fingerprint.Digest[0]++ },
+		func(item *store.AttachAttemptRequest) { item.Fingerprint.KeyVersion++ },
+		func(item *store.AttachAttemptRequest) { item.ExpiresAt = item.ExpiresAt.Add(time.Second) },
+		func(item *store.AttachAttemptRequest) { *item.IssuedCredentialGeneration++ },
+		func(item *store.AttachAttemptRequest) {
+			item.Outcome = store.AttachAttemptRejected
+			item.IssuedCredentialGeneration = nil
+		},
+	} {
+		changed := request
+		changed.IssuedCredentialGeneration = attachAttemptInt64(*request.IssuedCredentialGeneration)
+		mutate(&changed)
+		if _, err := attempts.CommitAttachAttempt(ctx, changed); err == nil {
+			t.Fatal("changed attach attempt unexpectedly succeeded")
+		}
+		current, err := attempts.AttachAttempt(ctx, request.Identity.JTIHash)
+		if err != nil {
+			t.Fatalf("changed retry mutated attempt = %+v, %v", current, err)
+		}
+		assertAttachAttempt(t, current, request)
+	}
+	newAttempt := request
+	newAttempt.Identity.JTIHash = [32]byte{3}
+	newAttempt.Fingerprint.KeyVersion = 2
+	newAttempt.IssuedCredentialGeneration = attachAttemptInt64(2)
+	start := make(chan struct{})
+	results := make(chan store.AttachAttemptCommit, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, item := range []store.AttachAttemptRequest{request, newAttempt} {
+		wg.Add(1)
+		go func(item store.AttachAttemptRequest) {
+			defer wg.Done()
+			<-start
+			result, err := attempts.CommitAttachAttempt(ctx, item)
+			results <- result
+			errs <- err
+		}(item)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent old/new attempt: %v", err)
+		}
+	}
+	var duplicate, created int
+	for result := range results {
+		if result.Duplicate {
+			duplicate++
+		} else {
+			created++
+		}
+	}
+	if duplicate != 1 || created != 1 {
+		t.Fatalf("concurrent old/new outcomes duplicate=%d created=%d", duplicate, created)
+	}
+	rejected := request
+	rejected.Identity.JTIHash = [32]byte{4}
+	rejected.Fingerprint.KeyVersion = 3
+	rejected.Outcome = store.AttachAttemptRejected
+	rejected.IssuedCredentialGeneration = nil
+	result, err := attempts.CommitAttachAttempt(ctx, rejected)
+	if err != nil {
+		t.Fatalf("commit rejected attempt = %+v, %v", result, err)
+	}
+	assertAttachAttempt(t, result.Attempt, rejected)
+	attempts = harness.Reopen(t, attempts)
+	old, err := attempts.AttachAttempt(ctx, request.Identity.JTIHash)
+	if err != nil {
+		t.Fatalf("retired-key old attempt = %+v, %v", old, err)
+	}
+	assertAttachAttempt(t, old, request)
+	newer, err := attempts.AttachAttempt(ctx, newAttempt.Identity.JTIHash)
+	if err != nil {
+		t.Fatalf("new attempt = %+v, %v", newer, err)
+	}
+	assertAttachAttempt(t, newer, newAttempt)
+}
+
+func attachAttemptInt64(value int64) *int64 { return &value }
+
+func assertAttachAttempt(t *testing.T, got store.AttachAttempt, want store.AttachAttemptRequest) {
+	t.Helper()
+	if got.Identity != want.Identity || got.Fingerprint != want.Fingerprint || !got.ExpiresAt.Equal(want.ExpiresAt) || got.Outcome != want.Outcome || (got.IssuedCredentialGeneration == nil) != (want.IssuedCredentialGeneration == nil) {
+		t.Fatalf("attach attempt = %+v, want %+v", got, want)
+	}
+	if got.IssuedCredentialGeneration != nil && *got.IssuedCredentialGeneration != *want.IssuedCredentialGeneration {
+		t.Fatalf("attach attempt generation = %d, want %d", *got.IssuedCredentialGeneration, *want.IssuedCredentialGeneration)
+	}
+}
+
 func ConnectionContract(t *testing.T, harness ConnectionHarness) {
 	t.Helper()
 	if harness.Open == nil || harness.Invalidate == nil {

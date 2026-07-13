@@ -263,6 +263,65 @@ type AdapterConnectionTransactor interface {
 	WithAdapterConnectionTransaction(ctx context.Context, fn func(AdapterConnectionStore) error) error
 }
 
+type AttachAttemptOutcome string
+
+const (
+	AttachAttemptAccepted AttachAttemptOutcome = "accepted"
+	AttachAttemptRejected AttachAttemptOutcome = "rejected"
+)
+
+// AttachAttemptIdentity contains only opaque, pre-hashed idempotency and
+// admission identities. It never carries a raw JTI, grant, credential, or
+// platform identity.
+type AttachAttemptIdentity struct {
+	JTIHash            [32]byte
+	AttachID           string
+	BootstrapSessionID string
+	TargetSessionID    string
+	Provider           string
+}
+
+// AttachAttemptFingerprint is the Hub-computed HMAC metadata. The Store
+// records its version and digest, but neither accepts nor retains key material.
+type AttachAttemptFingerprint struct {
+	Domain     string
+	Version    int64
+	Digest     [32]byte
+	KeyVersion int64
+}
+
+type AttachAttemptRequest struct {
+	Identity                   AttachAttemptIdentity
+	Fingerprint                AttachAttemptFingerprint
+	ExpiresAt                  time.Time
+	Outcome                    AttachAttemptOutcome
+	IssuedCredentialGeneration *int64
+}
+
+// AttachAttempt is immutable admission history. It is intentionally separate
+// from current attachment, delivery, credential, and connection state.
+type AttachAttempt struct {
+	Identity                   AttachAttemptIdentity
+	Fingerprint                AttachAttemptFingerprint
+	ExpiresAt                  time.Time
+	Outcome                    AttachAttemptOutcome
+	IssuedCredentialGeneration *int64
+}
+
+type AttachAttemptCommit struct {
+	Attempt   AttachAttempt
+	Duplicate bool
+}
+
+// AttachAttemptStore records one immutable, non-secret admission result for a
+// JTI hash. Exact retries return that original result; a changed request fails
+// without altering current attachment or connection truth.
+type AttachAttemptStore interface {
+	EventStore
+	CommitAttachAttempt(ctx context.Context, request AttachAttemptRequest) (AttachAttemptCommit, error)
+	AttachAttempt(ctx context.Context, jtiHash [32]byte) (AttachAttempt, error)
+}
+
 type ProposedEventStatus string
 
 const ProposedEventAccepted ProposedEventStatus = "accepted"
