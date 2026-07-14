@@ -109,6 +109,7 @@ type SessionWorkspaceLease struct {
 	SessionID            string
 	ConnectionEpoch      int64
 	CredentialGeneration int64
+	LeaseID              string
 	Status               string
 	Version              int64
 	ExpiresAt            pgtype.Timestamptz
