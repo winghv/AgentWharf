@@ -76,13 +76,23 @@ func (s *Store) Replay(ctx context.Context, sessionID string, afterSeq int64, fn
 		return errors.New("postgres event store pool is nil")
 	}
 
-	queries := db.New(s.pool)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return fmt.Errorf("begin replay transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+	queries := db.New(tx)
 	for nextSeq := afterSeq; ; {
 		row, err := queries.NextSessionEvent(ctx, db.NextSessionEventParams{
 			SessionID: sessionID,
 			Seq:       nextSeq,
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit replay transaction: %w", err)
+			}
 			return nil
 		}
 		if err != nil {

@@ -72,6 +72,39 @@ func TestReplayStopsBeforeFetchingPastFirstCallbackError(t *testing.T) {
 	}
 }
 
+func TestReplayUsesInitialSnapshotAcrossCallbackAppend(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_store_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	postgresStore := postgres.New(pool)
+	if _, err := postgresStore.Append(context.Background(), "ses_replay_snapshot", []store.PendingEvent{{Type: "session.message", Time: time.Unix(1, 0), Payload: []byte(`{"n":1}`)}}); err != nil {
+		t.Fatalf("append initial event: %v", err)
+	}
+	var replayed []int64
+	err := postgresStore.Replay(context.Background(), "ses_replay_snapshot", 0, func(event store.Event) error {
+		replayed = append(replayed, event.Seq)
+		if event.Seq == 1 {
+			_, err := postgresStore.Append(context.Background(), "ses_replay_snapshot", []store.PendingEvent{{Type: "session.message", Time: time.Unix(2, 0), Payload: []byte(`{"n":2}`)}})
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("replay initial snapshot: %v", err)
+	}
+	if len(replayed) != 1 || replayed[0] != 1 {
+		t.Fatalf("replay crossed initial snapshot: %v", replayed)
+	}
+	if latest, err := postgresStore.LatestSeq(context.Background(), "ses_replay_snapshot"); err != nil || latest != 2 {
+		t.Fatalf("callback append latest seq = %d, %v", latest, err)
+	}
+}
+
 func testDSN(t *testing.T) string {
 	t.Helper()
 
