@@ -2,8 +2,10 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,13 +30,46 @@ func TestEventStoreContract(t *testing.T) {
 			dropSchema(t, dsn, schemaName)
 		})
 
-		pool := openPool(t, dsn, schemaName)
+		pool := openPool(t, dsn, schemaName, nil)
 		t.Cleanup(func() {
 			pool.Close()
 		})
 		resetSchema(t, pool)
 		return postgres.New(pool)
 	})
+}
+
+func TestReplayStopsBeforeFetchingPastFirstCallbackError(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_store_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+
+	tracer := &replayQueryTracer{}
+	pool := openPool(t, dsn, schemaName, tracer)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	events := make([]store.PendingEvent, 64)
+	for index := range events {
+		events[index] = store.PendingEvent{Type: "session.message", Time: time.Unix(int64(index), 0), Payload: []byte(`{"n":1}`)}
+	}
+	postgresStore := postgres.New(pool)
+	if _, err := postgresStore.Append(context.Background(), "ses_replay_early_stop", events); err != nil {
+		t.Fatalf("append replay events: %v", err)
+	}
+	tracer.reset()
+	callbackErr := errors.New("stop replay")
+	calls := 0
+	err := postgresStore.Replay(context.Background(), "ses_replay_early_stop", 0, func(store.Event) error {
+		calls++
+		return callbackErr
+	})
+	if !errors.Is(err, callbackErr) || calls != 1 {
+		t.Fatalf("replay callback result = %v after %d calls", err, calls)
+	}
+	if tracer.eventQueries.Load() != 1 || !tracer.sawSingleRowLimit.Load() {
+		t.Fatalf("first callback error fetched %d event queries with single-row=%t", tracer.eventQueries.Load(), tracer.sawSingleRowLimit.Load())
+	}
 }
 
 func testDSN(t *testing.T) string {
@@ -88,7 +123,7 @@ func dropSchema(t *testing.T, dsn string, schemaName string) {
 	}
 }
 
-func openPool(t *testing.T, dsn string, schemaName string) *pgxpool.Pool {
+func openPool(t *testing.T, dsn string, schemaName string, tracer pgx.QueryTracer) *pgxpool.Pool {
 	t.Helper()
 
 	config, err := pgxpool.ParseConfig(dsn)
@@ -96,6 +131,7 @@ func openPool(t *testing.T, dsn string, schemaName string) *pgxpool.Pool {
 		t.Fatalf("parse postgres config: %v", err)
 	}
 	config.ConnConfig.RuntimeParams["search_path"] = schemaName
+	config.ConnConfig.Tracer = tracer
 
 	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
@@ -106,6 +142,26 @@ func openPool(t *testing.T, dsn string, schemaName string) *pgxpool.Pool {
 		t.Fatalf("ping postgres: %v", err)
 	}
 	return pool
+}
+
+type replayQueryTracer struct {
+	eventQueries      atomic.Int64
+	sawSingleRowLimit atomic.Bool
+}
+
+func (tracer *replayQueryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, "FROM session_events") {
+		tracer.eventQueries.Add(1)
+		tracer.sawSingleRowLimit.Store(strings.Contains(data.SQL, "LIMIT 1"))
+	}
+	return ctx
+}
+
+func (tracer *replayQueryTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (tracer *replayQueryTracer) reset() {
+	tracer.eventQueries.Store(0)
+	tracer.sawSingleRowLimit.Store(false)
 }
 
 func resetSchema(t *testing.T, pool *pgxpool.Pool) {

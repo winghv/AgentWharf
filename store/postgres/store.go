@@ -76,15 +76,18 @@ func (s *Store) Replay(ctx context.Context, sessionID string, afterSeq int64, fn
 		return errors.New("postgres event store pool is nil")
 	}
 
-	rows, err := db.New(s.pool).ReplaySessionEvents(ctx, db.ReplaySessionEventsParams{
-		SessionID: sessionID,
-		Seq:       afterSeq,
-	})
-	if err != nil {
-		return fmt.Errorf("query replay events: %w", err)
-	}
-
-	for _, row := range rows {
+	queries := db.New(s.pool)
+	for nextSeq := afterSeq; ; {
+		row, err := queries.NextSessionEvent(ctx, db.NextSessionEventParams{
+			SessionID: sessionID,
+			Seq:       nextSeq,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("query replay event: %w", err)
+		}
 		ev := store.Event{
 			SessionID: row.SessionID,
 			Seq:       row.Seq,
@@ -95,8 +98,8 @@ func (s *Store) Replay(ctx context.Context, sessionID string, afterSeq int64, fn
 		if err := fn(ev); err != nil {
 			return fmt.Errorf("replay event seq %d: %w", ev.Seq, err)
 		}
+		nextSeq = ev.Seq
 	}
-	return nil
 }
 
 func (s *Store) LatestSeq(ctx context.Context, sessionID string) (int64, error) {

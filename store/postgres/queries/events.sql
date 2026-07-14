@@ -10,8 +10,9 @@ WHERE session_id = $1;
 INSERT INTO session_events (session_id, seq, type, payload, created_at)
 VALUES ($1, $2, $3, $4, $5);
 
--- name: ReplaySessionEvents :many
+-- name: NextSessionEvent :one
 SELECT session_id, seq, type, payload, created_at
 FROM session_events
 WHERE session_id = $1 AND seq > $2
-ORDER BY seq ASC;
+ORDER BY seq ASC
+LIMIT 1;
