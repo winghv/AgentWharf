@@ -1595,6 +1595,9 @@ func WorkspaceLeaseContract(t *testing.T, harness WorkspaceLeaseHarness) {
 		func(item *store.WorkspaceLeaseReserve) {
 			item.ChildScope = &store.WorkspaceLeaseChildScope{ParentKey: request.Key, ExpiresAt: time.Now().Add(time.Minute)}
 		},
+		func(item *store.WorkspaceLeaseReserve) {
+			item.ChildScope = &store.WorkspaceLeaseChildScope{ParentKey: request.Key, CapabilityDigest: [32]byte{3}, ExpiresAt: time.Now()}
+		},
 	} {
 		invalid := request
 		mutate(&invalid)
@@ -1604,6 +1607,18 @@ func WorkspaceLeaseContract(t *testing.T, harness WorkspaceLeaseHarness) {
 		if current := workspaceLease(t, leases, request.Key); !reflect.DeepEqual(current, reserved) {
 			t.Fatalf("invalid reserve mutated lease = %+v, want %+v", current, reserved)
 		}
+	}
+	exactRetry, err := leases.ReserveWorkspaceLease(ctx, request)
+	if err != nil || !reflect.DeepEqual(exactRetry, reserved) {
+		t.Fatalf("exact owner retry = %+v, %v; want %+v, nil", exactRetry, err, reserved)
+	}
+	contender := workspaceLeaseReserve("worker_contender", 2, 2, "lease_contender")
+	contender.Key = request.Key
+	if _, err := leases.ReserveWorkspaceLease(ctx, contender); err == nil {
+		t.Fatal("second live owner unexpectedly replaced reserved lease")
+	}
+	if current := workspaceLease(t, leases, request.Key); !reflect.DeepEqual(current, reserved) {
+		t.Fatalf("contender reserve mutated lease = %+v, want %+v", current, reserved)
 	}
 	child := workspaceLeaseReserve("worker_child", 1, 1, "lease_child")
 	child.Key = store.WorkspaceLeaseKey{2}
@@ -1631,6 +1646,13 @@ func WorkspaceLeaseContract(t *testing.T, harness WorkspaceLeaseHarness) {
 	if _, err := leases.RecordWorkspaceStartReceived(ctx, request.Key, reserved.Version, request.Owner); err == nil {
 		t.Fatal("stale start_received version unexpectedly succeeded")
 	}
+	if _, err := leases.ReserveWorkspaceLease(ctx, contender); err == nil {
+		t.Fatal("second live owner unexpectedly replaced started lease")
+	}
+	if current := workspaceLease(t, leases, request.Key); !reflect.DeepEqual(current, started) {
+		t.Fatalf("contender reserve mutated started lease = %+v, want %+v", current, started)
+	}
+	assertWorkspaceLeaseReserveRace(t, harness, ctx)
 
 	for _, kind := range []WorkspaceLeaseAuthorityFailure{
 		WorkspaceLeaseAuthoritySuperseded,
@@ -1724,4 +1746,50 @@ func sameWorkspaceLeaseChildScope(left, right *store.WorkspaceLeaseChildScope) b
 		return left == nil && right == nil
 	}
 	return left.ParentKey == right.ParentKey && left.CapabilityDigest == right.CapabilityDigest && left.ExpiresAt.Equal(right.ExpiresAt)
+}
+
+func assertWorkspaceLeaseReserveRace(t *testing.T, harness WorkspaceLeaseHarness, ctx context.Context) {
+	t.Helper()
+	leases := harness.Open(t)
+	left := workspaceLeaseReserve("worker_race_left", 1, 1, "lease_race_left")
+	left.Key = store.WorkspaceLeaseKey{9}
+	right := workspaceLeaseReserve("worker_race_right", 2, 2, "lease_race_right")
+	right.Key = left.Key
+	type result struct {
+		request store.WorkspaceLeaseReserve
+		lease   store.WorkspaceLease
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var group sync.WaitGroup
+	for _, request := range []store.WorkspaceLeaseReserve{left, right} {
+		group.Add(1)
+		go func(request store.WorkspaceLeaseReserve) {
+			defer group.Done()
+			<-start
+			lease, err := leases.ReserveWorkspaceLease(ctx, request)
+			results <- result{request: request, lease: lease, err: err}
+		}(request)
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	var winner *result
+	for result := range results {
+		if result.err == nil {
+			if winner != nil {
+				t.Fatal("concurrent reserve admitted more than one owner")
+			}
+			copy := result
+			winner = &copy
+		}
+	}
+	if winner == nil {
+		t.Fatal("concurrent reserve admitted no owner")
+	}
+	assertWorkspaceLease(t, winner.lease, winner.request, store.WorkspaceLeaseReserved)
+	if current := workspaceLease(t, leases, left.Key); !reflect.DeepEqual(current, winner.lease) {
+		t.Fatalf("concurrent reserve stored %+v, want winner %+v", current, winner.lease)
+	}
 }
