@@ -50,6 +50,56 @@ type HistoryStore interface {
 }
 
 const (
+	AttentionBlockerQueued                  = "queued"
+	AttentionBlockerReauthorizationRequired = "reauthorization_required"
+	AttentionBlockerNewRunRequired          = "new_run_required"
+	AttentionBlockerOutcomeUnknown          = "outcome_unknown"
+	AttentionPermissionPending              = "pending"
+	AttentionProjectionComplete             = "complete"
+	AttentionProjectionIncomplete           = "incomplete"
+)
+
+// AttentionBlocker is bounded, provider-neutral ledger evidence. It carries
+// neither a provider object nor any command, content, credential, Task, or Run.
+type AttentionBlocker struct {
+	Kind              string
+	Reason            *string
+	ExpiresAt         *time.Time
+	BlockingSessionID *string
+	Operation         *string
+}
+
+// AttentionPermission is a pending, opaque permission-request reference.
+type AttentionPermission struct {
+	ID     string
+	Status string
+}
+
+// SessionAttentionSummary is the EventStore-owned durable projection for a
+// single Session. LatestSeq and SummaryVersion are independent domains: the
+// former records durable-event truth, while the latter records ledger-only
+// evidence. The activity timestamps are original Store-clock values only.
+type SessionAttentionSummary struct {
+	SessionID           string
+	LatestSeq           int64
+	State               string
+	Permission          *AttentionPermission
+	TerminalOutcome     *string
+	LatestChangeSeq     *int64
+	Blocker             *AttentionBlocker
+	SummaryVersion      int64
+	LastDurableEventAt  *time.Time
+	LastClientCommandAt *time.Time
+	StateOfProjection   string
+}
+
+// AttentionSummaryStore is separate so v1 stores need not claim v2 support.
+// Reads occur only after the Auth boundary has validated exact membership.
+type AttentionSummaryStore interface {
+	AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]SessionAttentionSummary, error)
+}
+
+const (
 	RetentionComplete = "complete"
 	RetentionGap      = "retention_gap"
 )

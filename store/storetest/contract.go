@@ -51,6 +51,85 @@ type AttachAttemptHarness struct {
 	Reopen func(t *testing.T, current store.AttachAttemptStore) store.AttachAttemptStore
 }
 
+type attentionSummarySurface interface {
+	AttentionSnapshot(context.Context, []string) ([]store.SessionAttentionSummary, error)
+}
+
+// AttentionSummaryContract fixes the v2 projection's provider-neutral surface.
+// Backend transaction, rebuild, and delivery behavior is deliberately exercised
+// by T36 and T37 once those stores implement the contract.
+func AttentionSummaryContract(t *testing.T) {
+	t.Helper()
+	var _ attentionSummarySurface = (store.AttentionSummaryStore)(nil)
+	assertAttentionFields(t, reflect.TypeOf(store.AttentionBlocker{}), []string{
+		"Kind", "Reason", "ExpiresAt", "BlockingSessionID", "Operation",
+	})
+	assertAttentionFields(t, reflect.TypeOf(store.AttentionPermission{}), []string{"ID", "Status"})
+	assertAttentionFields(t, reflect.TypeOf(store.SessionAttentionSummary{}), []string{
+		"SessionID", "LatestSeq", "State", "Permission", "TerminalOutcome", "LatestChangeSeq", "Blocker", "SummaryVersion", "LastDurableEventAt", "LastClientCommandAt", "StateOfProjection",
+	})
+	stringType := reflect.TypeOf("")
+	int64Type := reflect.TypeOf(int64(0))
+	int64PointerType := reflect.TypeOf((*int64)(nil))
+	timePointerType := reflect.TypeOf((*time.Time)(nil))
+	assertAttentionFieldTypes(t, reflect.TypeOf(store.AttentionBlocker{}), []reflect.Type{stringType, stringPointerType(), timePointerType, stringPointerType(), stringPointerType()})
+	assertAttentionFieldTypes(t, reflect.TypeOf(store.AttentionPermission{}), []reflect.Type{stringType, stringType})
+	assertAttentionFieldTypes(t, reflect.TypeOf(store.SessionAttentionSummary{}), []reflect.Type{
+		stringType, int64Type, stringType, reflect.TypeOf((*store.AttentionPermission)(nil)), stringPointerType(), int64PointerType, reflect.TypeOf((*store.AttentionBlocker)(nil)), int64Type, timePointerType, timePointerType, stringType,
+	})
+	for _, value := range []struct {
+		got, want string
+	}{
+		{store.AttentionBlockerQueued, "queued"},
+		{store.AttentionBlockerReauthorizationRequired, "reauthorization_required"},
+		{store.AttentionBlockerNewRunRequired, "new_run_required"},
+		{store.AttentionBlockerOutcomeUnknown, "outcome_unknown"},
+		{store.AttentionPermissionPending, "pending"},
+		{store.AttentionProjectionComplete, "complete"},
+		{store.AttentionProjectionIncomplete, "incomplete"},
+	} {
+		if value.got != value.want {
+			t.Fatalf("attention contract value = %q, want %q", value.got, value.want)
+		}
+	}
+	for _, shape := range []reflect.Type{
+		reflect.TypeOf(store.AttentionBlocker{}),
+		reflect.TypeOf(store.AttentionPermission{}),
+		reflect.TypeOf(store.SessionAttentionSummary{}),
+	} {
+		for _, forbidden := range []string{"Task", "Run", "Provider", "Content", "Credential", "Token", "Transcript", "Message", "File", "Diff"} {
+			if _, found := shape.FieldByName(forbidden); found {
+				t.Fatalf("attention type %s leaks %s", shape.Name(), forbidden)
+			}
+		}
+	}
+}
+
+func assertAttentionFields(t *testing.T, typ reflect.Type, want []string) {
+	t.Helper()
+	if typ.NumField() != len(want) {
+		t.Fatalf("%s field count = %d, want %d", typ.Name(), typ.NumField(), len(want))
+	}
+	for index, name := range want {
+		if got := typ.Field(index).Name; got != name {
+			t.Fatalf("%s field %d = %q, want %q", typ.Name(), index, got, name)
+		}
+	}
+}
+
+func assertAttentionFieldTypes(t *testing.T, typ reflect.Type, want []reflect.Type) {
+	t.Helper()
+	for index, expected := range want {
+		if got := typ.Field(index).Type; got != expected {
+			t.Fatalf("%s field %d type = %s, want %s", typ.Name(), index, got, expected)
+		}
+	}
+}
+
+func stringPointerType() reflect.Type {
+	return reflect.TypeOf((*string)(nil))
+}
+
 func AttachAttemptContract(t *testing.T, harness AttachAttemptHarness) {
 	t.Helper()
 	if harness.Open == nil || harness.Reopen == nil {
