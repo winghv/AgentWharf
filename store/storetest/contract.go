@@ -64,7 +64,7 @@ type WarmAttachHarness struct {
 	Open   func(t *testing.T) store.WarmAttachStore
 	Fail   func(t *testing.T, warm store.WarmAttachStore, failure WarmAttachFailure)
 	Expire func(t *testing.T, warm store.WarmAttachStore)
-	Absent func(t *testing.T, warm store.WarmAttachStore, sessionID string)
+	Absent func(t *testing.T, warm store.WarmAttachStore, request store.WarmAttachRequest)
 }
 
 // WarmAttachContract proves that admission and the initial reference-only
@@ -96,8 +96,33 @@ func WarmAttachContract(t *testing.T, harness WarmAttachHarness) {
 		if _, err := warm.CommitWarmAttach(ctx, expired); err == nil {
 			t.Fatal("expired grant committed warm attach")
 		}
-		harness.Absent(t, warm, request.Attachment.Identity.TargetSessionID)
+		harness.Absent(t, warm, expired)
 	})
+	for _, test := range []struct {
+		name   string
+		mutate func(*store.WarmAttachRequest)
+	}{
+		{name: "expired_delivery_deadline", mutate: func(item *store.WarmAttachRequest) {
+			expiresAt := time.Now().Add(-time.Second)
+			item.Attachment.ExpiresAt = expiresAt
+			item.FirstDelivery.ExpiresAt = expiresAt
+		}},
+		{name: "delivery_deadline_after_grant", mutate: func(item *store.WarmAttachRequest) {
+			expiresAt := item.Attempt.ExpiresAt.Add(time.Second)
+			item.Attachment.ExpiresAt = expiresAt
+			item.FirstDelivery.ExpiresAt = expiresAt
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			warm := harness.Open(t)
+			invalid := request
+			test.mutate(&invalid)
+			if _, err := warm.CommitWarmAttach(ctx, invalid); err == nil {
+				t.Fatal("invalid delivery deadline committed warm attach")
+			}
+			harness.Absent(t, warm, invalid)
+		})
+	}
 	for _, failure := range []WarmAttachFailure{
 		WarmAttachFailureAttempt, WarmAttachFailureAttachment, WarmAttachFailureOutbox, WarmAttachFailureSummary,
 	} {
@@ -107,7 +132,7 @@ func WarmAttachContract(t *testing.T, harness WarmAttachHarness) {
 			if _, err := warm.CommitWarmAttach(ctx, request); err == nil {
 				t.Fatalf("%s failpoint committed warm attach", failure)
 			}
-			harness.Absent(t, warm, request.Attachment.Identity.TargetSessionID)
+			harness.Absent(t, warm, request)
 		})
 	}
 

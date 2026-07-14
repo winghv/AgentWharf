@@ -32,11 +32,19 @@ func TestWarmAttachContract(t *testing.T) {
 			memory.now = time.Now().Add(2 * time.Minute)
 			memory.mu.Unlock()
 		},
-		Absent: func(t *testing.T, warm store.WarmAttachStore, sessionID string) {
+		Absent: func(t *testing.T, warm store.WarmAttachStore, request store.WarmAttachRequest) {
 			t.Helper()
-			summaries, err := warm.AttentionSnapshot(context.Background(), []string{sessionID})
-			if err != nil || len(summaries) != 0 {
-				t.Fatalf("rolled-back snapshot = %+v, %v", summaries, err)
+			memory := warm.(*memoryWarmAttachStore)
+			memory.mu.Lock()
+			defer memory.mu.Unlock()
+			if _, exists := memory.records[request.Attempt.Identity.JTIHash]; exists {
+				t.Fatal("rolled-back attach attempt remained durable")
+			}
+			if len(memory.records) != 0 || memory.latest[request.Attachment.Identity.TargetSessionID] != 0 {
+				t.Fatalf("rollback left attachment, lineage, outbox, or event sequence: %+v", memory.records)
+			}
+			if _, exists := memory.summaries[request.Attachment.Identity.TargetSessionID]; exists {
+				t.Fatal("rolled-back attention blocker remained durable")
 			}
 		},
 	})
