@@ -8,11 +8,113 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AgentSession struct {
+	ID string
+}
+
+type SessionAdapterConnection struct {
+	SessionID                         string
+	ConnectionEpoch                   int64
+	AcceptedFence                     int64
+	ActiveCredentialGeneration        int64
+	CredentialGenerationHighWatermark int64
+	ActiveCredentialExpiresAt         pgtype.Timestamptz
+	PendingCredentialGeneration       pgtype.Int8
+	PendingCredentialExpiresAt        pgtype.Timestamptz
+	PriorRecoveryCredentialGeneration pgtype.Int8
+	RotationID                        pgtype.Text
+	RevokedAt                         pgtype.Timestamptz
+	TerminalAt                        pgtype.Timestamptz
+	CreatedAt                         pgtype.Timestamptz
+	UpdatedAt                         pgtype.Timestamptz
+}
+
+type SessionAttachAttempt struct {
+	AttemptJtiHash             []byte
+	AttachID                   string
+	BootstrapSessionID         string
+	TargetSessionID            string
+	Provider                   string
+	FingerprintDomain          string
+	FingerprintVersion         int32
+	FingerprintDigest          []byte
+	FingerprintKeyVersion      int32
+	ExpiresAt                  pgtype.Timestamptz
+	AdmissionOutcome           string
+	IssuedCredentialGeneration pgtype.Int8
+	CreatedAt                  pgtype.Timestamptz
+}
+
+type SessionAttachment struct {
+	AttachID                   string
+	BootstrapSessionID         string
+	TargetSessionID            string
+	Status                     string
+	DeliveryState              string
+	DeliveryVersion            int64
+	QueueReason                pgtype.Text
+	ExpiresAt                  pgtype.Timestamptz
+	CanceledAt                 pgtype.Timestamptz
+	BlockingSessionID          pgtype.Text
+	TargetCredentialLineageRef string
+	CreatedAt                  pgtype.Timestamptz
+	UpdatedAt                  pgtype.Timestamptz
+}
+
+type SessionAttentionSummary struct {
+	SessionID           string
+	LatestSeq           int64
+	State               string
+	PermissionID        pgtype.Text
+	PermissionStatus    pgtype.Text
+	TerminalOutcome     pgtype.Text
+	LatestChangeSeq     pgtype.Int8
+	BlockerKind         pgtype.Text
+	BlockerReason       pgtype.Text
+	BlockerExpiresAt    pgtype.Timestamptz
+	BlockingSessionID   pgtype.Text
+	BlockerOperation    pgtype.Text
+	SummaryVersion      int64
+	LastDurableEventAt  pgtype.Timestamptz
+	LastClientCommandAt pgtype.Timestamptz
+	ProjectionState     string
+	CreatedAt           pgtype.Timestamptz
+	UpdatedAt           pgtype.Timestamptz
+}
+
 type SessionEvent struct {
-	ID        int64
+	ID         int64
+	SessionID  string
+	Seq        int64
+	Type       string
+	Payload    []byte
+	ProposalID pgtype.Text
+	CreatedAt  pgtype.Timestamptz
+}
+
+type SessionPendingCommand struct {
 	SessionID string
-	Seq       int64
+	CmdID     string
 	Type      string
-	Payload   []byte
+	EventSeq  int64
+	Status    string
+	ExpiresAt pgtype.Timestamptz
 	CreatedAt pgtype.Timestamptz
+	UpdatedAt pgtype.Timestamptz
+}
+
+type SessionWorkspaceLease struct {
+	WorkspaceKey         string
+	WorkerID             string
+	SessionID            string
+	ConnectionEpoch      int64
+	CredentialGeneration int64
+	Status               string
+	Version              int64
+	ExpiresAt            pgtype.Timestamptz
+	QuarantineReason     pgtype.Text
+	RecoveryState        string
+	CreatedAt            pgtype.Timestamptz
+	UpdatedAt            pgtype.Timestamptz
+	ReleasedAt           pgtype.Timestamptz
 }
