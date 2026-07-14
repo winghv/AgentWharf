@@ -338,6 +338,70 @@ type AttachAttemptStore interface {
 	AttachAttempt(ctx context.Context, jtiHash [32]byte) (AttachAttempt, error)
 }
 
+// WorkspaceLeaseKey is derived by trusted Hub/Auth code from an immutable
+// bootstrap attachment root or an authenticated opaque workspace claim.
+// Client, Adapter, and Provider input never selects this key.
+type WorkspaceLeaseKey [32]byte
+
+type WorkspaceLeaseStatus string
+
+const (
+	WorkspaceLeaseReserved      WorkspaceLeaseStatus = "reserved"
+	WorkspaceLeaseStartReceived WorkspaceLeaseStatus = "start_received"
+	WorkspaceLeaseQuarantined   WorkspaceLeaseStatus = "quarantined"
+	WorkspaceLeaseReleased      WorkspaceLeaseStatus = "released"
+)
+
+// WorkspaceLeaseOwner is the complete, non-secret authority tuple for one
+// writer. A Store implementation rechecks it against durable live authority
+// before every owner-controlled transition.
+type WorkspaceLeaseOwner struct {
+	WorkerID             string
+	SessionID            string
+	ConnectionEpoch      int64
+	CredentialGeneration int64
+	LeaseID              string
+}
+
+// WorkspaceLeaseChildScope is an Auth-verified, opaque authorization for one
+// isolated child workspace. Nil means the immutable default workspace root.
+// CapabilityDigest is a non-secret reference, never a bearer or raw capability.
+type WorkspaceLeaseChildScope struct {
+	ParentKey        WorkspaceLeaseKey
+	CapabilityDigest [32]byte
+	ExpiresAt        time.Time
+}
+
+type WorkspaceLeaseReserve struct {
+	Key        WorkspaceLeaseKey
+	ChildScope *WorkspaceLeaseChildScope
+	Owner      WorkspaceLeaseOwner
+	ExpiresAt  time.Time
+}
+
+// WorkspaceLease is durable pre-spawn ownership and recovery truth. It holds
+// no provider object, credential, path, command, or user content.
+type WorkspaceLease struct {
+	Key        WorkspaceLeaseKey
+	ChildScope *WorkspaceLeaseChildScope
+	Owner      WorkspaceLeaseOwner
+	Status     WorkspaceLeaseStatus
+	Version    int64
+	ExpiresAt  time.Time
+}
+
+// WorkspaceLeaseStore owns writer reservation and quarantine truth. Only a
+// trusted fixed-entry cleanup path may release a lease after it has proven the
+// entire prior tree quiescent; uncertainty must transition to quarantine.
+type WorkspaceLeaseStore interface {
+	EventStore
+	ReserveWorkspaceLease(ctx context.Context, reserve WorkspaceLeaseReserve) (WorkspaceLease, error)
+	WorkspaceLease(ctx context.Context, key WorkspaceLeaseKey) (WorkspaceLease, error)
+	RecordWorkspaceStartReceived(ctx context.Context, key WorkspaceLeaseKey, expectedVersion int64, owner WorkspaceLeaseOwner) (WorkspaceLease, error)
+	QuarantineWorkspaceLease(ctx context.Context, key WorkspaceLeaseKey, expectedVersion int64) (WorkspaceLease, error)
+	ReleaseWorkspaceLeaseAfterQuiescence(ctx context.Context, key WorkspaceLeaseKey, expectedVersion int64, owner WorkspaceLeaseOwner) (WorkspaceLease, error)
+}
+
 type ProposedEventStatus string
 
 const ProposedEventAccepted ProposedEventStatus = "accepted"

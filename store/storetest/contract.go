@@ -1536,3 +1536,192 @@ func assertSeqs(t *testing.T, got []store.Event, want []int64) {
 		}
 	}
 }
+
+type WorkspaceLeaseAuthorityFailure string
+
+const (
+	WorkspaceLeaseAuthoritySuperseded WorkspaceLeaseAuthorityFailure = "superseded"
+	WorkspaceLeaseAuthorityRevoked    WorkspaceLeaseAuthorityFailure = "revoked"
+	WorkspaceLeaseAuthorityExpired    WorkspaceLeaseAuthorityFailure = "expired"
+	WorkspaceLeaseAuthorityTerminal   WorkspaceLeaseAuthorityFailure = "terminal"
+	WorkspaceLeaseAttachmentExpired   WorkspaceLeaseAuthorityFailure = "attachment_expired"
+	WorkspaceLeaseAttachmentCanceled  WorkspaceLeaseAuthorityFailure = "attachment_canceled"
+)
+
+type WorkspaceLeaseHarness struct {
+	Open       func(t *testing.T) store.WorkspaceLeaseStore
+	Reopen     func(t *testing.T, current store.WorkspaceLeaseStore) store.WorkspaceLeaseStore
+	Invalidate func(t *testing.T, leases store.WorkspaceLeaseStore, key store.WorkspaceLeaseKey, owner store.WorkspaceLeaseOwner, kind WorkspaceLeaseAuthorityFailure)
+}
+
+// WorkspaceLeaseContract proves that a backend preserves only trusted,
+// non-secret writer ownership. It deliberately models no Provider spawn: a
+// rejected start receipt is the proof that spawning remains impossible.
+func WorkspaceLeaseContract(t *testing.T, harness WorkspaceLeaseHarness) {
+	t.Helper()
+	if harness.Open == nil || harness.Reopen == nil || harness.Invalidate == nil {
+		t.Fatal("workspace-lease harness must provide open, reopen, and invalidate")
+	}
+	for _, shape := range []reflect.Type{
+		reflect.TypeOf(store.WorkspaceLeaseKey{}),
+		reflect.TypeOf(store.WorkspaceLeaseOwner{}),
+		reflect.TypeOf(store.WorkspaceLeaseChildScope{}),
+		reflect.TypeOf(store.WorkspaceLeaseReserve{}),
+		reflect.TypeOf(store.WorkspaceLease{}),
+	} {
+		if shape.Kind() != reflect.Struct {
+			continue
+		}
+		for _, forbidden := range []string{"Client", "Adapter", "Provider", "Path", "Content", "Bearer", "Token", "Grant", "Credential"} {
+			if _, found := shape.FieldByName(forbidden); found {
+				t.Fatalf("workspace lease type %s leaks %s", shape.Name(), forbidden)
+			}
+		}
+	}
+
+	ctx := context.Background()
+	request := workspaceLeaseReserve("worker_first", 1, 1, "lease_first")
+	leases := harness.Open(t)
+	reserved, err := leases.ReserveWorkspaceLease(ctx, request)
+	if err != nil {
+		t.Fatalf("reserve workspace lease: %v", err)
+	}
+	assertWorkspaceLease(t, reserved, request, store.WorkspaceLeaseReserved)
+	for _, mutate := range []func(*store.WorkspaceLeaseReserve){
+		func(item *store.WorkspaceLeaseReserve) { item.Key = store.WorkspaceLeaseKey{} },
+		func(item *store.WorkspaceLeaseReserve) { item.Owner.WorkerID = "" },
+		func(item *store.WorkspaceLeaseReserve) { item.Owner.LeaseID = "" },
+		func(item *store.WorkspaceLeaseReserve) { item.ExpiresAt = time.Now() },
+		func(item *store.WorkspaceLeaseReserve) {
+			item.ChildScope = &store.WorkspaceLeaseChildScope{ParentKey: request.Key, ExpiresAt: time.Now().Add(time.Minute)}
+		},
+	} {
+		invalid := request
+		mutate(&invalid)
+		if _, err := leases.ReserveWorkspaceLease(ctx, invalid); err == nil {
+			t.Fatal("invalid workspace lease unexpectedly reserved")
+		}
+		if current := workspaceLease(t, leases, request.Key); !reflect.DeepEqual(current, reserved) {
+			t.Fatalf("invalid reserve mutated lease = %+v, want %+v", current, reserved)
+		}
+	}
+	child := workspaceLeaseReserve("worker_child", 1, 1, "lease_child")
+	child.Key = store.WorkspaceLeaseKey{2}
+	child.ChildScope = &store.WorkspaceLeaseChildScope{
+		ParentKey: request.Key, CapabilityDigest: [32]byte{3}, ExpiresAt: time.Now().Add(time.Minute),
+	}
+	childReserved, err := leases.ReserveWorkspaceLease(ctx, child)
+	if err != nil {
+		t.Fatalf("reserve scoped child workspace lease: %v", err)
+	}
+	assertWorkspaceLease(t, childReserved, child, store.WorkspaceLeaseReserved)
+	wrongOwner := request.Owner
+	wrongOwner.ConnectionEpoch++
+	if _, err := leases.RecordWorkspaceStartReceived(ctx, request.Key, reserved.Version, wrongOwner); err == nil {
+		t.Fatal("wrong owner unexpectedly recorded start_received")
+	}
+	if current := workspaceLease(t, leases, request.Key); !reflect.DeepEqual(current, reserved) {
+		t.Fatalf("wrong owner mutated lease = %+v, want %+v", current, reserved)
+	}
+	started, err := leases.RecordWorkspaceStartReceived(ctx, request.Key, reserved.Version, request.Owner)
+	if err != nil {
+		t.Fatalf("record start_received: %v", err)
+	}
+	assertWorkspaceLease(t, started, request, store.WorkspaceLeaseStartReceived)
+	if _, err := leases.RecordWorkspaceStartReceived(ctx, request.Key, reserved.Version, request.Owner); err == nil {
+		t.Fatal("stale start_received version unexpectedly succeeded")
+	}
+
+	for _, kind := range []WorkspaceLeaseAuthorityFailure{
+		WorkspaceLeaseAuthoritySuperseded,
+		WorkspaceLeaseAuthorityRevoked,
+		WorkspaceLeaseAuthorityExpired,
+		WorkspaceLeaseAuthorityTerminal,
+		WorkspaceLeaseAttachmentExpired,
+		WorkspaceLeaseAttachmentCanceled,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			request := workspaceLeaseReserve("worker_stale", 1, 1, "lease_stale")
+			leases := harness.Open(t)
+			reserved, err := leases.ReserveWorkspaceLease(ctx, request)
+			if err != nil {
+				t.Fatalf("reserve stale lease: %v", err)
+			}
+			assertWorkspaceLease(t, reserved, request, store.WorkspaceLeaseReserved)
+			harness.Invalidate(t, leases, request.Key, request.Owner, kind)
+			stale := workspaceLease(t, leases, request.Key)
+			if _, err := leases.RecordWorkspaceStartReceived(ctx, request.Key, stale.Version, request.Owner); err == nil {
+				t.Fatal("invalid authority unexpectedly recorded start_received")
+			}
+			quarantined, err := leases.QuarantineWorkspaceLease(ctx, request.Key, stale.Version)
+			if err != nil {
+				t.Fatalf("quarantine stale lease: %v", err)
+			}
+			assertWorkspaceLease(t, quarantined, request, store.WorkspaceLeaseQuarantined)
+			leases = harness.Reopen(t, leases)
+			if reconstructed := workspaceLease(t, leases, request.Key); !reflect.DeepEqual(reconstructed, quarantined) {
+				t.Fatalf("reconstructed quarantine = %+v, want %+v", reconstructed, quarantined)
+			}
+			retry := workspaceLeaseReserve("worker_current", 2, 2, "lease_current")
+			retry.Key = request.Key
+			if _, err := leases.ReserveWorkspaceLease(ctx, retry); err == nil {
+				t.Fatal("quarantined lease unexpectedly admitted replacement worker")
+			}
+		})
+	}
+
+	leases = harness.Open(t)
+	reserved, err = leases.ReserveWorkspaceLease(ctx, request)
+	if err != nil {
+		t.Fatalf("reserve releasable lease: %v", err)
+	}
+	if _, err := leases.ReleaseWorkspaceLeaseAfterQuiescence(ctx, request.Key, reserved.Version, wrongOwner); err == nil {
+		t.Fatal("wrong owner unexpectedly released lease")
+	}
+	released, err := leases.ReleaseWorkspaceLeaseAfterQuiescence(ctx, request.Key, reserved.Version, request.Owner)
+	if err != nil {
+		t.Fatalf("release after quiescence: %v", err)
+	}
+	assertWorkspaceLease(t, released, request, store.WorkspaceLeaseReleased)
+	retry := workspaceLeaseReserve("worker_current", 2, 2, "lease_current")
+	retry.Key = request.Key
+	if replacement, err := leases.ReserveWorkspaceLease(ctx, retry); err != nil {
+		t.Fatalf("known release rejected current worker retry: %v", err)
+	} else {
+		assertWorkspaceLease(t, replacement, retry, store.WorkspaceLeaseReserved)
+	}
+}
+
+func workspaceLeaseReserve(workerID string, epoch, generation int64, leaseID string) store.WorkspaceLeaseReserve {
+	return store.WorkspaceLeaseReserve{
+		Key: store.WorkspaceLeaseKey{1},
+		Owner: store.WorkspaceLeaseOwner{
+			WorkerID: workerID, SessionID: "ses_workspace", ConnectionEpoch: epoch,
+			CredentialGeneration: generation, LeaseID: leaseID,
+		},
+		ExpiresAt: time.Now().Add(time.Minute),
+	}
+}
+
+func workspaceLease(t *testing.T, leases store.WorkspaceLeaseStore, key store.WorkspaceLeaseKey) store.WorkspaceLease {
+	t.Helper()
+	lease, err := leases.WorkspaceLease(context.Background(), key)
+	if err != nil {
+		t.Fatalf("read workspace lease: %v", err)
+	}
+	return lease
+}
+
+func assertWorkspaceLease(t *testing.T, got store.WorkspaceLease, want store.WorkspaceLeaseReserve, status store.WorkspaceLeaseStatus) {
+	t.Helper()
+	if got.Key != want.Key || !sameWorkspaceLeaseChildScope(got.ChildScope, want.ChildScope) || got.Owner != want.Owner || got.Status != status || got.Version < 1 || !got.ExpiresAt.Equal(want.ExpiresAt) {
+		t.Fatalf("workspace lease = %+v, want key=%v owner=%+v status=%s", got, want.Key, want.Owner, status)
+	}
+}
+
+func sameWorkspaceLeaseChildScope(left, right *store.WorkspaceLeaseChildScope) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.ParentKey == right.ParentKey && left.CapabilityDigest == right.CapabilityDigest && left.ExpiresAt.Equal(right.ExpiresAt)
+}
