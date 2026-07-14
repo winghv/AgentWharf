@@ -60,3 +60,16 @@ func TestSchemaFixtureSessionEventsHasNoPlatformForeignKey(t *testing.T) {
 		t.Fatal("session_events fixture retains production-unbacked agent_sessions foreign key")
 	}
 }
+
+func TestSchemaFixtureForeignKeysUseDefaultReferentialActions(t *testing.T) {
+	fixture, err := os.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatalf("read sqlc schema fixture: %v", err)
+	}
+	schema := strings.ToUpper(string(fixture))
+	for _, unexpected := range []string{" ON DELETE ", " ON UPDATE ", " MATCH ", " DEFERRABLE"} {
+		if strings.Contains(schema, unexpected) {
+			t.Fatalf("schema fixture unexpectedly overrides foreign key semantics with %q", unexpected)
+		}
+	}
+}
