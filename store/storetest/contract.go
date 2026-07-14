@@ -51,6 +51,170 @@ type AttachAttemptHarness struct {
 	Reopen func(t *testing.T, current store.AttachAttemptStore) store.AttachAttemptStore
 }
 
+type WarmAttachFailure string
+
+const (
+	WarmAttachFailureAttempt    WarmAttachFailure = "attempt"
+	WarmAttachFailureAttachment WarmAttachFailure = "attachment"
+	WarmAttachFailureOutbox     WarmAttachFailure = "outbox"
+	WarmAttachFailureSummary    WarmAttachFailure = "summary"
+)
+
+type WarmAttachHarness struct {
+	Open   func(t *testing.T) store.WarmAttachStore
+	Fail   func(t *testing.T, warm store.WarmAttachStore, failure WarmAttachFailure)
+	Expire func(t *testing.T, warm store.WarmAttachStore)
+	Absent func(t *testing.T, warm store.WarmAttachStore, sessionID string)
+}
+
+// WarmAttachContract proves that admission and the initial reference-only
+// delivery are indivisible Store truth. Backend-specific SQL/SQLite work and
+// post-commit credential delivery remain outside this contract.
+func WarmAttachContract(t *testing.T, harness WarmAttachHarness) {
+	t.Helper()
+	if harness.Open == nil || harness.Fail == nil || harness.Expire == nil || harness.Absent == nil {
+		t.Fatal("warm-attach harness must provide open, fail, expire, and absent")
+	}
+	for _, shape := range []reflect.Type{
+		reflect.TypeOf(store.WarmAttachFirstDelivery{}),
+		reflect.TypeOf(store.WarmAttachRequest{}),
+		reflect.TypeOf(store.WarmAttachOutbox{}),
+		reflect.TypeOf(store.WarmAttachCommit{}),
+	} {
+		for _, forbidden := range []string{"Grant", "Bearer", "Credential", "Content", "Payload", "Message", "Token", "Task", "Run", "VM", "Provider", "TargetState", "TargetTerminal", "TargetConflict", "TargetTruth"} {
+			if _, found := shape.FieldByName(forbidden); found {
+				t.Fatalf("warm-attach type %s leaks %s", shape.Name(), forbidden)
+			}
+		}
+	}
+	request := warmAttachRequest()
+	ctx := context.Background()
+	t.Run("expired_grant_rolls_back", func(t *testing.T) {
+		warm := harness.Open(t)
+		expired := request
+		expired.Attempt.ExpiresAt = time.Now().Add(-time.Second)
+		if _, err := warm.CommitWarmAttach(ctx, expired); err == nil {
+			t.Fatal("expired grant committed warm attach")
+		}
+		harness.Absent(t, warm, request.Attachment.Identity.TargetSessionID)
+	})
+	for _, failure := range []WarmAttachFailure{
+		WarmAttachFailureAttempt, WarmAttachFailureAttachment, WarmAttachFailureOutbox, WarmAttachFailureSummary,
+	} {
+		t.Run("rollback_"+string(failure), func(t *testing.T) {
+			warm := harness.Open(t)
+			harness.Fail(t, warm, failure)
+			if _, err := warm.CommitWarmAttach(ctx, request); err == nil {
+				t.Fatalf("%s failpoint committed warm attach", failure)
+			}
+			harness.Absent(t, warm, request.Attachment.Identity.TargetSessionID)
+		})
+	}
+
+	warm := harness.Open(t)
+	committed, err := warm.CommitWarmAttach(ctx, request)
+	if err != nil || committed.Duplicate {
+		t.Fatalf("commit warm attach = %+v, %v", committed, err)
+	}
+	assertWarmAttachCommit(t, committed, request, 1)
+	snapshot, err := warm.AttentionSnapshot(ctx, []string{request.Attachment.Identity.TargetSessionID})
+	if err != nil || len(snapshot) != 1 || !reflect.DeepEqual(snapshot[0], committed.Summary) {
+		t.Fatalf("committed attention snapshot = %+v, %v; want %+v", snapshot, err, committed.Summary)
+	}
+	retry, err := warm.CommitWarmAttach(ctx, request)
+	expectedRetry := committed
+	expectedRetry.Duplicate = true
+	if err != nil || !retry.Duplicate || !reflect.DeepEqual(retry, expectedRetry) {
+		t.Fatalf("exact warm-attach retry = %+v, %v; want original duplicate", retry, err)
+	}
+	changed := request
+	changed.FirstDelivery.ReferenceDigest[0]++
+	if _, err := warm.CommitWarmAttach(ctx, changed); err == nil {
+		t.Fatal("changed warm-attach retry unexpectedly committed")
+	}
+	snapshot, err = warm.AttentionSnapshot(ctx, []string{request.Attachment.Identity.TargetSessionID})
+	if err != nil || len(snapshot) != 1 || !reflect.DeepEqual(snapshot[0], committed.Summary) {
+		t.Fatalf("changed retry mutated summary = %+v, %v", snapshot, err)
+	}
+	t.Run("concurrent_exact_retry", func(t *testing.T) {
+		warm := harness.Open(t)
+		start := make(chan struct{})
+		results := make(chan store.WarmAttachCommit, 2)
+		errors := make(chan error, 2)
+		var group sync.WaitGroup
+		for range 2 {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				<-start
+				commit, err := warm.CommitWarmAttach(ctx, request)
+				results <- commit
+				errors <- err
+			}()
+		}
+		close(start)
+		group.Wait()
+		close(results)
+		close(errors)
+		var created, duplicate int
+		for err := range errors {
+			if err != nil {
+				t.Fatalf("concurrent warm attach: %v", err)
+			}
+		}
+		for result := range results {
+			if result.Duplicate {
+				duplicate++
+			} else {
+				created++
+			}
+		}
+		if created != 1 || duplicate != 1 {
+			t.Fatalf("concurrent warm-attach outcomes created=%d duplicate=%d", created, duplicate)
+		}
+	})
+	if _, err := warm.ExpireWarmAttach(ctx, request.Attachment.Identity.AttachID, committed.Attachment.DeliveryVersion+1); err == nil {
+		t.Fatal("stale warm-attach expiry unexpectedly committed")
+	}
+	harness.Expire(t, warm)
+	expired, err := warm.ExpireWarmAttach(ctx, request.Attachment.Identity.AttachID, committed.Attachment.DeliveryVersion)
+	if err != nil {
+		t.Fatalf("expire warm attach: %v", err)
+	}
+	if expired.Attachment.Status != store.AttachmentReauthorizationRequired || expired.Attachment.DeliveryVersion != committed.Attachment.DeliveryVersion+1 || expired.Summary.Blocker == nil || expired.Summary.Blocker.Kind != store.AttentionBlockerReauthorizationRequired || expired.Summary.SummaryVersion != committed.Summary.SummaryVersion+1 || expired.Summary.LatestSeq != committed.Summary.LatestSeq || !sameWarmAttachTime(expired.Summary.LastDurableEventAt, committed.Summary.LastDurableEventAt) || !sameWarmAttachTime(expired.Summary.LastClientCommandAt, committed.Summary.LastClientCommandAt) {
+		t.Fatalf("expired warm attach = %+v; committed = %+v", expired, committed)
+	}
+}
+
+func warmAttachRequest() store.WarmAttachRequest {
+	grantExpiresAt := time.Now().Add(3 * time.Minute)
+	deliveryExpiresAt := time.Now().Add(20 * time.Second)
+	return store.WarmAttachRequest{
+		Attempt: store.AttachAttemptRequest{
+			Identity:    store.AttachAttemptIdentity{JTIHash: [32]byte{1}, AttachID: "att_warm", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code"},
+			Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{2}, KeyVersion: 1},
+			ExpiresAt:   grantExpiresAt, Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: attachAttemptInt64(1),
+		},
+		Attachment:         store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_warm", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", TargetCredentialLineageRef: "lineage_target"}, ExpiresAt: deliveryExpiresAt},
+		BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, GrantFence: 2},
+		FirstDelivery:      store.WarmAttachFirstDelivery{CommandID: "cmd_warm", ReferenceID: "ref_warm", ReferenceDigest: [32]byte{3}, ExpiresAt: deliveryExpiresAt},
+	}
+}
+
+func assertWarmAttachCommit(t *testing.T, got store.WarmAttachCommit, request store.WarmAttachRequest, summaryVersion int64) {
+	t.Helper()
+	if got.Attempt.Identity != request.Attempt.Identity || got.Attempt.Fingerprint != request.Attempt.Fingerprint || got.Attachment.Identity != request.Attachment.Identity || got.Attachment.Status != store.AttachmentJoinPending || got.Attachment.DeliveryState != store.AttachmentDeliveryPending || !sameWarmAttachTime(got.Attachment.ExpiresAt, &request.Attachment.ExpiresAt) || got.Outbox.TargetSessionID != request.Attachment.Identity.TargetSessionID || got.Outbox.CommandID != request.FirstDelivery.CommandID || got.Outbox.ReferenceID != request.FirstDelivery.ReferenceID || got.Outbox.ReferenceDigest != request.FirstDelivery.ReferenceDigest || !got.Outbox.ExpiresAt.Equal(request.FirstDelivery.ExpiresAt) || got.Outbox.EventSeq < 1 || got.Summary.SessionID != request.Attachment.Identity.TargetSessionID || got.Summary.Blocker == nil || got.Summary.Blocker.Kind != store.AttentionBlockerQueued || got.Summary.SummaryVersion != summaryVersion || got.Summary.LastDurableEventAt == nil || got.Summary.LastClientCommandAt == nil || got.Summary.StateOfProjection != store.AttentionProjectionComplete {
+		t.Fatalf("warm-attach commit = %+v", got)
+	}
+	if got.Summary.Blocker.Reason == nil || *got.Summary.Blocker.Reason != "join_pending" || got.Summary.Blocker.ExpiresAt == nil || !got.Summary.Blocker.ExpiresAt.Equal(request.Attachment.ExpiresAt) || got.Summary.Blocker.BlockingSessionID != nil || got.Summary.Blocker.Operation != nil || got.Summary.LatestSeq != got.Outbox.EventSeq {
+		t.Fatalf("warm-attach summary = %+v; outbox = %+v", got.Summary, got.Outbox)
+	}
+}
+
+func sameWarmAttachTime(left, right *time.Time) bool {
+	return (left == nil && right == nil) || (left != nil && right != nil && left.Equal(*right))
+}
+
 type attentionSummarySurface interface {
 	AttentionSnapshot(context.Context, []string) ([]store.SessionAttentionSummary, error)
 }

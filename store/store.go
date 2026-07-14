@@ -388,6 +388,60 @@ type AttachAttemptStore interface {
 	AttachAttempt(ctx context.Context, jtiHash [32]byte) (AttachAttempt, error)
 }
 
+// WarmAttachFirstDelivery is the reference-only first message/outbox record.
+// It deliberately contains neither command content nor a credential or grant.
+type WarmAttachFirstDelivery struct {
+	CommandID       string
+	ReferenceID     string
+	ReferenceDigest [32]byte
+	ExpiresAt       time.Time
+}
+
+// WarmAttachRequest binds the live bootstrap admission tuple to the immutable
+// attempt, target attachment lineage, and first reference-only delivery.
+// Implementations recheck target lifecycle and conflict truth in the same
+// transaction rather than accepting either as caller-provided input.
+type WarmAttachRequest struct {
+	Attempt            AttachAttemptRequest
+	Attachment         AttachmentCreate
+	BootstrapAdmission AdapterConnectionAdmission
+	FirstDelivery      WarmAttachFirstDelivery
+}
+
+// WarmAttachOutbox is durable, reference-only work released after commit.
+// EventSeq remains the Hub-issued durable-event sequence, not a ledger version.
+type WarmAttachOutbox struct {
+	TargetSessionID string
+	CommandID       string
+	EventSeq        int64
+	ReferenceID     string
+	ReferenceDigest [32]byte
+	ExpiresAt       time.Time
+}
+
+type WarmAttachCommit struct {
+	Attempt    AttachAttempt
+	Attachment Attachment
+	Outbox     WarmAttachOutbox
+	Summary    SessionAttentionSummary
+	Duplicate  bool
+}
+
+type WarmAttachExpiry struct {
+	Attachment Attachment
+	Summary    SessionAttentionSummary
+}
+
+// WarmAttachStore commits all warm-attach truth in one transaction. A failed
+// commit exposes neither a partial outbox nor a summary blocker, and successful
+// expiry replaces the queued blocker with reauthorization-required truth.
+type WarmAttachStore interface {
+	EventStore
+	AttentionSummaryStore
+	CommitWarmAttach(ctx context.Context, request WarmAttachRequest) (WarmAttachCommit, error)
+	ExpireWarmAttach(ctx context.Context, attachID string, expectedDeliveryVersion int64) (WarmAttachExpiry, error)
+}
+
 // WorkspaceLeaseKey is derived by trusted Hub/Auth code from an immutable
 // bootstrap attachment root or an authenticated opaque workspace claim.
 // Client, Adapter, and Provider input never selects this key.
