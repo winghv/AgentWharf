@@ -38,6 +38,19 @@ func TestSchemaFixtureIsEventStoreOnly(t *testing.T) {
 			t.Fatalf("schema fixture missing %q", expected)
 		}
 	}
+	for _, forbidden := range []string{"task_id", "run_id", "vm_id", "org_id", "provider_object", "raw_credential", "credential_value", "token", "bearer", "content"} {
+		if strings.Contains(strings.ToLower(schema), forbidden) {
+			t.Fatalf("schema fixture contains non-EventStore field %q", forbidden)
+		}
+	}
+}
+
+func TestSchemaFixtureSessionEventsHasNoPlatformForeignKey(t *testing.T) {
+	fixture, err := os.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatalf("read sqlc schema fixture: %v", err)
+	}
+	schema := string(fixture)
 	eventStart := strings.Index(schema, "CREATE TABLE session_events")
 	eventEnd := strings.Index(schema, "CREATE INDEX session_events_session_seq_idx")
 	if eventStart < 0 || eventEnd <= eventStart {
@@ -45,10 +58,5 @@ func TestSchemaFixtureIsEventStoreOnly(t *testing.T) {
 	}
 	if strings.Contains(schema[eventStart:eventEnd], "REFERENCES agent_sessions(id)") {
 		t.Fatal("session_events fixture retains production-unbacked agent_sessions foreign key")
-	}
-	for _, forbidden := range []string{"task_id", "run_id", "vm_id", "org_id", "provider_object", "raw_credential", "credential_value", "token", "bearer", "content"} {
-		if strings.Contains(strings.ToLower(schema), forbidden) {
-			t.Fatalf("schema fixture contains non-EventStore field %q", forbidden)
-		}
 	}
 }
