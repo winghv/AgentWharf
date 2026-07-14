@@ -7,7 +7,7 @@ CREATE TABLE agent_sessions (
 
 CREATE TABLE session_events (
     id BIGSERIAL PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+    session_id TEXT NOT NULL,
     seq BIGINT NOT NULL CHECK (seq > 0),
     type TEXT NOT NULL,
     payload JSONB NOT NULL,
@@ -57,7 +57,7 @@ CREATE INDEX session_attention_summaries_projection_state_session_idx
     ON session_attention_summaries (projection_state, session_id);
 
 CREATE TABLE session_pending_commands (
-    session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+    session_id TEXT NOT NULL CHECK (char_length(session_id) BETWEEN 1 AND 255) REFERENCES agent_sessions(id),
     cmd_id TEXT NOT NULL CHECK (char_length(cmd_id) BETWEEN 1 AND 256),
     type TEXT NOT NULL CHECK (type IN ('session.send')),
     event_seq BIGINT NOT NULL CHECK (event_seq > 0),
@@ -91,7 +91,14 @@ CREATE TABLE session_attachments (
     CHECK (bootstrap_session_id <> target_session_id),
     CHECK (blocking_session_id IS NULL OR blocking_session_id <> target_session_id),
     CHECK (expires_at IS NULL OR expires_at > created_at),
-    CHECK (canceled_at IS NULL OR canceled_at >= created_at)
+    CHECK (canceled_at IS NULL OR canceled_at >= created_at),
+    CHECK (
+        (status = 'join_pending' AND delivery_state = 'pending' AND queue_reason IS NULL AND expires_at IS NOT NULL AND canceled_at IS NULL AND blocking_session_id IS NULL)
+        OR (status = 'queued' AND delivery_state = 'pending' AND queue_reason IS NOT NULL AND expires_at IS NOT NULL AND canceled_at IS NULL AND blocking_session_id IS NOT NULL)
+        OR (status = 'start_received' AND delivery_state IN ('received', 'completed', 'outcome_unknown') AND queue_reason IS NULL AND expires_at IS NULL AND canceled_at IS NULL AND blocking_session_id IS NULL)
+        OR (status = 'reauthorization_required' AND delivery_state IN ('pending', 'outcome_unknown') AND queue_reason IS NULL AND expires_at IS NULL AND canceled_at IS NULL AND blocking_session_id IS NULL)
+        OR (status = 'canceled' AND queue_reason IS NULL AND expires_at IS NULL AND canceled_at IS NOT NULL AND blocking_session_id IS NULL)
+    )
 );
 
 CREATE INDEX session_attachments_status_expiry_idx
@@ -117,9 +124,12 @@ CREATE TABLE session_adapter_connections (
     CHECK ((pending_credential_generation IS NULL AND pending_credential_expires_at IS NULL AND rotation_id IS NULL) OR (pending_credential_generation IS NOT NULL AND pending_credential_expires_at IS NOT NULL AND rotation_id IS NOT NULL)),
     CHECK (pending_credential_generation IS NULL OR pending_credential_generation <> active_credential_generation),
     CHECK (prior_recovery_credential_generation IS NULL OR prior_recovery_credential_generation <> active_credential_generation),
+    CHECK (pending_credential_generation IS NULL OR prior_recovery_credential_generation IS NULL OR pending_credential_generation <> prior_recovery_credential_generation),
     CHECK (active_credential_generation <= credential_generation_high_watermark),
     CHECK (pending_credential_generation IS NULL OR pending_credential_generation <= credential_generation_high_watermark),
-    CHECK (prior_recovery_credential_generation IS NULL OR prior_recovery_credential_generation <= credential_generation_high_watermark)
+    CHECK (prior_recovery_credential_generation IS NULL OR prior_recovery_credential_generation <= credential_generation_high_watermark),
+    CHECK (revoked_at IS NULL OR revoked_at >= created_at),
+    CHECK (terminal_at IS NULL OR terminal_at >= created_at)
 );
 
 CREATE INDEX session_adapter_connections_active_expiry_idx

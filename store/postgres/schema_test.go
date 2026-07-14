@@ -21,9 +21,14 @@ func TestSchemaFixtureIsEventStoreOnly(t *testing.T) {
 		"last_durable_event_at",
 		"last_client_command_at",
 		"CREATE TABLE session_pending_commands",
+		"session_id TEXT NOT NULL CHECK (char_length(session_id) BETWEEN 1 AND 255) REFERENCES agent_sessions(id)",
 		"CREATE TABLE session_attachments",
+		"status = 'join_pending' AND delivery_state = 'pending'",
 		"proposal_id TEXT",
 		"CREATE TABLE session_adapter_connections",
+		"pending_credential_generation <> prior_recovery_credential_generation",
+		"revoked_at IS NULL OR revoked_at >= created_at",
+		"terminal_at IS NULL OR terminal_at >= created_at",
 		"CREATE TABLE session_attach_attempts",
 		"CREATE TABLE session_workspace_leases",
 		"lease_id TEXT NOT NULL",
@@ -32,6 +37,14 @@ func TestSchemaFixtureIsEventStoreOnly(t *testing.T) {
 		if !strings.Contains(schema, expected) {
 			t.Fatalf("schema fixture missing %q", expected)
 		}
+	}
+	eventStart := strings.Index(schema, "CREATE TABLE session_events")
+	eventEnd := strings.Index(schema, "CREATE INDEX session_events_session_seq_idx")
+	if eventStart < 0 || eventEnd <= eventStart {
+		t.Fatal("schema fixture has malformed session_events section")
+	}
+	if strings.Contains(schema[eventStart:eventEnd], "REFERENCES agent_sessions(id)") {
+		t.Fatal("session_events fixture retains production-unbacked agent_sessions foreign key")
 	}
 	for _, forbidden := range []string{"task_id", "run_id", "vm_id", "org_id", "provider_object", "raw_credential", "credential_value", "token", "bearer", "content"} {
 		if strings.Contains(strings.ToLower(schema), forbidden) {
