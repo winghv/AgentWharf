@@ -26,6 +26,8 @@ func TestSchemaFixtureIsEventStoreOnly(t *testing.T) {
 		"CREATE TABLE session_adapter_connections",
 		"CREATE TABLE session_attach_attempts",
 		"CREATE TABLE session_workspace_leases",
+		"lease_id TEXT NOT NULL",
+		"status IN ('reserved', 'start_received', 'quarantined', 'released')",
 	} {
 		if !strings.Contains(schema, expected) {
 			t.Fatalf("schema fixture missing %q", expected)

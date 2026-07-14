@@ -153,7 +153,8 @@ CREATE TABLE session_workspace_leases (
     session_id TEXT NOT NULL REFERENCES agent_sessions(id),
     connection_epoch BIGINT NOT NULL CHECK (connection_epoch > 0),
     credential_generation BIGINT NOT NULL CHECK (credential_generation > 0),
-    status TEXT NOT NULL CHECK (status IN ('reserved', 'active', 'quarantined', 'released')),
+    lease_id TEXT NOT NULL CHECK (char_length(lease_id) BETWEEN 1 AND 255),
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'start_received', 'quarantined', 'released')),
     version BIGINT NOT NULL CHECK (version > 0),
     expires_at TIMESTAMPTZ,
     quarantine_reason TEXT CHECK (quarantine_reason IN ('authority_superseded', 'cleanup_uncertain', 'recovery_incomplete')),
@@ -163,13 +164,13 @@ CREATE TABLE session_workspace_leases (
     released_at TIMESTAMPTZ,
     CHECK (
         (status = 'reserved' AND expires_at IS NOT NULL AND quarantine_reason IS NULL AND recovery_state = 'not_required' AND released_at IS NULL)
-        OR (status = 'active' AND expires_at IS NULL AND quarantine_reason IS NULL AND recovery_state = 'not_required' AND released_at IS NULL)
+        OR (status = 'start_received' AND expires_at IS NULL AND quarantine_reason IS NULL AND recovery_state = 'not_required' AND released_at IS NULL)
         OR (status = 'quarantined' AND expires_at IS NULL AND quarantine_reason IS NOT NULL AND recovery_state = 'pending' AND released_at IS NULL)
         OR (status = 'released' AND expires_at IS NOT NULL AND quarantine_reason IS NULL AND recovery_state = 'quiescent' AND released_at IS NOT NULL)
     )
 );
 
 CREATE INDEX session_workspace_leases_owner_cas_idx
-    ON session_workspace_leases (workspace_key, worker_id, session_id, connection_epoch, credential_generation, version);
+    ON session_workspace_leases (workspace_key, worker_id, session_id, connection_epoch, credential_generation, lease_id, version);
 CREATE INDEX session_workspace_leases_released_cleanup_idx
     ON session_workspace_leases (expires_at) WHERE status = 'released';
