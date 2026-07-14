@@ -111,20 +111,11 @@ func openPool(t *testing.T, dsn string, schemaName string) *pgxpool.Pool {
 func resetSchema(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 
-	if _, err := pool.Exec(context.Background(), `
-DROP TABLE IF EXISTS session_events;
-CREATE TABLE session_events (
-	id bigserial PRIMARY KEY,
-	session_id text NOT NULL,
-	seq bigint NOT NULL CHECK (seq > 0),
-	type text NOT NULL,
-	payload jsonb NOT NULL,
-	created_at timestamptz NOT NULL DEFAULT now(),
-	UNIQUE (session_id, seq)
-);
-CREATE INDEX session_events_session_seq_idx
-	ON session_events (session_id, seq);
-`); err != nil {
+	fixture, err := os.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatalf("read sqlc schema fixture: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), string(fixture)); err != nil {
 		t.Fatalf("reset session_events schema: %v", err)
 	}
 }
