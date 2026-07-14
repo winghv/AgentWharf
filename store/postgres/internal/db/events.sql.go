@@ -57,19 +57,20 @@ func (q *Queries) LockSessionEventStream(ctx context.Context, pgAdvisoryXactLock
 	return err
 }
 
-const replaySessionEvents = `-- name: ReplaySessionEvents :many
+const nextSessionEvent = `-- name: NextSessionEvent :one
 SELECT session_id, seq, type, payload, created_at
 FROM session_events
 WHERE session_id = $1 AND seq > $2
 ORDER BY seq ASC
+LIMIT 1
 `
 
-type ReplaySessionEventsParams struct {
+type NextSessionEventParams struct {
 	SessionID string
 	Seq       int64
 }
 
-type ReplaySessionEventsRow struct {
+type NextSessionEventRow struct {
 	SessionID string
 	Seq       int64
 	Type      string
@@ -77,28 +78,15 @@ type ReplaySessionEventsRow struct {
 	CreatedAt pgtype.Timestamptz
 }
 
-func (q *Queries) ReplaySessionEvents(ctx context.Context, arg ReplaySessionEventsParams) ([]ReplaySessionEventsRow, error) {
-	rows, err := q.db.Query(ctx, replaySessionEvents, arg.SessionID, arg.Seq)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []ReplaySessionEventsRow
-	for rows.Next() {
-		var i ReplaySessionEventsRow
-		if err := rows.Scan(
-			&i.SessionID,
-			&i.Seq,
-			&i.Type,
-			&i.Payload,
-			&i.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+func (q *Queries) NextSessionEvent(ctx context.Context, arg NextSessionEventParams) (NextSessionEventRow, error) {
+	row := q.db.QueryRow(ctx, nextSessionEvent, arg.SessionID, arg.Seq)
+	var i NextSessionEventRow
+	err := row.Scan(
+		&i.SessionID,
+		&i.Seq,
+		&i.Type,
+		&i.Payload,
+		&i.CreatedAt,
+	)
+	return i, err
 }
