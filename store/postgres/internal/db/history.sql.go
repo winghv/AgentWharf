@@ -15,17 +15,12 @@ const reverseSessionEventPage = `-- name: ReverseSessionEventPage :many
 SELECT session_id, seq, type, payload, created_at
 FROM session_events
 WHERE session_id = $1
-  AND (
-      $2::BIGINT IS NULL
-      OR seq < $2::BIGINT
-  )
 ORDER BY seq DESC
-LIMIT $3
+LIMIT $2
 `
 
 type ReverseSessionEventPageParams struct {
 	SessionID string
-	BeforeSeq pgtype.Int8
 	PageLimit int32
 }
 
@@ -38,7 +33,7 @@ type ReverseSessionEventPageRow struct {
 }
 
 func (q *Queries) ReverseSessionEventPage(ctx context.Context, arg ReverseSessionEventPageParams) ([]ReverseSessionEventPageRow, error) {
-	rows, err := q.db.Query(ctx, reverseSessionEventPage, arg.SessionID, arg.BeforeSeq, arg.PageLimit)
+	rows, err := q.db.Query(ctx, reverseSessionEventPage, arg.SessionID, arg.PageLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -63,22 +58,71 @@ func (q *Queries) ReverseSessionEventPage(ctx context.Context, arg ReverseSessio
 	return items, nil
 }
 
-const sessionEventHistoryBounds = `-- name: SessionEventHistoryBounds :one
-SELECT
-    COALESCE(MIN(seq), 0)::BIGINT AS earliest_seq,
-    COALESCE(MAX(seq), 0)::BIGINT AS latest_seq
+const reverseSessionEventPageBefore = `-- name: ReverseSessionEventPageBefore :many
+SELECT session_id, seq, type, payload, created_at
 FROM session_events
+WHERE session_id = $1
+  AND seq < $2
+ORDER BY seq DESC
+LIMIT $3
+`
+
+type ReverseSessionEventPageBeforeParams struct {
+	SessionID string
+	BeforeSeq int64
+	PageLimit int32
+}
+
+type ReverseSessionEventPageBeforeRow struct {
+	SessionID string
+	Seq       int64
+	Type      string
+	Payload   []byte
+	CreatedAt pgtype.Timestamptz
+}
+
+func (q *Queries) ReverseSessionEventPageBefore(ctx context.Context, arg ReverseSessionEventPageBeforeParams) ([]ReverseSessionEventPageBeforeRow, error) {
+	rows, err := q.db.Query(ctx, reverseSessionEventPageBefore, arg.SessionID, arg.BeforeSeq, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ReverseSessionEventPageBeforeRow
+	for rows.Next() {
+		var i ReverseSessionEventPageBeforeRow
+		if err := rows.Scan(
+			&i.SessionID,
+			&i.Seq,
+			&i.Type,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sessionEventHistoryState = `-- name: SessionEventHistoryState :one
+SELECT
+    COALESCE(MAX(latest_seq), 0)::BIGINT AS latest_seq,
+    COALESCE(BOOL_OR(retention_gap), false)::BOOLEAN AS retention_gap
+FROM session_event_streams
 WHERE session_id = $1
 `
 
-type SessionEventHistoryBoundsRow struct {
-	EarliestSeq int64
-	LatestSeq   int64
+type SessionEventHistoryStateRow struct {
+	LatestSeq    int64
+	RetentionGap bool
 }
 
-func (q *Queries) SessionEventHistoryBounds(ctx context.Context, sessionID string) (SessionEventHistoryBoundsRow, error) {
-	row := q.db.QueryRow(ctx, sessionEventHistoryBounds, sessionID)
-	var i SessionEventHistoryBoundsRow
-	err := row.Scan(&i.EarliestSeq, &i.LatestSeq)
+func (q *Queries) SessionEventHistoryState(ctx context.Context, sessionID string) (SessionEventHistoryStateRow, error) {
+	row := q.db.QueryRow(ctx, sessionEventHistoryState, sessionID)
+	var i SessionEventHistoryStateRow
+	err := row.Scan(&i.LatestSeq, &i.RetentionGap)
 	return i, err
 }

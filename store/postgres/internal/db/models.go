@@ -92,6 +92,14 @@ type SessionEvent struct {
 	CreatedAt  pgtype.Timestamptz
 }
 
+type SessionEventStream struct {
+	SessionID    string
+	LatestSeq    int64
+	RetentionGap bool
+	CreatedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
+}
+
 type SessionPendingCommand struct {
 	SessionID string
 	CmdID     string

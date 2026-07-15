@@ -36,9 +36,11 @@ func (q *Queries) InsertSessionEvent(ctx context.Context, arg InsertSessionEvent
 }
 
 const latestSessionEventSeq = `-- name: LatestSessionEventSeq :one
-SELECT COALESCE(MAX(seq), 0)::BIGINT
-FROM session_events
-WHERE session_id = $1
+SELECT COALESCE((
+    SELECT latest_seq
+    FROM session_event_streams
+    WHERE session_id = $1
+), 0)::BIGINT
 `
 
 func (q *Queries) LatestSessionEventSeq(ctx context.Context, sessionID string) (int64, error) {
