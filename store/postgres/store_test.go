@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,6 +38,124 @@ func TestEventStoreContract(t *testing.T) {
 		resetSchema(t, pool)
 		return postgres.New(pool)
 	})
+}
+
+func TestHistoryStoreContract(t *testing.T) {
+	storetest.HistoryContract(t, storetest.HistoryHarness{
+		Open: func(t *testing.T) store.HistoryStore {
+			t.Helper()
+
+			dsn := testDSN(t)
+			schemaName := fmt.Sprintf("agentwharf_history_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+			setupSchema(t, dsn, schemaName)
+			harness := &postgresHistoryHarness{dsn: dsn, schemaName: schemaName}
+			harness.reopen(t)
+			resetSchema(t, harness.pool)
+			t.Cleanup(func() {
+				harness.pool.Close()
+				dropSchema(t, dsn, schemaName)
+			})
+			return harness
+		},
+		Reopen: func(t *testing.T, current store.HistoryStore) store.HistoryStore {
+			t.Helper()
+
+			harness := current.(*postgresHistoryHarness)
+			harness.pool.Close()
+			harness.reopen(t)
+			return harness
+		},
+		PruneBefore: func(t *testing.T, current store.HistoryStore, sessionID string, beforeSeq int64) {
+			t.Helper()
+
+			harness := current.(*postgresHistoryHarness)
+			if _, err := harness.pool.Exec(context.Background(),
+				"DELETE FROM session_events WHERE session_id = $1 AND seq < $2", sessionID, beforeSeq); err != nil {
+				t.Fatalf("prune retained history: %v", err)
+			}
+		},
+	})
+}
+
+type postgresHistoryHarness struct {
+	*postgres.Store
+	pool       *pgxpool.Pool
+	dsn        string
+	schemaName string
+}
+
+func (h *postgresHistoryHarness) reopen(t *testing.T) {
+	t.Helper()
+
+	h.pool = openPool(t, h.dsn, h.schemaName, nil)
+	h.Store = postgres.New(h.pool)
+}
+
+func TestHistoryUsesInitialSnapshotAcrossConcurrentAppend(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_history_snapshot_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+
+	tracer := newHistorySnapshotTracer()
+	pool := openPool(t, dsn, schemaName, tracer)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	postgresStore := postgres.New(pool)
+	if _, err := postgresStore.Append(context.Background(), "ses_history_snapshot", []store.PendingEvent{
+		{Type: "session.message", Time: time.Unix(1, 0), Payload: []byte(`{"n":1}`)},
+	}); err != nil {
+		t.Fatalf("append initial history event: %v", err)
+	}
+
+	type historyResult struct {
+		page store.HistoryPage
+		err  error
+	}
+	result := make(chan historyResult, 1)
+	go func() {
+		page, err := postgresStore.History(context.Background(), "ses_history_snapshot", nil, 100)
+		result <- historyResult{page: page, err: err}
+	}()
+	<-tracer.pageQuery
+	if _, err := postgresStore.Append(context.Background(), "ses_history_snapshot", []store.PendingEvent{
+		{Type: "session.message", Time: time.Unix(2, 0), Payload: []byte(`{"n":2}`)},
+	}); err != nil {
+		t.Fatalf("append concurrent history event: %v", err)
+	}
+	close(tracer.resume)
+
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("History() error = %v", got.err)
+	}
+	if got.page.LatestSeq != 1 || len(got.page.Events) != 1 || got.page.Events[0].Seq != 1 {
+		t.Fatalf("history crossed initial snapshot: %+v", got.page)
+	}
+	if latest, err := postgresStore.LatestSeq(context.Background(), "ses_history_snapshot"); err != nil || latest != 2 {
+		t.Fatalf("latest seq after concurrent append = %d, %v", latest, err)
+	}
+}
+
+func TestAppendRollsBackBatchWhenLaterPayloadIsInvalid(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_append_rollback_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	postgresStore := postgres.New(pool)
+	if _, err := postgresStore.Append(context.Background(), "ses_append_rollback", []store.PendingEvent{
+		{Type: "session.message", Time: time.Unix(1, 0), Payload: []byte(`{"n":1}`)},
+		{Type: "session.message", Time: time.Unix(2, 0), Payload: []byte(`not-json`)},
+	}); err == nil {
+		t.Fatal("Append() error = nil, want invalid JSON rollback")
+	}
+	if latest, err := postgresStore.LatestSeq(context.Background(), "ses_append_rollback"); err != nil || latest != 0 {
+		t.Fatalf("latest seq after rollback = %d, %v", latest, err)
+	}
 }
 
 func TestReplayStopsBeforeFetchingPastFirstCallbackError(t *testing.T) {
@@ -181,6 +300,26 @@ type replayQueryTracer struct {
 	eventQueries      atomic.Int64
 	sawSingleRowLimit atomic.Bool
 }
+
+type historySnapshotTracer struct {
+	pageQuery chan struct{}
+	resume    chan struct{}
+	once      sync.Once
+}
+
+func newHistorySnapshotTracer() *historySnapshotTracer {
+	return &historySnapshotTracer{pageQuery: make(chan struct{}), resume: make(chan struct{})}
+}
+
+func (tracer *historySnapshotTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, "ORDER BY seq DESC") {
+		tracer.once.Do(func() { close(tracer.pageQuery) })
+		<-tracer.resume
+	}
+	return ctx
+}
+
+func (*historySnapshotTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func (tracer *replayQueryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
 	if strings.Contains(data.SQL, "FROM session_events") {

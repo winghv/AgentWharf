@@ -18,6 +18,8 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
+const maxHistoryPageSize = 100
+
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
@@ -110,6 +112,68 @@ func (s *Store) Replay(ctx context.Context, sessionID string, afterSeq int64, fn
 		}
 		nextSeq = ev.Seq
 	}
+}
+
+func (s *Store) History(ctx context.Context, sessionID string, beforeSeq *int64, limit int) (store.HistoryPage, error) {
+	if limit < 1 || limit > maxHistoryPageSize {
+		return store.HistoryPage{}, errors.New("history limit is out of range")
+	}
+	if s.pool == nil {
+		return store.HistoryPage{}, errors.New("postgres event store pool is nil")
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return store.HistoryPage{}, fmt.Errorf("begin history transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	queries := db.New(tx)
+	bounds, err := queries.SessionEventHistoryBounds(ctx, sessionID)
+	if err != nil {
+		return store.HistoryPage{}, fmt.Errorf("select history bounds: %w", err)
+	}
+	cursor := pgtype.Int8{}
+	if beforeSeq != nil {
+		cursor = pgtype.Int8{Int64: *beforeSeq, Valid: true}
+	}
+	rows, err := queries.ReverseSessionEventPage(ctx, db.ReverseSessionEventPageParams{
+		SessionID: sessionID,
+		BeforeSeq: cursor,
+		PageLimit: int32(limit + 1),
+	})
+	if err != nil {
+		return store.HistoryPage{}, fmt.Errorf("select reverse history page: %w", err)
+	}
+
+	page := store.HistoryPage{
+		LatestSeq:      bounds.LatestSeq,
+		RetentionState: store.RetentionComplete,
+	}
+	if bounds.EarliestSeq > 1 {
+		page.RetentionState = store.RetentionGap
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
+		next := rows[len(rows)-1].Seq
+		page.NextBeforeSeq = &next
+	}
+	page.Events = make([]store.Event, len(rows))
+	for index, row := range rows {
+		page.Events[len(rows)-1-index] = store.Event{
+			SessionID: row.SessionID,
+			Seq:       row.Seq,
+			Type:      row.Type,
+			Time:      row.CreatedAt.Time,
+			Payload:   append([]byte(nil), row.Payload...),
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.HistoryPage{}, fmt.Errorf("commit history transaction: %w", err)
+	}
+	return page, nil
 }
 
 func (s *Store) LatestSeq(ctx context.Context, sessionID string) (int64, error) {
