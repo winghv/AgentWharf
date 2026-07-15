@@ -77,6 +77,93 @@ func TestHistoryStoreContract(t *testing.T) {
 	})
 }
 
+func TestPendingCommandStoreContract(t *testing.T) {
+	storetest.PendingCommandContract(t, storetest.PendingCommandHarness{
+		Open: func(t *testing.T) store.CommandLedgerStore {
+			t.Helper()
+			dsn := testDSN(t)
+			schemaName := fmt.Sprintf("agentwharf_command_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+			setupSchema(t, dsn, schemaName)
+			harness := &postgresCommandHarness{dsn: dsn, schemaName: schemaName}
+			harness.reopen(t)
+			resetSchema(t, harness.pool)
+			harness.seedAuthority(t)
+			t.Cleanup(func() {
+				harness.pool.Close()
+				dropSchema(t, dsn, schemaName)
+			})
+			return harness
+		},
+		Reopen: func(t *testing.T, current store.CommandLedgerStore) store.CommandLedgerStore {
+			t.Helper()
+			harness := current.(*postgresCommandHarness)
+			harness.pool.Close()
+			harness.reopen(t)
+			return harness
+		},
+		Authority: func(t *testing.T, _ store.CommandLedgerStore) store.CommandAuthority {
+			t.Helper()
+			return store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+		},
+		Invalidate: func(t *testing.T, current store.CommandLedgerStore, kind storetest.CommandAuthorityFailure) {
+			t.Helper()
+			harness := current.(*postgresCommandHarness)
+			var statement string
+			switch kind {
+			case storetest.CommandAuthoritySuperseded:
+				statement = "UPDATE session_adapter_connections SET connection_epoch = 2"
+			case storetest.CommandAuthorityRevoked:
+				statement = "UPDATE session_adapter_connections SET revoked_at = statement_timestamp()"
+			case storetest.CommandAuthorityExpired:
+				statement = "UPDATE session_adapter_connections SET created_at = statement_timestamp() - interval '2 minutes', active_credential_expires_at = statement_timestamp() - interval '1 minute'"
+			case storetest.CommandAuthorityTerminal:
+				statement = "UPDATE session_adapter_connections SET terminal_at = statement_timestamp()"
+			default:
+				t.Fatalf("unknown command authority failure %q", kind)
+			}
+			if _, err := harness.pool.Exec(context.Background(), statement); err != nil {
+				t.Fatalf("invalidate command authority %s: %v", kind, err)
+			}
+		},
+	})
+}
+
+type postgresCommandHarness struct {
+	*postgres.Store
+	pool       *pgxpool.Pool
+	dsn        string
+	schemaName string
+}
+
+func (h *postgresCommandHarness) reopen(t *testing.T) {
+	t.Helper()
+	h.pool = openPool(t, h.dsn, h.schemaName, nil)
+	h.Store = postgres.New(h.pool)
+}
+
+func (h *postgresCommandHarness) seedAuthority(t *testing.T) {
+	t.Helper()
+	sessionIDs := []string{
+		"ses_command_1", "ses_command_claim", "ses_command_stale",
+		"ses_command_expired", "ses_command_reopen", "ses_command_invalid",
+	}
+	if _, err := h.pool.Exec(context.Background(), `
+INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS session_id
+`, sessionIDs); err != nil {
+		t.Fatalf("seed command sessions: %v", err)
+	}
+	if _, err := h.pool.Exec(context.Background(), `
+INSERT INTO session_adapter_connections (
+	session_id, connection_epoch, accepted_fence, active_credential_generation,
+	credential_generation_high_watermark, active_credential_expires_at
+)
+SELECT session_id, 1, 1, 1, 1, statement_timestamp() + interval '1 hour'
+FROM unnest($1::text[]) AS session_id
+`, sessionIDs); err != nil {
+		t.Fatalf("seed command authority: %v", err)
+	}
+}
+
 type postgresHistoryHarness struct {
 	*postgres.Store
 	pool       *pgxpool.Pool
@@ -226,6 +313,46 @@ func TestAppendRollsBackBatchWhenLaterPayloadIsInvalid(t *testing.T) {
 	}
 	if latest, err := postgresStore.LatestSeq(context.Background(), "ses_append_rollback"); err != nil || latest != 0 {
 		t.Fatalf("latest seq after rollback = %d, %v", latest, err)
+	}
+}
+
+func TestPendingCommandCommitRollsBackEventWhenLedgerInsertFails(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_command_rollback_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+
+	harness := &postgresCommandHarness{dsn: dsn, schemaName: schemaName}
+	harness.reopen(t)
+	t.Cleanup(harness.pool.Close)
+	resetSchema(t, harness.pool)
+	harness.seedAuthority(t)
+	if _, err := harness.pool.Exec(context.Background(), `
+CREATE FUNCTION reject_test_pending_command() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	RAISE EXCEPTION 'forced pending command failure';
+END;
+$$;
+CREATE TRIGGER session_pending_commands_reject_test
+BEFORE INSERT ON session_pending_commands
+FOR EACH ROW EXECUTE FUNCTION reject_test_pending_command();
+`); err != nil {
+		t.Fatalf("install pending command failpoint: %v", err)
+	}
+
+	_, err := harness.CommitPendingCommand(context.Background(), "ses_command_1",
+		store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+		store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"user"}`)},
+		store.PendingCommandRequest{CommandID: "cmd_rollback", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)})
+	if err == nil {
+		t.Fatal("CommitPendingCommand() unexpectedly succeeded through failpoint")
+	}
+	if latest, latestErr := harness.LatestSeq(context.Background(), "ses_command_1"); latestErr != nil || latest != 0 {
+		t.Fatalf("rolled-back pending command latest seq = %d, %v", latest, latestErr)
+	}
+	var commandCount int
+	if countErr := harness.pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM session_pending_commands`).Scan(&commandCount); countErr != nil || commandCount != 0 {
+		t.Fatalf("rolled-back pending command rows = %d, %v", commandCount, countErr)
 	}
 }
 
