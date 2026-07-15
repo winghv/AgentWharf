@@ -67,3 +67,23 @@ func TestGrantFenceContract(t *testing.T) {
 		t.Fatalf("grant fence = %d, accepted fence = %d, err = %v", grant, connection.AcceptedFence, err)
 	}
 }
+
+func TestGrantFenceAllocatorUsesCallerTransaction(t *testing.T) {
+	ctx := context.Background()
+	harness := newPostgresConnectionHarness(t)
+	tx, err := harness.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin caller transaction: %v", err)
+	}
+	first, err := postgres.NewAdapterConnectionTx(tx).AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatalf("allocate caller transaction fence: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback caller transaction: %v", err)
+	}
+	second, err := harness.AllocateAdapterGrantFence(ctx)
+	if err != nil || second <= first {
+		t.Fatalf("post-rollback fence = %d, first = %d, err = %v", second, first, err)
+	}
+}
