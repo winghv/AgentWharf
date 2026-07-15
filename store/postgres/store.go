@@ -241,6 +241,16 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("lock pending command stream: %w", err)
 	}
+	if err := validateCommandAuthorityCurrent(ctx, queries, sessionID, authority); err != nil {
+		return store.PendingCommandCommit{}, err
+	}
+	storeNow, err = queries.CommandStoreNow(ctx)
+	if err != nil {
+		return store.PendingCommandCommit{}, fmt.Errorf("refresh command Store clock: %w", err)
+	}
+	if err := validatePendingCommandInput(event, request, storeNow.Time); err != nil {
+		return store.PendingCommandCommit{}, err
+	}
 	existing, err := queries.PendingCommandByID(ctx, db.PendingCommandByIDParams{SessionID: sessionID, CmdID: request.CommandID})
 	if err == nil {
 		if err := tx.Commit(ctx); err != nil {
@@ -256,11 +266,13 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 		return store.PendingCommandCommit{}, err
 	}
 	row, err := queries.InsertPendingCommand(ctx, db.InsertPendingCommandParams{
-		SessionID: sessionID,
-		CmdID:     request.CommandID,
-		Type:      request.Type,
-		EventSeq:  seq,
-		ExpiresAt: pgtype.Timestamptz{Time: request.ExpiresAt, Valid: true},
+		SessionID:            sessionID,
+		CmdID:                request.CommandID,
+		Type:                 request.Type,
+		EventSeq:             seq,
+		ExpiresAt:            pgtype.Timestamptz{Time: request.ExpiresAt, Valid: true},
+		ConnectionEpoch:      authority.ConnectionEpoch,
+		CredentialGeneration: authority.CredentialGeneration,
 	})
 	if err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("insert pending command: %w", err)
@@ -282,11 +294,23 @@ func (s *Store) ClaimPendingCommand(ctx context.Context, sessionID string, autho
 		return store.PendingCommandClaim{}, fmt.Errorf("lock claimable pending command: %w", err)
 	}
 	command := pendingCommand(row)
+	if err := validateCommandAuthorityCurrent(ctx, queries, sessionID, authority); err != nil {
+		return store.PendingCommandClaim{}, err
+	}
+	storeNow, err := queries.CommandStoreNow(ctx)
+	if err != nil {
+		return store.PendingCommandClaim{}, fmt.Errorf("refresh claim Store clock: %w", err)
+	}
+	if !command.ExpiresAt.After(storeNow.Time) {
+		return store.PendingCommandClaim{}, errors.New("pending command expired")
+	}
 	claimed := false
 	if command.Status == store.PendingCommandPending {
 		updated, updateErr := queries.UpdatePendingCommandStatus(ctx, db.UpdatePendingCommandStatusParams{
 			Status: string(store.PendingCommandReceived), SessionID: sessionID, CmdID: commandID,
-			ExpectedStatus: string(store.PendingCommandPending),
+			ExpectedStatus:   string(store.PendingCommandPending),
+			RequireUnexpired: true, ConnectionEpoch: authority.ConnectionEpoch,
+			CredentialGeneration: authority.CredentialGeneration,
 		})
 		if updateErr != nil {
 			return store.PendingCommandClaim{}, fmt.Errorf("claim pending command: %w", updateErr)
@@ -316,9 +340,14 @@ func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, aut
 	if store.PendingCommandStatus(row.Status) != store.PendingCommandReceived {
 		return store.PendingCommand{}, errors.New("pending command is not received")
 	}
+	if err := validateCommandAuthorityCurrent(ctx, queries, sessionID, authority); err != nil {
+		return store.PendingCommand{}, err
+	}
 	updated, err := queries.UpdatePendingCommandStatus(ctx, db.UpdatePendingCommandStatusParams{
 		Status: string(status), SessionID: sessionID, CmdID: commandID,
-		ExpectedStatus: string(store.PendingCommandReceived),
+		ExpectedStatus:   string(store.PendingCommandReceived),
+		RequireUnexpired: false, ConnectionEpoch: authority.ConnectionEpoch,
+		CredentialGeneration: authority.CredentialGeneration,
 	})
 	if err != nil {
 		return store.PendingCommand{}, fmt.Errorf("resolve pending command: %w", err)
@@ -352,6 +381,20 @@ func lockCommandAuthority(ctx context.Context, queries *db.Queries, sessionID st
 	})
 	if err != nil {
 		return fmt.Errorf("lock current command authority: %w", err)
+	}
+	return nil
+}
+
+func validateCommandAuthorityCurrent(ctx context.Context, queries *db.Queries, sessionID string, authority store.CommandAuthority) error {
+	current, err := queries.CommandAuthorityCurrent(ctx, db.CommandAuthorityCurrentParams{
+		SessionID: sessionID, ConnectionEpoch: authority.ConnectionEpoch,
+		CredentialGeneration: authority.CredentialGeneration,
+	})
+	if err != nil {
+		return fmt.Errorf("revalidate command authority: %w", err)
+	}
+	if !current {
+		return errors.New("command authority is no longer current")
 	}
 	return nil
 }

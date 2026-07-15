@@ -2,8 +2,10 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"strings"
 	"sync"
@@ -81,18 +83,7 @@ func TestPendingCommandStoreContract(t *testing.T) {
 	storetest.PendingCommandContract(t, storetest.PendingCommandHarness{
 		Open: func(t *testing.T) store.CommandLedgerStore {
 			t.Helper()
-			dsn := testDSN(t)
-			schemaName := fmt.Sprintf("agentwharf_command_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
-			setupSchema(t, dsn, schemaName)
-			harness := &postgresCommandHarness{dsn: dsn, schemaName: schemaName}
-			harness.reopen(t)
-			resetSchema(t, harness.pool)
-			harness.seedAuthority(t)
-			t.Cleanup(func() {
-				harness.pool.Close()
-				dropSchema(t, dsn, schemaName)
-			})
-			return harness
+			return newPostgresCommandHarness(t, "agentwharf_command", nil)
 		},
 		Reopen: func(t *testing.T, current store.CommandLedgerStore) store.CommandLedgerStore {
 			t.Helper()
@@ -137,8 +128,29 @@ type postgresCommandHarness struct {
 
 func (h *postgresCommandHarness) reopen(t *testing.T) {
 	t.Helper()
-	h.pool = openPool(t, h.dsn, h.schemaName, nil)
+	h.reopenWithTracer(t, nil)
+}
+
+func (h *postgresCommandHarness) reopenWithTracer(t *testing.T, tracer pgx.QueryTracer) {
+	t.Helper()
+	h.pool = openPool(t, h.dsn, h.schemaName, tracer)
 	h.Store = postgres.New(h.pool)
+}
+
+func newPostgresCommandHarness(t *testing.T, prefix string, tracer pgx.QueryTracer) *postgresCommandHarness {
+	t.Helper()
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("%s_%d_%d", prefix, time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	harness := &postgresCommandHarness{dsn: dsn, schemaName: schemaName}
+	harness.reopenWithTracer(t, tracer)
+	resetSchema(t, harness.pool)
+	harness.seedAuthority(t)
+	t.Cleanup(func() {
+		harness.pool.Close()
+		dropSchema(t, dsn, schemaName)
+	})
+	return harness
 }
 
 func (h *postgresCommandHarness) seedAuthority(t *testing.T) {
@@ -356,6 +368,154 @@ FOR EACH ROW EXECUTE FUNCTION reject_test_pending_command();
 	}
 }
 
+func TestPendingCommandRejectsAuthorityExpiredDuringStreamLockWait(t *testing.T) {
+	tracer := newQueryStartSignal("pg_advisory_xact_lock")
+	harness := newPostgresCommandHarness(t, "agentwharf_command_expiry", tracer)
+	blocker := openPool(t, harness.dsn, harness.schemaName, nil)
+	t.Cleanup(blocker.Close)
+	blockerTx, err := blocker.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin stream blocker: %v", err)
+	}
+	defer func() { _ = blockerTx.Rollback(context.Background()) }()
+	if _, err := blockerTx.Exec(context.Background(), `SELECT pg_advisory_xact_lock($1)`, commandAdvisoryLockKey("ses_command_1")); err != nil {
+		t.Fatalf("lock command stream: %v", err)
+	}
+	if _, err := harness.pool.Exec(context.Background(), `
+UPDATE session_adapter_connections
+SET active_credential_expires_at = clock_timestamp() + interval '250 milliseconds'
+`); err != nil {
+		t.Fatalf("shorten command authority: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, commitErr := harness.CommitPendingCommand(context.Background(), "ses_command_1",
+			store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+			store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"user"}`)},
+			store.PendingCommandRequest{CommandID: "cmd_expiry_wait", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)})
+		result <- commitErr
+	}()
+	<-tracer.started
+	time.Sleep(300 * time.Millisecond)
+	if err := blockerTx.Commit(context.Background()); err != nil {
+		t.Fatalf("release command stream: %v", err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("command committed after authority expired during stream wait")
+	}
+	assertPendingCommandRollback(t, harness, "ses_command_1")
+}
+
+func TestPendingCommandClaimRejectsExpiryDuringRowLockWait(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		expireAuthority   bool
+		commandExpiration time.Duration
+	}{
+		{name: "authority", expireAuthority: true, commandExpiration: 10 * time.Second},
+		{name: "command", commandExpiration: 350 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newPostgresCommandHarness(t, "agentwharf_claim_expiry", nil)
+			request := store.PendingCommandRequest{CommandID: "cmd_claim_wait", Type: "session.send", ExpiresAt: time.Now().Add(test.commandExpiration)}
+			if _, err := harness.CommitPendingCommand(context.Background(), "ses_command_claim",
+				store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+				store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"user"}`)}, request); err != nil {
+				t.Fatalf("prepare blocked claim: %v", err)
+			}
+			blocker := openPool(t, harness.dsn, harness.schemaName, nil)
+			t.Cleanup(blocker.Close)
+			blockerTx, err := blocker.Begin(context.Background())
+			if err != nil {
+				t.Fatalf("begin claim blocker: %v", err)
+			}
+			defer func() { _ = blockerTx.Rollback(context.Background()) }()
+			if _, err := blockerTx.Exec(context.Background(), `
+SELECT 1 FROM session_pending_commands
+WHERE session_id = 'ses_command_claim' AND cmd_id = 'cmd_claim_wait' FOR UPDATE
+`); err != nil {
+				t.Fatalf("lock pending command: %v", err)
+			}
+			if test.expireAuthority {
+				if _, err := harness.pool.Exec(context.Background(), `
+UPDATE session_adapter_connections
+SET active_credential_expires_at = clock_timestamp() + interval '250 milliseconds'
+`); err != nil {
+					t.Fatalf("shorten claim authority: %v", err)
+				}
+			}
+			tracer := newQueryStartSignal("LockPendingCommandForClaim")
+			harness.pool.Close()
+			harness.reopenWithTracer(t, tracer)
+			result := make(chan error, 1)
+			go func() {
+				_, claimErr := harness.ClaimPendingCommand(context.Background(), "ses_command_claim",
+					store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, request.CommandID)
+				result <- claimErr
+			}()
+			<-tracer.started
+			time.Sleep(400 * time.Millisecond)
+			if err := blockerTx.Commit(context.Background()); err != nil {
+				t.Fatalf("release pending command: %v", err)
+			}
+			if err := <-result; err == nil {
+				t.Fatalf("claim succeeded after %s expired during row wait", test.name)
+			}
+			assertPendingCommandStatus(t, harness, "ses_command_claim", request.CommandID, store.PendingCommandPending)
+		})
+	}
+}
+
+func TestPendingCommandResolveRejectsAuthorityExpiredDuringRowLockWait(t *testing.T) {
+	harness := newPostgresCommandHarness(t, "agentwharf_resolve_expiry", nil)
+	authority := store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+	request := store.PendingCommandRequest{CommandID: "cmd_resolve_wait", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := harness.CommitPendingCommand(context.Background(), "ses_command_claim", authority,
+		store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"user"}`)}, request); err != nil {
+		t.Fatalf("prepare blocked resolve: %v", err)
+	}
+	if claim, err := harness.ClaimPendingCommand(context.Background(), "ses_command_claim", authority, request.CommandID); err != nil || !claim.Claimed {
+		t.Fatalf("claim before blocked resolve = %+v, %v", claim, err)
+	}
+	blocker := openPool(t, harness.dsn, harness.schemaName, nil)
+	t.Cleanup(blocker.Close)
+	blockerTx, err := blocker.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin resolve blocker: %v", err)
+	}
+	defer func() { _ = blockerTx.Rollback(context.Background()) }()
+	if _, err := blockerTx.Exec(context.Background(), `
+SELECT 1 FROM session_pending_commands
+WHERE session_id = 'ses_command_claim' AND cmd_id = 'cmd_resolve_wait' FOR UPDATE
+`); err != nil {
+		t.Fatalf("lock received command: %v", err)
+	}
+	if _, err := harness.pool.Exec(context.Background(), `
+UPDATE session_adapter_connections
+SET active_credential_expires_at = clock_timestamp() + interval '250 milliseconds'
+`); err != nil {
+		t.Fatalf("shorten resolve authority: %v", err)
+	}
+	tracer := newQueryStartSignal("LockPendingCommandForResolve")
+	harness.pool.Close()
+	harness.reopenWithTracer(t, tracer)
+	result := make(chan error, 1)
+	go func() {
+		_, resolveErr := harness.ResolvePendingCommand(context.Background(), "ses_command_claim", authority, request.CommandID, store.PendingCommandCompleted)
+		result <- resolveErr
+	}()
+	<-tracer.started
+	time.Sleep(300 * time.Millisecond)
+	if err := blockerTx.Commit(context.Background()); err != nil {
+		t.Fatalf("release received command: %v", err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("resolve succeeded after authority expired during row wait")
+	}
+	assertPendingCommandStatus(t, harness, "ses_command_claim", request.CommandID, store.PendingCommandReceived)
+}
+
 func TestReplayStopsBeforeFetchingPastFirstCallbackError(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_store_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
@@ -505,6 +665,25 @@ type historySnapshotTracer struct {
 	once      sync.Once
 }
 
+type queryStartSignal struct {
+	needle  string
+	started chan struct{}
+	once    sync.Once
+}
+
+func newQueryStartSignal(needle string) *queryStartSignal {
+	return &queryStartSignal{needle: needle, started: make(chan struct{})}
+}
+
+func (tracer *queryStartSignal) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, tracer.needle) {
+		tracer.once.Do(func() { close(tracer.started) })
+	}
+	return ctx
+}
+
+func (*queryStartSignal) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
 func newHistorySnapshotTracer() *historySnapshotTracer {
 	return &historySnapshotTracer{pageQuery: make(chan struct{}), resume: make(chan struct{})}
 }
@@ -543,5 +722,37 @@ func resetSchema(t *testing.T, pool *pgxpool.Pool) {
 	}
 	if _, err := pool.Exec(context.Background(), string(fixture)); err != nil {
 		t.Fatalf("reset session_events schema: %v", err)
+	}
+}
+
+func commandAdvisoryLockKey(sessionID string) int64 {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(sessionID))
+	return int64(binary.BigEndian.Uint64(hash.Sum(nil)))
+}
+
+func assertPendingCommandRollback(t *testing.T, harness *postgresCommandHarness, sessionID string) {
+	t.Helper()
+	if latest, err := harness.LatestSeq(context.Background(), sessionID); err != nil || latest != 0 {
+		t.Fatalf("rejected command latest seq = %d, %v", latest, err)
+	}
+	var count int
+	if err := harness.pool.QueryRow(context.Background(), `
+SELECT COUNT(*) FROM session_pending_commands WHERE session_id = $1
+`, sessionID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rejected command rows = %d, %v", count, err)
+	}
+}
+
+func assertPendingCommandStatus(t *testing.T, harness *postgresCommandHarness, sessionID, commandID string, want store.PendingCommandStatus) {
+	t.Helper()
+	var got string
+	if err := harness.pool.QueryRow(context.Background(), `
+SELECT status FROM session_pending_commands WHERE session_id = $1 AND cmd_id = $2
+`, sessionID, commandID).Scan(&got); err != nil {
+		t.Fatalf("read pending command status: %v", err)
+	}
+	if store.PendingCommandStatus(got) != want {
+		t.Fatalf("pending command status = %s, want %s", got, want)
 	}
 }

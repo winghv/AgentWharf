@@ -1,16 +1,28 @@
 -- name: LockCommandAuthority :one
 SELECT true AS current
-FROM session_adapter_connections
-WHERE session_id = sqlc.arg(session_id)
-  AND connection_epoch = sqlc.arg(connection_epoch)
-  AND active_credential_generation = sqlc.arg(credential_generation)
-  AND active_credential_expires_at > statement_timestamp()
-  AND revoked_at IS NULL
-  AND terminal_at IS NULL
+FROM session_adapter_connections AS authority
+WHERE authority.session_id = sqlc.arg(session_id)
+  AND authority.connection_epoch = sqlc.arg(connection_epoch)
+  AND authority.active_credential_generation = sqlc.arg(credential_generation)
+  AND authority.active_credential_expires_at > clock_timestamp()
+  AND authority.revoked_at IS NULL
+  AND authority.terminal_at IS NULL
 FOR UPDATE;
 
 -- name: CommandStoreNow :one
-SELECT statement_timestamp()::TIMESTAMPTZ;
+SELECT clock_timestamp()::TIMESTAMPTZ;
+
+-- name: CommandAuthorityCurrent :one
+SELECT EXISTS (
+    SELECT 1
+    FROM session_adapter_connections AS authority
+    WHERE authority.session_id = sqlc.arg(session_id)
+      AND authority.connection_epoch = sqlc.arg(connection_epoch)
+      AND authority.active_credential_generation = sqlc.arg(credential_generation)
+      AND authority.active_credential_expires_at > clock_timestamp()
+      AND authority.revoked_at IS NULL
+      AND authority.terminal_at IS NULL
+) AS current;
 
 -- name: PendingCommandByID :one
 SELECT *
@@ -33,15 +45,34 @@ FOR UPDATE;
 -- name: InsertPendingCommand :one
 INSERT INTO session_pending_commands (
     session_id, cmd_id, type, event_seq, status, expires_at
-) VALUES (
+) SELECT
     sqlc.arg(session_id), sqlc.arg(cmd_id), sqlc.arg(type), sqlc.arg(event_seq), 'pending', sqlc.arg(expires_at)
-)
+FROM session_adapter_connections AS authority
+WHERE authority.session_id = sqlc.arg(session_id)
+  AND authority.connection_epoch = sqlc.arg(connection_epoch)
+  AND authority.active_credential_generation = sqlc.arg(credential_generation)
+  AND authority.active_credential_expires_at > clock_timestamp()
+  AND authority.revoked_at IS NULL
+  AND authority.terminal_at IS NULL
+  AND sqlc.arg(expires_at)::TIMESTAMPTZ > clock_timestamp()
+  AND sqlc.arg(expires_at)::TIMESTAMPTZ <= clock_timestamp() + interval '30 seconds'
 RETURNING *;
 
 -- name: UpdatePendingCommandStatus :one
-UPDATE session_pending_commands
+UPDATE session_pending_commands AS command
 SET status = sqlc.arg(status), updated_at = statement_timestamp()
-WHERE session_id = sqlc.arg(session_id)
-  AND cmd_id = sqlc.arg(cmd_id)
-  AND status = sqlc.arg(expected_status)
-RETURNING *;
+WHERE command.session_id = sqlc.arg(session_id)
+  AND command.cmd_id = sqlc.arg(cmd_id)
+  AND command.status = sqlc.arg(expected_status)
+  AND (NOT sqlc.arg(require_unexpired)::BOOLEAN OR command.expires_at > clock_timestamp())
+  AND EXISTS (
+      SELECT 1
+      FROM session_adapter_connections AS authority
+      WHERE authority.session_id = sqlc.arg(session_id)
+        AND authority.connection_epoch = sqlc.arg(connection_epoch)
+        AND authority.active_credential_generation = sqlc.arg(credential_generation)
+        AND authority.active_credential_expires_at > clock_timestamp()
+        AND authority.revoked_at IS NULL
+        AND authority.terminal_at IS NULL
+  )
+RETURNING command.*;
