@@ -278,6 +278,15 @@ type AdapterConnectionInitialize struct {
 	ActiveCredentialExpiresAt  time.Time
 }
 
+type AdapterCredentialPreHelloRefresh struct {
+	ExpectedActiveCredentialGeneration int64
+	ActiveCredentialExpiresAt          time.Time
+}
+
+type AdapterConnectionPreHelloTermination struct {
+	ExpectedActiveCredentialGeneration int64
+}
+
 type AdapterHello struct {
 	CredentialGeneration int64
 }
@@ -310,10 +319,15 @@ type AdapterCredentialActivation struct {
 // AdapterConnectionStore owns opaque Session connection fencing and credential
 // lineage truth. Normal hello and pending activation each advance the epoch and
 // accepted fence atomically against current Store-owned revocation, expiry, and
-// terminal state; callers cannot allocate epochs or accepted fences.
+// terminal state; callers cannot allocate epochs or accepted fences. A changed
+// pre-hello refresh is valid only after Store-clock expiry; exact retry may read
+// the same future expiry. Termination atomically revokes and terminalizes only a
+// never-connected exact generation.
 type AdapterConnectionStore interface {
 	EventStore
 	InitializeAdapterConnection(ctx context.Context, request AdapterConnectionInitialize) (AdapterConnection, error)
+	RefreshAdapterCredentialBeforeHello(ctx context.Context, sessionID string, refresh AdapterCredentialPreHelloRefresh) (AdapterConnection, error)
+	TerminateAdapterConnectionBeforeHello(ctx context.Context, sessionID string, termination AdapterConnectionPreHelloTermination) (AdapterConnection, error)
 	AcceptAdapterHello(ctx context.Context, sessionID string, hello AdapterHello) (AdapterConnection, error)
 	ValidateAdapterAdmission(ctx context.Context, sessionID string, admission AdapterConnectionAdmission) (AdapterConnection, error)
 	PrepareAdapterCredentialRotation(ctx context.Context, sessionID string, rotation AdapterCredentialRotation) (AdapterConnection, error)

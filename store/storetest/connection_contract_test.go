@@ -3,6 +3,7 @@ package storetest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -83,6 +84,37 @@ func (s *memoryConnectionStore) InitializeAdapterConnection(_ context.Context, r
 	s.connections[r.SessionID] = c
 	return c, nil
 }
+func (s *memoryConnectionStore) RefreshAdapterCredentialBeforeHello(_ context.Context, id string, r store.AdapterCredentialPreHelloRefresh) (store.AdapterConnection, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.connections[id]
+	now := time.Now()
+	exact := r.ActiveCredentialExpiresAt.Equal(c.ActiveCredentialExpiresAt) && r.ActiveCredentialExpiresAt.After(now)
+	replacement := !c.ActiveCredentialExpiresAt.After(now) && r.ActiveCredentialExpiresAt.After(now) && r.ActiveCredentialExpiresAt.After(c.ActiveCredentialExpiresAt)
+	if !ok || c.ConnectionEpoch != 0 || c.AcceptedFence != 0 || c.RevokedAt != nil || c.TerminalAt != nil || r.ExpectedActiveCredentialGeneration != c.ActiveCredentialGeneration || (!exact && !replacement) {
+		return store.AdapterConnection{}, errors.New("invalid pre-hello refresh")
+	}
+	c.ActiveCredentialExpiresAt = r.ActiveCredentialExpiresAt
+	s.connections[id] = c
+	return c, nil
+}
+func (s *memoryConnectionStore) TerminateAdapterConnectionBeforeHello(_ context.Context, id string, r store.AdapterConnectionPreHelloTermination) (store.AdapterConnection, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.connections[id]
+	if !ok || c.ConnectionEpoch != 0 || c.AcceptedFence != 0 || r.ExpectedActiveCredentialGeneration != c.ActiveCredentialGeneration {
+		return store.AdapterConnection{}, errors.New("invalid pre-hello termination")
+	}
+	if c.RevokedAt == nil && c.TerminalAt == nil {
+		now := time.Now()
+		c.RevokedAt, c.TerminalAt = &now, &now
+		s.connections[id] = c
+	}
+	if c.RevokedAt == nil || c.TerminalAt == nil {
+		return store.AdapterConnection{}, errors.New("conflicting pre-hello termination")
+	}
+	return c, nil
+}
 func (s *memoryConnectionStore) AcceptAdapterHello(_ context.Context, id string, h store.AdapterHello) (store.AdapterConnection, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -94,6 +126,137 @@ func (s *memoryConnectionStore) AcceptAdapterHello(_ context.Context, id string,
 	c.AcceptedFence++
 	s.connections[id] = c
 	return c, nil
+}
+
+func TestPreHelloLifecycleContract(t *testing.T) {
+	ctx := context.Background()
+	connections := &memoryConnectionStore{connections: make(map[string]store.AdapterConnection)}
+	init := store.AdapterConnectionInitialize{SessionID: "ses_refresh", ActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(100 * time.Millisecond)}
+	if _, err := connections.InitializeAdapterConnection(ctx, init); err != nil {
+		t.Fatal(err)
+	}
+	early := store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	if _, err := connections.RefreshAdapterCredentialBeforeHello(ctx, init.SessionID, early); err == nil {
+		t.Fatal("live credential refresh succeeded")
+	}
+	time.Sleep(150 * time.Millisecond)
+	refresh := store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	refreshed, err := connections.RefreshAdapterCredentialBeforeHello(ctx, init.SessionID, refresh)
+	if err != nil || !refreshed.ActiveCredentialExpiresAt.Equal(refresh.ActiveCredentialExpiresAt) {
+		t.Fatalf("refresh = %+v, %v", refreshed, err)
+	}
+	if exact, err := connections.RefreshAdapterCredentialBeforeHello(ctx, init.SessionID, refresh); err != nil || exact != refreshed {
+		t.Fatalf("exact refresh = %+v, %v", exact, err)
+	}
+	for _, invalid := range []store.AdapterCredentialPreHelloRefresh{
+		{ExpectedActiveCredentialGeneration: 2, ActiveCredentialExpiresAt: refresh.ActiveCredentialExpiresAt},
+		{ExpectedActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(-time.Minute)},
+		{ExpectedActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: refresh.ActiveCredentialExpiresAt.Add(-time.Second)},
+		{ExpectedActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: refresh.ActiveCredentialExpiresAt.Add(time.Second)},
+	} {
+		if _, err := connections.RefreshAdapterCredentialBeforeHello(ctx, init.SessionID, invalid); err == nil {
+			t.Fatalf("invalid refresh succeeded: %+v", invalid)
+		}
+	}
+	if _, err := connections.AcceptAdapterHello(ctx, init.SessionID, store.AdapterHello{CredentialGeneration: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connections.RefreshAdapterCredentialBeforeHello(ctx, init.SessionID, refresh); err == nil {
+		t.Fatal("post-hello refresh succeeded")
+	}
+	if _, err := connections.TerminateAdapterConnectionBeforeHello(ctx, init.SessionID, store.AdapterConnectionPreHelloTermination{ExpectedActiveCredentialGeneration: 3}); err == nil {
+		t.Fatal("post-hello termination succeeded")
+	}
+
+	terminationInit := store.AdapterConnectionInitialize{SessionID: "ses_terminate", ActiveCredentialGeneration: 4, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	if _, err := connections.InitializeAdapterConnection(ctx, terminationInit); err != nil {
+		t.Fatal(err)
+	}
+	request := store.AdapterConnectionPreHelloTermination{ExpectedActiveCredentialGeneration: 4}
+	terminated, err := connections.TerminateAdapterConnectionBeforeHello(ctx, terminationInit.SessionID, request)
+	if err != nil || terminated.RevokedAt == nil || terminated.TerminalAt == nil || !terminated.RevokedAt.Equal(*terminated.TerminalAt) {
+		t.Fatalf("termination = %+v, %v", terminated, err)
+	}
+	if exact, err := connections.TerminateAdapterConnectionBeforeHello(ctx, terminationInit.SessionID, request); err != nil || exact != terminated {
+		t.Fatalf("exact termination = %+v, %v", exact, err)
+	}
+	if _, err := connections.AcceptAdapterHello(ctx, terminationInit.SessionID, store.AdapterHello{CredentialGeneration: 4}); err == nil {
+		t.Fatal("late hello succeeded")
+	}
+
+	rollback := errors.New("rollback")
+	refreshRollback := store.AdapterConnectionInitialize{SessionID: "ses_refresh_rollback", ActiveCredentialGeneration: 5, ActiveCredentialExpiresAt: time.Now().Add(100 * time.Millisecond)}
+	if _, err := connections.InitializeAdapterConnection(ctx, refreshRollback); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	before := connections.connections[refreshRollback.SessionID]
+	if err := connections.WithAdapterConnectionTransaction(ctx, func(tx store.AdapterConnectionStore) error {
+		if _, err := tx.RefreshAdapterCredentialBeforeHello(ctx, refreshRollback.SessionID, store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 5, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) || connections.connections[refreshRollback.SessionID] != before {
+		t.Fatalf("refresh rollback = %v", err)
+	}
+	terminateRollback := store.AdapterConnectionInitialize{SessionID: "ses_terminate_rollback", ActiveCredentialGeneration: 6, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	if _, err := connections.InitializeAdapterConnection(ctx, terminateRollback); err != nil {
+		t.Fatal(err)
+	}
+	before = connections.connections[terminateRollback.SessionID]
+	if err := connections.WithAdapterConnectionTransaction(ctx, func(tx store.AdapterConnectionStore) error {
+		if _, err := tx.TerminateAdapterConnectionBeforeHello(ctx, terminateRollback.SessionID, store.AdapterConnectionPreHelloTermination{ExpectedActiveCredentialGeneration: 6}); err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) || connections.connections[terminateRollback.SessionID] != before {
+		t.Fatalf("termination rollback = %v", err)
+	}
+
+	for _, terminal := range []bool{false, true} {
+		id := fmt.Sprintf("ses_invalidated_%v", terminal)
+		if _, err := connections.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: id, ActiveCredentialGeneration: 7, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+		invalidated := connections.connections[id]
+		now := time.Now()
+		if terminal {
+			invalidated.TerminalAt = &now
+		} else {
+			invalidated.RevokedAt = &now
+		}
+		connections.connections[id] = invalidated
+		if _, err := connections.RefreshAdapterCredentialBeforeHello(ctx, id, store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 7, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err == nil {
+			t.Fatal("invalidated refresh succeeded")
+		}
+		if _, err := connections.TerminateAdapterConnectionBeforeHello(ctx, id, store.AdapterConnectionPreHelloTermination{ExpectedActiveCredentialGeneration: 7}); err == nil {
+			t.Fatal("invalidated termination succeeded")
+		}
+	}
+
+	raceInit := store.AdapterConnectionInitialize{SessionID: "ses_terminate_hello_race", ActiveCredentialGeneration: 8, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	if _, err := connections.InitializeAdapterConnection(ctx, raceInit); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var terminateErr, helloErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, terminateErr = connections.TerminateAdapterConnectionBeforeHello(ctx, raceInit.SessionID, store.AdapterConnectionPreHelloTermination{ExpectedActiveCredentialGeneration: 8})
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, helloErr = connections.AcceptAdapterHello(ctx, raceInit.SessionID, store.AdapterHello{CredentialGeneration: 8})
+	}()
+	close(start)
+	wg.Wait()
+	if (terminateErr == nil) == (helloErr == nil) {
+		t.Fatalf("terminate/hello race: terminate=%v hello=%v", terminateErr, helloErr)
+	}
 }
 func (s *memoryConnectionStore) ValidateAdapterAdmission(_ context.Context, id string, a store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
 	s.mu.Lock()
