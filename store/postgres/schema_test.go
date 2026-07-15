@@ -65,6 +65,21 @@ func TestSchemaFixtureSessionEventsHasNoPlatformForeignKey(t *testing.T) {
 	}
 }
 
+func TestSchemaFixtureCreatesStreamBeforeItsTriggers(t *testing.T) {
+	fixture, err := os.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatalf("read sqlc schema fixture: %v", err)
+	}
+	schema := string(fixture)
+	table := strings.Index(schema, "CREATE TABLE session_event_streams")
+	insertTrigger := strings.Index(schema, "CREATE TRIGGER session_events_track_stream_insert")
+	deleteTrigger := strings.Index(schema, "CREATE TRIGGER session_events_mark_stream_retention_gap")
+	nextTable := strings.Index(schema, "CREATE TABLE session_attention_summaries")
+	if table < 0 || insertTrigger <= table || deleteTrigger <= insertTrigger || nextTable <= deleteTrigger {
+		t.Fatal("stream table and retention triggers are not created in dependency order")
+	}
+}
+
 func TestSchemaFixtureForeignKeysUseDefaultReferentialActions(t *testing.T) {
 	fixture, err := os.ReadFile("schema.sql")
 	if err != nil {
