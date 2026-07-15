@@ -28,6 +28,12 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
+// NewAdapterConnectionTx binds connection operations to a caller-owned
+// transaction. The caller alone commits or rolls it back.
+func NewAdapterConnectionTx(tx pgx.Tx) *Store {
+	return &Store{connectionTx: tx}
+}
+
 func (s *Store) Append(ctx context.Context, sessionID string, evs []store.PendingEvent) (firstSeq int64, err error) {
 	if len(evs) == 0 {
 		return 0, nil
@@ -485,8 +491,8 @@ func (s *Store) AcceptAdapterHello(ctx context.Context, sessionID string, hello 
 }
 
 func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
-	if !validConnectionID(sessionID) || admission.CredentialGeneration < 1 || admission.ConnectionEpoch < 0 ||
-		admission.AcceptedFence < 0 || admission.GrantFence <= admission.AcceptedFence {
+	if !validConnectionID(sessionID) || admission.CredentialGeneration < 1 || admission.ConnectionEpoch < 1 ||
+		admission.AcceptedFence < 1 || admission.GrantFence <= admission.AcceptedFence {
 		return store.AdapterConnection{}, errors.New("invalid adapter admission")
 	}
 	queries, err := s.adapterConnectionQueries()
@@ -504,7 +510,7 @@ func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, 
 }
 
 func (s *Store) PrepareAdapterCredentialRotation(ctx context.Context, sessionID string, rotation store.AdapterCredentialRotation) (store.AdapterConnection, error) {
-	if !validConnectionID(sessionID) || rotation.ExpectedActiveCredentialGeneration < 1 || rotation.ExpectedEpoch < 0 ||
+	if !validConnectionID(sessionID) || rotation.ExpectedActiveCredentialGeneration < 1 || rotation.ExpectedEpoch < 1 ||
 		rotation.PendingGeneration < 1 || !validAttachmentText(rotation.RotationID, 255) {
 		return store.AdapterConnection{}, errors.New("invalid adapter credential rotation")
 	}
@@ -524,7 +530,7 @@ func (s *Store) PrepareAdapterCredentialRotation(ctx context.Context, sessionID 
 }
 
 func (s *Store) ActivateAdapterCredential(ctx context.Context, sessionID string, activation store.AdapterCredentialActivation) (store.AdapterConnection, error) {
-	if !validConnectionID(sessionID) || activation.ExpectedActiveCredentialGeneration < 1 || activation.ExpectedEpoch < 0 ||
+	if !validConnectionID(sessionID) || activation.ExpectedActiveCredentialGeneration < 1 || activation.ExpectedEpoch < 1 ||
 		activation.PendingGeneration < 1 || !validAttachmentText(activation.RotationID, 255) {
 		return store.AdapterConnection{}, errors.New("invalid adapter credential activation")
 	}

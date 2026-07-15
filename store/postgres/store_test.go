@@ -425,6 +425,94 @@ func TestAdapterConnectionInitializeExactRetry(t *testing.T) {
 	}
 }
 
+func TestAdapterConnectionRejectsPreHelloLiveOperations(t *testing.T) {
+	harness := newPostgresConnectionHarness(t)
+	request := store.AdapterConnectionInitialize{
+		SessionID: "ses_connection", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute),
+	}
+	initialized, err := harness.InitializeAdapterConnection(context.Background(), request)
+	if err != nil {
+		t.Fatalf("initialize pre-hello connection: %v", err)
+	}
+	if _, err := harness.ValidateAdapterAdmission(context.Background(), request.SessionID, store.AdapterConnectionAdmission{
+		CredentialGeneration: 1, ConnectionEpoch: 0, AcceptedFence: 0, GrantFence: 1,
+	}); err == nil {
+		t.Fatal("pre-hello admission unexpectedly succeeded")
+	}
+	if _, err := harness.PrepareAdapterCredentialRotation(context.Background(), request.SessionID, store.AdapterCredentialRotation{
+		ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: 0, PendingGeneration: 2,
+		ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_prehello",
+	}); err == nil {
+		t.Fatal("pre-hello rotation unexpectedly succeeded")
+	}
+	if _, err := harness.pool.Exec(context.Background(), `
+UPDATE session_adapter_connections
+SET pending_credential_generation = 2,
+    pending_credential_expires_at = clock_timestamp() + interval '1 minute',
+    rotation_id = 'rot_prehello', credential_generation_high_watermark = 2
+WHERE session_id = 'ses_connection'
+`); err != nil {
+		t.Fatalf("seed pre-hello pending generation: %v", err)
+	}
+	pending := mustConnection(t, harness, request.SessionID)
+	if _, err := harness.ActivateAdapterCredential(context.Background(), request.SessionID, store.AdapterCredentialActivation{
+		ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: 0, PendingGeneration: 2, RotationID: "rot_prehello",
+	}); err == nil {
+		t.Fatal("pre-hello activation unexpectedly succeeded")
+	}
+	if current := mustConnection(t, harness, request.SessionID); !reflect.DeepEqual(current, pending) || initialized.ConnectionEpoch != 0 {
+		t.Fatalf("pre-hello rejection mutated connection = %+v, want %+v", current, pending)
+	}
+}
+
+func TestAdapterConnectionCallerOwnedTransaction(t *testing.T) {
+	harness := newPostgresConnectionHarness(t)
+	request := store.AdapterConnectionInitialize{
+		SessionID: "ses_connection_transaction", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute),
+	}
+	tx, err := harness.pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin caller transaction: %v", err)
+	}
+	bound := postgres.NewAdapterConnectionTx(tx)
+	if _, err := bound.InitializeAdapterConnection(context.Background(), request); err != nil {
+		t.Fatalf("initialize in caller transaction: %v", err)
+	}
+	if _, err := harness.AdapterConnection(context.Background(), request.SessionID); err == nil {
+		t.Fatal("uncommitted caller transaction became externally visible")
+	}
+	if err := tx.Rollback(context.Background()); err != nil {
+		t.Fatalf("rollback caller transaction: %v", err)
+	}
+	if _, err := harness.AdapterConnection(context.Background(), request.SessionID); err == nil {
+		t.Fatal("rolled back caller transaction left connection lineage")
+	}
+	tx, err = harness.pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin committed caller transaction: %v", err)
+	}
+	bound = postgres.NewAdapterConnectionTx(tx)
+	committed, err := bound.InitializeAdapterConnection(context.Background(), request)
+	if err != nil {
+		t.Fatalf("initialize committed caller transaction: %v", err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit caller transaction: %v", err)
+	}
+	if current := mustConnection(t, harness, request.SessionID); !reflect.DeepEqual(current, committed) {
+		t.Fatalf("committed caller transaction = %+v, want %+v", current, committed)
+	}
+}
+
+func mustConnection(t *testing.T, harness *postgresConnectionHarness, sessionID string) store.AdapterConnection {
+	t.Helper()
+	connection, err := harness.AdapterConnection(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("read adapter connection: %v", err)
+	}
+	return connection
+}
+
 type postgresConnectionHarness struct {
 	*postgres.Store
 	pool       *pgxpool.Pool

@@ -40,6 +40,7 @@ WHERE session_id = sqlc.arg(session_id)
   AND active_credential_generation = sqlc.arg(credential_generation)
   AND connection_epoch = sqlc.arg(connection_epoch)
   AND accepted_fence = sqlc.arg(accepted_fence)
+  AND connection_epoch > 0 AND accepted_fence > 0
   AND sqlc.arg(grant_fence)::BIGINT > accepted_fence
   AND active_credential_expires_at > clock_timestamp()
   AND revoked_at IS NULL
@@ -55,6 +56,7 @@ SET pending_credential_generation = sqlc.arg(pending_generation),
 WHERE session_id = sqlc.arg(session_id)
   AND active_credential_generation = sqlc.arg(expected_active_generation)
   AND connection_epoch = sqlc.arg(expected_epoch)
+  AND connection_epoch > 0 AND accepted_fence > 0
   AND pending_credential_generation IS NULL
   AND sqlc.arg(pending_generation)::BIGINT > credential_generation_high_watermark
   AND active_credential_expires_at > clock_timestamp()
@@ -77,6 +79,7 @@ SET prior_recovery_credential_generation = active_credential_generation,
 WHERE session_id = sqlc.arg(session_id)
   AND active_credential_generation = sqlc.arg(expected_active_generation)
   AND connection_epoch = sqlc.arg(expected_epoch)
+  AND connection_epoch > 0 AND accepted_fence > 0
   AND pending_credential_generation = sqlc.arg(pending_generation)
   AND rotation_id = sqlc.arg(rotation_id)
   AND active_credential_expires_at > clock_timestamp()
