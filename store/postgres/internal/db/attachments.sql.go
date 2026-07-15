@@ -155,6 +155,8 @@ SET status = $1,
     updated_at = clock_timestamp()
 WHERE attach_id = $6
   AND delivery_version = $7
+  AND ($1 <> 'start_received' OR status = 'start_received'
+       OR (expires_at IS NOT NULL AND expires_at > clock_timestamp()))
 RETURNING attach_id, bootstrap_session_id, target_session_id, status, delivery_state, delivery_version, queue_reason, expires_at, canceled_at, blocking_session_id, target_credential_lineage_ref, created_at, updated_at
 `
 
