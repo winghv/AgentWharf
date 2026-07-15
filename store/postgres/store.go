@@ -358,6 +358,76 @@ func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, aut
 	return pendingCommand(updated), nil
 }
 
+func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, authority store.CommandAuthority, proposal store.ProposedEventRequest) (store.ProposedEventReceipt, error) {
+	if s.pool == nil {
+		return store.ProposedEventReceipt{}, errors.New("postgres event store pool is nil")
+	}
+	event := proposal.Event
+	event.Payload = append([]byte(nil), proposal.Event.Payload...)
+	if err := validateProposedEventInput(sessionID, authority, proposal.ProposalID, event); err != nil {
+		return store.ProposedEventReceipt{}, err
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("begin proposed event transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	if err := lockCommandAuthority(ctx, queries, sessionID, authority); err != nil {
+		return store.ProposedEventReceipt{}, err
+	}
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("lock proposed event stream: %w", err)
+	}
+	if err := validateCommandAuthorityCurrent(ctx, queries, sessionID, authority); err != nil {
+		return store.ProposedEventReceipt{}, err
+	}
+	existing, err := queries.ProposedEventByID(ctx, db.ProposedEventByIDParams{
+		SessionID: sessionID, ProposalID: pgtype.Text{String: proposal.ProposalID, Valid: true},
+		EventType: event.Type, Payload: event.Payload,
+	})
+	if err == nil {
+		if !existing.Matches.Valid || !existing.Matches.Bool {
+			return store.ProposedEventReceipt{}, errors.New("conflicting proposed event retry")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return store.ProposedEventReceipt{}, fmt.Errorf("commit proposed event duplicate: %w", err)
+		}
+		return proposedEventReceipt(sessionID, proposal.ProposalID, existing.Seq), nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.ProposedEventReceipt{}, fmt.Errorf("select proposed event: %w", err)
+	}
+	latest, err := queries.LatestSessionEventSeq(ctx, sessionID)
+	if err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("select proposed event sequence: %w", err)
+	}
+	row, err := queries.InsertProposedEvent(ctx, db.InsertProposedEventParams{
+		SessionID: sessionID, Seq: latest + 1, EventType: event.Type, Payload: event.Payload,
+		ProposalID: pgtype.Text{String: proposal.ProposalID, Valid: true}, CreatedAt: pgtype.Timestamptz{Time: event.Time, Valid: true},
+		ConnectionEpoch: authority.ConnectionEpoch, CredentialGeneration: authority.CredentialGeneration,
+	})
+	if err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("insert proposed event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("commit proposed event: %w", err)
+	}
+	return proposedEventReceipt(row.SessionID, proposal.ProposalID, row.Seq), nil
+}
+
+func validateProposedEventInput(sessionID string, authority store.CommandAuthority, proposalID string, event store.PendingEvent) error {
+	if sessionID == "" || len(sessionID) > 255 || proposalID == "" || len(proposalID) > 255 ||
+		authority.ConnectionEpoch < 1 || authority.CredentialGeneration < 1 || event.Type == "" || !json.Valid(event.Payload) {
+		return errors.New("invalid proposed event")
+	}
+	return nil
+}
+
+func proposedEventReceipt(sessionID, proposalID string, seq int64) store.ProposedEventReceipt {
+	return store.ProposedEventReceipt{SessionID: sessionID, ProposalID: proposalID, Seq: seq, Status: store.ProposedEventAccepted}
+}
+
 func (s *Store) CreateAttachment(ctx context.Context, request store.AttachmentCreate) (store.AttachmentCommit, error) {
 	if s.pool == nil {
 		return store.AttachmentCommit{}, errors.New("postgres event store pool is nil")

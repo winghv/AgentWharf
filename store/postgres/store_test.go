@@ -214,6 +214,214 @@ func TestAttachmentOutcomeOperationIsBounded(t *testing.T) {
 	}
 }
 
+func TestProposedEventStoreContract(t *testing.T) {
+	storetest.ProposalContract(t, storetest.ProposalHarness{
+		Open: func(t *testing.T) store.ProposedEventStore {
+			t.Helper()
+			return newPostgresProposalHarness(t)
+		},
+		Reopen: func(t *testing.T, current store.ProposedEventStore) store.ProposedEventStore {
+			t.Helper()
+			harness := current.(*postgresProposalHarness)
+			harness.pool.Close()
+			harness.reopen(t)
+			return harness
+		},
+		Authority: func(t *testing.T, _ store.ProposedEventStore) store.CommandAuthority {
+			t.Helper()
+			return store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+		},
+		Invalidate: func(t *testing.T, current store.ProposedEventStore, kind storetest.CommandAuthorityFailure) {
+			t.Helper()
+			harness := current.(*postgresProposalHarness)
+			var statement string
+			switch kind {
+			case storetest.CommandAuthoritySuperseded:
+				statement = "UPDATE session_adapter_connections SET connection_epoch = 2"
+			case storetest.CommandAuthorityRevoked:
+				statement = "UPDATE session_adapter_connections SET revoked_at = clock_timestamp()"
+			case storetest.CommandAuthorityExpired:
+				statement = "UPDATE session_adapter_connections SET created_at = clock_timestamp() - interval '2 minutes', active_credential_expires_at = clock_timestamp() - interval '1 minute'"
+			case storetest.CommandAuthorityTerminal:
+				statement = "UPDATE session_adapter_connections SET terminal_at = clock_timestamp()"
+			default:
+				t.Fatalf("unknown proposal authority failure %q", kind)
+			}
+			if _, err := harness.pool.Exec(context.Background(), statement); err != nil {
+				t.Fatalf("invalidate proposal authority %s: %v", kind, err)
+			}
+		},
+	})
+}
+
+func TestProposedEventRollback(t *testing.T) {
+	harness := newPostgresProposalHarness(t)
+	if _, err := harness.pool.Exec(context.Background(), `
+CREATE FUNCTION reject_test_proposed_event() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.proposal_id IS NOT NULL THEN RAISE EXCEPTION 'forced proposed event failure'; END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER session_events_reject_test_proposal
+BEFORE INSERT ON session_events FOR EACH ROW EXECUTE FUNCTION reject_test_proposed_event();
+`); err != nil {
+		t.Fatalf("install proposed event failpoint: %v", err)
+	}
+	_, err := harness.CommitProposedEvent(context.Background(), "ses_proposal_1",
+		store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+		store.ProposedEventRequest{ProposalID: "proposal_rollback", Event: store.PendingEvent{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"starting"}`)}})
+	if err == nil {
+		t.Fatal("CommitProposedEvent() unexpectedly succeeded through failpoint")
+	}
+	assertProposedEventRollback(t, harness, "ses_proposal_1")
+}
+
+func TestProposedEventRejectsQueuedAuthorityChange(t *testing.T) {
+	updates := map[string]string{
+		"epoch":      "UPDATE session_adapter_connections SET connection_epoch = 2 WHERE session_id = 'ses_proposal_1'",
+		"generation": "UPDATE session_adapter_connections SET active_credential_generation = 2, credential_generation_high_watermark = 2 WHERE session_id = 'ses_proposal_1'",
+		"revoked":    "UPDATE session_adapter_connections SET revoked_at = clock_timestamp() WHERE session_id = 'ses_proposal_1'",
+		"expired":    "UPDATE session_adapter_connections SET created_at = clock_timestamp() - interval '2 minutes', active_credential_expires_at = clock_timestamp() - interval '1 minute' WHERE session_id = 'ses_proposal_1'",
+		"terminal":   "UPDATE session_adapter_connections SET terminal_at = clock_timestamp() WHERE session_id = 'ses_proposal_1'",
+	}
+	for name, update := range updates {
+		t.Run(name, func(t *testing.T) {
+			harness := newPostgresProposalHarness(t)
+			tracer := newQueryStartSignal("FROM session_adapter_connections AS authority")
+			harness.pool.Close()
+			harness.reopenWithTracer(t, tracer)
+			blocker := openPool(t, harness.dsn, harness.schemaName, nil)
+			t.Cleanup(blocker.Close)
+			tx, err := blocker.Begin(context.Background())
+			if err != nil {
+				t.Fatalf("begin authority blocker: %v", err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			if _, err := tx.Exec(context.Background(), "SELECT 1 FROM session_adapter_connections WHERE session_id = 'ses_proposal_1' FOR UPDATE"); err != nil {
+				t.Fatalf("lock proposal authority: %v", err)
+			}
+			result := make(chan error, 1)
+			go func() {
+				_, commitErr := harness.CommitProposedEvent(context.Background(), "ses_proposal_1",
+					store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+					store.ProposedEventRequest{ProposalID: "proposal_queued_" + name, Event: store.PendingEvent{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"starting"}`)}})
+				result <- commitErr
+			}()
+			<-tracer.started
+			if _, err := tx.Exec(context.Background(), update); err != nil {
+				t.Fatalf("change queued proposal authority: %v", err)
+			}
+			if err := tx.Commit(context.Background()); err != nil {
+				t.Fatalf("commit queued authority change: %v", err)
+			}
+			if err := <-result; err == nil {
+				t.Fatal("queued proposal committed after authority changed")
+			}
+			assertProposedEventRollback(t, harness, "ses_proposal_1")
+		})
+	}
+}
+
+func TestProposedEventRejectsExpiryDuringStreamWait(t *testing.T) {
+	harness := newPostgresProposalHarness(t)
+	tracer := newQueryStartSignal("pg_advisory_xact_lock")
+	harness.pool.Close()
+	harness.reopenWithTracer(t, tracer)
+	blocker := openPool(t, harness.dsn, harness.schemaName, nil)
+	t.Cleanup(blocker.Close)
+	tx, err := blocker.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin proposal stream blocker: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(context.Background(), "SELECT pg_advisory_xact_lock($1)", commandAdvisoryLockKey("ses_proposal_1")); err != nil {
+		t.Fatalf("lock proposal stream: %v", err)
+	}
+	if _, err := harness.pool.Exec(context.Background(), "UPDATE session_adapter_connections SET active_credential_expires_at = clock_timestamp() + interval '250 milliseconds'"); err != nil {
+		t.Fatalf("shorten proposal authority: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, commitErr := harness.CommitProposedEvent(context.Background(), "ses_proposal_1",
+			store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+			store.ProposedEventRequest{ProposalID: "proposal_expiry_wait", Event: store.PendingEvent{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"starting"}`)}})
+		result <- commitErr
+	}()
+	<-tracer.started
+	time.Sleep(300 * time.Millisecond)
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("release proposal stream: %v", err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("proposal committed after authority expired during stream wait")
+	}
+	assertProposedEventRollback(t, harness, "ses_proposal_1")
+}
+
+func assertProposedEventRollback(t *testing.T, harness *postgresProposalHarness, sessionID string) {
+	t.Helper()
+	if latest, err := harness.LatestSeq(context.Background(), sessionID); err != nil || latest != 0 {
+		t.Fatalf("proposed event rollback latest seq = %d, %v", latest, err)
+	}
+	var count int
+	if err := harness.pool.QueryRow(context.Background(), "SELECT COUNT(*) FROM session_events WHERE proposal_id IS NOT NULL").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("proposed event rollback rows = %d, %v", count, err)
+	}
+}
+
+type postgresProposalHarness struct {
+	*postgres.Store
+	pool       *pgxpool.Pool
+	dsn        string
+	schemaName string
+}
+
+func newPostgresProposalHarness(t *testing.T) *postgresProposalHarness {
+	t.Helper()
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_proposal_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	harness := &postgresProposalHarness{dsn: dsn, schemaName: schemaName}
+	harness.reopen(t)
+	resetSchema(t, harness.pool)
+	harness.seedAuthority(t)
+	t.Cleanup(func() {
+		harness.pool.Close()
+		dropSchema(t, dsn, schemaName)
+	})
+	return harness
+}
+
+func (h *postgresProposalHarness) reopen(t *testing.T) {
+	t.Helper()
+	h.reopenWithTracer(t, nil)
+}
+
+func (h *postgresProposalHarness) reopenWithTracer(t *testing.T, tracer pgx.QueryTracer) {
+	t.Helper()
+	h.pool = openPool(t, h.dsn, h.schemaName, tracer)
+	h.Store = postgres.New(h.pool)
+}
+
+func (h *postgresProposalHarness) seedAuthority(t *testing.T) {
+	t.Helper()
+	sessionIDs := []string{"ses_proposal_1", "ses_proposal_conflict", "ses_proposal_snapshot", "ses_proposal_stale", "ses_proposal_reopen"}
+	if _, err := h.pool.Exec(context.Background(), `INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS session_id`, sessionIDs); err != nil {
+		t.Fatalf("seed proposal sessions: %v", err)
+	}
+	if _, err := h.pool.Exec(context.Background(), `
+INSERT INTO session_adapter_connections (
+    session_id, connection_epoch, accepted_fence, active_credential_generation,
+    credential_generation_high_watermark, active_credential_expires_at
+)
+SELECT session_id, 1, 1, 1, 1, clock_timestamp() + interval '1 hour'
+FROM unnest($1::text[]) AS session_id
+`, sessionIDs); err != nil {
+		t.Fatalf("seed proposal authority: %v", err)
+	}
+}
+
 type postgresAttachmentHarness struct {
 	*postgres.Store
 	pool       *pgxpool.Pool
