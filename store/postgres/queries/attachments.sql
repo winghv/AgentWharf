@@ -32,4 +32,6 @@ SET status = sqlc.arg(status),
     updated_at = clock_timestamp()
 WHERE attach_id = sqlc.arg(attach_id)
   AND delivery_version = sqlc.arg(expected_version)
+  AND (sqlc.arg(status) <> 'start_received' OR status = 'start_received'
+       OR (expires_at IS NOT NULL AND expires_at > clock_timestamp()))
 RETURNING *;

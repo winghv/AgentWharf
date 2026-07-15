@@ -362,19 +362,15 @@ func (s *Store) CreateAttachment(ctx context.Context, request store.AttachmentCr
 	if s.pool == nil {
 		return store.AttachmentCommit{}, errors.New("postgres event store pool is nil")
 	}
+	if err := validateAttachmentIdentity(request.Identity); err != nil {
+		return store.AttachmentCommit{}, err
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return store.AttachmentCommit{}, fmt.Errorf("begin attachment create: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := db.New(tx)
-	storeNow, err := queries.AttachmentStoreNow(ctx)
-	if err != nil {
-		return store.AttachmentCommit{}, fmt.Errorf("read attachment Store clock: %w", err)
-	}
-	if err := validateAttachmentCreate(request, storeNow.Time); err != nil {
-		return store.AttachmentCommit{}, err
-	}
 	existing, err := queries.AttachmentByID(ctx, request.Identity.AttachID)
 	if err == nil {
 		attachment := attachment(existing)
@@ -388,6 +384,13 @@ func (s *Store) CreateAttachment(ctx context.Context, request store.AttachmentCr
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return store.AttachmentCommit{}, fmt.Errorf("select attachment: %w", err)
+	}
+	storeNow, err := queries.AttachmentStoreNow(ctx)
+	if err != nil {
+		return store.AttachmentCommit{}, fmt.Errorf("read attachment Store clock: %w", err)
+	}
+	if !validAttachmentExpiry(request.ExpiresAt, storeNow.Time) {
+		return store.AttachmentCommit{}, errors.New("attachment expiry is outside the Store-clock delivery window")
 	}
 	row, err := queries.InsertAttachment(ctx, db.InsertAttachmentParams{
 		AttachID: request.Identity.AttachID, BootstrapSessionID: request.Identity.BootstrapSessionID,
@@ -468,8 +471,7 @@ func (s *Store) UpdateAttachment(ctx context.Context, attachID string, expectedV
 	return store.AttachmentMutation{Attachment: updated, Summary: attachmentSummary(updated, update.Blocker)}, nil
 }
 
-func validateAttachmentCreate(request store.AttachmentCreate, storeNow time.Time) error {
-	identity := request.Identity
+func validateAttachmentIdentity(identity store.AttachmentIdentity) error {
 	if !validAttachmentText(identity.AttachID, 255) ||
 		!validAttachmentText(identity.BootstrapSessionID, 255) ||
 		!validAttachmentText(identity.TargetSessionID, 255) ||
@@ -479,9 +481,6 @@ func validateAttachmentCreate(request store.AttachmentCreate, storeNow time.Time
 	if identity.BootstrapSessionID == identity.TargetSessionID {
 		return errors.New("attachment bootstrap and target sessions must differ")
 	}
-	if !validAttachmentExpiry(request.ExpiresAt, storeNow) {
-		return errors.New("attachment expiry is outside the Store-clock delivery window")
-	}
 	return nil
 }
 
@@ -489,6 +488,10 @@ func validateAttachmentUpdate(current store.Attachment, update store.AttachmentU
 	if current.Status == store.AttachmentCanceled ||
 		(current.Status == store.AttachmentStartReceived && update.Status != store.AttachmentStartReceived) {
 		return errors.New("terminal attachment status cannot be reopened")
+	}
+	if update.Status == store.AttachmentStartReceived && current.Status != store.AttachmentStartReceived &&
+		(current.ExpiresAt == nil || !current.ExpiresAt.After(storeNow)) {
+		return errors.New("expired attachment cannot record start receipt")
 	}
 	if update.ExpiresAt != nil {
 		if !validAttachmentExpiry(*update.ExpiresAt, storeNow) {
@@ -531,8 +534,7 @@ func validateAttachmentUpdate(current store.Attachment, update store.AttachmentU
 		if update.QueueReason == nil && update.ExpiresAt == nil && update.BlockingSessionID == nil {
 			if update.DeliveryState == store.AttachmentDeliveryOutcomeUnknown {
 				valid = summaryMatches(store.AttachmentBlockerOutcomeUnknown, false, false, false, true) &&
-					update.Blocker.Operation != nil &&
-					(*update.Blocker.Operation == "start" || *update.Blocker.Operation == "command")
+					validAttachmentOperation(update.Blocker.Operation)
 			} else {
 				valid = (update.DeliveryState == store.AttachmentDeliveryReceived || update.DeliveryState == store.AttachmentDeliveryCompleted) && update.Blocker == nil
 			}
@@ -540,7 +542,8 @@ func validateAttachmentUpdate(current store.Attachment, update store.AttachmentU
 	case store.AttachmentReauthorizationRequired:
 		if update.QueueReason == nil && update.ExpiresAt == nil && update.BlockingSessionID == nil {
 			if update.DeliveryState == store.AttachmentDeliveryOutcomeUnknown {
-				valid = summaryMatches(store.AttachmentBlockerOutcomeUnknown, false, false, false, true)
+				valid = summaryMatches(store.AttachmentBlockerOutcomeUnknown, false, false, false, true) &&
+					validAttachmentOperation(update.Blocker.Operation)
 			} else {
 				valid = update.DeliveryState == store.AttachmentDeliveryPending &&
 					summaryMatches(store.AttachmentBlockerReauthorizationRequired, false, false, false, false)
@@ -563,6 +566,10 @@ func validAttachmentExpiry(expiresAt, storeNow time.Time) bool {
 
 func validAttachmentText(value string, max int) bool {
 	return len(value) > 0 && len(value) <= max
+}
+
+func validAttachmentOperation(value *string) bool {
+	return value != nil && (*value == "start" || *value == "command")
 }
 
 func attachment(row db.SessionAttachment) store.Attachment {

@@ -160,6 +160,60 @@ func TestAttachmentCreateRollback(t *testing.T) {
 	}
 }
 
+func TestAttachmentExpiredRetryAndStart(t *testing.T) {
+	harness := newPostgresAttachmentHarness(t)
+	request := store.AttachmentCreate{
+		Identity: store.AttachmentIdentity{
+			AttachID: "attach_expired_retry", BootstrapSessionID: "ses_bootstrap_expired_retry",
+			TargetSessionID: "ses_target_expired_retry", TargetCredentialLineageRef: "lineage_expired_retry",
+		},
+		ExpiresAt: time.Now().Add(250 * time.Millisecond),
+	}
+	created, err := harness.CreateAttachment(context.Background(), request)
+	if err != nil {
+		t.Fatalf("CreateAttachment() error = %v", err)
+	}
+	time.Sleep(time.Until(request.ExpiresAt) + 100*time.Millisecond)
+	retry, err := harness.CreateAttachment(context.Background(), request)
+	if err != nil || !retry.Noop || retry.Attachment.Identity != created.Attachment.Identity {
+		t.Fatalf("expired exact retry = %+v, %v; want durable no-op", retry, err)
+	}
+	started := store.AttachmentUpdate{Status: store.AttachmentStartReceived, DeliveryState: store.AttachmentDeliveryReceived}
+	if _, err := harness.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, started); err == nil {
+		t.Fatal("expired attachment unexpectedly recorded start receipt")
+	}
+	stored, err := harness.Attachment(context.Background(), request.Identity.AttachID)
+	if err != nil || stored.Status != store.AttachmentJoinPending || stored.DeliveryVersion != 0 {
+		t.Fatalf("expired attachment after rejected start = %+v, %v", stored, err)
+	}
+}
+
+func TestAttachmentOutcomeOperationIsBounded(t *testing.T) {
+	harness := newPostgresAttachmentHarness(t)
+	request := store.AttachmentCreate{
+		Identity: store.AttachmentIdentity{
+			AttachID: "attach_operation", BootstrapSessionID: "ses_bootstrap_operation",
+			TargetSessionID: "ses_target_operation", TargetCredentialLineageRef: "lineage_operation",
+		},
+		ExpiresAt: time.Now().Add(20 * time.Second),
+	}
+	if _, err := harness.CreateAttachment(context.Background(), request); err != nil {
+		t.Fatalf("CreateAttachment() error = %v", err)
+	}
+	reauthorize := store.AttachmentUpdate{Status: store.AttachmentReauthorizationRequired, DeliveryState: store.AttachmentDeliveryPending,
+		Blocker: &store.AttachmentBlocker{Kind: store.AttachmentBlockerReauthorizationRequired}}
+	if _, err := harness.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, reauthorize); err != nil {
+		t.Fatalf("reauthorization update: %v", err)
+	}
+	for _, operation := range []string{"other", strings.Repeat("x", 129)} {
+		unknown := store.AttachmentUpdate{Status: store.AttachmentReauthorizationRequired, DeliveryState: store.AttachmentDeliveryOutcomeUnknown,
+			Blocker: &store.AttachmentBlocker{Kind: store.AttachmentBlockerOutcomeUnknown, Operation: &operation}}
+		if _, err := harness.UpdateAttachment(context.Background(), request.Identity.AttachID, 1, unknown); err == nil {
+			t.Fatalf("outcome_unknown operation %q unexpectedly succeeded", operation)
+		}
+	}
+}
+
 type postgresAttachmentHarness struct {
 	*postgres.Store
 	pool       *pgxpool.Pool
@@ -203,6 +257,8 @@ INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS ses
 		"ses_bootstrap_expiry", "ses_target_expiry", "ses_blocker_expiry",
 		"ses_bootstrap_concurrent", "ses_target_concurrent",
 		"ses_bootstrap_reopen", "ses_target_reopen",
+		"ses_bootstrap_expired_retry", "ses_target_expired_retry",
+		"ses_bootstrap_operation", "ses_target_operation",
 	}); err != nil {
 		t.Fatalf("seed attachment sessions: %v", err)
 	}
