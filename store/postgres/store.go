@@ -475,6 +475,41 @@ func (s *Store) InitializeAdapterConnection(ctx context.Context, request store.A
 	return adapterConnection(existing), nil
 }
 
+func (s *Store) RefreshAdapterCredentialBeforeHello(ctx context.Context, sessionID string, refresh store.AdapterCredentialPreHelloRefresh) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || refresh.ExpectedActiveCredentialGeneration < 1 || refresh.ActiveCredentialExpiresAt.IsZero() {
+		return store.AdapterConnection{}, errors.New("invalid pre-hello adapter credential refresh")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.RefreshAdapterCredentialBeforeHello(ctx, db.RefreshAdapterCredentialBeforeHelloParams{
+		SessionID: sessionID, ExpectedActiveGeneration: refresh.ExpectedActiveCredentialGeneration,
+		ActiveExpiresAt: pgtype.Timestamptz{Time: refresh.ActiveCredentialExpiresAt, Valid: true},
+	})
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("refresh pre-hello adapter credential: %w", err)
+	}
+	return adapterConnection(db.SessionAdapterConnection(row)), nil
+}
+
+func (s *Store) TerminateAdapterConnectionBeforeHello(ctx context.Context, sessionID string, termination store.AdapterConnectionPreHelloTermination) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || termination.ExpectedActiveCredentialGeneration < 1 {
+		return store.AdapterConnection{}, errors.New("invalid pre-hello adapter connection termination")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.TerminateAdapterConnectionBeforeHello(ctx, db.TerminateAdapterConnectionBeforeHelloParams{
+		SessionID: sessionID, ExpectedActiveGeneration: termination.ExpectedActiveCredentialGeneration,
+	})
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("terminate pre-hello adapter connection: %w", err)
+	}
+	return adapterConnection(db.SessionAdapterConnection(row)), nil
+}
+
 func (s *Store) AcceptAdapterHello(ctx context.Context, sessionID string, hello store.AdapterHello) (store.AdapterConnection, error) {
 	if !validConnectionID(sessionID) || hello.CredentialGeneration < 1 {
 		return store.AdapterConnection{}, errors.New("invalid adapter hello")

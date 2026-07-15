@@ -22,6 +22,65 @@ WHERE session_id = sqlc.arg(session_id)
   AND pending_credential_generation IS NULL AND prior_recovery_credential_generation IS NULL
   AND rotation_id IS NULL AND revoked_at IS NULL AND terminal_at IS NULL;
 
+-- name: RefreshAdapterCredentialBeforeHello :one
+WITH locked AS MATERIALIZED (
+  SELECT connection.* FROM session_adapter_connections connection
+  WHERE connection.session_id = sqlc.arg(session_id)
+  FOR UPDATE
+), refreshed AS (
+  UPDATE session_adapter_connections AS connection
+  SET active_credential_expires_at = sqlc.arg(active_expires_at),
+      updated_at = clock_timestamp()
+  WHERE connection.session_id = sqlc.arg(session_id)
+    AND EXISTS (SELECT 1 FROM locked)
+    AND connection.active_credential_generation = sqlc.arg(expected_active_generation)
+    AND connection.connection_epoch = 0 AND connection.accepted_fence = 0
+    AND connection.pending_credential_generation IS NULL AND connection.prior_recovery_credential_generation IS NULL
+    AND connection.rotation_id IS NULL AND connection.revoked_at IS NULL AND connection.terminal_at IS NULL
+    AND connection.active_credential_expires_at <= clock_timestamp()
+    AND sqlc.arg(active_expires_at)::TIMESTAMPTZ > clock_timestamp()
+    AND sqlc.arg(active_expires_at)::TIMESTAMPTZ > connection.active_credential_expires_at
+  RETURNING connection.*
+)
+SELECT * FROM refreshed
+UNION ALL
+SELECT locked.* FROM locked
+WHERE locked.active_credential_generation = sqlc.arg(expected_active_generation)
+  AND locked.connection_epoch = 0 AND locked.accepted_fence = 0
+  AND locked.active_credential_expires_at = sqlc.arg(active_expires_at)
+  AND locked.active_credential_expires_at > clock_timestamp()
+  AND locked.pending_credential_generation IS NULL AND locked.prior_recovery_credential_generation IS NULL
+  AND locked.rotation_id IS NULL AND locked.revoked_at IS NULL AND locked.terminal_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM refreshed)
+LIMIT 1;
+
+-- name: TerminateAdapterConnectionBeforeHello :one
+WITH locked AS MATERIALIZED (
+  SELECT connection.* FROM session_adapter_connections connection
+  WHERE connection.session_id = sqlc.arg(session_id)
+  FOR UPDATE
+), terminated AS (
+  UPDATE session_adapter_connections AS connection
+  SET revoked_at = statement_timestamp(), terminal_at = statement_timestamp(),
+      updated_at = statement_timestamp()
+  WHERE connection.session_id = sqlc.arg(session_id)
+    AND EXISTS (SELECT 1 FROM locked)
+    AND connection.active_credential_generation = sqlc.arg(expected_active_generation)
+    AND connection.connection_epoch = 0 AND connection.accepted_fence = 0
+    AND connection.pending_credential_generation IS NULL AND connection.prior_recovery_credential_generation IS NULL
+    AND connection.rotation_id IS NULL AND connection.revoked_at IS NULL AND connection.terminal_at IS NULL
+  RETURNING connection.*
+)
+SELECT * FROM terminated
+UNION ALL
+SELECT locked.* FROM locked
+WHERE locked.active_credential_generation = sqlc.arg(expected_active_generation)
+  AND locked.connection_epoch = 0 AND locked.accepted_fence = 0
+  AND locked.pending_credential_generation IS NULL AND locked.prior_recovery_credential_generation IS NULL
+  AND locked.rotation_id IS NULL AND locked.revoked_at IS NOT NULL AND locked.terminal_at IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM terminated)
+LIMIT 1;
+
 -- name: AcceptAdapterHello :one
 UPDATE session_adapter_connections
 SET connection_epoch = connection_epoch + 1,
