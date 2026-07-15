@@ -11,8 +11,34 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const commandAuthorityCurrent = `-- name: CommandAuthorityCurrent :one
+SELECT EXISTS (
+    SELECT 1
+    FROM session_adapter_connections AS authority
+    WHERE authority.session_id = $1
+      AND authority.connection_epoch = $2
+      AND authority.active_credential_generation = $3
+      AND authority.active_credential_expires_at > clock_timestamp()
+      AND authority.revoked_at IS NULL
+      AND authority.terminal_at IS NULL
+) AS current
+`
+
+type CommandAuthorityCurrentParams struct {
+	SessionID            string
+	ConnectionEpoch      int64
+	CredentialGeneration int64
+}
+
+func (q *Queries) CommandAuthorityCurrent(ctx context.Context, arg CommandAuthorityCurrentParams) (bool, error) {
+	row := q.db.QueryRow(ctx, commandAuthorityCurrent, arg.SessionID, arg.ConnectionEpoch, arg.CredentialGeneration)
+	var current bool
+	err := row.Scan(&current)
+	return current, err
+}
+
 const commandStoreNow = `-- name: CommandStoreNow :one
-SELECT statement_timestamp()::TIMESTAMPTZ
+SELECT clock_timestamp()::TIMESTAMPTZ
 `
 
 func (q *Queries) CommandStoreNow(ctx context.Context) (pgtype.Timestamptz, error) {
@@ -25,18 +51,28 @@ func (q *Queries) CommandStoreNow(ctx context.Context) (pgtype.Timestamptz, erro
 const insertPendingCommand = `-- name: InsertPendingCommand :one
 INSERT INTO session_pending_commands (
     session_id, cmd_id, type, event_seq, status, expires_at
-) VALUES (
+) SELECT
     $1, $2, $3, $4, 'pending', $5
-)
+FROM session_adapter_connections AS authority
+WHERE authority.session_id = $1
+  AND authority.connection_epoch = $6
+  AND authority.active_credential_generation = $7
+  AND authority.active_credential_expires_at > clock_timestamp()
+  AND authority.revoked_at IS NULL
+  AND authority.terminal_at IS NULL
+  AND $5::TIMESTAMPTZ > clock_timestamp()
+  AND $5::TIMESTAMPTZ <= clock_timestamp() + interval '30 seconds'
 RETURNING session_id, cmd_id, type, event_seq, status, expires_at, created_at, updated_at
 `
 
 type InsertPendingCommandParams struct {
-	SessionID string
-	CmdID     string
-	Type      string
-	EventSeq  int64
-	ExpiresAt pgtype.Timestamptz
+	SessionID            string
+	CmdID                string
+	Type                 string
+	EventSeq             int64
+	ExpiresAt            pgtype.Timestamptz
+	ConnectionEpoch      int64
+	CredentialGeneration int64
 }
 
 func (q *Queries) InsertPendingCommand(ctx context.Context, arg InsertPendingCommandParams) (SessionPendingCommand, error) {
@@ -46,6 +82,8 @@ func (q *Queries) InsertPendingCommand(ctx context.Context, arg InsertPendingCom
 		arg.Type,
 		arg.EventSeq,
 		arg.ExpiresAt,
+		arg.ConnectionEpoch,
+		arg.CredentialGeneration,
 	)
 	var i SessionPendingCommand
 	err := row.Scan(
@@ -63,13 +101,13 @@ func (q *Queries) InsertPendingCommand(ctx context.Context, arg InsertPendingCom
 
 const lockCommandAuthority = `-- name: LockCommandAuthority :one
 SELECT true AS current
-FROM session_adapter_connections
-WHERE session_id = $1
-  AND connection_epoch = $2
-  AND active_credential_generation = $3
-  AND active_credential_expires_at > statement_timestamp()
-  AND revoked_at IS NULL
-  AND terminal_at IS NULL
+FROM session_adapter_connections AS authority
+WHERE authority.session_id = $1
+  AND authority.connection_epoch = $2
+  AND authority.active_credential_generation = $3
+  AND authority.active_credential_expires_at > clock_timestamp()
+  AND authority.revoked_at IS NULL
+  AND authority.terminal_at IS NULL
 FOR UPDATE
 `
 
@@ -171,19 +209,33 @@ func (q *Queries) PendingCommandByID(ctx context.Context, arg PendingCommandByID
 }
 
 const updatePendingCommandStatus = `-- name: UpdatePendingCommandStatus :one
-UPDATE session_pending_commands
+UPDATE session_pending_commands AS command
 SET status = $1, updated_at = statement_timestamp()
-WHERE session_id = $2
-  AND cmd_id = $3
-  AND status = $4
-RETURNING session_id, cmd_id, type, event_seq, status, expires_at, created_at, updated_at
+WHERE command.session_id = $2
+  AND command.cmd_id = $3
+  AND command.status = $4
+  AND (NOT $5::BOOLEAN OR command.expires_at > clock_timestamp())
+  AND EXISTS (
+      SELECT 1
+      FROM session_adapter_connections AS authority
+      WHERE authority.session_id = $2
+        AND authority.connection_epoch = $6
+        AND authority.active_credential_generation = $7
+        AND authority.active_credential_expires_at > clock_timestamp()
+        AND authority.revoked_at IS NULL
+        AND authority.terminal_at IS NULL
+  )
+RETURNING command.session_id, command.cmd_id, command.type, command.event_seq, command.status, command.expires_at, command.created_at, command.updated_at
 `
 
 type UpdatePendingCommandStatusParams struct {
-	Status         string
-	SessionID      string
-	CmdID          string
-	ExpectedStatus string
+	Status               string
+	SessionID            string
+	CmdID                string
+	ExpectedStatus       string
+	RequireUnexpired     bool
+	ConnectionEpoch      int64
+	CredentialGeneration int64
 }
 
 func (q *Queries) UpdatePendingCommandStatus(ctx context.Context, arg UpdatePendingCommandStatusParams) (SessionPendingCommand, error) {
@@ -192,6 +244,9 @@ func (q *Queries) UpdatePendingCommandStatus(ctx context.Context, arg UpdatePend
 		arg.SessionID,
 		arg.CmdID,
 		arg.ExpectedStatus,
+		arg.RequireUnexpired,
+		arg.ConnectionEpoch,
+		arg.CredentialGeneration,
 	)
 	var i SessionPendingCommand
 	err := row.Scan(
