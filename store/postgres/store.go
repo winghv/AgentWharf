@@ -131,28 +131,41 @@ func (s *Store) History(ctx context.Context, sessionID string, beforeSeq *int64,
 	}()
 
 	queries := db.New(tx)
-	bounds, err := queries.SessionEventHistoryBounds(ctx, sessionID)
+	historyState, err := queries.SessionEventHistoryState(ctx, sessionID)
 	if err != nil {
-		return store.HistoryPage{}, fmt.Errorf("select history bounds: %w", err)
+		return store.HistoryPage{}, fmt.Errorf("select history state: %w", err)
 	}
-	cursor := pgtype.Int8{}
-	if beforeSeq != nil {
-		cursor = pgtype.Int8{Int64: *beforeSeq, Valid: true}
-	}
-	rows, err := queries.ReverseSessionEventPage(ctx, db.ReverseSessionEventPageParams{
-		SessionID: sessionID,
-		BeforeSeq: cursor,
-		PageLimit: int32(limit + 1),
-	})
-	if err != nil {
-		return store.HistoryPage{}, fmt.Errorf("select reverse history page: %w", err)
+	rows := make([]historyRow, 0, limit+1)
+	if beforeSeq == nil {
+		pageRows, queryErr := queries.ReverseSessionEventPage(ctx, db.ReverseSessionEventPageParams{
+			SessionID: sessionID,
+			PageLimit: int32(limit + 1),
+		})
+		if queryErr != nil {
+			return store.HistoryPage{}, fmt.Errorf("select reverse history page: %w", queryErr)
+		}
+		for _, row := range pageRows {
+			rows = append(rows, historyRow(row))
+		}
+	} else {
+		pageRows, queryErr := queries.ReverseSessionEventPageBefore(ctx, db.ReverseSessionEventPageBeforeParams{
+			SessionID: sessionID,
+			BeforeSeq: *beforeSeq,
+			PageLimit: int32(limit + 1),
+		})
+		if queryErr != nil {
+			return store.HistoryPage{}, fmt.Errorf("select reverse history page before cursor: %w", queryErr)
+		}
+		for _, row := range pageRows {
+			rows = append(rows, historyRow(row))
+		}
 	}
 
 	page := store.HistoryPage{
-		LatestSeq:      bounds.LatestSeq,
+		LatestSeq:      historyState.LatestSeq,
 		RetentionState: store.RetentionComplete,
 	}
-	if bounds.EarliestSeq > 1 {
+	if historyState.RetentionGap {
 		page.RetentionState = store.RetentionGap
 	}
 	if len(rows) > limit {
@@ -174,6 +187,14 @@ func (s *Store) History(ctx context.Context, sessionID string, beforeSeq *int64,
 		return store.HistoryPage{}, fmt.Errorf("commit history transaction: %w", err)
 	}
 	return page, nil
+}
+
+type historyRow struct {
+	SessionID string
+	Seq       int64
+	Type      string
+	Payload   []byte
+	CreatedAt pgtype.Timestamptz
 }
 
 func (s *Store) LatestSeq(ctx context.Context, sessionID string) (int64, error) {

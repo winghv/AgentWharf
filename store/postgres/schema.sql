@@ -20,6 +20,66 @@ CREATE INDEX session_events_session_seq_idx ON session_events (session_id, seq);
 CREATE UNIQUE INDEX session_events_proposal_id_idx
     ON session_events (session_id, proposal_id) WHERE proposal_id IS NOT NULL;
 
+CREATE TABLE session_event_streams (
+    session_id TEXT PRIMARY KEY CHECK (char_length(session_id) BETWEEN 1 AND 255),
+    latest_seq BIGINT NOT NULL DEFAULT 0 CHECK (latest_seq >= 0),
+    retention_gap BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
+);
+
+CREATE FUNCTION enforce_session_event_stream_monotonicity()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.latest_seq < OLD.latest_seq THEN
+        RAISE EXCEPTION 'session event stream latest_seq must not regress';
+    END IF;
+    IF OLD.retention_gap AND NOT NEW.retention_gap THEN
+        RAISE EXCEPTION 'session event stream retention_gap must not clear';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER session_event_streams_enforce_monotonicity
+BEFORE UPDATE ON session_event_streams FOR EACH ROW
+EXECUTE FUNCTION enforce_session_event_stream_monotonicity();
+
+CREATE FUNCTION track_session_event_stream_insert()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO session_event_streams (
+        session_id, latest_seq, retention_gap, created_at, updated_at
+    ) VALUES (
+        NEW.session_id, NEW.seq, NEW.seq <> 1, NEW.created_at, statement_timestamp()
+    )
+    ON CONFLICT (session_id) DO UPDATE
+    SET latest_seq = GREATEST(session_event_streams.latest_seq, EXCLUDED.latest_seq),
+        retention_gap = session_event_streams.retention_gap
+            OR EXCLUDED.latest_seq > session_event_streams.latest_seq + 1,
+        updated_at = statement_timestamp();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER session_events_track_stream_insert
+AFTER INSERT ON session_events FOR EACH ROW
+EXECUTE FUNCTION track_session_event_stream_insert();
+
+CREATE FUNCTION mark_session_event_stream_retention_gap()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE session_event_streams
+    SET retention_gap = true, updated_at = statement_timestamp()
+    WHERE session_id = OLD.session_id;
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER session_events_mark_stream_retention_gap
+AFTER DELETE ON session_events FOR EACH ROW
+EXECUTE FUNCTION mark_session_event_stream_retention_gap();
+
 CREATE TABLE session_attention_summaries (
     session_id TEXT PRIMARY KEY CHECK (char_length(session_id) BETWEEN 1 AND 255),
     latest_seq BIGINT NOT NULL DEFAULT 0 CHECK (latest_seq >= 0),

@@ -137,6 +137,77 @@ func TestHistoryUsesInitialSnapshotAcrossConcurrentAppend(t *testing.T) {
 	}
 }
 
+func TestHistoryRetainsHighWaterAfterAllEventsArePruned(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_history_all_pruned_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	postgresStore := postgres.New(pool)
+	if _, err := postgresStore.Append(context.Background(), "ses_history_all_pruned", []store.PendingEvent{
+		{Type: "session.message", Time: time.Unix(1, 0), Payload: []byte(`{"n":1}`)},
+		{Type: "session.message", Time: time.Unix(2, 0), Payload: []byte(`{"n":2}`)},
+		{Type: "session.message", Time: time.Unix(3, 0), Payload: []byte(`{"n":3}`)},
+	}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `DELETE FROM session_events WHERE session_id = 'ses_history_all_pruned'`); err != nil {
+		t.Fatalf("prune all history: %v", err)
+	}
+
+	page, err := postgresStore.History(context.Background(), "ses_history_all_pruned", nil, 100)
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	if len(page.Events) != 0 || page.LatestSeq != 3 || page.RetentionState != store.RetentionGap {
+		t.Fatalf("all-pruned history lost durable truth: %+v", page)
+	}
+	if latest, err := postgresStore.LatestSeq(context.Background(), "ses_history_all_pruned"); err != nil || latest != 3 {
+		t.Fatalf("LatestSeq() after all-pruned = %d, %v", latest, err)
+	}
+}
+
+func TestHistoryReportsInternalRetentionGap(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_history_internal_gap_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	postgresStore := postgres.New(pool)
+	events := make([]store.PendingEvent, 5)
+	for index := range events {
+		events[index] = store.PendingEvent{
+			Type: "session.message", Time: time.Unix(int64(index+1), 0), Payload: []byte(`{"n":1}`),
+		}
+	}
+	if _, err := postgresStore.Append(context.Background(), "ses_history_internal_gap", events); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `DELETE FROM session_events WHERE session_id = 'ses_history_internal_gap' AND seq = 3`); err != nil {
+		t.Fatalf("prune internal history: %v", err)
+	}
+
+	page, err := postgresStore.History(context.Background(), "ses_history_internal_gap", nil, 100)
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	want := []int64{1, 2, 4, 5}
+	if len(page.Events) != len(want) || page.LatestSeq != 5 || page.RetentionState != store.RetentionGap {
+		t.Fatalf("internal-gap history = %+v", page)
+	}
+	for index, event := range page.Events {
+		if event.Seq != want[index] {
+			t.Fatalf("internal-gap event[%d].Seq = %d, want %d", index, event.Seq, want[index])
+		}
+	}
+}
+
 func TestAppendRollsBackBatchWhenLaterPayloadIsInvalid(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_append_rollback_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
