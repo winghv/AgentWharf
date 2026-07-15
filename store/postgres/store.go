@@ -18,7 +18,8 @@ import (
 )
 
 type Store struct {
-	pool *pgxpool.Pool
+	pool         *pgxpool.Pool
+	connectionTx pgx.Tx
 }
 
 const maxHistoryPageSize = 100
@@ -414,6 +415,182 @@ func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, autho
 		return store.ProposedEventReceipt{}, fmt.Errorf("commit proposed event: %w", err)
 	}
 	return proposedEventReceipt(row.SessionID, proposal.ProposalID, row.Seq), nil
+}
+
+func (s *Store) WithAdapterConnectionTransaction(ctx context.Context, fn func(store.AdapterConnectionStore) error) error {
+	if fn == nil {
+		return errors.New("adapter connection transaction callback is nil")
+	}
+	if s.connectionTx != nil {
+		return errors.New("nested adapter connection transaction is not supported")
+	}
+	if s.pool == nil {
+		return errors.New("postgres event store pool is nil")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin adapter connection transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := fn(&Store{connectionTx: tx}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit adapter connection transaction: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) InitializeAdapterConnection(ctx context.Context, request store.AdapterConnectionInitialize) (store.AdapterConnection, error) {
+	if !validConnectionID(request.SessionID) || request.ActiveCredentialGeneration < 1 {
+		return store.AdapterConnection{}, errors.New("invalid adapter connection initialization")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.InitializeAdapterConnection(ctx, db.InitializeAdapterConnectionParams{
+		SessionID: request.SessionID, ActiveGeneration: request.ActiveCredentialGeneration,
+		ActiveExpiresAt: pgtype.Timestamptz{Time: request.ActiveCredentialExpiresAt, Valid: true},
+	})
+	if err == nil {
+		return adapterConnection(row), nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.AdapterConnection{}, fmt.Errorf("initialize adapter connection: %w", err)
+	}
+	existing, err := queries.MatchingInitialAdapterConnection(ctx, db.MatchingInitialAdapterConnectionParams{
+		SessionID: request.SessionID, ActiveGeneration: request.ActiveCredentialGeneration,
+		ActiveExpiresAt: pgtype.Timestamptz{Time: request.ActiveCredentialExpiresAt, Valid: true},
+	})
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("adapter connection initialization conflicts with existing state: %w", err)
+	}
+	return adapterConnection(existing), nil
+}
+
+func (s *Store) AcceptAdapterHello(ctx context.Context, sessionID string, hello store.AdapterHello) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || hello.CredentialGeneration < 1 {
+		return store.AdapterConnection{}, errors.New("invalid adapter hello")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.AcceptAdapterHello(ctx, db.AcceptAdapterHelloParams{SessionID: sessionID, CredentialGeneration: hello.CredentialGeneration})
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("accept adapter hello: %w", err)
+	}
+	return adapterConnection(row), nil
+}
+
+func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || admission.CredentialGeneration < 1 || admission.ConnectionEpoch < 0 ||
+		admission.AcceptedFence < 0 || admission.GrantFence <= admission.AcceptedFence {
+		return store.AdapterConnection{}, errors.New("invalid adapter admission")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.ValidateAdapterAdmission(ctx, db.ValidateAdapterAdmissionParams{
+		SessionID: sessionID, CredentialGeneration: admission.CredentialGeneration,
+		ConnectionEpoch: admission.ConnectionEpoch, AcceptedFence: admission.AcceptedFence, GrantFence: admission.GrantFence,
+	})
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("validate adapter admission: %w", err)
+	}
+	return adapterConnection(row), nil
+}
+
+func (s *Store) PrepareAdapterCredentialRotation(ctx context.Context, sessionID string, rotation store.AdapterCredentialRotation) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || rotation.ExpectedActiveCredentialGeneration < 1 || rotation.ExpectedEpoch < 0 ||
+		rotation.PendingGeneration < 1 || !validAttachmentText(rotation.RotationID, 255) {
+		return store.AdapterConnection{}, errors.New("invalid adapter credential rotation")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.PrepareAdapterCredentialRotation(ctx, db.PrepareAdapterCredentialRotationParams{
+		PendingGeneration: pgtype.Int8{Int64: rotation.PendingGeneration, Valid: true}, PendingExpiresAt: pgtype.Timestamptz{Time: rotation.ExpiresAt, Valid: true},
+		RotationID: pgtype.Text{String: rotation.RotationID, Valid: true}, SessionID: sessionID,
+		ExpectedActiveGeneration: rotation.ExpectedActiveCredentialGeneration, ExpectedEpoch: rotation.ExpectedEpoch,
+	})
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("prepare adapter credential rotation: %w", err)
+	}
+	return adapterConnection(row), nil
+}
+
+func (s *Store) ActivateAdapterCredential(ctx context.Context, sessionID string, activation store.AdapterCredentialActivation) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || activation.ExpectedActiveCredentialGeneration < 1 || activation.ExpectedEpoch < 0 ||
+		activation.PendingGeneration < 1 || !validAttachmentText(activation.RotationID, 255) {
+		return store.AdapterConnection{}, errors.New("invalid adapter credential activation")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.ActivateAdapterCredential(ctx, db.ActivateAdapterCredentialParams{
+		SessionID: sessionID, ExpectedActiveGeneration: activation.ExpectedActiveCredentialGeneration,
+		ExpectedEpoch: activation.ExpectedEpoch, PendingGeneration: pgtype.Int8{Int64: activation.PendingGeneration, Valid: true},
+		RotationID: pgtype.Text{String: activation.RotationID, Valid: true},
+	})
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("activate adapter credential: %w", err)
+	}
+	return adapterConnection(row), nil
+}
+
+func (s *Store) AdapterConnection(ctx context.Context, sessionID string) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) {
+		return store.AdapterConnection{}, errors.New("invalid adapter connection session")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.AdapterConnectionByID(ctx, sessionID)
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("select adapter connection: %w", err)
+	}
+	return adapterConnection(row), nil
+}
+
+func (s *Store) adapterConnectionQueries() (*db.Queries, error) {
+	if s.connectionTx != nil {
+		return db.New(s.connectionTx), nil
+	}
+	if s.pool == nil {
+		return nil, errors.New("postgres event store pool is nil")
+	}
+	return db.New(s.pool), nil
+}
+
+func validConnectionID(value string) bool {
+	return len(value) > 0 && len(value) <= 255
+}
+
+func adapterConnection(row db.SessionAdapterConnection) store.AdapterConnection {
+	return store.AdapterConnection{
+		SessionID: row.SessionID, ConnectionEpoch: row.ConnectionEpoch, AcceptedFence: row.AcceptedFence,
+		ActiveCredentialGeneration:        row.ActiveCredentialGeneration,
+		CredentialGenerationHighWatermark: row.CredentialGenerationHighWatermark,
+		ActiveCredentialExpiresAt:         row.ActiveCredentialExpiresAt.Time,
+		PendingCredentialGeneration:       int64Pointer(row.PendingCredentialGeneration),
+		PendingCredentialExpiresAt:        timePointer(row.PendingCredentialExpiresAt),
+		PriorRecoveryGeneration:           int64Pointer(row.PriorRecoveryCredentialGeneration),
+		RotationID:                        textPointer(row.RotationID), RevokedAt: timePointer(row.RevokedAt), TerminalAt: timePointer(row.TerminalAt),
+	}
+}
+
+func int64Pointer(value pgtype.Int8) *int64 {
+	if !value.Valid {
+		return nil
+	}
+	copy := value.Int64
+	return &copy
 }
 
 func validateProposedEventInput(sessionID string, authority store.CommandAuthority, proposalID string, event store.PendingEvent) error {

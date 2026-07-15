@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -357,6 +358,107 @@ func TestProposedEventRejectsExpiryDuringStreamWait(t *testing.T) {
 		t.Fatal("proposal committed after authority expired during stream wait")
 	}
 	assertProposedEventRollback(t, harness, "ses_proposal_1")
+}
+
+func TestAdapterConnectionStoreContract(t *testing.T) {
+	storetest.ConnectionContract(t, storetest.ConnectionHarness{
+		Open: func(t *testing.T) store.AdapterConnectionStore {
+			t.Helper()
+			return newPostgresConnectionHarness(t)
+		},
+		Invalidate: func(t *testing.T, current store.AdapterConnectionStore, terminal bool) {
+			t.Helper()
+			harness := current.(*postgresConnectionHarness)
+			column := "revoked_at"
+			if terminal {
+				column = "terminal_at"
+			}
+			if _, err := harness.pool.Exec(context.Background(), "UPDATE session_adapter_connections SET "+column+" = clock_timestamp() WHERE session_id = 'ses_connection'"); err != nil {
+				t.Fatalf("invalidate adapter connection: %v", err)
+			}
+		},
+	})
+}
+
+func TestAdapterConnectionReopenPreservesGlobalFence(t *testing.T) {
+	harness := newPostgresConnectionHarness(t)
+	for _, sessionID := range []string{"ses_connection", "ses_connection_other"} {
+		if _, err := harness.InitializeAdapterConnection(context.Background(), store.AdapterConnectionInitialize{
+			SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute),
+		}); err != nil {
+			t.Fatalf("initialize %s: %v", sessionID, err)
+		}
+	}
+	first, err := harness.AcceptAdapterHello(context.Background(), "ses_connection", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("first global fence: %v", err)
+	}
+	second, err := harness.AcceptAdapterHello(context.Background(), "ses_connection_other", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil || second.AcceptedFence <= first.AcceptedFence {
+		t.Fatalf("second global fence = %+v, %v; first=%+v", second, err, first)
+	}
+	harness.pool.Close()
+	harness.reopen(t)
+	reopened, err := harness.AdapterConnection(context.Background(), "ses_connection_other")
+	if err != nil || !reflect.DeepEqual(reopened, second) {
+		t.Fatalf("reopened connection = %+v, %v; want %+v", reopened, err, second)
+	}
+	third, err := harness.AcceptAdapterHello(context.Background(), "ses_connection", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil || third.AcceptedFence <= second.AcceptedFence || third.ConnectionEpoch != first.ConnectionEpoch+1 {
+		t.Fatalf("post-reopen fence = %+v, %v; first=%+v second=%+v", third, err, first, second)
+	}
+}
+
+func TestAdapterConnectionInitializeExactRetry(t *testing.T) {
+	harness := newPostgresConnectionHarness(t)
+	request := store.AdapterConnectionInitialize{
+		SessionID: "ses_connection", ActiveCredentialGeneration: 1,
+		ActiveCredentialExpiresAt: time.Now().Add(time.Minute),
+	}
+	first, err := harness.InitializeAdapterConnection(context.Background(), request)
+	if err != nil {
+		t.Fatalf("first initialize: %v", err)
+	}
+	retry, err := harness.InitializeAdapterConnection(context.Background(), request)
+	if err != nil || !reflect.DeepEqual(retry, first) {
+		t.Fatalf("exact initialize retry = %+v, %v; want %+v", retry, err, first)
+	}
+}
+
+type postgresConnectionHarness struct {
+	*postgres.Store
+	pool       *pgxpool.Pool
+	dsn        string
+	schemaName string
+}
+
+func newPostgresConnectionHarness(t *testing.T) *postgresConnectionHarness {
+	t.Helper()
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_connection_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	pool := openPool(t, dsn, schemaName, nil)
+	resetSchema(t, pool)
+	if _, err := pool.Exec(context.Background(), `CREATE SEQUENCE session_adapter_connection_accepted_fence_seq AS BIGINT MINVALUE 1 START WITH 1`); err != nil {
+		t.Fatalf("create connection fence sequence: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS session_id
+	`, []string{"ses_connection_transaction", "ses_connection", "ses_connection_expired", "ses_connection_active_expiry", "ses_connection_other"}); err != nil {
+		t.Fatalf("seed connection sessions: %v", err)
+	}
+	harness := &postgresConnectionHarness{Store: postgres.New(pool), pool: pool, dsn: dsn, schemaName: schemaName}
+	t.Cleanup(func() {
+		harness.pool.Close()
+		dropSchema(t, dsn, schemaName)
+	})
+	return harness
+}
+
+func (h *postgresConnectionHarness) reopen(t *testing.T) {
+	t.Helper()
+	h.pool = openPool(t, h.dsn, h.schemaName, nil)
+	h.Store = postgres.New(h.pool)
 }
 
 func assertProposedEventRollback(t *testing.T, harness *postgresProposalHarness, sessionID string) {
