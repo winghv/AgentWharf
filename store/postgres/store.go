@@ -358,6 +358,299 @@ func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, aut
 	return pendingCommand(updated), nil
 }
 
+func (s *Store) CreateAttachment(ctx context.Context, request store.AttachmentCreate) (store.AttachmentCommit, error) {
+	if s.pool == nil {
+		return store.AttachmentCommit{}, errors.New("postgres event store pool is nil")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.AttachmentCommit{}, fmt.Errorf("begin attachment create: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	storeNow, err := queries.AttachmentStoreNow(ctx)
+	if err != nil {
+		return store.AttachmentCommit{}, fmt.Errorf("read attachment Store clock: %w", err)
+	}
+	if err := validateAttachmentCreate(request, storeNow.Time); err != nil {
+		return store.AttachmentCommit{}, err
+	}
+	existing, err := queries.AttachmentByID(ctx, request.Identity.AttachID)
+	if err == nil {
+		attachment := attachment(existing)
+		if attachment.Identity != request.Identity {
+			return store.AttachmentCommit{}, errors.New("attachment identity is immutable")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return store.AttachmentCommit{}, fmt.Errorf("commit attachment no-op: %w", err)
+		}
+		return store.AttachmentCommit{Attachment: attachment, Summary: attachmentSummary(attachment, nil), Noop: true}, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.AttachmentCommit{}, fmt.Errorf("select attachment: %w", err)
+	}
+	row, err := queries.InsertAttachment(ctx, db.InsertAttachmentParams{
+		AttachID: request.Identity.AttachID, BootstrapSessionID: request.Identity.BootstrapSessionID,
+		TargetSessionID:            request.Identity.TargetSessionID,
+		ExpiresAt:                  pgtype.Timestamptz{Time: request.ExpiresAt, Valid: true},
+		TargetCredentialLineageRef: request.Identity.TargetCredentialLineageRef,
+	})
+	if err != nil {
+		return store.AttachmentCommit{}, fmt.Errorf("insert attachment: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.AttachmentCommit{}, fmt.Errorf("commit attachment create: %w", err)
+	}
+	created := attachment(row)
+	return store.AttachmentCommit{Attachment: created, Summary: attachmentSummary(created, nil)}, nil
+}
+
+func (s *Store) Attachment(ctx context.Context, attachID string) (store.Attachment, error) {
+	if s.pool == nil {
+		return store.Attachment{}, errors.New("postgres event store pool is nil")
+	}
+	row, err := db.New(s.pool).AttachmentByID(ctx, attachID)
+	if err != nil {
+		return store.Attachment{}, fmt.Errorf("select attachment: %w", err)
+	}
+	return attachment(row), nil
+}
+
+func (s *Store) AttachmentForTarget(ctx context.Context, targetSessionID string) (store.Attachment, error) {
+	if s.pool == nil {
+		return store.Attachment{}, errors.New("postgres event store pool is nil")
+	}
+	row, err := db.New(s.pool).AttachmentByTarget(ctx, targetSessionID)
+	if err != nil {
+		return store.Attachment{}, fmt.Errorf("select target attachment: %w", err)
+	}
+	return attachment(row), nil
+}
+
+func (s *Store) UpdateAttachment(ctx context.Context, attachID string, expectedVersion int64, update store.AttachmentUpdate) (store.AttachmentMutation, error) {
+	if s.pool == nil {
+		return store.AttachmentMutation{}, errors.New("postgres event store pool is nil")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("begin attachment update: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	currentRow, err := queries.LockAttachment(ctx, attachID)
+	if err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("lock attachment: %w", err)
+	}
+	current := attachment(currentRow)
+	storeNow, err := queries.AttachmentStoreNow(ctx)
+	if err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("read attachment update clock: %w", err)
+	}
+	if current.DeliveryVersion != expectedVersion {
+		return store.AttachmentMutation{}, errors.New("stale attachment version")
+	}
+	if err := validateAttachmentUpdate(current, update, storeNow.Time); err != nil {
+		return store.AttachmentMutation{}, err
+	}
+	row, err := queries.UpdateAttachment(ctx, db.UpdateAttachmentParams{
+		Status: string(update.Status), DeliveryState: string(update.DeliveryState),
+		QueueReason: textValue(update.QueueReason), ExpiresAt: timeValue(update.ExpiresAt),
+		BlockingSessionID: textValue(update.BlockingSessionID), AttachID: attachID,
+		ExpectedVersion: expectedVersion,
+	})
+	if err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("update attachment: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("commit attachment update: %w", err)
+	}
+	updated := attachment(row)
+	return store.AttachmentMutation{Attachment: updated, Summary: attachmentSummary(updated, update.Blocker)}, nil
+}
+
+func validateAttachmentCreate(request store.AttachmentCreate, storeNow time.Time) error {
+	identity := request.Identity
+	if !validAttachmentText(identity.AttachID, 255) ||
+		!validAttachmentText(identity.BootstrapSessionID, 255) ||
+		!validAttachmentText(identity.TargetSessionID, 255) ||
+		!validAttachmentText(identity.TargetCredentialLineageRef, 255) {
+		return errors.New("attachment identity is invalid")
+	}
+	if identity.BootstrapSessionID == identity.TargetSessionID {
+		return errors.New("attachment bootstrap and target sessions must differ")
+	}
+	if !validAttachmentExpiry(request.ExpiresAt, storeNow) {
+		return errors.New("attachment expiry is outside the Store-clock delivery window")
+	}
+	return nil
+}
+
+func validateAttachmentUpdate(current store.Attachment, update store.AttachmentUpdate, storeNow time.Time) error {
+	if current.Status == store.AttachmentCanceled ||
+		(current.Status == store.AttachmentStartReceived && update.Status != store.AttachmentStartReceived) {
+		return errors.New("terminal attachment status cannot be reopened")
+	}
+	if update.ExpiresAt != nil {
+		if !validAttachmentExpiry(*update.ExpiresAt, storeNow) {
+			return errors.New("attachment expiry is outside the Store-clock delivery window")
+		}
+		if current.ExpiresAt != nil && update.ExpiresAt.After(*current.ExpiresAt) {
+			return errors.New("attachment expiry cannot be extended")
+		}
+	}
+
+	summaryMatches := func(kind store.AttachmentBlockerKind, reason, expiry, blockingSession, operation bool) bool {
+		blocker := update.Blocker
+		if blocker == nil || blocker.Kind != kind ||
+			(!reason && blocker.Reason != nil) || (!expiry && blocker.ExpiresAt != nil) ||
+			(!blockingSession && blocker.BlockingSessionID != nil) || (!operation && blocker.Operation != nil) {
+			return false
+		}
+		if reason && (blocker.Reason == nil || update.QueueReason == nil || *blocker.Reason != *update.QueueReason) {
+			return false
+		}
+		if expiry && (blocker.ExpiresAt == nil || update.ExpiresAt == nil || !blocker.ExpiresAt.Equal(*update.ExpiresAt)) {
+			return false
+		}
+		if blockingSession && (blocker.BlockingSessionID == nil || update.BlockingSessionID == nil || *blocker.BlockingSessionID != *update.BlockingSessionID) {
+			return false
+		}
+		return true
+	}
+
+	valid := false
+	switch update.Status {
+	case store.AttachmentQueued:
+		valid = update.DeliveryState == store.AttachmentDeliveryPending &&
+			update.QueueReason != nil && validAttachmentText(*update.QueueReason, 128) &&
+			update.ExpiresAt != nil && update.BlockingSessionID != nil &&
+			validAttachmentText(*update.BlockingSessionID, 255) &&
+			*update.BlockingSessionID != current.Identity.TargetSessionID &&
+			summaryMatches(store.AttachmentBlockerQueued, true, true, true, false)
+	case store.AttachmentStartReceived:
+		if update.QueueReason == nil && update.ExpiresAt == nil && update.BlockingSessionID == nil {
+			if update.DeliveryState == store.AttachmentDeliveryOutcomeUnknown {
+				valid = summaryMatches(store.AttachmentBlockerOutcomeUnknown, false, false, false, true) &&
+					update.Blocker.Operation != nil &&
+					(*update.Blocker.Operation == "start" || *update.Blocker.Operation == "command")
+			} else {
+				valid = (update.DeliveryState == store.AttachmentDeliveryReceived || update.DeliveryState == store.AttachmentDeliveryCompleted) && update.Blocker == nil
+			}
+		}
+	case store.AttachmentReauthorizationRequired:
+		if update.QueueReason == nil && update.ExpiresAt == nil && update.BlockingSessionID == nil {
+			if update.DeliveryState == store.AttachmentDeliveryOutcomeUnknown {
+				valid = summaryMatches(store.AttachmentBlockerOutcomeUnknown, false, false, false, true)
+			} else {
+				valid = update.DeliveryState == store.AttachmentDeliveryPending &&
+					summaryMatches(store.AttachmentBlockerReauthorizationRequired, false, false, false, false)
+			}
+		}
+	case store.AttachmentCanceled:
+		valid = update.DeliveryState == store.AttachmentDeliveryPending &&
+			update.QueueReason == nil && update.ExpiresAt == nil && update.BlockingSessionID == nil &&
+			summaryMatches(store.AttachmentBlockerNewRunRequired, false, false, false, false)
+	}
+	if !valid {
+		return errors.New("invalid attachment update")
+	}
+	return nil
+}
+
+func validAttachmentExpiry(expiresAt, storeNow time.Time) bool {
+	return expiresAt.After(storeNow) && !expiresAt.After(storeNow.Add(30*time.Second))
+}
+
+func validAttachmentText(value string, max int) bool {
+	return len(value) > 0 && len(value) <= max
+}
+
+func attachment(row db.SessionAttachment) store.Attachment {
+	return store.Attachment{
+		Identity: store.AttachmentIdentity{
+			AttachID:                   row.AttachID,
+			BootstrapSessionID:         row.BootstrapSessionID,
+			TargetSessionID:            row.TargetSessionID,
+			TargetCredentialLineageRef: row.TargetCredentialLineageRef,
+		},
+		Status:            store.AttachmentStatus(row.Status),
+		DeliveryState:     store.AttachmentDeliveryState(row.DeliveryState),
+		DeliveryVersion:   row.DeliveryVersion,
+		QueueReason:       textPointer(row.QueueReason),
+		ExpiresAt:         timePointer(row.ExpiresAt),
+		CanceledAt:        timePointer(row.CanceledAt),
+		BlockingSessionID: textPointer(row.BlockingSessionID),
+	}
+}
+
+func attachmentSummary(attachment store.Attachment, blocker *store.AttachmentBlocker) store.AttachmentSummary {
+	return store.AttachmentSummary{
+		AttachID:        attachment.Identity.AttachID,
+		TargetSessionID: attachment.Identity.TargetSessionID,
+		DeliveryVersion: attachment.DeliveryVersion,
+		ExpiresAt:       cloneTime(attachment.ExpiresAt),
+		Blocker:         cloneAttachmentBlocker(blocker),
+	}
+}
+
+func textValue(value *string) pgtype.Text {
+	if value == nil {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: *value, Valid: true}
+}
+
+func timeValue(value *time.Time) pgtype.Timestamptz {
+	if value == nil {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: *value, Valid: true}
+}
+
+func textPointer(value pgtype.Text) *string {
+	if !value.Valid {
+		return nil
+	}
+	copy := value.String
+	return &copy
+}
+
+func timePointer(value pgtype.Timestamptz) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	copy := value.Time
+	return &copy
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func cloneAttachmentBlocker(value *store.AttachmentBlocker) *store.AttachmentBlocker {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.Reason = cloneString(value.Reason)
+	copy.ExpiresAt = cloneTime(value.ExpiresAt)
+	copy.BlockingSessionID = cloneString(value.BlockingSessionID)
+	copy.Operation = cloneString(value.Operation)
+	return &copy
+}
+
+func cloneString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
 func (s *Store) beginCommandMutation(ctx context.Context, sessionID string, authority store.CommandAuthority) (pgx.Tx, *db.Queries, error) {
 	if s.pool == nil {
 		return nil, nil, errors.New("postgres event store pool is nil")

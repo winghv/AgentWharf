@@ -119,6 +119,95 @@ func TestPendingCommandStoreContract(t *testing.T) {
 	})
 }
 
+func TestAttachmentStoreContract(t *testing.T) {
+	storetest.AttachmentContract(t, storetest.AttachmentHarness{
+		Open: func(t *testing.T) store.AttachmentStore {
+			t.Helper()
+			return newPostgresAttachmentHarness(t)
+		},
+		Reopen: func(t *testing.T, current store.AttachmentStore) store.AttachmentStore {
+			t.Helper()
+			harness := current.(*postgresAttachmentHarness)
+			harness.pool.Close()
+			harness.reopen(t)
+			return harness
+		},
+	})
+}
+
+func TestAttachmentCreateRollback(t *testing.T) {
+	harness := newPostgresAttachmentHarness(t)
+	request := store.AttachmentCreate{
+		Identity: store.AttachmentIdentity{
+			AttachID:                   "attach_rollback",
+			BootstrapSessionID:         "ses_bootstrap_lookup",
+			TargetSessionID:            "ses_target_rollback",
+			TargetCredentialLineageRef: "lineage_attach_rollback",
+		},
+		ExpiresAt: time.Now().Add(20 * time.Second),
+	}
+	if _, err := harness.CreateAttachment(context.Background(), request); err == nil {
+		t.Fatal("CreateAttachment() without target FK unexpectedly succeeded")
+	}
+	if _, err := harness.Attachment(context.Background(), request.Identity.AttachID); err == nil {
+		t.Fatal("failed attachment create left durable state")
+	}
+	if _, err := harness.pool.Exec(context.Background(), "INSERT INTO agent_sessions (id) VALUES ($1)", request.Identity.TargetSessionID); err != nil {
+		t.Fatalf("seed rollback target session: %v", err)
+	}
+	if commit, err := harness.CreateAttachment(context.Background(), request); err != nil || commit.Noop {
+		t.Fatalf("CreateAttachment() after rollback = %+v, %v; want new attachment", commit, err)
+	}
+}
+
+type postgresAttachmentHarness struct {
+	*postgres.Store
+	pool       *pgxpool.Pool
+	dsn        string
+	schemaName string
+}
+
+func newPostgresAttachmentHarness(t *testing.T) *postgresAttachmentHarness {
+	t.Helper()
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attachment_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	harness := &postgresAttachmentHarness{dsn: dsn, schemaName: schemaName}
+	harness.reopen(t)
+	resetSchema(t, harness.pool)
+	harness.seedSessions(t)
+	t.Cleanup(func() {
+		harness.pool.Close()
+		dropSchema(t, dsn, schemaName)
+	})
+	return harness
+}
+
+func (h *postgresAttachmentHarness) reopen(t *testing.T) {
+	t.Helper()
+	h.pool = openPool(t, h.dsn, h.schemaName, nil)
+	h.Store = postgres.New(h.pool)
+}
+
+func (h *postgresAttachmentHarness) seedSessions(t *testing.T) {
+	t.Helper()
+	if _, err := h.pool.Exec(context.Background(), `
+INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS session_id
+`, []string{
+		"ses_bootstrap_lookup", "ses_target_lookup", "ses_bootstrap_rewrite", "ses_target_rewrite",
+		"ses_bootstrap_mutation", "ses_target_mutation", "ses_blocker_mutation",
+		"ses_bootstrap_reconnect", "ses_target_reconnect",
+		"ses_bootstrap_healthy", "ses_target_healthy",
+		"ses_bootstrap_outcome", "ses_target_outcome", "ses_bootstrap_replacement",
+		"ses_bootstrap_expired", "ses_target_expired", "ses_bootstrap_long", "ses_target_long",
+		"ses_bootstrap_expiry", "ses_target_expiry", "ses_blocker_expiry",
+		"ses_bootstrap_concurrent", "ses_target_concurrent",
+		"ses_bootstrap_reopen", "ses_target_reopen",
+	}); err != nil {
+		t.Fatalf("seed attachment sessions: %v", err)
+	}
+}
+
 type postgresCommandHarness struct {
 	*postgres.Store
 	pool       *pgxpool.Pool
