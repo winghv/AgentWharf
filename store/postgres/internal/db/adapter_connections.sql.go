@@ -65,6 +65,7 @@ SET prior_recovery_credential_generation = active_credential_generation,
 WHERE session_id = $1
   AND active_credential_generation = $2
   AND connection_epoch = $3
+  AND connection_epoch > 0 AND accepted_fence > 0
   AND pending_credential_generation = $4
   AND rotation_id = $5
   AND active_credential_expires_at > clock_timestamp()
@@ -225,6 +226,7 @@ SET pending_credential_generation = $1,
 WHERE session_id = $4
   AND active_credential_generation = $5
   AND connection_epoch = $6
+  AND connection_epoch > 0 AND accepted_fence > 0
   AND pending_credential_generation IS NULL
   AND $1::BIGINT > credential_generation_high_watermark
   AND active_credential_expires_at > clock_timestamp()
@@ -278,6 +280,7 @@ WHERE session_id = $1
   AND active_credential_generation = $2
   AND connection_epoch = $3
   AND accepted_fence = $4
+  AND connection_epoch > 0 AND accepted_fence > 0
   AND $5::BIGINT > accepted_fence
   AND active_credential_expires_at > clock_timestamp()
   AND revoked_at IS NULL
