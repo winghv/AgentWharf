@@ -9,7 +9,8 @@ import (
 	"time"
 
 	"github.com/winghv/agentwharf/store"
-	_ "modernc.org/sqlite"
+	sqliteDriver "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const (
@@ -557,14 +558,17 @@ func (s *Store) UpdateAttachment(ctx context.Context, attachID string, expectedV
 	if err := validateAttachmentUpdate(current, update, time.UnixMilli(nowMS)); err != nil {
 		return store.AttachmentMutation{}, err
 	}
-	result, err := tx.ExecContext(ctx, `
+	result, err := executeAttachmentUpdate(ctx, tx, `
 UPDATE session_attachments SET
     status = ?, delivery_state = ?, delivery_version = delivery_version + 1,
     queue_reason = ?, expires_at_ns = ?, canceled_at_ms = CASE WHEN ? = 'canceled' THEN ? ELSE NULL END,
     blocking_session_id = ?, updated_at_ms = ?
 WHERE attach_id = ? AND delivery_version = ?
+  AND (? <> 'start_received' OR status = 'start_received'
+       OR (expires_at_ns IS NOT NULL AND expires_at_ns >
+           CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 1000000))
 `, update.Status, update.DeliveryState, nullableString(update.QueueReason), nullableTimeNano(update.ExpiresAt),
-		update.Status, nowMS, nullableString(update.BlockingSessionID), nowMS, attachID, expectedVersion)
+		update.Status, nowMS, nullableString(update.BlockingSessionID), nowMS, attachID, expectedVersion, update.Status)
 	if err != nil {
 		return store.AttachmentMutation{}, fmt.Errorf("update attachment: %w", err)
 	}
@@ -579,6 +583,27 @@ WHERE attach_id = ? AND delivery_version = ?
 		return store.AttachmentMutation{}, fmt.Errorf("commit attachment update: %w", err)
 	}
 	return store.AttachmentMutation{Attachment: updated, Summary: sqliteAttachmentSummary(updated, update.Blocker)}, nil
+}
+
+func executeAttachmentUpdate(ctx context.Context, tx *sql.Tx, statement string, args ...any) (sql.Result, error) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		result, err := tx.ExecContext(ctx, statement, args...)
+		if err == nil {
+			return result, nil
+		}
+		var sqliteError *sqliteDriver.Error
+		if !errors.As(err, &sqliteError) || sqliteError.Code() != sqlite3.SQLITE_BUSY || !time.Now().Before(deadline) {
+			return nil, err
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 const attachmentColumns = `
