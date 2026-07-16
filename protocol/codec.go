@@ -1,9 +1,11 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 )
 
 const (
@@ -20,15 +22,18 @@ var (
 type FrameName string
 
 const (
-	FrameHello      FrameName = "hello"
-	FrameHelloAck   FrameName = "hello.ack"
-	FrameEvent      FrameName = "event"
-	FrameCommand    FrameName = "command"
-	FrameCommandAck FrameName = "command.ack"
-	FramePing       FrameName = "ping"
-	FramePong       FrameName = "pong"
-	FrameError      FrameName = "error"
+	FrameHello       FrameName = "hello"
+	FrameHelloAck    FrameName = "hello.ack"
+	FrameEvent       FrameName = "event"
+	FrameCommand     FrameName = "command"
+	FrameCommandAck  FrameName = "command.ack"
+	FramePing        FrameName = "ping"
+	FramePong        FrameName = "pong"
+	FrameError       FrameName = "error"
+	FrameHistoryPage FrameName = "history.page"
 )
+
+const HistoryPageMaxLimit = 100
 
 type Role string
 
@@ -150,6 +155,35 @@ type Error struct {
 
 func (*Error) FrameName() FrameName { return FrameError }
 
+type HistoryPageRequest struct {
+	RequestID string `json:"request_id"`
+	SessionID string `json:"session_id"`
+	BeforeSeq *int64 `json:"before_seq,omitempty"`
+	Limit     int    `json:"limit"`
+}
+
+func (*HistoryPageRequest) FrameName() FrameName { return FrameHistoryPage }
+
+type HistoryPageEvent struct {
+	Frame     FrameName       `json:"frame"`
+	Type      string          `json:"type"`
+	SessionID string          `json:"session_id"`
+	Seq       int64           `json:"seq"`
+	Time      int64           `json:"time"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+type HistoryPageResponse struct {
+	RequestID      string             `json:"request_id"`
+	SessionID      string             `json:"session_id"`
+	Events         []HistoryPageEvent `json:"events"`
+	LatestSeq      int64              `json:"latest_seq"`
+	NextBeforeSeq  *int64             `json:"next_before_seq"`
+	RetentionState string             `json:"retention_state"`
+}
+
+func (*HistoryPageResponse) FrameName() FrameName { return FrameHistoryPage }
+
 func Decode(data []byte) (Frame, error) {
 	var env struct {
 		Frame FrameName `json:"frame"`
@@ -175,9 +209,114 @@ func Decode(data []byte) (Frame, error) {
 		return decodeInto(data, &Pong{})
 	case FrameError:
 		return decodeInto(data, &Error{})
+	case FrameHistoryPage:
+		return decodeHistoryPage(data)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownFrame, env.Frame)
 	}
+}
+
+func decodeHistoryPage(data []byte) (Frame, error) {
+	fields, err := strictObject(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode history.page: %w", err)
+	}
+	allowed := map[string]bool{
+		"frame": true, "request_id": true, "session_id": true, "before_seq": true, "limit": true,
+		"events": true, "latest_seq": true, "next_before_seq": true, "retention_state": true,
+	}
+	for key := range fields {
+		if !allowed[key] {
+			return nil, fmt.Errorf("decode history.page: unknown field %q", key)
+		}
+	}
+	var frame FrameName
+	if err := json.Unmarshal(fields["frame"], &frame); err != nil || frame != FrameHistoryPage {
+		return nil, errors.New("decode history.page: invalid frame")
+	}
+	response := fields["events"] != nil || fields["latest_seq"] != nil ||
+		fields["next_before_seq"] != nil || fields["retention_state"] != nil
+	if response {
+		if fields["before_seq"] != nil || fields["limit"] != nil {
+			return nil, errors.New("decode history.page: mixed request and response fields")
+		}
+		var out HistoryPageResponse
+		if err := decodeRequiredHistoryFields(fields, &out.RequestID, &out.SessionID); err != nil {
+			return nil, err
+		}
+		for _, key := range []string{"events", "latest_seq", "next_before_seq", "retention_state"} {
+			if fields[key] == nil {
+				return nil, fmt.Errorf("decode history.page: missing %s", key)
+			}
+		}
+		if err := json.Unmarshal(fields["events"], &out.Events); err != nil ||
+			json.Unmarshal(fields["latest_seq"], &out.LatestSeq) != nil ||
+			json.Unmarshal(fields["next_before_seq"], &out.NextBeforeSeq) != nil ||
+			json.Unmarshal(fields["retention_state"], &out.RetentionState) != nil {
+			return nil, errors.New("decode history.page: invalid response")
+		}
+		return &out, nil
+	}
+
+	var out HistoryPageRequest
+	if err := decodeRequiredHistoryFields(fields, &out.RequestID, &out.SessionID); err != nil {
+		return nil, err
+	}
+	if fields["limit"] == nil || json.Unmarshal(fields["limit"], &out.Limit) != nil ||
+		out.Limit < 1 || out.Limit > HistoryPageMaxLimit {
+		return nil, errors.New("decode history.page: limit must be in 1..100")
+	}
+	if raw := fields["before_seq"]; raw != nil {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &out.BeforeSeq) != nil ||
+			out.BeforeSeq == nil || *out.BeforeSeq < 1 {
+			return nil, errors.New("decode history.page: before_seq must be positive")
+		}
+	}
+	return &out, nil
+}
+
+func decodeRequiredHistoryFields(fields map[string]json.RawMessage, requestID, sessionID *string) error {
+	if fields["request_id"] == nil || json.Unmarshal(fields["request_id"], requestID) != nil || *requestID == "" {
+		return errors.New("decode history.page: request_id is required")
+	}
+	if fields["session_id"] == nil || json.Unmarshal(fields["session_id"], sessionID) != nil || *sessionID == "" {
+		return errors.New("decode history.page: session_id is required")
+	}
+	return nil
+}
+
+func strictObject(data []byte) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, errors.New("expected object")
+	}
+	fields := make(map[string]json.RawMessage)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return nil, errors.New("expected object key")
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return nil, fmt.Errorf("duplicate field %q", key)
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return nil, err
+		}
+		fields[key] = raw
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	if token, err := decoder.Token(); err != io.EOF || token != nil {
+		return nil, errors.New("trailing JSON value")
+	}
+	return fields, nil
 }
 
 func Encode(frame Frame) ([]byte, error) {

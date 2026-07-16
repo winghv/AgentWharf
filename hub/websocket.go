@@ -189,6 +189,14 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn)
 		_ = conn.Close(websocket.StatusPolicyViolation, code)
 		return AcceptedPeer{}, err
 	}
+	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
+		if _, ok := h.events.(store.HistoryStore); ok {
+			if ack.Capabilities == nil {
+				ack.Capabilities = &protocol.HelloCapabilities{}
+			}
+			ack.Capabilities.HistoryPage = &protocol.HistoryPageCapability{MaxLimit: protocol.HistoryPageMaxLimit}
+		}
+	}
 	if err := writeProtocolFrame(ctx, conn, &ack); err != nil {
 		return AcceptedPeer{}, err
 	}
@@ -235,6 +243,10 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			}
 		case *protocol.Pong:
 			continue
+		case *protocol.HistoryPageRequest:
+			if err := h.handleHistoryPage(ctx, conn, accepted, peer, adapter, typed); err != nil {
+				return
+			}
 		case *protocol.Event:
 			if accepted.Role != protocol.RoleAdapter {
 				_ = writeProtocolError(ctx, conn, "unsupported_frame", "client event frames are not accepted", false)
@@ -261,6 +273,59 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			_ = writeProtocolError(ctx, conn, "unsupported_frame", fmt.Sprintf("unsupported frame %s", typed.FrameName()), false)
 		}
 	}
+}
+
+func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, peer *clientConnection, adapter *adapterConnection, request *protocol.HistoryPageRequest) error {
+	history, ready := h.events.(store.HistoryStore)
+	if accepted.Role != protocol.RoleClient || accepted.ProtocolVersion != protocol.ProtocolVersionV2 || !ready {
+		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
+			Code: "history_unsupported", Message: "history pagination is unavailable",
+		})
+	}
+	if request == nil || peer == nil || !subscribesTo(accepted.Subscribed, request.SessionID) ||
+		!hasExactHistoryAccess(accepted.Principal, request.SessionID) || h.handshake == nil || h.handshake.authenticator == nil ||
+		h.handshake.authenticator.Authorize(ctx, accepted.Principal, auth.SessionView(request.SessionID)) != nil {
+		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
+			Code: "history_unavailable", Message: "history is unavailable",
+		})
+	}
+	page, err := history.History(ctx, request.SessionID, request.BeforeSeq, request.Limit)
+	if err != nil {
+		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
+			Code: "history_unavailable", Message: "history is unavailable",
+		})
+	}
+	events := make([]protocol.HistoryPageEvent, len(page.Events))
+	for index, event := range page.Events {
+		events[index] = protocol.HistoryPageEvent{
+			Frame: protocol.FrameEvent, Type: event.Type, SessionID: event.SessionID, Seq: event.Seq,
+			Time: event.Time.UnixMilli(), Payload: clonePayload(event.Payload),
+		}
+	}
+	return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.HistoryPageResponse{
+		RequestID: request.RequestID, SessionID: request.SessionID, Events: events,
+		LatestSeq: page.LatestSeq, NextBeforeSeq: page.NextBeforeSeq, RetentionState: page.RetentionState,
+	})
+}
+
+func hasExactHistoryAccess(principal auth.Principal, sessionID string) bool {
+	for _, scope := range principal.Scopes {
+		if scope.Kind == auth.KindSession && scope.ID == sessionID &&
+			(scope.Access == auth.AccessView || scope.Access == auth.AccessControl) {
+			return true
+		}
+	}
+	return false
+}
+
+func writeConnectionFrame(ctx context.Context, conn *websocket.Conn, peer *clientConnection, adapter *adapterConnection, frame protocol.Frame) error {
+	if peer != nil {
+		return peer.writeFrame(ctx, frame)
+	}
+	if adapter != nil {
+		return adapter.writeFrame(ctx, frame)
+	}
+	return writeProtocolFrame(ctx, conn, frame)
 }
 
 func writePongFrame(ctx context.Context, conn *websocket.Conn, peer *clientConnection, adapter *adapterConnection, nonce string) error {

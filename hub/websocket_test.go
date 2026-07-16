@@ -60,6 +60,133 @@ func TestWebSocketServerNegotiatesV2WithoutHistoryCapability(t *testing.T) {
 	if ack.ProtocolVersion != protocol.ProtocolVersionV2 || ack.Capabilities != nil {
 		t.Fatalf("v2 hello ack = %+v, want v2 with no capabilities", ack)
 	}
+	writeFrame(t, conn, &protocol.HistoryPageRequest{RequestID: "hist_unready", SessionID: "ses_1", Limit: 1})
+	if got := readFrame(t, conn).(*protocol.Error); got.Code != "history_unsupported" {
+		t.Fatalf("unready history error = %+v", got)
+	}
+}
+
+func TestWebSocketServerAdvertisesAndServesAuthorizedHistory(t *testing.T) {
+	t.Parallel()
+
+	before := int64(58)
+	next := int64(52)
+	events := &fakeHistoryStore{
+		fakeEventStore: newFakeEventStore(map[string]int64{"ses_1": 57}, nil),
+		page: store.HistoryPage{
+			Events:    []store.Event{{SessionID: "ses_1", Seq: 52, Type: "session.message", Time: time.UnixMilli(1001), Payload: json.RawMessage(`{"n":1}`)}},
+			LatestSeq: 57, NextBeforeSeq: &next, RetentionState: store.RetentionGap,
+		},
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "view-token",
+		Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}},
+	})
+	ack := readFrame(t, client).(*protocol.HelloAck)
+	if ack.Capabilities == nil || ack.Capabilities.HistoryPage == nil || ack.Capabilities.HistoryPage.MaxLimit != 100 {
+		t.Fatalf("history capability = %+v", ack.Capabilities)
+	}
+	writeFrame(t, client, &protocol.HistoryPageRequest{
+		RequestID: "hist_1", SessionID: "ses_1", BeforeSeq: &before, Limit: 100,
+	})
+	response := readFrame(t, client).(*protocol.HistoryPageResponse)
+	if response.RequestID != "hist_1" || response.SessionID != "ses_1" || response.LatestSeq != 57 ||
+		response.NextBeforeSeq == nil || *response.NextBeforeSeq != next || len(response.Events) != 1 ||
+		response.Events[0].Frame != protocol.FrameEvent || response.Events[0].Seq != 52 || response.RetentionState != store.RetentionGap {
+		t.Fatalf("history response = %+v", response)
+	}
+	call := events.historyCall(t)
+	if call.sessionID != "ses_1" || call.beforeSeq == nil || *call.beforeSeq != before || call.limit != 100 {
+		t.Fatalf("history call = %+v", call)
+	}
+
+	control := dialWebSocket(t, server.URL)
+	defer control.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, control, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token",
+		Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}},
+	})
+	_ = readFrame(t, control).(*protocol.HelloAck)
+	writeFrame(t, control, &protocol.HistoryPageRequest{RequestID: "hist_control", SessionID: "ses_1", Limit: 1})
+	if got := readFrame(t, control).(*protocol.HistoryPageResponse); got.RequestID != "hist_control" {
+		t.Fatalf("control history response = %+v", got)
+	}
+	if calls := events.historyCalls(); calls != 2 {
+		t.Fatalf("history calls = %d, want 2", calls)
+	}
+}
+
+func TestWebSocketServerHistoryAuthorizationAndAvailability(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		version    int
+		token      string
+		sessionID  string
+		storeError error
+		wantCode   string
+	}{
+		{name: "v1 unsupported", version: 1, token: "view-token", sessionID: "ses_1", wantCode: "history_unsupported"},
+		{name: "api wildcard denied", version: 2, token: "api-token", sessionID: "ses_1", wantCode: "history_unavailable"},
+		{name: "cross session denied", version: 2, token: "view-token", sessionID: "ses_2", wantCode: "history_unavailable"},
+		{name: "store failure", version: 2, token: "view-token", sessionID: "ses_1", storeError: errors.New("private store failure"), wantCode: "history_unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			events := &fakeHistoryStore{fakeEventStore: newFakeEventStore(map[string]int64{"ses_1": 0}, nil), err: test.storeError}
+			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+				cfg.EventStore = events
+			})
+			client := dialWebSocket(t, server.URL)
+			defer client.Close(websocket.StatusNormalClosure, "")
+			writeFrame(t, client, &protocol.Hello{
+				ProtocolVersion: test.version, Role: protocol.RoleClient, Token: test.token,
+				Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}},
+			})
+			_ = readFrame(t, client).(*protocol.HelloAck)
+			writeFrame(t, client, &protocol.HistoryPageRequest{RequestID: "hist_denied", SessionID: test.sessionID, Limit: 1})
+			got := readFrame(t, client).(*protocol.Error)
+			if got.Code != test.wantCode || got.Message == "private store failure" {
+				t.Fatalf("history error = %+v", got)
+			}
+			if test.name != "store failure" && events.historyCalls() != 0 {
+				t.Fatalf("denied history reached store")
+			}
+			writeFrame(t, client, &protocol.Ping{Nonce: "after-history-error"})
+			if pong := readFrame(t, client).(*protocol.Pong); pong.Nonce != "after-history-error" {
+				t.Fatalf("pong after history error = %+v", pong)
+			}
+		})
+	}
+}
+
+func TestWebSocketServerRejectsAdapterHistoryRequest(t *testing.T) {
+	t.Parallel()
+
+	events := &fakeHistoryStore{fakeEventStore: newFakeEventStore(map[string]int64{"ses_1": 0}, nil)}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	ack := readFrame(t, adapter).(*protocol.HelloAck)
+	if ack.Capabilities != nil {
+		t.Fatalf("adapter capabilities = %+v", ack.Capabilities)
+	}
+	writeFrame(t, adapter, &protocol.HistoryPageRequest{RequestID: "hist_adapter", SessionID: "ses_1", Limit: 1})
+	if got := readFrame(t, adapter).(*protocol.Error); got.Code != "history_unsupported" {
+		t.Fatalf("adapter history error = %+v", got)
+	}
+	if events.historyCalls() != 0 {
+		t.Fatal("adapter history request reached store")
+	}
 }
 
 func TestWebSocketServerReplaysEventsAfterHelloAck(t *testing.T) {
@@ -948,6 +1075,10 @@ func testHandshakeWithStore(events store.EventStore) *hub.Handshake {
 					Subject: "adapter",
 					Scopes:  []auth.Scope{auth.SessionAdapter("ses_1")},
 				},
+				"api-token": {
+					Subject: "api",
+					Scopes:  []auth.Scope{auth.API()},
+				},
 			},
 		},
 		EventStore:    events,
@@ -1016,6 +1147,48 @@ type fakeEventStore struct {
 	appendErr     error
 	appendCalls   []appendCall
 	onReplayEvent func()
+}
+
+type historyCall struct {
+	sessionID string
+	beforeSeq *int64
+	limit     int
+}
+
+type fakeHistoryStore struct {
+	*fakeEventStore
+	mu    sync.Mutex
+	page  store.HistoryPage
+	err   error
+	calls []historyCall
+}
+
+func (f *fakeHistoryStore) History(_ context.Context, sessionID string, beforeSeq *int64, limit int) (store.HistoryPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := historyCall{sessionID: sessionID, limit: limit}
+	if beforeSeq != nil {
+		value := *beforeSeq
+		call.beforeSeq = &value
+	}
+	f.calls = append(f.calls, call)
+	return f.page, f.err
+}
+
+func (f *fakeHistoryStore) historyCall(t *testing.T) historyCall {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.calls) != 1 {
+		t.Fatalf("history calls = %d, want 1", len(f.calls))
+	}
+	return f.calls[0]
+}
+
+func (f *fakeHistoryStore) historyCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
 }
 
 type appendCall struct {

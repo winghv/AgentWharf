@@ -263,3 +263,56 @@ func TestEventTypeAllowed(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeHistoryPageRequestStrictly(t *testing.T) {
+	frame, err := Decode([]byte(`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","before_seq":58,"limit":100}`))
+	if err != nil {
+		t.Fatalf("Decode(history.page) error = %v", err)
+	}
+	request, ok := frame.(*HistoryPageRequest)
+	if !ok || request.RequestID != "hist_1" || request.SessionID != "ses_1" ||
+		request.BeforeSeq == nil || *request.BeforeSeq != 58 || request.Limit != 100 {
+		t.Fatalf("history request = %#v", frame)
+	}
+
+	for _, raw := range []string{
+		`{"frame":"history.page","request_id":"","session_id":"ses_1","limit":1}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"","limit":1}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","limit":0}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","limit":101}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","before_seq":0,"limit":1}`,
+		`{"frame":"history.page","request_id":"hist_1","request_id":"hist_2","session_id":"ses_1","limit":1}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","limit":1,"unknown":true}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) unexpectedly succeeded", raw)
+		}
+	}
+}
+
+func TestEncodeHistoryPageResponse(t *testing.T) {
+	seq := int64(52)
+	encoded, err := Encode(&HistoryPageResponse{
+		RequestID: "hist_1", SessionID: "ses_1",
+		Events: []HistoryPageEvent{{
+			Frame: FrameEvent, Type: "session.message", SessionID: "ses_1", Seq: seq,
+			Time: 1764937200123, Payload: json.RawMessage(`{"role":"agent"}`),
+		}},
+		LatestSeq: 57, NextBeforeSeq: nil, RetentionState: "complete",
+	})
+	if err != nil {
+		t.Fatalf("Encode(history.page) error = %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got["frame"] != "history.page" || got["next_before_seq"] != nil {
+		t.Fatalf("history response envelope = %s", encoded)
+	}
+	events := got["events"].([]any)
+	event := events[0].(map[string]any)
+	if event["frame"] != "event" || event["seq"] != float64(seq) {
+		t.Fatalf("nested history event = %#v", event)
+	}
+}
