@@ -427,7 +427,8 @@ FROM session_pending_commands AS command
 JOIN session_events AS event
   ON event.session_id = command.session_id AND event.seq = command.event_seq
 WHERE command.session_id = ? AND command.cmd_id = ?
-`, sessionID, commandID).Scan(
+  AND length(event.payload) BETWEEN 1 AND ?
+`, sessionID, commandID, maxEventPayloadSize).Scan(
 		&command.SessionID, &command.CommandID, &command.Type, &command.EventSeq, &status,
 		&expiresAtNS, &createdAtMS, &eventType, &eventPayload,
 	)
