@@ -155,6 +155,63 @@ func TestPendingCommandCorruptStatusFailsClosed(t *testing.T) {
 	}
 }
 
+func TestPendingCommandCorruptReferenceFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		statement string
+		args      []any
+	}{
+		{
+			name:      "missing event",
+			statement: `DELETE FROM session_events WHERE session_id = ? AND seq = 1`,
+			args:      []any{"ses_command_1"},
+		},
+		{
+			name:      "wrong event type",
+			statement: `UPDATE session_events SET type = 'session.state' WHERE session_id = ? AND seq = 1`,
+			args:      []any{"ses_command_1"},
+		},
+		{
+			name:      "non-user event",
+			statement: `UPDATE session_events SET payload = ? WHERE session_id = ? AND seq = 1`,
+			args:      []any{[]byte(`{"role":"agent"}`), "ses_command_1"},
+		},
+		{
+			name:      "unbounded expiry",
+			statement: `UPDATE session_pending_commands SET expires_at_ns = (created_at_ms + 31000) * 1000000 WHERE session_id = ? AND cmd_id = ?`,
+			args:      []any{"ses_command_1", "cmd_corrupt_reference"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "events.db")
+			ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}
+			seedCommandAuthorities(t, path)
+			authority := store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+			request := store.PendingCommandRequest{CommandID: "cmd_corrupt_reference", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+			event := store.PendingEvent{Type: "session.message", Time: testTime(1), Payload: []byte(`{"role":"user"}`)}
+			if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, event, request); err != nil {
+				t.Fatalf("CommitPendingCommand() error = %v", err)
+			}
+			db := openRawSQLite(t, path)
+			if _, err := db.ExecContext(context.Background(), `PRAGMA foreign_keys = OFF`); err != nil {
+				t.Fatalf("disable foreign keys for corruption fixture: %v", err)
+			}
+			if _, err := db.ExecContext(context.Background(), `PRAGMA ignore_check_constraints = ON`); err != nil {
+				t.Fatalf("enable corruption fixture: %v", err)
+			}
+			if _, err := db.ExecContext(context.Background(), test.statement, test.args...); err != nil {
+				t.Fatalf("corrupt pending-command reference: %v", err)
+			}
+			if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, event, request); err == nil {
+				t.Fatal("duplicate CommitPendingCommand() returned corrupt reference truth")
+			}
+			if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_1", authority, request.CommandID); err == nil {
+				t.Fatal("ClaimPendingCommand() accepted corrupt reference truth")
+			}
+		})
+	}
+}
+
 func TestPendingCommandQueuedBehindAuthorityChangeWritesNothing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}
