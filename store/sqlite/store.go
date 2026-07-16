@@ -11,6 +11,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const maxHistoryPageSize = 100
+
 type Store struct {
 	db *sql.DB
 }
@@ -137,6 +139,86 @@ WHERE session_id = ?
 		return 0, fmt.Errorf("select latest seq: %w", err)
 	}
 	return latest, nil
+}
+
+func (s *Store) History(ctx context.Context, sessionID string, beforeSeq *int64, limit int) (store.HistoryPage, error) {
+	if limit < 1 || limit > maxHistoryPageSize {
+		return store.HistoryPage{}, fmt.Errorf("history limit must be between 1 and %d", maxHistoryPageSize)
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return store.HistoryPage{}, fmt.Errorf("begin history transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var latestSeq, earliestSeq, eventCount int64
+	if err := tx.QueryRowContext(ctx, `
+SELECT COALESCE(MAX(seq), 0), COALESCE(MIN(seq), 0), COUNT(*)
+FROM session_events
+WHERE session_id = ?
+`, sessionID).Scan(&latestSeq, &earliestSeq, &eventCount); err != nil {
+		return store.HistoryPage{}, fmt.Errorf("select history bounds: %w", err)
+	}
+
+	var rows *sql.Rows
+	if beforeSeq == nil {
+		rows, err = tx.QueryContext(ctx, `
+SELECT session_id, seq, type, payload, event_time_ms
+FROM session_events
+WHERE session_id = ?
+ORDER BY seq DESC
+LIMIT ?
+`, sessionID, limit+1)
+	} else {
+		rows, err = tx.QueryContext(ctx, `
+SELECT session_id, seq, type, payload, event_time_ms
+FROM session_events
+WHERE session_id = ? AND seq < ?
+ORDER BY seq DESC
+LIMIT ?
+`, sessionID, *beforeSeq, limit+1)
+	}
+	if err != nil {
+		return store.HistoryPage{}, fmt.Errorf("query history events: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	events := make([]store.Event, 0, limit+1)
+	for rows.Next() {
+		var (
+			event       store.Event
+			payload     []byte
+			eventTimeMS int64
+		)
+		if err := rows.Scan(&event.SessionID, &event.Seq, &event.Type, &payload, &eventTimeMS); err != nil {
+			return store.HistoryPage{}, fmt.Errorf("scan history event: %w", err)
+		}
+		event.Time = time.UnixMilli(eventTimeMS)
+		event.Payload = append(event.Payload[:0], payload...)
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return store.HistoryPage{}, fmt.Errorf("iterate history events: %w", err)
+	}
+
+	page := store.HistoryPage{
+		LatestSeq:      latestSeq,
+		RetentionState: store.RetentionComplete,
+	}
+	if eventCount > 0 && (earliestSeq > 1 || eventCount != latestSeq-earliestSeq+1) {
+		page.RetentionState = store.RetentionGap
+	}
+	if len(events) > limit {
+		nextBeforeSeq := events[limit-1].Seq
+		page.NextBeforeSeq = &nextBeforeSeq
+		events = events[:limit]
+	}
+	page.Events = make([]store.Event, len(events))
+	for index := range events {
+		page.Events[len(events)-1-index] = events[index]
+	}
+	return page, nil
 }
 
 func (s *Store) init(ctx context.Context) error {
