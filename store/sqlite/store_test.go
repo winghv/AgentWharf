@@ -463,6 +463,96 @@ func TestConnectionFenceSidecarIdentityFailsClosed(t *testing.T) {
 	}
 }
 
+func TestConnectionFencePartialStateFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		database  string
+		statement string
+	}{
+		{name: "main identity table", statement: `DROP TABLE session_adapter_fence_identity`},
+		{name: "main identity row", statement: `DELETE FROM session_adapter_fence_identity`},
+		{name: "main allocator table", statement: `DROP TABLE session_adapter_fence_allocator`},
+		{name: "main allocator row", statement: `DELETE FROM session_adapter_fence_allocator`},
+		{name: "side identity table", database: ".fences", statement: `DROP TABLE adapter_fence_identity`},
+		{name: "side identity row", database: ".fences", statement: `DELETE FROM adapter_fence_identity`},
+		{name: "side allocator table", database: ".fences", statement: `DROP TABLE adapter_fence_allocator`},
+		{name: "side allocator row", database: ".fences", statement: `DELETE FROM adapter_fence_allocator`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "events.db")
+			st, err := sqlite.Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db := openRawSQLite(t, path+test.database)
+			if _, err := db.ExecContext(context.Background(), test.statement); err != nil {
+				t.Fatalf("corrupt %s: %v", test.name, err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if reopened, err := sqlite.Open(context.Background(), path); err == nil {
+				_ = reopened.Close()
+				t.Fatalf("missing %s was silently repaired", test.name)
+			}
+		})
+	}
+}
+
+func TestConnectionFenceClosedBackupPreservesReturnedFence(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "events.db")
+	st, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollback := errors.New("rollback before backup")
+	var returned int64
+	if err := st.WithAdapterConnectionTransaction(ctx, func(tx store.AdapterConnectionStore) error {
+		var err error
+		returned, err = tx.(store.AdapterGrantFenceStore).AllocateAdapterGrantFence(ctx)
+		if err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatalf("allocate returned rollback fence: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fenceDB := openRawSQLite(t, path+".fences")
+	var mode string
+	if err := fenceDB.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&mode); err != nil || mode != "delete" {
+		t.Fatalf("fence journal mode = %q, %v, want delete", mode, err)
+	}
+	if err := fenceDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(t.TempDir(), "restored.db")
+	for _, suffix := range []string{"", ".fences"} {
+		contents, err := os.ReadFile(path + suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(restored+suffix, contents, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reopened, err := sqlite.Open(ctx, restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopened.Close() }()
+	next, err := reopened.AllocateAdapterGrantFence(ctx)
+	if err != nil || next <= returned {
+		t.Fatalf("restored fence = %d, %v, want > returned rollback fence %d", next, err, returned)
+	}
+}
+
 func TestConnectionTwoStoreOrderingAndExpiry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	first, second := openStore(t, path), openStore(t, path)
