@@ -12,7 +12,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const maxHistoryPageSize = 100
+const (
+	maxHistoryPageSize  = 100
+	maxEventPayloadSize = 64 * 1024
+)
 
 type Store struct {
 	db *sql.DB
@@ -240,7 +243,7 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 		return store.PendingCommandCommit{}, err
 	}
 
-	existing, err := queryPendingCommand(ctx, tx, sessionID, request.CommandID)
+	existing, err := queryPendingCommand(ctx, tx, sessionID, request.CommandID, nowMS)
 	if err == nil {
 		if err := tx.Commit(); err != nil {
 			return store.PendingCommandCommit{}, fmt.Errorf("commit duplicate pending command lookup: %w", err)
@@ -302,7 +305,7 @@ func (s *Store) ClaimPendingCommand(ctx context.Context, sessionID string, autho
 	if err := validateCommandAuthority(ctx, tx, sessionID, authority, nowMS); err != nil {
 		return store.PendingCommandClaim{}, err
 	}
-	command, err := queryPendingCommand(ctx, tx, sessionID, commandID)
+	command, err := queryPendingCommand(ctx, tx, sessionID, commandID, nowMS)
 	if err != nil {
 		return store.PendingCommandClaim{}, fmt.Errorf("select claimable pending command: %w", err)
 	}
@@ -356,7 +359,7 @@ func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, aut
 	if err := validateCommandAuthority(ctx, tx, sessionID, authority, nowMS); err != nil {
 		return store.PendingCommand{}, err
 	}
-	command, err := queryPendingCommand(ctx, tx, sessionID, commandID)
+	command, err := queryPendingCommand(ctx, tx, sessionID, commandID, nowMS)
 	if err != nil {
 		return store.PendingCommand{}, fmt.Errorf("select resolvable pending command: %w", err)
 	}
@@ -412,7 +415,7 @@ SELECT EXISTS (
 	return nil
 }
 
-func queryPendingCommand(ctx context.Context, tx *sql.Tx, sessionID, commandID string) (store.PendingCommand, error) {
+func queryPendingCommand(ctx context.Context, tx *sql.Tx, sessionID, commandID string, nowMS int64) (store.PendingCommand, error) {
 	var command store.PendingCommand
 	var status, eventType string
 	var expiresAtNS, createdAtMS int64
@@ -438,8 +441,9 @@ WHERE command.session_id = ? AND command.cmd_id = ?
 	}
 	if command.SessionID == "" || len(command.SessionID) > 255 || command.CommandID == "" || len(command.CommandID) > 256 ||
 		command.Type != "session.send" || command.EventSeq < 1 || !validPendingCommandStatus(command.Status) ||
-		createdAtMS < 1 || expiresAtNS <= createdAtMS*int64(time.Millisecond) ||
+		createdAtMS < 1 || createdAtMS > nowMS || expiresAtNS <= createdAtMS*int64(time.Millisecond) ||
 		expiresAtNS > (createdAtMS+30000)*int64(time.Millisecond) || eventType != "session.message" ||
+		expiresAtNS > (nowMS+30000)*int64(time.Millisecond) || len(eventPayload) < 1 || len(eventPayload) > maxEventPayloadSize ||
 		json.Unmarshal(eventPayload, &payload) != nil || payload.Role != "user" {
 		return store.PendingCommand{}, errors.New("pending command row is invalid")
 	}
@@ -460,7 +464,8 @@ func validatePendingCommandInput(event store.PendingEvent, request store.Pending
 		Role string `json:"role"`
 	}
 	if request.CommandID == "" || len(request.CommandID) > 256 || request.Type != "session.send" ||
-		event.Type != "session.message" || json.Unmarshal(event.Payload, &payload) != nil || payload.Role != "user" ||
+		event.Type != "session.message" || len(event.Payload) < 1 || len(event.Payload) > maxEventPayloadSize ||
+		json.Unmarshal(event.Payload, &payload) != nil || payload.Role != "user" ||
 		!request.ExpiresAt.After(storeNow) || request.ExpiresAt.After(storeNow.Add(30*time.Second)) {
 		return errors.New("invalid pending command")
 	}
