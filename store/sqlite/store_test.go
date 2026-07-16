@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -245,6 +246,32 @@ func TestPendingCommandPayloadBound(t *testing.T) {
 		Type: "session.message", Time: testTime(3), Payload: []byte(`{"role":"user"}`),
 	}, request); err == nil {
 		t.Fatal("duplicate CommitPendingCommand() accepted oversized referenced payload")
+	}
+}
+
+func TestPendingCommandOversizedCorruptReferenceIsNotMaterialized(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}
+	seedCommandAuthorities(t, path)
+	authority := store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+	request := store.PendingCommandRequest{CommandID: "cmd_payload_materialization", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	event := store.PendingEvent{Type: "session.message", Time: testTime(1), Payload: []byte(`{"role":"user"}`)}
+	if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, event, request); err != nil {
+		t.Fatalf("CommitPendingCommand() error = %v", err)
+	}
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `UPDATE session_events SET payload = zeroblob(8 * 1024 * 1024) WHERE session_id = ? AND seq = 1`, "ses_command_1"); err != nil {
+		t.Fatalf("corrupt event payload size: %v", err)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, event, request); err == nil {
+		t.Fatal("duplicate CommitPendingCommand() accepted oversized referenced payload")
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 2*1024*1024 {
+		t.Fatalf("oversized corrupt reference allocated %d bytes, want <= 2 MiB", allocated)
 	}
 }
 
