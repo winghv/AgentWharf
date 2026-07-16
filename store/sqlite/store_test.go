@@ -253,6 +253,7 @@ func TestConnectionGrantFenceSharesAllocatorAndRollback(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		assertDurableFenceAllocated(t, path, rolledBack)
 		return rollback
 	}); !errors.Is(err, rollback) {
 		t.Fatalf("grant rollback error = %v, want %v", err, rollback)
@@ -274,6 +275,7 @@ func TestConnectionGrantFenceSharesAllocatorAndRollback(t *testing.T) {
 			if err != nil {
 				return err
 			}
+			assertDurableFenceAllocated(t, path, panicked)
 			panic("rollback grant fence panic")
 		})
 	}()
@@ -353,6 +355,7 @@ func TestConnectionAcceptedFencesSurviveTransactionFailure(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		assertDurableFenceAllocated(t, path, rolledBack.AcceptedFence)
 		return rollback
 	}); !errors.Is(err, rollback) {
 		t.Fatalf("hello rollback error = %v", err)
@@ -397,6 +400,7 @@ func TestConnectionAcceptedFencesSurviveTransactionFailure(t *testing.T) {
 			if err != nil {
 				return err
 			}
+			assertDurableFenceAllocated(t, path, panicked.AcceptedFence)
 			panic("rollback activation fence")
 		})
 	}()
@@ -420,6 +424,15 @@ func TestConnectionFenceAllocatorRejectsOverflow(t *testing.T) {
 	var next int64
 	if err := db.QueryRowContext(context.Background(), `SELECT typeof(next_fence), next_fence FROM adapter_fence_allocator WHERE singleton = 1`).Scan(&kind, &next); err != nil || kind != "integer" || next != math.MaxInt64 {
 		t.Fatalf("overflow allocator = kind %q next %d, %v", kind, next, err)
+	}
+}
+
+func assertDurableFenceAllocated(t *testing.T, path string, fence int64) {
+	t.Helper()
+	db := openRawSQLite(t, path+".fences")
+	var next int64
+	if err := db.QueryRowContext(context.Background(), `SELECT next_fence FROM adapter_fence_allocator WHERE singleton = 1`).Scan(&next); err != nil || next <= fence {
+		t.Fatalf("durable fence next = %d, %v, want > returned %d", next, err, fence)
 	}
 }
 
