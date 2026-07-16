@@ -282,6 +282,22 @@ func TestConnectionGrantFenceSharesAllocatorAndRollback(t *testing.T) {
 }
 
 func TestConnectionCredentialLineageCorruptionFailsClosed(t *testing.T) {
+	schemaPath := filepath.Join(t.TempDir(), "schema.db")
+	openStore(t, schemaPath)
+	schemaDB := openRawSQLite(t, schemaPath)
+	var schema string
+	if err := schemaDB.QueryRowContext(context.Background(), `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_adapter_connections'`).Scan(&schema); err != nil {
+		t.Fatalf("read adapter connection schema: %v", err)
+	}
+	for _, invariant := range []string{
+		"pending_credential_generation <> active_credential_generation",
+		"prior_recovery_credential_generation <> active_credential_generation",
+		"pending_credential_generation <> prior_recovery_credential_generation",
+	} {
+		if !strings.Contains(schema, invariant) {
+			t.Fatalf("adapter connection schema lacks lineage invariant %q", invariant)
+		}
+	}
 	cases := []struct {
 		name                  string
 		active, highWatermark int64
