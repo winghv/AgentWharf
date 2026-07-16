@@ -220,6 +220,106 @@ UPDATE session_adapter_connections SET connection_epoch = 2, updated_at_ms = ? W
 	}
 }
 
+func TestProposalDuplicateQueuedBehindAuthorityChangeReturnsNoReceipt(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		statement string
+		args      func(now int64, sessionID string) []any
+	}{
+		{name: "epoch", statement: `UPDATE session_adapter_connections SET connection_epoch = 2, updated_at_ms = ? WHERE session_id = ?`, args: func(now int64, sessionID string) []any { return []any{now, sessionID} }},
+		{name: "generation", statement: `UPDATE session_adapter_connections SET active_credential_generation = 2, credential_generation_high_watermark = 2, updated_at_ms = ? WHERE session_id = ?`, args: func(now int64, sessionID string) []any { return []any{now, sessionID} }},
+		{name: "revoked", statement: `UPDATE session_adapter_connections SET revoked_at_ms = ?, updated_at_ms = ? WHERE session_id = ?`, args: func(now int64, sessionID string) []any { return []any{now, now, sessionID} }},
+		{name: "expired", statement: `UPDATE session_adapter_connections SET created_at_ms = ?, active_credential_expires_at_ms = ?, updated_at_ms = ? WHERE session_id = ?`, args: func(now int64, sessionID string) []any {
+			return []any{now - int64((2*time.Minute)/time.Millisecond), now - 1, now, sessionID}
+		}},
+		{name: "terminal", statement: `UPDATE session_adapter_connections SET terminal_at_ms = ?, updated_at_ms = ? WHERE session_id = ?`, args: func(now int64, sessionID string) []any { return []any{now, now, sessionID} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "events.db")
+			proposals := &sqliteProposalHarness{Store: openStore(t, path), path: path}
+			seedProposalAuthorities(t, path)
+			sessionID := "ses_proposal_duplicate_" + test.name
+			authority := store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+			request := store.ProposedEventRequest{ProposalID: "proposal_duplicate_authority", Event: store.PendingEvent{
+				Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`),
+			}}
+			if _, err := proposals.CommitProposedEvent(context.Background(), sessionID, authority, request); err != nil {
+				t.Fatalf("initial CommitProposedEvent() error = %v", err)
+			}
+			db := openRawSQLite(t, path)
+			if _, err := db.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+				t.Fatalf("begin duplicate authority change: %v", err)
+			}
+			now := time.Now().UnixMilli()
+			if _, err := db.ExecContext(context.Background(), test.statement, test.args(now, sessionID)...); err != nil {
+				t.Fatalf("stage duplicate authority change: %v", err)
+			}
+			result := make(chan error, 1)
+			go func() {
+				_, err := proposals.CommitProposedEvent(context.Background(), sessionID, authority, request)
+				result <- err
+			}()
+			var retryErr error
+			received := false
+			select {
+			case retryErr = <-result:
+				received = true
+				if retryErr == nil {
+					t.Fatal("duplicate proposal returned accepted receipt while authority change was pending")
+				}
+			case <-time.After(50 * time.Millisecond):
+			}
+			if _, err := db.ExecContext(context.Background(), `COMMIT`); err != nil {
+				t.Fatalf("commit duplicate authority change: %v", err)
+			}
+			if !received {
+				retryErr = <-result
+			}
+			if retryErr == nil {
+				t.Fatal("duplicate proposal returned accepted receipt after authority change")
+			}
+			events := replayProposalEvents(t, proposals, sessionID)
+			if len(events) != 1 || events[0].Seq != 1 {
+				t.Fatalf("duplicate authority race changed durable events: %+v", events)
+			}
+		})
+	}
+}
+
+func TestProposalReceiptFailureRollsBackEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	proposals := &sqliteProposalHarness{Store: openStore(t, path), path: path}
+	seedProposalAuthorities(t, path)
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `
+CREATE TRIGGER fail_proposal_receipt BEFORE INSERT ON session_event_proposals
+BEGIN SELECT RAISE(ABORT, 'proposal receipt failpoint'); END
+`); err != nil {
+		t.Fatalf("create proposal receipt failpoint: %v", err)
+	}
+	if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_rollback",
+		store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, store.ProposedEventRequest{
+			ProposalID: "proposal_rollback", Event: store.PendingEvent{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)},
+		}); err == nil {
+		t.Fatal("CommitProposedEvent() unexpectedly survived receipt failpoint")
+	}
+	if latest, err := proposals.LatestSeq(context.Background(), "ses_proposal_rollback"); err != nil || latest != 0 {
+		t.Fatalf("proposal receipt rollback latest seq = %d, %v; want 0, nil", latest, err)
+	}
+}
+
+func replayProposalEvents(t *testing.T, proposals store.ProposedEventStore, sessionID string) []store.Event {
+	t.Helper()
+	var events []store.Event
+	if err := proposals.Replay(context.Background(), sessionID, 0, func(event store.Event) error {
+		events = append(events, event)
+		return nil
+	}); err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	return events
+}
+
 func TestAttachmentStoreContract(t *testing.T) {
 	storetest.AttachmentContract(t, storetest.AttachmentHarness{
 		Open: func(t *testing.T) store.AttachmentStore {
@@ -785,7 +885,9 @@ func seedProposalAuthorities(t *testing.T, path string) {
 	now := time.Now().UnixMilli()
 	for _, sessionID := range []string{
 		"ses_proposal_1", "ses_proposal_conflict", "ses_proposal_snapshot", "ses_proposal_stale", "ses_proposal_reopen",
-		"ses_proposal_corrupt", "ses_proposal_queued",
+		"ses_proposal_corrupt", "ses_proposal_queued", "ses_proposal_rollback",
+		"ses_proposal_duplicate_epoch", "ses_proposal_duplicate_generation", "ses_proposal_duplicate_revoked",
+		"ses_proposal_duplicate_expired", "ses_proposal_duplicate_terminal",
 	} {
 		if _, err := db.ExecContext(context.Background(), `
 INSERT INTO session_adapter_connections (
