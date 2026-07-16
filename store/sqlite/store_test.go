@@ -453,6 +453,14 @@ func TestConnectionFenceSidecarIdentityFailsClosed(t *testing.T) {
 		_ = reopened.Close()
 		t.Fatal("missing fence sidecar was silently recreated")
 	}
+	replacement := openRawSQLite(t, path+".fences")
+	if _, err := replacement.ExecContext(context.Background(), `INSERT INTO adapter_fence_identity (singleton, store_id) VALUES (1, 'mismatched')`); err != nil {
+		t.Fatalf("seed mismatched fence sidecar: %v", err)
+	}
+	if reopened, err := sqlite.Open(context.Background(), path); err == nil {
+		_ = reopened.Close()
+		t.Fatal("mismatched fence sidecar was accepted")
+	}
 }
 
 func TestConnectionTwoStoreOrderingAndExpiry(t *testing.T) {
