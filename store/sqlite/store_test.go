@@ -156,6 +156,7 @@ func TestPendingCommandCorruptStatusFailsClosed(t *testing.T) {
 }
 
 func TestPendingCommandCorruptReferenceFailsClosed(t *testing.T) {
+	futureCreatedAt := time.Now().Add(time.Minute).UnixMilli()
 	for _, test := range []struct {
 		name      string
 		statement string
@@ -180,6 +181,11 @@ func TestPendingCommandCorruptReferenceFailsClosed(t *testing.T) {
 			name:      "unbounded expiry",
 			statement: `UPDATE session_pending_commands SET expires_at_ns = (created_at_ms + 31000) * 1000000 WHERE session_id = ? AND cmd_id = ?`,
 			args:      []any{"ses_command_1", "cmd_corrupt_reference"},
+		},
+		{
+			name:      "future expiry window",
+			statement: `UPDATE session_pending_commands SET created_at_ms = ?, expires_at_ns = ? WHERE session_id = ? AND cmd_id = ?`,
+			args:      []any{futureCreatedAt, (futureCreatedAt + 10000) * int64(time.Millisecond), "ses_command_1", "cmd_corrupt_reference"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -209,6 +215,36 @@ func TestPendingCommandCorruptReferenceFailsClosed(t *testing.T) {
 				t.Fatal("ClaimPendingCommand() accepted corrupt reference truth")
 			}
 		})
+	}
+}
+
+func TestPendingCommandPayloadBound(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}
+	seedCommandAuthorities(t, path)
+	authority := store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+	request := store.PendingCommandRequest{CommandID: "cmd_payload_exact", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, store.PendingEvent{
+		Type: "session.message", Time: testTime(1), Payload: userPayloadBytes(t, 64*1024),
+	}, request); err != nil {
+		t.Fatalf("exact-bound CommitPendingCommand() error = %v", err)
+	}
+	request.CommandID = "cmd_payload_oversized"
+	if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, store.PendingEvent{
+		Type: "session.message", Time: testTime(2), Payload: userPayloadBytes(t, 64*1024+1),
+	}, request); err == nil {
+		t.Fatal("oversized CommitPendingCommand() unexpectedly succeeded")
+	}
+
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `UPDATE session_events SET payload = ? WHERE session_id = ? AND seq = 1`, userPayloadBytes(t, 64*1024+1), "ses_command_1"); err != nil {
+		t.Fatalf("corrupt event payload size: %v", err)
+	}
+	request.CommandID = "cmd_payload_exact"
+	if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, store.PendingEvent{
+		Type: "session.message", Time: testTime(3), Payload: []byte(`{"role":"user"}`),
+	}, request); err == nil {
+		t.Fatal("duplicate CommitPendingCommand() accepted oversized referenced payload")
 	}
 }
 
@@ -394,4 +430,20 @@ func openRawSQLite(t *testing.T, path string) *sql.DB {
 	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func userPayloadBytes(t *testing.T, size int) []byte {
+	t.Helper()
+	prefix := []byte(`{"role":"user","padding":"`)
+	suffix := []byte(`"}`)
+	if size < len(prefix)+len(suffix) {
+		t.Fatalf("payload size %d is too small", size)
+	}
+	payload := make([]byte, size)
+	copy(payload, prefix)
+	for index := len(prefix); index < size-len(suffix); index++ {
+		payload[index] = 'x'
+	}
+	copy(payload[size-len(suffix):], suffix)
+	return payload
 }
