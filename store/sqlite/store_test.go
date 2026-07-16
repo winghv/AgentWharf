@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -424,6 +425,118 @@ func TestConnectionFenceAllocatorRejectsOverflow(t *testing.T) {
 	var next int64
 	if err := db.QueryRowContext(context.Background(), `SELECT typeof(next_fence), next_fence FROM adapter_fence_allocator WHERE singleton = 1`).Scan(&kind, &next); err != nil || kind != "integer" || next != math.MaxInt64 {
 		t.Fatalf("overflow allocator = kind %q next %d, %v", kind, next, err)
+	}
+}
+
+func TestConnectionFenceSidecarIdentityFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	connections, err := sqlite.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollback := errors.New("rollback sidecar identity")
+	if err := connections.WithAdapterConnectionTransaction(context.Background(), func(tx store.AdapterConnectionStore) error {
+		if _, err := tx.(store.AdapterGrantFenceStore).AllocateAdapterGrantFence(context.Background()); err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatalf("allocate rollback fence: %v", err)
+	}
+	if err := connections.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path + ".fences"); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := sqlite.Open(context.Background(), path); err == nil {
+		_ = reopened.Close()
+		t.Fatal("missing fence sidecar was silently recreated")
+	}
+}
+
+func TestConnectionTwoStoreOrderingAndExpiry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	first, second := openStore(t, path), openStore(t, path)
+	ctx := context.Background()
+	init := store.AdapterConnectionInitialize{SessionID: "ses_two_store", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	if _, err := first.InitializeAdapterConnection(ctx, init); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan store.AdapterConnection, 8)
+	errs := make(chan error, 8)
+	var wg sync.WaitGroup
+	for index := range 8 {
+		current := first
+		if index%2 == 1 {
+			current = second
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			connection, err := current.AcceptAdapterHello(ctx, init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+			results <- connection
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("two-Store hello: %v", err)
+		}
+	}
+	seen := make(map[int64]bool)
+	for connection := range results {
+		if seen[connection.AcceptedFence] {
+			t.Fatalf("duplicate two-Store fence %d", connection.AcceptedFence)
+		}
+		seen[connection.AcceptedFence] = true
+	}
+
+	for _, tc := range []struct {
+		sessionID string
+		mutation  func(store.AdapterConnectionStore) error
+	}{
+		{sessionID: "ses_two_store_expired_hello", mutation: func(connections store.AdapterConnectionStore) error {
+			_, err := connections.AcceptAdapterHello(ctx, "ses_two_store_expired_hello", store.AdapterHello{CredentialGeneration: 1})
+			return err
+		}},
+		{sessionID: "ses_two_store_expired_rotation", mutation: func(connections store.AdapterConnectionStore) error {
+			_, err := connections.PrepareAdapterCredentialRotation(ctx, "ses_two_store_expired_rotation", store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: 1, PendingGeneration: 2, ExpiresAt: time.Now().Add(60 * time.Millisecond), RotationID: "rot_two_store_expired"})
+			return err
+		}},
+	} {
+		expiresAt := time.Now().Add(60 * time.Millisecond)
+		if _, err := first.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: tc.sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: expiresAt}); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(tc.sessionID, "rotation") {
+			if _, err := first.AcceptAdapterHello(ctx, tc.sessionID, store.AdapterHello{CredentialGeneration: 1}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		lockDB := openRawSQLite(t, path)
+		lockTx, err := lockDB.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := lockTx.ExecContext(ctx, `UPDATE session_adapter_connections SET updated_at_ms = updated_at_ms WHERE session_id = ?`, tc.sessionID); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- tc.mutation(second) }()
+		time.Sleep(100 * time.Millisecond)
+		if err := lockTx.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err == nil {
+			t.Fatalf("queued expired mutation for %s succeeded", tc.sessionID)
+		}
 	}
 }
 
