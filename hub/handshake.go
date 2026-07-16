@@ -129,6 +129,10 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 		if err != nil {
 			return protocol.HelloAck{}, AcceptedPeer{}, err
 		}
+		if decision.Mode == auth.SessionAdmissionAttachOnly &&
+			(len(hello.Subscriptions) != 1 || !isExclusiveAttachOnlyPrincipal(principal, sub.SessionID)) {
+			return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+		}
 		state := "ready"
 		if decision.Mode == auth.SessionAdmissionAttachOnly {
 			state = string(auth.SessionAdmissionAttachOnly)
@@ -272,6 +276,10 @@ func hasExactSessionAccess(principal auth.Principal, sessionID string, access au
 		}
 	}
 	return false
+}
+
+func isExclusiveAttachOnlyPrincipal(principal auth.Principal, sessionID string) bool {
+	return len(principal.Scopes) == 1 && hasExactSessionAccess(principal, sessionID, auth.AccessControl)
 }
 
 func (p AcceptedPeer) currentSubscriptions() []protocol.Subscription {

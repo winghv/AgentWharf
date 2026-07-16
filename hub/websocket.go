@@ -189,7 +189,8 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn)
 		_ = conn.Close(websocket.StatusPolicyViolation, code)
 		return AcceptedPeer{}, "", err
 	}
-	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
+	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 &&
+		len(accepted.currentSubscriptions()) > 0 {
 		if _, ok := h.events.(store.HistoryStore); ok {
 			if ack.Capabilities == nil {
 				ack.Capabilities = &protocol.HelloCapabilities{}
