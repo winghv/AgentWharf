@@ -415,7 +415,9 @@ func TestConnectionFenceAllocatorRejectsOverflow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
 	db := openRawSQLite(t, path+".fences")
-	if _, err := db.ExecContext(context.Background(), `UPDATE adapter_fence_allocator SET next_fence = ? WHERE singleton = 1`, int64(math.MaxInt64)); err != nil {
+	if _, err := db.ExecContext(context.Background(), `DROP TRIGGER adapter_fence_allocator_advance;
+UPDATE adapter_fence_allocator SET next_fence = ? WHERE singleton = 1;
+CREATE TRIGGER adapter_fence_allocator_advance BEFORE UPDATE OF next_fence ON adapter_fence_allocator WHEN NEW.next_fence <> OLD.next_fence + 1 BEGIN SELECT RAISE(ABORT, 'adapter fence allocator must advance by one'); END;`, int64(math.MaxInt64)); err != nil {
 		t.Fatalf("seed maximum fence: %v", err)
 	}
 	if _, err := connections.Store.AllocateAdapterGrantFence(context.Background()); err == nil {
@@ -627,7 +629,10 @@ func TestConnectionFenceRuntimeDivergenceFailsClosed(t *testing.T) {
 	t.Run("main shadow inflation", func(t *testing.T) {
 		ctx := context.Background()
 		path := filepath.Join(t.TempDir(), "events.db")
-		st := openStore(t, path)
+		st, err := sqlite.Open(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
 		init := store.AdapterConnectionInitialize{SessionID: "ses_runtime_divergence", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
 		if _, err := st.InitializeAdapterConnection(ctx, init); err != nil {
 			t.Fatal(err)
@@ -647,6 +652,9 @@ func TestConnectionFenceRuntimeDivergenceFailsClosed(t *testing.T) {
 		}
 		if _, err := st.ValidateAdapterAdmission(ctx, init.SessionID, store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: forged}); err == nil {
 			t.Fatal("runtime main-shadow inflation admitted an unallocated grant")
+		}
+		if err := st.Close(); err == nil {
+			t.Fatal("Close() accepted runtime main-shadow inflation")
 		}
 	})
 }
@@ -805,6 +813,7 @@ UPDATE session_adapter_fence_allocator SET next_fence = 2 WHERE singleton = 1;
 				tc.prior, tc.rotation, now, now); err != nil {
 				t.Fatalf("seed corrupt lineage: %v", err)
 			}
+			seedFixtureFence(t, path, 2)
 			before := connectionCorruptionSnapshot(t, db, "ses_lineage_corrupt")
 			if _, err := connections.AdapterConnection(context.Background(), "ses_lineage_corrupt"); err == nil {
 				t.Fatal("AdapterConnection() accepted corrupt credential lineage")
