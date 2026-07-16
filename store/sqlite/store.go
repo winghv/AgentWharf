@@ -422,9 +422,16 @@ FROM session_pending_commands WHERE session_id = ? AND cmd_id = ?
 `, sessionID, commandID).Scan(
 		&command.SessionID, &command.CommandID, &command.Type, &command.EventSeq, &status, &expiresAtNS,
 	)
+	if err != nil {
+		return store.PendingCommand{}, err
+	}
 	command.Status = store.PendingCommandStatus(status)
 	command.ExpiresAt = time.Unix(0, expiresAtNS)
-	return command, err
+	if command.SessionID == "" || len(command.SessionID) > 255 || command.CommandID == "" || len(command.CommandID) > 256 ||
+		command.Type != "session.send" || command.EventSeq < 1 || !validPendingCommandStatus(command.Status) || expiresAtNS < 1 {
+		return store.PendingCommand{}, errors.New("pending command row is invalid")
+	}
+	return command, nil
 }
 
 func validPendingCommandStatus(status store.PendingCommandStatus) bool {
