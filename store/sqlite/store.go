@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/winghv/agentwharf/store"
@@ -20,7 +21,10 @@ const (
 )
 
 type Store struct {
-	db *sql.DB
+	db           *sql.DB
+	fenceDB      *sql.DB
+	connectionTx *sql.Tx
+	closed       atomic.Bool
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -31,17 +35,39 @@ func Open(ctx context.Context, path string) (*Store, error) {
 
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-
-	st := &Store{db: db}
-	if err := st.init(ctx); err != nil {
+	fencePath := path + ".fences"
+	if _, err := db.ExecContext(ctx, `ATTACH DATABASE ? AS fence_store`, fencePath); err != nil {
 		_ = db.Close()
+		return nil, fmt.Errorf("attach sqlite fence store: %w", err)
+	}
+	fenceDB, err := sql.Open("sqlite", fencePath)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open sqlite fence store: %w", err)
+	}
+	fenceDB.SetMaxOpenConns(1)
+	fenceDB.SetMaxIdleConns(1)
+	st := &Store{db: db, fenceDB: fenceDB}
+	if err := st.init(ctx); err != nil {
+		_ = st.Close()
 		return nil, err
 	}
 	return st, nil
 }
 
 func (s *Store) Close() error {
-	return s.db.Close()
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	// Backups require all Store handles closed; online copies are unsupported, and the main DB plus .fences form one unit.
+	var next int64
+	syncErr := s.db.QueryRow(`SELECT side.next_fence FROM session_adapter_fence_allocator AS main, fence_store.adapter_fence_allocator AS side WHERE main.singleton = 1 AND side.singleton = 1 AND typeof(main.next_fence) = 'integer' AND typeof(side.next_fence) = 'integer' AND side.next_fence >= main.next_fence`).Scan(&next)
+	if syncErr == nil {
+		syncErr = syncAdapterFence(context.Background(), s.db, next-1)
+	} else if errors.Is(syncErr, sql.ErrConnDone) {
+		syncErr = nil
+	}
+	return errors.Join(syncErr, s.db.Close(), s.fenceDB.Close())
 }
 
 func (s *Store) Append(ctx context.Context, sessionID string, evs []store.PendingEvent) (firstSeq int64, err error) {
@@ -503,7 +529,335 @@ func proposedEventReceipt(sessionID, proposalID string, seq int64) store.Propose
 	return store.ProposedEventReceipt{SessionID: sessionID, ProposalID: proposalID, Seq: seq, Status: store.ProposedEventAccepted}
 }
 
-func sqliteNowMillis(ctx context.Context, tx *sql.Tx) (int64, error) {
+type sqliteConnectionExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (s *Store) AllocateAdapterGrantFence(ctx context.Context) (int64, error) {
+	fence, err := s.allocateAdapterFence(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if err := syncAdapterFence(ctx, s.connectionExecutor(), fence); err != nil {
+		return 0, err
+	}
+	return fence, nil
+}
+
+func (s *Store) allocateAdapterFence(ctx context.Context) (int64, error) {
+	if s == nil || s.fenceDB == nil {
+		return 0, errors.New("sqlite grant fence store is nil")
+	}
+	var fence int64
+	if err := s.fenceDB.QueryRowContext(ctx, `
+UPDATE adapter_fence_allocator SET next_fence = next_fence + 1
+WHERE singleton = 1 AND typeof(next_fence) = 'integer' AND next_fence < 9223372036854775807 AND EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'adapter_fence_allocator_advance')
+RETURNING next_fence - 1
+`).Scan(&fence); err != nil {
+		return 0, fmt.Errorf("allocate adapter grant fence: %w", err)
+	}
+	if fence < 1 {
+		return 0, errors.New("sqlite allocated invalid grant fence")
+	}
+	return fence, nil
+}
+
+func syncAdapterFence(ctx context.Context, executor sqliteConnectionExecutor, fence int64) error {
+	_, err := executor.ExecContext(ctx, `UPDATE session_adapter_fence_allocator SET next_fence = MAX(next_fence, ?) WHERE singleton = 1`, fence+1)
+	return err
+}
+
+func (s *Store) WithAdapterConnectionTransaction(ctx context.Context, fn func(store.AdapterConnectionStore) error) error {
+	if fn == nil {
+		return errors.New("adapter connection transaction callback is nil")
+	}
+	if s.connectionTx != nil {
+		return errors.New("nested adapter connection transaction is not supported")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin adapter connection transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(&Store{db: s.db, fenceDB: s.fenceDB, connectionTx: tx}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit adapter connection transaction: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) InitializeAdapterConnection(ctx context.Context, request store.AdapterConnectionInitialize) (store.AdapterConnection, error) {
+	if !validConnectionID(request.SessionID) || request.ActiveCredentialGeneration < 1 || request.ActiveCredentialExpiresAt.IsZero() {
+		return store.AdapterConnection{}, errors.New("invalid adapter connection initialization")
+	}
+	return s.withConnectionMutation(ctx, func(executor sqliteConnectionExecutor) (store.AdapterConnection, error) {
+		nowMS, err := sqliteNowMillis(ctx, executor)
+		if err != nil || request.ActiveCredentialExpiresAt.UnixMilli() <= nowMS {
+			return store.AdapterConnection{}, errors.New("adapter connection expiry is not in the future")
+		}
+		if _, err := executor.ExecContext(ctx, `INSERT OR IGNORE INTO session_adapter_connections
+(session_id, connection_epoch, accepted_fence, active_credential_generation, credential_generation_high_watermark, active_credential_expires_at_ms, created_at_ms, updated_at_ms) VALUES (?, 0, 0, ?, ?, ?, ?, ?)`, request.SessionID, request.ActiveCredentialGeneration, request.ActiveCredentialGeneration,
+			request.ActiveCredentialExpiresAt.UnixMilli(), nowMS, nowMS); err != nil {
+			return store.AdapterConnection{}, fmt.Errorf("initialize adapter connection: %w", err)
+		}
+		connection, err := queryAdapterConnection(ctx, executor, request.SessionID)
+		if err != nil {
+			return store.AdapterConnection{}, fmt.Errorf("read initialized adapter connection: %w", err)
+		}
+		if connection.ConnectionEpoch != 0 || connection.AcceptedFence != 0 ||
+			connection.ActiveCredentialGeneration != request.ActiveCredentialGeneration ||
+			connection.CredentialGenerationHighWatermark != request.ActiveCredentialGeneration ||
+			!connection.ActiveCredentialExpiresAt.Equal(time.UnixMilli(request.ActiveCredentialExpiresAt.UnixMilli())) ||
+			connection.PendingCredentialGeneration != nil || connection.PriorRecoveryGeneration != nil ||
+			connection.RotationID != nil || connection.RevokedAt != nil || connection.TerminalAt != nil {
+			return store.AdapterConnection{}, errors.New("adapter connection initialization conflicts with existing state")
+		}
+		return connection, nil
+	})
+}
+
+func (s *Store) RefreshAdapterCredentialBeforeHello(ctx context.Context, sessionID string, refresh store.AdapterCredentialPreHelloRefresh) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || refresh.ExpectedActiveCredentialGeneration < 1 || refresh.ActiveCredentialExpiresAt.IsZero() {
+		return store.AdapterConnection{}, errors.New("invalid pre-hello adapter credential refresh")
+	}
+	return s.updateConnection(ctx, sessionID, `UPDATE session_adapter_connections SET active_credential_expires_at_ms = ?, updated_at_ms = ?
+WHERE session_id = ? AND active_credential_generation = ? AND connection_epoch = 0 AND accepted_fence = 0 AND pending_credential_generation IS NULL AND prior_recovery_credential_generation IS NULL AND rotation_id IS NULL
+AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL AND ((active_credential_expires_at_ms = ? AND active_credential_expires_at_ms > ?) OR (active_credential_expires_at_ms <= ? AND ? > ? AND ? > active_credential_expires_at_ms))`, false, func(nowMS, _ int64) []any {
+		expiresAtMS := refresh.ActiveCredentialExpiresAt.UnixMilli()
+		return []any{expiresAtMS, nowMS, sessionID, refresh.ExpectedActiveCredentialGeneration,
+			expiresAtMS, nowMS, nowMS, expiresAtMS, nowMS, expiresAtMS}
+	})
+}
+
+func (s *Store) TerminateAdapterConnectionBeforeHello(ctx context.Context, sessionID string, termination store.AdapterConnectionPreHelloTermination) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || termination.ExpectedActiveCredentialGeneration < 1 {
+		return store.AdapterConnection{}, errors.New("invalid pre-hello adapter connection termination")
+	}
+	return s.updateConnection(ctx, sessionID, `UPDATE session_adapter_connections SET revoked_at_ms = COALESCE(revoked_at_ms, ?), terminal_at_ms = COALESCE(terminal_at_ms, ?), updated_at_ms = ?
+WHERE session_id = ? AND active_credential_generation = ? AND connection_epoch = 0 AND accepted_fence = 0 AND pending_credential_generation IS NULL AND prior_recovery_credential_generation IS NULL AND rotation_id IS NULL
+AND ((revoked_at_ms IS NULL AND terminal_at_ms IS NULL) OR revoked_at_ms = terminal_at_ms)`, false, func(nowMS, _ int64) []any {
+		return []any{nowMS, nowMS, nowMS, sessionID, termination.ExpectedActiveCredentialGeneration}
+	})
+}
+
+func (s *Store) AcceptAdapterHello(ctx context.Context, sessionID string, hello store.AdapterHello) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || hello.CredentialGeneration < 1 {
+		return store.AdapterConnection{}, errors.New("invalid adapter hello")
+	}
+	if _, err := s.AdapterConnection(ctx, sessionID); err != nil {
+		return store.AdapterConnection{}, err
+	}
+	return s.updateConnection(ctx, sessionID, `UPDATE session_adapter_connections SET connection_epoch = connection_epoch + 1, accepted_fence = ?, updated_at_ms = ?
+WHERE session_id = ? AND active_credential_generation = ? AND active_credential_expires_at_ms > ? AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL`, true, func(nowMS, fence int64) []any {
+		return []any{fence, nowMS, sessionID, hello.CredentialGeneration, nowMS}
+	})
+}
+
+func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || admission.CredentialGeneration < 1 || admission.ConnectionEpoch < 1 ||
+		admission.AcceptedFence < 1 || admission.GrantFence <= admission.AcceptedFence {
+		return store.AdapterConnection{}, errors.New("invalid adapter admission")
+	}
+	connection, err := queryAdapterConnectionWhere(ctx, s.connectionExecutor(), `connection.session_id = ? AND connection.active_credential_generation = ?
+AND connection.connection_epoch = ? AND connection.accepted_fence = ? AND ? > connection.accepted_fence AND ? < (SELECT next_fence FROM session_adapter_fence_allocator WHERE singleton = 1) AND ? < (SELECT next_fence FROM fence_store.adapter_fence_allocator WHERE singleton = 1)
+AND connection.active_credential_expires_at_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) AND connection.revoked_at_ms IS NULL AND connection.terminal_at_ms IS NULL`, sessionID, admission.CredentialGeneration, admission.ConnectionEpoch, admission.AcceptedFence,
+		admission.GrantFence, admission.GrantFence, admission.GrantFence)
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("validate adapter admission: %w", err)
+	}
+	return connection, nil
+}
+
+func (s *Store) PrepareAdapterCredentialRotation(ctx context.Context, sessionID string, rotation store.AdapterCredentialRotation) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || rotation.ExpectedActiveCredentialGeneration < 1 || rotation.ExpectedEpoch < 1 ||
+		rotation.PendingGeneration < 1 || !validAttachmentText(rotation.RotationID, 255) || rotation.ExpiresAt.IsZero() {
+		return store.AdapterConnection{}, errors.New("invalid adapter credential rotation")
+	}
+	return s.updateConnection(ctx, sessionID, `UPDATE session_adapter_connections SET pending_credential_generation = ?, pending_credential_expires_at_ms = ?, rotation_id = ?, credential_generation_high_watermark = ?, updated_at_ms = ?
+WHERE session_id = ? AND active_credential_generation = ? AND connection_epoch = ? AND connection_epoch > 0 AND accepted_fence > 0 AND pending_credential_generation IS NULL
+AND ? > credential_generation_high_watermark AND active_credential_expires_at_ms > ? AND ? > ? AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL`, false, func(nowMS, _ int64) []any {
+		expiresAtMS := rotation.ExpiresAt.UnixMilli()
+		return []any{rotation.PendingGeneration, expiresAtMS, rotation.RotationID, rotation.PendingGeneration, nowMS,
+			sessionID, rotation.ExpectedActiveCredentialGeneration, rotation.ExpectedEpoch,
+			rotation.PendingGeneration, nowMS, expiresAtMS, nowMS}
+	})
+}
+
+func (s *Store) ActivateAdapterCredential(ctx context.Context, sessionID string, activation store.AdapterCredentialActivation) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || activation.ExpectedActiveCredentialGeneration < 1 || activation.ExpectedEpoch < 1 ||
+		activation.PendingGeneration < 1 || !validAttachmentText(activation.RotationID, 255) {
+		return store.AdapterConnection{}, errors.New("invalid adapter credential activation")
+	}
+	if _, err := s.AdapterConnection(ctx, sessionID); err != nil {
+		return store.AdapterConnection{}, err
+	}
+	return s.updateConnection(ctx, sessionID, `UPDATE session_adapter_connections SET prior_recovery_credential_generation = active_credential_generation, active_credential_generation = pending_credential_generation,
+active_credential_expires_at_ms = pending_credential_expires_at_ms, pending_credential_generation = NULL, pending_credential_expires_at_ms = NULL, rotation_id = NULL,
+connection_epoch = connection_epoch + 1, accepted_fence = ?, updated_at_ms = ? WHERE session_id = ? AND active_credential_generation = ? AND connection_epoch = ?
+AND connection_epoch > 0 AND accepted_fence > 0 AND pending_credential_generation = ? AND rotation_id = ? AND active_credential_expires_at_ms > ? AND pending_credential_expires_at_ms > ?
+AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL`, true, func(nowMS, fence int64) []any {
+		return []any{fence, nowMS, sessionID, activation.ExpectedActiveCredentialGeneration, activation.ExpectedEpoch,
+			activation.PendingGeneration, activation.RotationID, nowMS, nowMS}
+	})
+}
+
+func (s *Store) AdapterConnection(ctx context.Context, sessionID string) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) {
+		return store.AdapterConnection{}, errors.New("invalid adapter connection session")
+	}
+	connection, err := queryAdapterConnection(ctx, s.connectionExecutor(), sessionID)
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("select adapter connection: %w", err)
+	}
+	return connection, nil
+}
+
+func (s *Store) connectionExecutor() sqliteConnectionExecutor {
+	if s.connectionTx != nil {
+		return s.connectionTx
+	}
+	return s.db
+}
+
+func (s *Store) withConnectionMutation(ctx context.Context, fn func(sqliteConnectionExecutor) (store.AdapterConnection, error)) (store.AdapterConnection, error) {
+	if s.connectionTx != nil {
+		return fn(s.connectionTx)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("begin adapter connection mutation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	connection, err := fn(tx)
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("commit adapter connection mutation: %w", err)
+	}
+	return connection, nil
+}
+
+func (s *Store) updateConnection(ctx context.Context, sessionID, statement string, fenced bool, args func(int64, int64) []any) (store.AdapterConnection, error) {
+	return s.withConnectionMutation(ctx, func(executor sqliteConnectionExecutor) (store.AdapterConnection, error) {
+		result, err := executor.ExecContext(ctx, `UPDATE session_adapter_connections SET updated_at_ms = updated_at_ms WHERE session_id = ?`, sessionID)
+		if err != nil {
+			return store.AdapterConnection{}, fmt.Errorf("lock adapter connection for mutation: %w", err)
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return store.AdapterConnection{}, errors.New("lock adapter connection for mutation")
+		}
+		var fence int64
+		if fenced {
+			fence, err = s.allocateAdapterFence(ctx)
+			if err == nil {
+				err = syncAdapterFence(ctx, executor, fence)
+			}
+			if err != nil {
+				return store.AdapterConnection{}, err
+			}
+		}
+		nowMS, err := sqliteNowMillis(ctx, executor)
+		if err != nil {
+			return store.AdapterConnection{}, err
+		}
+		if _, err := queryAdapterConnection(ctx, executor, sessionID); err != nil {
+			return store.AdapterConnection{}, fmt.Errorf("validate adapter connection before mutation: %w", err)
+		}
+		result, err = executor.ExecContext(ctx, statement, args(nowMS, fence)...)
+		if err != nil {
+			return store.AdapterConnection{}, fmt.Errorf("update adapter connection: %w", err)
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return store.AdapterConnection{}, errors.New("adapter connection state conflict")
+		}
+		return queryAdapterConnection(ctx, executor, sessionID)
+	})
+}
+
+const adapterConnectionColumns = `connection.session_id, connection.connection_epoch, connection.accepted_fence, connection.active_credential_generation,
+connection.credential_generation_high_watermark, connection.active_credential_expires_at_ms, connection.pending_credential_generation, connection.pending_credential_expires_at_ms,
+connection.prior_recovery_credential_generation, connection.rotation_id, connection.revoked_at_ms, connection.terminal_at_ms, connection.created_at_ms, connection.updated_at_ms,
+CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), (SELECT next_fence FROM session_adapter_fence_allocator WHERE singleton = 1)`
+
+func queryAdapterConnection(ctx context.Context, executor sqliteConnectionExecutor, sessionID string) (store.AdapterConnection, error) {
+	return queryAdapterConnectionWhere(ctx, executor, `connection.session_id = ?`, sessionID)
+}
+
+func queryAdapterConnectionWhere(ctx context.Context, executor sqliteConnectionExecutor, predicate string, args ...any) (store.AdapterConnection, error) {
+	var connection store.AdapterConnection
+	var activeExpiresAtMS, createdAtMS, updatedAtMS, nowMS, nextFence int64
+	var pendingGeneration, pendingExpiresAtMS, priorGeneration, revokedAtMS, terminalAtMS sql.NullInt64
+	var rotationID sql.NullString
+	err := executor.QueryRowContext(ctx, `SELECT `+adapterConnectionColumns+`
+FROM session_adapter_connections AS connection WHERE `+predicate, args...).Scan(
+		&connection.SessionID, &connection.ConnectionEpoch, &connection.AcceptedFence,
+		&connection.ActiveCredentialGeneration, &connection.CredentialGenerationHighWatermark,
+		&activeExpiresAtMS, &pendingGeneration, &pendingExpiresAtMS, &priorGeneration,
+		&rotationID, &revokedAtMS, &terminalAtMS, &createdAtMS, &updatedAtMS, &nowMS, &nextFence,
+	)
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	connection.ActiveCredentialExpiresAt = time.UnixMilli(activeExpiresAtMS)
+	connection.PendingCredentialGeneration = nullInt64Pointer(pendingGeneration)
+	connection.PendingCredentialExpiresAt = nullMilliTimePointer(pendingExpiresAtMS)
+	connection.PriorRecoveryGeneration = nullInt64Pointer(priorGeneration)
+	connection.RotationID = nullStringPointer(rotationID)
+	connection.RevokedAt = nullMilliTimePointer(revokedAtMS)
+	connection.TerminalAt = nullMilliTimePointer(terminalAtMS)
+	if !validAdapterConnectionRow(connection, createdAtMS, updatedAtMS, nowMS, nextFence) {
+		return store.AdapterConnection{}, errors.New("adapter connection row is invalid")
+	}
+	return connection, nil
+}
+
+func validAdapterConnectionRow(connection store.AdapterConnection, createdAtMS, updatedAtMS, nowMS, nextFence int64) bool {
+	if !validConnectionID(connection.SessionID) || connection.ConnectionEpoch < 0 || connection.AcceptedFence < 0 ||
+		(connection.ConnectionEpoch == 0) != (connection.AcceptedFence == 0) ||
+		connection.ActiveCredentialGeneration < 1 || connection.CredentialGenerationHighWatermark < connection.ActiveCredentialGeneration ||
+		connection.ActiveCredentialExpiresAt.UnixMilli() <= createdAtMS || createdAtMS < 1 || createdAtMS > updatedAtMS || updatedAtMS > nowMS ||
+		nextFence < 1 || connection.AcceptedFence >= nextFence ||
+		(connection.PendingCredentialGeneration == nil) != (connection.PendingCredentialExpiresAt == nil) ||
+		(connection.PendingCredentialGeneration == nil) != (connection.RotationID == nil) {
+		return false
+	}
+	if connection.PendingCredentialGeneration != nil && (*connection.PendingCredentialGeneration < 1 ||
+		*connection.PendingCredentialGeneration > connection.CredentialGenerationHighWatermark ||
+		*connection.PendingCredentialGeneration == connection.ActiveCredentialGeneration ||
+		(connection.PriorRecoveryGeneration != nil && *connection.PendingCredentialGeneration == *connection.PriorRecoveryGeneration) ||
+		connection.PendingCredentialExpiresAt.UnixMilli() <= createdAtMS || !validAttachmentText(*connection.RotationID, 255)) {
+		return false
+	}
+	if connection.PriorRecoveryGeneration != nil && (*connection.PriorRecoveryGeneration < 1 ||
+		*connection.PriorRecoveryGeneration > connection.CredentialGenerationHighWatermark ||
+		*connection.PriorRecoveryGeneration == connection.ActiveCredentialGeneration) {
+		return false
+	}
+	for _, timestamp := range []*time.Time{connection.RevokedAt, connection.TerminalAt} {
+		if timestamp != nil && (timestamp.UnixMilli() < createdAtMS || timestamp.UnixMilli() > nowMS) {
+			return false
+		}
+	}
+	return true
+}
+
+func validConnectionID(value string) bool { return len(value) > 0 && len(value) <= 255 }
+
+func nullInt64Pointer(value sql.NullInt64) *int64 {
+	if !value.Valid {
+		return nil
+	}
+	copy := value.Int64
+	return &copy
+}
+
+func sqliteNowMillis(ctx context.Context, tx interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (int64, error) {
 	var nowMS int64
 	if err := tx.QueryRowContext(ctx, `SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`).Scan(&nowMS); err != nil {
 		return 0, fmt.Errorf("read sqlite Store clock: %w", err)
@@ -938,8 +1292,11 @@ func nullMilliTimePointer(value sql.NullInt64) *time.Time {
 }
 
 func (s *Store) init(ctx context.Context) error {
+	if _, err := s.fenceDB.ExecContext(ctx, `PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000`); err != nil {
+		return fmt.Errorf("configure sqlite fence store: %w", err)
+	}
 	pragmas := []string{
-		`PRAGMA journal_mode = WAL`,
+		`PRAGMA main.journal_mode = WAL`,
 		`PRAGMA synchronous = NORMAL`,
 		`PRAGMA busy_timeout = 5000`,
 		`PRAGMA foreign_keys = ON`,
@@ -948,6 +1305,10 @@ func (s *Store) init(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, pragma); err != nil {
 			return fmt.Errorf("configure sqlite event store %q: %w", pragma, err)
 		}
+	}
+	var fenceTables int
+	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('session_adapter_fence_allocator', 'session_adapter_fence_identity')) + (SELECT count(*) FROM fence_store.sqlite_master WHERE type = 'table' AND name IN ('adapter_fence_allocator', 'adapter_fence_identity'))`).Scan(&fenceTables); err != nil || (fenceTables != 0 && fenceTables != 4) {
+		return errors.New("sqlite fence store schema is incomplete")
 	}
 
 	if _, err := s.db.ExecContext(ctx, `
@@ -986,13 +1347,15 @@ CREATE TABLE IF NOT EXISTS session_adapter_connections (
     CHECK (active_credential_generation <= credential_generation_high_watermark),
     CHECK (pending_credential_generation IS NULL OR pending_credential_generation <= credential_generation_high_watermark),
     CHECK (prior_recovery_credential_generation IS NULL OR prior_recovery_credential_generation <= credential_generation_high_watermark),
+    CHECK (pending_credential_generation IS NULL OR pending_credential_generation <> active_credential_generation),
+    CHECK (prior_recovery_credential_generation IS NULL OR prior_recovery_credential_generation <> active_credential_generation),
+    CHECK (pending_credential_generation IS NULL OR prior_recovery_credential_generation IS NULL OR pending_credential_generation <> prior_recovery_credential_generation),
     CHECK (revoked_at_ms IS NULL OR revoked_at_ms >= created_at_ms),
     CHECK (terminal_at_ms IS NULL OR terminal_at_ms >= created_at_ms)
 );
 
 CREATE INDEX IF NOT EXISTS session_adapter_connections_active_expiry_idx
 ON session_adapter_connections (active_credential_expires_at_ms);
-
 CREATE TABLE IF NOT EXISTS session_pending_commands (
     session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
     cmd_id TEXT NOT NULL CHECK (length(cmd_id) BETWEEN 1 AND 256),
@@ -1045,6 +1408,26 @@ CREATE INDEX IF NOT EXISTS session_attachments_status_expiry_idx
 ON session_attachments (status, expires_at_ns);
 `); err != nil {
 		return fmt.Errorf("initialize sqlite event store schema: %w", err)
+	}
+	if fenceTables == 0 {
+		_, err := s.db.ExecContext(ctx, `
+CREATE TABLE session_adapter_fence_allocator (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_fence INTEGER NOT NULL CHECK (next_fence > 0));
+CREATE TABLE fence_store.adapter_fence_allocator (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_fence INTEGER NOT NULL CHECK (typeof(next_fence) = 'integer' AND next_fence > 0));
+CREATE TABLE session_adapter_fence_identity (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), store_id TEXT UNIQUE NOT NULL);
+CREATE TABLE fence_store.adapter_fence_identity (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), store_id TEXT UNIQUE NOT NULL);
+INSERT INTO session_adapter_fence_allocator SELECT 1, COALESCE(MAX(accepted_fence), 0) + 1 FROM session_adapter_connections;
+INSERT INTO fence_store.adapter_fence_allocator SELECT singleton, next_fence FROM session_adapter_fence_allocator;
+INSERT INTO fence_store.adapter_fence_identity VALUES (1, lower(hex(randomblob(16))));
+INSERT INTO session_adapter_fence_identity SELECT singleton, store_id FROM fence_store.adapter_fence_identity;
+CREATE TRIGGER fence_store.adapter_fence_allocator_advance BEFORE UPDATE OF next_fence ON adapter_fence_allocator WHEN NEW.next_fence <> OLD.next_fence + 1 BEGIN SELECT RAISE(ABORT, 'adapter fence allocator must advance by one'); END;
+CREATE TRIGGER session_adapter_connections_advance_fence BEFORE UPDATE OF accepted_fence ON session_adapter_connections WHEN NEW.accepted_fence <> OLD.accepted_fence BEGIN SELECT CASE WHEN NEW.accepted_fence <= OLD.accepted_fence OR NEW.accepted_fence >= (SELECT next_fence FROM session_adapter_fence_allocator WHERE singleton = 1) THEN RAISE(ABORT, 'adapter accepted fence is not allocator-owned') END; END;`)
+		if err != nil {
+			return fmt.Errorf("initialize sqlite fence store schema: %w", err)
+		}
+	}
+	var fenceOK bool
+	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM session_adapter_fence_identity) = 1 AND (SELECT count(*) FROM fence_store.adapter_fence_identity) = 1 AND EXISTS (SELECT 1 FROM session_adapter_fence_identity AS main JOIN fence_store.adapter_fence_identity AS fence USING (singleton, store_id)) AND (SELECT count(*) FROM session_adapter_fence_allocator) = 1 AND (SELECT count(*) FROM session_adapter_fence_allocator WHERE singleton = 1 AND typeof(next_fence) = 'integer' AND next_fence > (SELECT COALESCE(MAX(accepted_fence), 0) FROM session_adapter_connections)) = 1 AND (SELECT count(*) FROM fence_store.adapter_fence_allocator) = 1 AND (SELECT count(*) FROM fence_store.adapter_fence_allocator WHERE singleton = 1 AND typeof(next_fence) = 'integer' AND next_fence >= (SELECT next_fence FROM session_adapter_fence_allocator WHERE singleton = 1)) = 1 AND EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'session_adapter_connections_advance_fence') AND EXISTS (SELECT 1 FROM fence_store.sqlite_master WHERE type = 'trigger' AND name = 'adapter_fence_allocator_advance')`).Scan(&fenceOK); err != nil || !fenceOK {
+		return errors.New("sqlite fence store state is missing, mismatched or stale")
 	}
 	return nil
 }
