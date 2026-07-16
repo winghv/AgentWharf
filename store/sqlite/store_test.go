@@ -484,6 +484,11 @@ func TestConnectionFencePartialStateFailsClosed(t *testing.T) {
 		{name: "side identity row", database: ".fences", statement: `DELETE FROM adapter_fence_identity`},
 		{name: "side allocator table", database: ".fences", statement: `DROP TABLE adapter_fence_allocator`},
 		{name: "side allocator row", database: ".fences", statement: `DELETE FROM adapter_fence_allocator`},
+		{name: "main identity extra row", statement: `PRAGMA ignore_check_constraints = ON; INSERT INTO session_adapter_fence_identity VALUES (2, 'extra')`},
+		{name: "main allocator extra row", statement: `PRAGMA ignore_check_constraints = ON; INSERT INTO session_adapter_fence_allocator VALUES (2, 1)`},
+		{name: "side identity extra row", database: ".fences", statement: `PRAGMA ignore_check_constraints = ON; INSERT INTO adapter_fence_identity VALUES (2, 'extra')`},
+		{name: "side allocator extra row", database: ".fences", statement: `PRAGMA ignore_check_constraints = ON; INSERT INTO adapter_fence_allocator VALUES (2, 1)`},
+		{name: "main fence trigger", statement: `DROP TRIGGER session_adapter_connections_advance_fence`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "events.db")
