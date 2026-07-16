@@ -125,15 +125,16 @@ func TestWebSocketServerHistoryAuthorizationAndAvailability(t *testing.T) {
 	t.Parallel()
 
 	for _, test := range []struct {
-		name       string
-		version    int
-		token      string
-		sessionID  string
-		storeError error
-		wantCode   string
+		name        string
+		version     int
+		token       string
+		sessionID   string
+		storeError  error
+		wantCode    string
+		helloDenied bool
 	}{
 		{name: "v1 unsupported", version: 1, token: "view-token", sessionID: "ses_1", wantCode: "history_unsupported"},
-		{name: "api wildcard denied", version: 2, token: "api-token", sessionID: "ses_1", wantCode: "history_unavailable"},
+		{name: "api wildcard denied", version: 2, token: "api-token", sessionID: "ses_1", helloDenied: true},
 		{name: "cross session denied", version: 2, token: "view-token", sessionID: "ses_2", wantCode: "history_unavailable"},
 		{name: "store failure", version: 2, token: "view-token", sessionID: "ses_1", storeError: errors.New("private store failure"), wantCode: "history_unavailable"},
 	} {
@@ -149,7 +150,14 @@ func TestWebSocketServerHistoryAuthorizationAndAvailability(t *testing.T) {
 				ProtocolVersion: test.version, Role: protocol.RoleClient, Token: test.token,
 				Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}},
 			})
-			_ = readFrame(t, client).(*protocol.HelloAck)
+			first := readFrame(t, client)
+			if test.helloDenied {
+				if got := first.(*protocol.Error); got.Code != "unauthorized" || events.historyCalls() != 0 {
+					t.Fatalf("hello error = %+v, history calls = %d", got, events.historyCalls())
+				}
+				return
+			}
+			_ = first.(*protocol.HelloAck)
 			writeFrame(t, client, &protocol.HistoryPageRequest{RequestID: "hist_denied", SessionID: test.sessionID, Limit: 1})
 			got := readFrame(t, client).(*protocol.Error)
 			if got.Code != test.wantCode || got.Message == "private store failure" {
@@ -234,7 +242,7 @@ func TestWebSocketServerReauthenticatesHistoryBeforeAndAfterStore(t *testing.T) 
 				page:           store.HistoryPage{Events: []store.Event{{SessionID: "ses_1", Seq: 1, Type: "x", Payload: json.RawMessage(`{}`)}}, LatestSeq: 1, RetentionState: store.RetentionComplete},
 			}
 			authenticator := &boundedWebsocketAuth{validCalls: test.validCalls, principal: auth.Principal{Subject: "viewer", Scopes: []auth.Scope{auth.SessionView("ses_1")}}}
-			handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events, SessionLookup: fakeSessions{"ses_1": {State: "ready"}}})
+			handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events})
 			server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
 			client := dialWebSocket(t, server.URL)
 			defer client.Close(websocket.StatusNormalClosure, "")
@@ -255,7 +263,7 @@ func TestWebSocketServerRejectsReboundHistoryPrincipal(t *testing.T) {
 		{Subject: "viewer-a", Scopes: []auth.Scope{auth.SessionView("ses_1")}},
 		{Subject: "viewer-b", Scopes: []auth.Scope{auth.SessionView("ses_1")}},
 	}}
-	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events, SessionLookup: fakeSessions{"ses_1": {State: "ready"}}})
+	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events})
 	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
 	client := dialWebSocket(t, server.URL)
 	defer client.Close(websocket.StatusNormalClosure, "")
@@ -287,6 +295,39 @@ func TestWebSocketServerRejectsAdapterHistoryRequest(t *testing.T) {
 	}
 	if events.historyCalls() != 0 {
 		t.Fatal("adapter history request reached store")
+	}
+}
+
+func TestWebSocketServerAttachOnlyDeniesReadReplayLiveAndCommands(t *testing.T) {
+	t.Parallel()
+	base := newFakeEventStore(map[string]int64{"ses_1": 0}, map[string][]store.Event{
+		"ses_1": {{SessionID: "ses_1", Seq: 1, Type: "session.message", Payload: json.RawMessage(`{}`)}},
+	})
+	base.setAdmissionTruth("ses_1", store.SessionAdmissionTruth{SessionID: "ses_1"})
+	events := &fakeHistoryStore{fakeEventStore: base, page: store.HistoryPage{RetentionState: store.RetentionComplete}}
+	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: testHandshakeWithStore(events), EventStore: events})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: 2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	ack := readFrame(t, client).(*protocol.HelloAck)
+	if ack.Sessions[0].State != "attach_only" || base.replayCallCount() != 0 {
+		t.Fatalf("attach-only ack = %+v, replay calls = %d", ack.Sessions[0], base.replayCallCount())
+	}
+	writeFrame(t, client, &protocol.HistoryPageRequest{RequestID: "hist_attach_only", SessionID: "ses_1", Limit: 1})
+	if got := readFrame(t, client).(*protocol.Error); got.Code != "history_unavailable" || events.historyCalls() != 0 {
+		t.Fatalf("history error = %+v, store calls = %d", got, events.historyCalls())
+	}
+	writeFrame(t, client, &protocol.Command{CommandID: "cmd_attach_only", Type: protocol.CommandSessionSend, SessionID: "ses_1", Payload: json.RawMessage(`{"content":[{"kind":"text","text":"blocked"}]}`)})
+	if got := readFrame(t, client).(*protocol.CommandAck); got.Status != protocol.AckRejected || len(base.appended()) != 0 {
+		t.Fatalf("command ack = %+v, appends = %d", got, len(base.appended()))
+	}
+	if err := handler.EmitEphemeralEvent(context.Background(), protocol.Event{Type: "log.tail", SessionID: "ses_1", Payload: json.RawMessage(`{}`)}); err != nil {
+		t.Fatalf("EmitEphemeralEvent() error = %v", err)
+	}
+	if frame, err := readFrameWithin(client, 80*time.Millisecond); err == nil {
+		t.Fatalf("attach-only client received live frame %+v", frame)
 	}
 }
 
@@ -1182,8 +1223,7 @@ func testHandshakeWithStore(events store.EventStore) *hub.Handshake {
 				},
 			},
 		},
-		EventStore:    events,
-		SessionLookup: fakeSessions{"ses_1": {State: "ready", Provider: "claude-code"}},
+		EventStore: events,
 	})
 }
 
@@ -1219,6 +1259,10 @@ func (a *reboundWebsocketAuth) Authorize(_ context.Context, principal auth.Princ
 	return auth.Authorize(principal, scope)
 }
 
+func (a *reboundWebsocketAuth) SessionAdmissionClaim(_ context.Context, _ auth.Principal, sessionID string) (auth.SessionAdmissionClaim, error) {
+	return auth.SessionAdmissionClaim{SessionID: sessionID, Provider: "claude-code", ExpiresAt: time.Now().Add(time.Minute)}, nil
+}
+
 func (a *boundedWebsocketAuth) Authenticate(_ context.Context, _ string) (auth.Principal, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1231,6 +1275,10 @@ func (a *boundedWebsocketAuth) Authenticate(_ context.Context, _ string) (auth.P
 
 func (a *boundedWebsocketAuth) Authorize(_ context.Context, principal auth.Principal, scope auth.Scope) error {
 	return auth.Authorize(principal, scope)
+}
+
+func (a *boundedWebsocketAuth) SessionAdmissionClaim(_ context.Context, _ auth.Principal, sessionID string) (auth.SessionAdmissionClaim, error) {
+	return auth.SessionAdmissionClaim{SessionID: sessionID, Provider: "claude-code", ExpiresAt: time.Now().Add(time.Minute)}, nil
 }
 
 type recordingCommandActivityObserver struct {
@@ -1283,6 +1331,10 @@ func (a websocketTestAuth) Authorize(_ context.Context, principal auth.Principal
 	return auth.Authorize(principal, scope)
 }
 
+func (a websocketTestAuth) SessionAdmissionClaim(_ context.Context, _ auth.Principal, sessionID string) (auth.SessionAdmissionClaim, error) {
+	return auth.SessionAdmissionClaim{SessionID: sessionID, Provider: "claude-code", ExpiresAt: time.Now().Add(time.Minute)}, nil
+}
+
 type fakeEventStore struct {
 	mu            sync.Mutex
 	latest        map[string]int64
@@ -1290,6 +1342,8 @@ type fakeEventStore struct {
 	appendErr     error
 	appendCalls   []appendCall
 	onReplayEvent func()
+	truth         map[string]store.SessionAdmissionTruth
+	replayCalls   int
 }
 
 type historyCall struct {
@@ -1346,7 +1400,32 @@ func newFakeEventStore(latest map[string]int64, events map[string][]store.Event)
 	if events == nil {
 		events = make(map[string][]store.Event)
 	}
-	return &fakeEventStore{latest: latest, events: events}
+	truth := make(map[string]store.SessionAdmissionTruth, len(latest))
+	for sessionID := range latest {
+		truth[sessionID] = store.SessionAdmissionTruth{SessionID: sessionID, Exists: true, Complete: true, Live: true}
+	}
+	return &fakeEventStore{latest: latest, events: events, truth: truth}
+}
+
+func (f *fakeEventStore) setAdmissionTruth(sessionID string, truth store.SessionAdmissionTruth) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.truth[sessionID] = truth
+}
+
+func (f *fakeEventStore) SessionAdmissionTruth(_ context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if truth, ok := f.truth[sessionID]; ok {
+		return truth, nil
+	}
+	return store.SessionAdmissionTruth{SessionID: sessionID}, nil
+}
+
+func (f *fakeEventStore) replayCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.replayCalls
 }
 
 func (f *fakeEventStore) setAppendError(err error) {
@@ -1395,6 +1474,7 @@ func (f *fakeEventStore) LatestSeq(_ context.Context, sessionID string) (int64, 
 
 func (f *fakeEventStore) Replay(_ context.Context, sessionID string, afterSeq int64, fn func(store.Event) error) error {
 	f.mu.Lock()
+	f.replayCalls++
 	events := append([]store.Event(nil), f.events[sessionID]...)
 	onReplayEvent := f.onReplayEvent
 	f.mu.Unlock()

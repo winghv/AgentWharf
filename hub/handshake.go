@@ -4,24 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/winghv/agentwharf/auth"
 	"github.com/winghv/agentwharf/protocol"
+	"github.com/winghv/agentwharf/store"
 )
 
 var (
 	ErrInvalidHello       = errors.New("invalid hello")
 	ErrVersionUnsupported = errors.New("protocol version unsupported")
-	ErrSessionNotFound    = errors.New("session not found")
 )
 
-type SessionInfo struct {
-	State    string
-	Provider string
-}
-
-type SessionLookup interface {
-	LookupSession(ctx context.Context, sessionID string) (SessionInfo, error)
+type SessionAdmissionAuthenticator interface {
+	auth.Authenticator
+	SessionAdmissionClaim(context.Context, auth.Principal, string) (auth.SessionAdmissionClaim, error)
 }
 
 type HandshakeConfig struct {
@@ -29,7 +26,6 @@ type HandshakeConfig struct {
 	EventStore    interface {
 		LatestSeq(ctx context.Context, sessionID string) (int64, error)
 	}
-	SessionLookup SessionLookup
 }
 
 type Handshake struct {
@@ -37,7 +33,6 @@ type Handshake struct {
 	events        interface {
 		LatestSeq(ctx context.Context, sessionID string) (int64, error)
 	}
-	sessions SessionLookup
 }
 
 type AcceptedPeer struct {
@@ -48,6 +43,7 @@ type AcceptedPeer struct {
 	Provider        string
 	Resume          bool
 	Subscribed      []protocol.Subscription
+	Admissions      map[string]auth.SessionAdmissionDecision
 }
 
 func NewHandshake(cfg HandshakeConfig) *Handshake {
@@ -55,14 +51,9 @@ func NewHandshake(cfg HandshakeConfig) *Handshake {
 	if events == nil {
 		events = noopEventStore{}
 	}
-	sessions := cfg.SessionLookup
-	if sessions == nil {
-		sessions = noopSessionLookup{}
-	}
 	return &Handshake{
 		authenticator: cfg.Authenticator,
 		events:        events,
-		sessions:      sessions,
 	}
 }
 
@@ -123,20 +114,34 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 	accepted := AcceptedPeer{
 		Role: protocol.RoleClient, ProtocolVersion: selectedVersion, Principal: principal,
 		Subscribed: append([]protocol.Subscription(nil), hello.Subscriptions...),
+		Admissions: make(map[string]auth.SessionAdmissionDecision, len(hello.Subscriptions)),
 	}
 
 	for _, sub := range hello.Subscriptions {
 		if sub.SessionID == "" || sub.LastSeq < 0 {
 			return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: invalid subscription", ErrInvalidHello)
 		}
-		if err := h.authenticator.Authorize(ctx, principal, auth.SessionView(sub.SessionID)); err != nil {
-			return protocol.HelloAck{}, AcceptedPeer{}, err
+		access := exactSessionAccess(principal, sub.SessionID)
+		if access == "" || h.authenticator.Authorize(ctx, principal, auth.Scope{Kind: auth.KindSession, ID: sub.SessionID, Access: access}) != nil {
+			return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
 		}
-		summary, err := h.summary(ctx, sub.SessionID, sub.LastSeq)
+		claim, decision, err := h.clientAdmission(ctx, principal, sub.SessionID, access)
 		if err != nil {
 			return protocol.HelloAck{}, AcceptedPeer{}, err
 		}
+		state := "ready"
+		if decision.Mode == auth.SessionAdmissionAttachOnly {
+			state = string(auth.SessionAdmissionAttachOnly)
+		}
+		summary, err := h.summary(ctx, sub.SessionID, sub.LastSeq, state, claim.Provider)
+		if err != nil {
+			return protocol.HelloAck{}, AcceptedPeer{}, err
+		}
+		if decision.Mode == auth.SessionAdmissionAttachOnly && summary.LatestSeq != 0 {
+			return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+		}
 		ack.Sessions = append(ack.Sessions, summary)
+		accepted.Admissions[sub.SessionID] = decision
 	}
 
 	return ack, accepted, nil
@@ -146,10 +151,19 @@ func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, pr
 	if hello.SessionID == "" || hello.Provider == "" {
 		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: adapter session_id and provider are required", ErrInvalidHello)
 	}
-	if err := h.authenticator.Authorize(ctx, principal, auth.SessionAdapter(hello.SessionID)); err != nil {
-		return protocol.HelloAck{}, AcceptedPeer{}, err
+	if !hasExactSessionAccess(principal, hello.SessionID, auth.AccessAdapter) ||
+		h.authenticator.Authorize(ctx, principal, auth.SessionAdapter(hello.SessionID)) != nil {
+		return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
 	}
-	summary, err := h.adapterSummary(ctx, hello.SessionID)
+	claim, err := h.sessionAdmissionClaim(ctx, principal, hello.SessionID)
+	if err != nil || claim.Provider != hello.Provider {
+		return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+	}
+	truth, err := h.sessionAdmissionTruth(ctx, hello.SessionID)
+	if err != nil || !truth.Exists || !truth.Complete || truth.Terminal || truth.Conflicting {
+		return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+	}
+	summary, err := h.adapterSummary(ctx, hello.SessionID, claim.Provider)
 	if err != nil {
 		return protocol.HelloAck{}, AcceptedPeer{}, err
 	}
@@ -163,8 +177,8 @@ func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, pr
 		}, nil
 }
 
-func (h *Handshake) adapterSummary(ctx context.Context, sessionID string) (protocol.SessionSummary, error) {
-	summary, err := h.summary(ctx, sessionID, 0)
+func (h *Handshake) adapterSummary(ctx context.Context, sessionID, provider string) (protocol.SessionSummary, error) {
+	summary, err := h.summary(ctx, sessionID, 0, "ready", provider)
 	if err != nil {
 		return protocol.SessionSummary{}, err
 	}
@@ -172,11 +186,7 @@ func (h *Handshake) adapterSummary(ctx context.Context, sessionID string) (proto
 	return summary, nil
 }
 
-func (h *Handshake) summary(ctx context.Context, sessionID string, lastSeq int64) (protocol.SessionSummary, error) {
-	info, err := h.sessions.LookupSession(ctx, sessionID)
-	if err != nil {
-		return protocol.SessionSummary{}, err
-	}
+func (h *Handshake) summary(ctx context.Context, sessionID string, lastSeq int64, state, provider string) (protocol.SessionSummary, error) {
 	latest, err := h.events.LatestSeq(ctx, sessionID)
 	if err != nil {
 		return protocol.SessionSummary{}, fmt.Errorf("latest seq for %s: %w", sessionID, err)
@@ -184,8 +194,8 @@ func (h *Handshake) summary(ctx context.Context, sessionID string, lastSeq int64
 	replayFrom := lastSeq + 1
 	return protocol.SessionSummary{
 		SessionID:  sessionID,
-		State:      info.State,
-		Provider:   info.Provider,
+		State:      state,
+		Provider:   provider,
 		LatestSeq:  latest,
 		ReplayFrom: replayFrom,
 	}, nil
@@ -197,8 +207,90 @@ func (noopEventStore) LatestSeq(context.Context, string) (int64, error) {
 	return 0, nil
 }
 
-type noopSessionLookup struct{}
+type sessionAdmissionTruthStore interface {
+	SessionAdmissionTruth(context.Context, string) (store.SessionAdmissionTruth, error)
+}
 
-func (noopSessionLookup) LookupSession(context.Context, string) (SessionInfo, error) {
-	return SessionInfo{}, ErrSessionNotFound
+func (h *Handshake) clientAdmission(ctx context.Context, principal auth.Principal, sessionID string, access auth.Access) (auth.SessionAdmissionClaim, auth.SessionAdmissionDecision, error) {
+	claim, err := h.sessionAdmissionClaim(ctx, principal, sessionID)
+	if err != nil {
+		return auth.SessionAdmissionClaim{}, auth.SessionAdmissionDecision{}, err
+	}
+	truth, err := h.sessionAdmissionTruth(ctx, sessionID)
+	if err != nil {
+		return auth.SessionAdmissionClaim{}, auth.SessionAdmissionDecision{}, err
+	}
+	if access == auth.AccessControl {
+		decision, err := auth.EvaluateSessionAdmission(auth.SessionAdmissionRequest{Principal: principal, Claim: claim, Truth: truth})
+		return claim, decision, err
+	}
+	if access != auth.AccessView || !truth.Exists || !truth.Complete || truth.Terminal || truth.Conflicting || !truth.Live {
+		return auth.SessionAdmissionClaim{}, auth.SessionAdmissionDecision{}, auth.ErrUnauthorized
+	}
+	return claim, auth.SessionAdmissionDecision{Mode: auth.SessionAdmissionCurrent}, nil
+}
+
+func (h *Handshake) sessionAdmissionClaim(ctx context.Context, principal auth.Principal, sessionID string) (auth.SessionAdmissionClaim, error) {
+	authenticator, ok := h.authenticator.(SessionAdmissionAuthenticator)
+	if !ok {
+		return auth.SessionAdmissionClaim{}, auth.ErrUnauthorized
+	}
+	claim, err := authenticator.SessionAdmissionClaim(ctx, principal, sessionID)
+	now := time.Now()
+	if err != nil || claim.SessionID != sessionID || claim.Provider == "" || !claim.ExpiresAt.After(now) || claim.ExpiresAt.After(now.Add(5*time.Minute)) {
+		return auth.SessionAdmissionClaim{}, auth.ErrUnauthorized
+	}
+	return claim, nil
+}
+
+func (h *Handshake) sessionAdmissionTruth(ctx context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
+	truthStore, ok := h.events.(sessionAdmissionTruthStore)
+	if !ok {
+		return store.SessionAdmissionTruth{}, auth.ErrUnauthorized
+	}
+	truth, err := truthStore.SessionAdmissionTruth(ctx, sessionID)
+	if err != nil || truth.SessionID != sessionID {
+		return store.SessionAdmissionTruth{}, auth.ErrUnauthorized
+	}
+	return truth, nil
+}
+
+func exactSessionAccess(principal auth.Principal, sessionID string) auth.Access {
+	if hasExactSessionAccess(principal, sessionID, auth.AccessControl) {
+		return auth.AccessControl
+	}
+	if hasExactSessionAccess(principal, sessionID, auth.AccessView) {
+		return auth.AccessView
+	}
+	return ""
+}
+
+func hasExactSessionAccess(principal auth.Principal, sessionID string, access auth.Access) bool {
+	for _, scope := range principal.Scopes {
+		if scope.Kind == auth.KindSession && scope.ID == sessionID && scope.Access == access {
+			return true
+		}
+	}
+	return false
+}
+
+func (p AcceptedPeer) currentSubscriptions() []protocol.Subscription {
+	current := make([]protocol.Subscription, 0, len(p.Subscribed))
+	for _, sub := range p.Subscribed {
+		if p.Admissions[sub.SessionID].Mode == auth.SessionAdmissionCurrent {
+			current = append(current, sub)
+		}
+	}
+	return current
+}
+
+func (p AcceptedPeer) allows(sessionID string, action auth.SessionAdmissionAction) bool {
+	decision, ok := p.Admissions[sessionID]
+	if !ok {
+		return false
+	}
+	if action == auth.SessionAdmissionHistory {
+		return decision.Mode == auth.SessionAdmissionCurrent
+	}
+	return decision.Allows(action)
 }

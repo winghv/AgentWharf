@@ -31,6 +31,7 @@ import (
 	"github.com/winghv/agentwharf/auth/static"
 	"github.com/winghv/agentwharf/hub"
 	"github.com/winghv/agentwharf/protocol"
+	"github.com/winghv/agentwharf/store"
 	"github.com/winghv/agentwharf/store/sqlite"
 	"nhooyr.io/websocket"
 )
@@ -1809,7 +1810,7 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 		return nil, fmt.Errorf("listen %s: %w", cfg.Addr, err)
 	}
 
-	authenticator := static.New([]static.Token{
+	baseAuthenticator := static.New([]static.Token{
 		{
 			Token:   cfg.ControlToken,
 			Subject: "local-client",
@@ -1821,17 +1822,14 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 			Scopes:  []auth.Scope{auth.SessionAdapter(cfg.SessionID)},
 		},
 	})
+	authenticator := localSessionAuthenticator{Authenticator: baseAuthenticator, sessionID: cfg.SessionID, provider: cfg.Provider}
+	sessionStore := localSessionStore{Store: eventStore, sessionID: cfg.SessionID}
 	handshake := hub.NewHandshake(hub.HandshakeConfig{
 		Authenticator: authenticator,
-		EventStore:    eventStore,
-		SessionLookup: singleSessionLookup{
-			sessionID: cfg.SessionID,
-			provider:  cfg.Provider,
-			state:     "ready",
-		},
+		EventStore:    sessionStore,
 	})
 	server := &http.Server{
-		Handler:           hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: eventStore}),
+		Handler:           hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: sessionStore}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -1873,15 +1871,27 @@ func (r *runningServe) wait() error {
 	return nil
 }
 
-type singleSessionLookup struct {
+type localSessionAuthenticator struct {
+	auth.Authenticator
 	sessionID string
 	provider  string
-	state     string
 }
 
-func (s singleSessionLookup) LookupSession(_ context.Context, sessionID string) (hub.SessionInfo, error) {
-	if sessionID != s.sessionID {
-		return hub.SessionInfo{}, hub.ErrSessionNotFound
+func (a localSessionAuthenticator) SessionAdmissionClaim(_ context.Context, _ auth.Principal, sessionID string) (auth.SessionAdmissionClaim, error) {
+	if sessionID != a.sessionID {
+		return auth.SessionAdmissionClaim{}, auth.ErrUnauthorized
 	}
-	return hub.SessionInfo{State: s.state, Provider: s.provider}, nil
+	return auth.SessionAdmissionClaim{SessionID: sessionID, Provider: a.provider, ExpiresAt: time.Now().Add(5 * time.Minute)}, nil
+}
+
+type localSessionStore struct {
+	*sqlite.Store
+	sessionID string
+}
+
+func (s localSessionStore) SessionAdmissionTruth(_ context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
+	if sessionID != s.sessionID {
+		return store.SessionAdmissionTruth{}, auth.ErrUnauthorized
+	}
+	return store.SessionAdmissionTruth{SessionID: sessionID, Exists: true, Complete: true, Live: true}, nil
 }

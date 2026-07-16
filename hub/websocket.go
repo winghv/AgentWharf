@@ -287,6 +287,7 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocke
 		})
 	}
 	if request == nil || peer == nil || !subscribesTo(accepted.Subscribed, request.SessionID) ||
+		!accepted.allows(request.SessionID, auth.SessionAdmissionHistory) ||
 		!h.authorizeHistory(ctx, historyToken, accepted.Principal.Subject, request.SessionID) {
 		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
@@ -398,7 +399,7 @@ func (h *webSocketHandler) replayAccepted(ctx context.Context, peer *clientConne
 	if h.events == nil || accepted.Role != protocol.RoleClient || peer == nil {
 		return nil
 	}
-	for _, sub := range accepted.Subscribed {
+	for _, sub := range accepted.currentSubscriptions() {
 		if err := h.events.Replay(ctx, sub.SessionID, sub.LastSeq, func(ev store.Event) error {
 			seq := ev.Seq
 			return peer.writeReplayEvent(ctx, protocol.Event{
@@ -424,10 +425,11 @@ func (h *webSocketHandler) registerPeer(conn *websocket.Conn, accepted AcceptedP
 	if accepted.Role != protocol.RoleClient {
 		return nil
 	}
-	peer := newClientConnection(conn, accepted.ProtocolVersion, accepted.Subscribed, h.events != nil)
+	current := accepted.currentSubscriptions()
+	peer := newClientConnection(conn, accepted.ProtocolVersion, current, h.events != nil)
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, sub := range accepted.Subscribed {
+	for _, sub := range current {
 		if h.subscribers[sub.SessionID] == nil {
 			h.subscribers[sub.SessionID] = make(map[*clientConnection]struct{})
 		}
@@ -556,6 +558,11 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websoc
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return err
 	}
+	if !accepted.allows(cmd.SessionID, commandAdmissionAction(cmd.Type)) {
+		err := errors.New("session admission denies command")
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
+		return err
+	}
 	if h.handshake == nil || h.handshake.authenticator == nil {
 		err := errors.New("hub authenticator is not configured")
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "internal_error")
@@ -620,6 +627,19 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websoc
 		return err
 	}
 	return nil
+}
+
+func commandAdmissionAction(commandType protocol.CommandType) auth.SessionAdmissionAction {
+	switch commandType {
+	case protocol.CommandSessionSend:
+		return auth.SessionAdmissionSend
+	case protocol.CommandPermissionRespond:
+		return auth.SessionAdmissionPermission
+	case protocol.CommandSessionInterrupt, protocol.CommandSessionStop:
+		return auth.SessionAdmissionRunControl
+	default:
+		return ""
+	}
 }
 
 func (h *webSocketHandler) observeCommandActivity(ctx context.Context, activity CommandActivity) {
@@ -1157,8 +1177,6 @@ func protocolErrorCode(err error) string {
 		return "invalid_hello"
 	case errors.Is(err, auth.ErrInvalidToken), errors.Is(err, auth.ErrUnauthorized):
 		return "unauthorized"
-	case errors.Is(err, ErrSessionNotFound):
-		return "session_not_found"
 	default:
 		return "internal_error"
 	}
