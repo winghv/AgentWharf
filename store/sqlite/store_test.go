@@ -334,6 +334,107 @@ func TestConnectionGrantFenceSharesAllocatorAndRollback(t *testing.T) {
 	}
 }
 
+func TestConnectionAcceptedFencesSurviveTransactionFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
+	ctx := context.Background()
+	for _, sessionID := range []string{"ses_hello_rollback", "ses_hello_cancel"} {
+		if _, err := connections.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+			SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute),
+		}); err != nil {
+			t.Fatalf("initialize %s: %v", sessionID, err)
+		}
+	}
+	rollback := errors.New("rollback accepted hello")
+	var rolledBack store.AdapterConnection
+	if err := connections.WithAdapterConnectionTransaction(ctx, func(tx store.AdapterConnectionStore) error {
+		var err error
+		rolledBack, err = tx.AcceptAdapterHello(ctx, "ses_hello_rollback", store.AdapterHello{CredentialGeneration: 1})
+		if err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatalf("hello rollback error = %v", err)
+	}
+	afterRollback, err := connections.AcceptAdapterHello(ctx, "ses_hello_rollback", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil || afterRollback.ConnectionEpoch != 1 || afterRollback.AcceptedFence <= rolledBack.AcceptedFence {
+		t.Fatalf("post-rollback hello = %+v, %v, returned rollback = %+v", afterRollback, err, rolledBack)
+	}
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	var canceled store.AdapterConnection
+	err = connections.WithAdapterConnectionTransaction(canceledCtx, func(tx store.AdapterConnectionStore) error {
+		var err error
+		canceled, err = tx.AcceptAdapterHello(canceledCtx, "ses_hello_cancel", store.AdapterHello{CredentialGeneration: 1})
+		cancel()
+		return err
+	})
+	if err == nil {
+		t.Fatal("canceled hello transaction unexpectedly committed")
+	}
+	afterCancel, err := connections.AcceptAdapterHello(ctx, "ses_hello_cancel", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil || afterCancel.ConnectionEpoch != 1 || afterCancel.AcceptedFence <= canceled.AcceptedFence {
+		t.Fatalf("post-cancel hello = %+v, %v, returned canceled = %+v", afterCancel, err, canceled)
+	}
+
+	init := store.AdapterConnectionInitialize{SessionID: "ses_activation_panic", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	active := initializeConnectionForRotation(t, connections, init)
+	rotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: active.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_activation_panic"}
+	if _, err := connections.PrepareAdapterCredentialRotation(ctx, init.SessionID, rotation); err != nil {
+		t.Fatalf("prepare activation panic: %v", err)
+	}
+	var panicked store.AdapterConnection
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("activation transaction panic was swallowed")
+			}
+		}()
+		_ = connections.WithAdapterConnectionTransaction(ctx, func(tx store.AdapterConnectionStore) error {
+			var err error
+			panicked, err = tx.ActivateAdapterCredential(ctx, init.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: active.ConnectionEpoch, PendingGeneration: 2, RotationID: rotation.RotationID})
+			if err != nil {
+				return err
+			}
+			panic("rollback activation fence")
+		})
+	}()
+	activated, err := connections.ActivateAdapterCredential(ctx, init.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: active.ConnectionEpoch, PendingGeneration: 2, RotationID: rotation.RotationID})
+	if err != nil || activated.AcceptedFence <= panicked.AcceptedFence {
+		t.Fatalf("post-panic activation = %+v, %v, returned panic = %+v", activated, err, panicked)
+	}
+}
+
+func TestConnectionFenceAllocatorRejectsOverflow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
+	db := openRawSQLite(t, path+".fences")
+	if _, err := db.ExecContext(context.Background(), `UPDATE adapter_fence_allocator SET next_fence = ? WHERE singleton = 1`, int64(math.MaxInt64)); err != nil {
+		t.Fatalf("seed maximum fence: %v", err)
+	}
+	if _, err := connections.Store.AllocateAdapterGrantFence(context.Background()); err == nil {
+		t.Fatal("maximum fence allocation unexpectedly succeeded")
+	}
+	var kind string
+	var next int64
+	if err := db.QueryRowContext(context.Background(), `SELECT typeof(next_fence), next_fence FROM adapter_fence_allocator WHERE singleton = 1`).Scan(&kind, &next); err != nil || kind != "integer" || next != math.MaxInt64 {
+		t.Fatalf("overflow allocator = kind %q next %d, %v", kind, next, err)
+	}
+}
+
+func initializeConnectionForRotation(t *testing.T, connections *sqliteConnectionHarness, init store.AdapterConnectionInitialize) store.AdapterConnection {
+	t.Helper()
+	if _, err := connections.InitializeAdapterConnection(context.Background(), init); err != nil {
+		t.Fatalf("initialize rotation connection: %v", err)
+	}
+	connection, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: init.ActiveCredentialGeneration})
+	if err != nil {
+		t.Fatalf("hello rotation connection: %v", err)
+	}
+	return connection
+}
+
 func TestConnectionCredentialLineageCorruptionFailsClosed(t *testing.T) {
 	schemaPath := filepath.Join(t.TempDir(), "schema.db")
 	openStore(t, schemaPath)
