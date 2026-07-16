@@ -107,6 +107,17 @@ func TestProposalStoreContract(t *testing.T) {
 	})
 }
 
+func TestConnectionStoreContract(t *testing.T) {
+	storetest.ConnectionContract(t, storetest.ConnectionHarness{
+		Open: func(t *testing.T) store.AdapterConnectionStore {
+			t.Helper()
+			path := filepath.Join(t.TempDir(), "events.db")
+			return &sqliteConnectionHarness{Store: openStore(t, path), path: path}
+		},
+		Invalidate: invalidateAdapterConnection,
+	})
+}
+
 func TestProposalLedgerStoresReferencesOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	proposals := &sqliteProposalHarness{Store: openStore(t, path), path: path}
@@ -874,9 +885,30 @@ type sqliteProposalHarness struct {
 	path string
 }
 
+type sqliteConnectionHarness struct {
+	*sqlite.Store
+	path string
+}
+
 type sqliteAttachmentHarness struct {
 	*sqlite.Store
 	path string
+}
+
+func invalidateAdapterConnection(t *testing.T, current store.AdapterConnectionStore, terminal bool) {
+	t.Helper()
+	harness := current.(*sqliteConnectionHarness)
+	db := openRawSQLite(t, harness.path)
+	now := time.Now().UnixMilli()
+	column := "revoked_at_ms"
+	if terminal {
+		column = "terminal_at_ms"
+	}
+	if _, err := db.ExecContext(context.Background(), `
+UPDATE session_adapter_connections SET `+column+` = ?, updated_at_ms = ? WHERE session_id = 'ses_connection'
+`, now, now); err != nil {
+		t.Fatalf("invalidate adapter connection terminal=%v: %v", terminal, err)
+	}
 }
 
 func seedProposalAuthorities(t *testing.T, path string) {
