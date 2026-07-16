@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -389,6 +390,113 @@ WHERE session_id = ? AND cmd_id = ? AND status = 'received'
 	}
 	command.Status = status
 	return command, nil
+}
+
+func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, authority store.CommandAuthority, proposal store.ProposedEventRequest) (store.ProposedEventReceipt, error) {
+	event := proposal.Event
+	event.Payload = append([]byte(nil), proposal.Event.Payload...)
+	if err := validateProposedEventInput(sessionID, authority, proposal.ProposalID, event); err != nil {
+		return store.ProposedEventReceipt{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("begin proposed event transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.ProposedEventReceipt{}, err
+	}
+	if err := validateCommandAuthority(ctx, tx, sessionID, authority, nowMS); err != nil {
+		return store.ProposedEventReceipt{}, err
+	}
+
+	existing, existingType, existingPayload, err := queryProposedEvent(ctx, tx, sessionID, proposal.ProposalID, nowMS)
+	if err == nil {
+		if existingType != event.Type || !bytes.Equal(existingPayload, event.Payload) {
+			return store.ProposedEventReceipt{}, errors.New("conflicting proposed event retry")
+		}
+		if err := tx.Commit(); err != nil {
+			return store.ProposedEventReceipt{}, fmt.Errorf("commit proposed event duplicate: %w", err)
+		}
+		return existing, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return store.ProposedEventReceipt{}, fmt.Errorf("select proposed event: %w", err)
+	}
+
+	var latest int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM session_events WHERE session_id = ?`, sessionID).Scan(&latest); err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("select proposed event sequence: %w", err)
+	}
+	seq := latest + 1
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO session_events (session_id, seq, type, payload, event_time_ms, created_at_ms)
+VALUES (?, ?, ?, ?, ?, ?)
+`, sessionID, seq, event.Type, event.Payload, event.Time.UnixMilli(), nowMS); err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("append proposed event: %w", err)
+	}
+	nowMS, err = sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.ProposedEventReceipt{}, err
+	}
+	result, err := tx.ExecContext(ctx, `
+INSERT INTO session_event_proposals (session_id, proposal_id, event_seq, created_at_ms)
+SELECT ?, ?, ?, ? FROM session_adapter_connections
+WHERE session_id = ? AND connection_epoch = ? AND active_credential_generation = ?
+  AND active_credential_expires_at_ms > ? AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL
+`, sessionID, proposal.ProposalID, seq, nowMS, sessionID, authority.ConnectionEpoch, authority.CredentialGeneration, nowMS)
+	if err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("insert proposed event receipt: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return store.ProposedEventReceipt{}, errors.New("proposed event lost authority")
+	}
+	if err := tx.Commit(); err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("commit proposed event: %w", err)
+	}
+	return proposedEventReceipt(sessionID, proposal.ProposalID, seq), nil
+}
+
+func queryProposedEvent(ctx context.Context, tx *sql.Tx, sessionID, proposalID string, nowMS int64) (store.ProposedEventReceipt, string, []byte, error) {
+	var seq, createdAtMS int64
+	var eventSessionID, eventType sql.NullString
+	var eventSeq, payloadLength sql.NullInt64
+	var payload []byte
+	err := tx.QueryRowContext(ctx, `
+SELECT proposal.event_seq, proposal.created_at_ms, event.session_id, event.seq, event.type,
+       CASE WHEN length(event.payload) BETWEEN 1 AND ? THEN event.payload END,
+       length(event.payload)
+FROM session_event_proposals AS proposal
+LEFT JOIN session_events AS event
+  ON event.session_id = proposal.session_id AND event.seq = proposal.event_seq
+WHERE proposal.session_id = ? AND proposal.proposal_id = ?
+`, maxEventPayloadSize, sessionID, proposalID).Scan(
+		&seq, &createdAtMS, &eventSessionID, &eventSeq, &eventType, &payload, &payloadLength,
+	)
+	if err != nil {
+		return store.ProposedEventReceipt{}, "", nil, err
+	}
+	if seq < 1 || createdAtMS < 1 || createdAtMS > nowMS || !eventSessionID.Valid || eventSessionID.String != sessionID ||
+		!eventSeq.Valid || eventSeq.Int64 != seq || !eventType.Valid || eventType.String == "" ||
+		!payloadLength.Valid || payloadLength.Int64 < 1 || payloadLength.Int64 > maxEventPayloadSize ||
+		len(payload) != int(payloadLength.Int64) || !json.Valid(payload) {
+		return store.ProposedEventReceipt{}, "", nil, errors.New("proposed event row is invalid")
+	}
+	return proposedEventReceipt(sessionID, proposalID, seq), eventType.String, append([]byte(nil), payload...), nil
+}
+
+func validateProposedEventInput(sessionID string, authority store.CommandAuthority, proposalID string, event store.PendingEvent) error {
+	if sessionID == "" || len(sessionID) > 255 || proposalID == "" || len(proposalID) > 255 ||
+		authority.ConnectionEpoch < 1 || authority.CredentialGeneration < 1 || event.Type == "" ||
+		len(event.Payload) < 1 || len(event.Payload) > maxEventPayloadSize || !json.Valid(event.Payload) {
+		return errors.New("invalid proposed event")
+	}
+	return nil
+}
+
+func proposedEventReceipt(sessionID, proposalID string, seq int64) store.ProposedEventReceipt {
+	return store.ProposedEventReceipt{SessionID: sessionID, ProposalID: proposalID, Seq: seq, Status: store.ProposedEventAccepted}
 }
 
 func sqliteNowMillis(ctx context.Context, tx *sql.Tx) (int64, error) {
@@ -882,6 +990,16 @@ CREATE TABLE IF NOT EXISTS session_pending_commands (
 
 CREATE INDEX IF NOT EXISTS session_pending_commands_status_expiry_idx
 ON session_pending_commands (status, expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS session_event_proposals (
+    session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
+    proposal_id TEXT NOT NULL CHECK (length(proposal_id) BETWEEN 1 AND 255),
+    event_seq INTEGER NOT NULL CHECK (event_seq > 0),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    PRIMARY KEY (session_id, proposal_id),
+    UNIQUE (session_id, event_seq),
+    FOREIGN KEY (session_id, event_seq) REFERENCES session_events(session_id, seq)
+);
 
 CREATE TABLE IF NOT EXISTS session_attachments (
     attach_id TEXT PRIMARY KEY CHECK (length(attach_id) BETWEEN 1 AND 255),
