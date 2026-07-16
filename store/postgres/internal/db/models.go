@@ -112,18 +112,22 @@ type SessionPendingCommand struct {
 }
 
 type SessionWorkspaceLease struct {
-	WorkspaceKey         string
-	WorkerID             string
-	SessionID            string
-	ConnectionEpoch      int64
-	CredentialGeneration int64
-	LeaseID              string
-	Status               string
-	Version              int64
-	ExpiresAt            pgtype.Timestamptz
-	QuarantineReason     pgtype.Text
-	RecoveryState        string
-	CreatedAt            pgtype.Timestamptz
-	UpdatedAt            pgtype.Timestamptz
-	ReleasedAt           pgtype.Timestamptz
+	WorkspaceKey            string
+	WorkerID                string
+	SessionID               string
+	ConnectionEpoch         int64
+	CredentialGeneration    int64
+	LeaseID                 string
+	ChildParentWorkspaceKey pgtype.Text
+	ChildCapabilityDigest   []byte
+	ChildScopeExpiresAt     pgtype.Timestamptz
+	Status                  string
+	Version                 int64
+	ExpiresAt               pgtype.Timestamptz
+	ReservationExpiresAt    pgtype.Timestamptz
+	QuarantineReason        pgtype.Text
+	RecoveryState           string
+	CreatedAt               pgtype.Timestamptz
+	UpdatedAt               pgtype.Timestamptz
+	ReleasedAt              pgtype.Timestamptz
 }
