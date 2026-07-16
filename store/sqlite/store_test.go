@@ -446,6 +446,10 @@ func TestConnectionFenceSidecarIdentityFailsClosed(t *testing.T) {
 	if err := connections.Close(); err != nil {
 		t.Fatal(err)
 	}
+	sidecar, err := os.ReadFile(path + ".fences")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(path + ".fences"); err != nil {
 		t.Fatal(err)
 	}
@@ -453,8 +457,11 @@ func TestConnectionFenceSidecarIdentityFailsClosed(t *testing.T) {
 		_ = reopened.Close()
 		t.Fatal("missing fence sidecar was silently recreated")
 	}
+	if err := os.WriteFile(path+".fences", sidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	replacement := openRawSQLite(t, path+".fences")
-	if _, err := replacement.ExecContext(context.Background(), `INSERT INTO adapter_fence_identity (singleton, store_id) VALUES (1, 'mismatched')`); err != nil {
+	if _, err := replacement.ExecContext(context.Background(), `UPDATE adapter_fence_identity SET store_id = 'mismatched' WHERE singleton = 1`); err != nil {
 		t.Fatalf("seed mismatched fence sidecar: %v", err)
 	}
 	if reopened, err := sqlite.Open(context.Background(), path); err == nil {
@@ -550,6 +557,39 @@ func TestConnectionFenceClosedBackupPreservesReturnedFence(t *testing.T) {
 	next, err := reopened.AllocateAdapterGrantFence(ctx)
 	if err != nil || next <= returned {
 		t.Fatalf("restored fence = %d, %v, want > returned rollback fence %d", next, err, returned)
+	}
+}
+
+func TestConnectionFenceStaleSameIdentitySidecarFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "events.db")
+	st, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := os.ReadFile(path + ".fences")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err = sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AllocateAdapterGrantFence(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".fences", stale, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := sqlite.Open(ctx, path); err == nil {
+		_ = reopened.Close()
+		t.Fatal("stale same-identity fence sidecar was accepted")
 	}
 }
 
