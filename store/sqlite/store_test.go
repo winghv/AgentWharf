@@ -261,6 +261,27 @@ func TestConnectionGrantFenceSharesAllocatorAndRollback(t *testing.T) {
 	if err != nil || reused <= rolledBack {
 		t.Fatalf("post-rollback grant = %d, %v, want > returned rollback fence %d", reused, err, rolledBack)
 	}
+	var panicked int64
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("grant transaction panic was swallowed")
+			}
+		}()
+		_ = connections.WithAdapterConnectionTransaction(context.Background(), func(tx store.AdapterConnectionStore) error {
+			var err error
+			panicked, err = tx.(store.AdapterGrantFenceStore).AllocateAdapterGrantFence(context.Background())
+			if err != nil {
+				return err
+			}
+			panic("rollback grant fence panic")
+		})
+	}()
+	afterPanic, err := fences.AllocateAdapterGrantFence(context.Background())
+	if err != nil || afterPanic <= panicked {
+		t.Fatalf("post-panic grant = %d, %v, want > returned panic fence %d", afterPanic, err, panicked)
+	}
+	reused = afterPanic
 	grants := make(chan int64, 8)
 	errs := make(chan error, 8)
 	var wg sync.WaitGroup
