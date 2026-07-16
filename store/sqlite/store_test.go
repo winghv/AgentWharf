@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -204,6 +205,157 @@ func TestConnectionFenceAllocatorPersistsAcrossSessionsAndReopen(t *testing.T) {
 	if err != nil || a2.AcceptedFence <= b1.AcceptedFence || a2.ConnectionEpoch != a1.ConnectionEpoch+1 {
 		t.Fatalf("reopened fence = %+v after %+v, %v", a2, b1, err)
 	}
+}
+
+func TestConnectionGrantFenceSharesAllocatorAndRollback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
+	init := store.AdapterConnectionInitialize{
+		SessionID: "ses_grant_fence", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute),
+	}
+	if _, err := connections.InitializeAdapterConnection(context.Background(), init); err != nil {
+		t.Fatalf("InitializeAdapterConnection() error = %v", err)
+	}
+	record, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("AcceptAdapterHello() error = %v", err)
+	}
+	fences, ok := any(connections.Store).(store.AdapterGrantFenceStore)
+	if !ok {
+		t.Fatal("SQLite connection store does not own adapter grant fences")
+	}
+	grant, err := fences.AllocateAdapterGrantFence(context.Background())
+	if err != nil || grant <= record.AcceptedFence {
+		t.Fatalf("AllocateAdapterGrantFence() = %d, %v after accepted fence %d", grant, err, record.AcceptedFence)
+	}
+	admission := store.AdapterConnectionAdmission{
+		CredentialGeneration: 1, ConnectionEpoch: record.ConnectionEpoch, AcceptedFence: record.AcceptedFence, GrantFence: grant,
+	}
+	if _, err := connections.ValidateAdapterAdmission(context.Background(), record.SessionID, admission); err != nil {
+		t.Fatalf("validate allocated grant: %v", err)
+	}
+	forged := admission
+	forged.GrantFence = math.MaxInt64
+	if _, err := connections.ValidateAdapterAdmission(context.Background(), record.SessionID, forged); err == nil {
+		t.Fatal("admission accepted an unallocated high grant fence")
+	}
+
+	rollback := errors.New("rollback grant fence")
+	var rolledBack int64
+	if err := connections.WithAdapterConnectionTransaction(context.Background(), func(tx store.AdapterConnectionStore) error {
+		txFences, ok := tx.(store.AdapterGrantFenceStore)
+		if !ok {
+			return errors.New("transaction does not own adapter grant fences")
+		}
+		var err error
+		rolledBack, err = txFences.AllocateAdapterGrantFence(context.Background())
+		if err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatalf("grant rollback error = %v, want %v", err, rollback)
+	}
+	reused, err := fences.AllocateAdapterGrantFence(context.Background())
+	if err != nil || reused != rolledBack {
+		t.Fatalf("post-rollback grant = %d, %v, want %d", reused, err, rolledBack)
+	}
+	newer, err := connections.AcceptAdapterHello(context.Background(), record.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil || newer.AcceptedFence <= reused {
+		t.Fatalf("hello fence = %d, %v, want > committed grant %d", newer.AcceptedFence, err, reused)
+	}
+	if _, err := connections.ValidateAdapterAdmission(context.Background(), record.SessionID, admission); err == nil {
+		t.Fatal("new hello did not fence the older grant")
+	}
+	if err := connections.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	connections.Store = openStore(t, path)
+	fences, ok = any(connections.Store).(store.AdapterGrantFenceStore)
+	if !ok {
+		t.Fatal("reopened SQLite connection store does not own adapter grant fences")
+	}
+	afterReopen, err := fences.AllocateAdapterGrantFence(context.Background())
+	if err != nil || afterReopen <= newer.AcceptedFence {
+		t.Fatalf("reopened grant = %d, %v, want > accepted fence %d", afterReopen, err, newer.AcceptedFence)
+	}
+}
+
+func TestConnectionCredentialLineageCorruptionFailsClosed(t *testing.T) {
+	cases := []struct {
+		name                  string
+		active, highWatermark int64
+		pending, prior        any
+		rotation              any
+	}{
+		{name: "pending_equals_active", active: 1, highWatermark: 2, pending: int64(1), rotation: "rot_corrupt"},
+		{name: "prior_equals_active", active: 2, highWatermark: 2, prior: int64(2)},
+		{name: "pending_equals_prior", active: 2, highWatermark: 3, pending: int64(1), prior: int64(1), rotation: "rot_corrupt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "events.db")
+			connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
+			db := openRawSQLite(t, path)
+			if _, err := db.ExecContext(context.Background(), `PRAGMA ignore_check_constraints = ON`); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UnixMilli()
+			if _, err := db.ExecContext(context.Background(), `
+INSERT INTO session_adapter_connections (
+    session_id, connection_epoch, accepted_fence, active_credential_generation,
+    credential_generation_high_watermark, active_credential_expires_at_ms,
+    pending_credential_generation, pending_credential_expires_at_ms,
+    prior_recovery_credential_generation, rotation_id, created_at_ms, updated_at_ms
+) VALUES (?, 1, 1, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE ? END, ?, ?, ?, ?);
+UPDATE session_adapter_fence_allocator SET next_fence = 2 WHERE singleton = 1;
+`, "ses_lineage_corrupt", tc.active, tc.highWatermark, now+60000, tc.pending, tc.pending, now+60000,
+				tc.prior, tc.rotation, now, now); err != nil {
+				t.Fatalf("seed corrupt lineage: %v", err)
+			}
+			before := connectionCorruptionSnapshot(t, db, "ses_lineage_corrupt")
+			if _, err := connections.AdapterConnection(context.Background(), "ses_lineage_corrupt"); err == nil {
+				t.Fatal("AdapterConnection() accepted corrupt credential lineage")
+			}
+			mutations := []func() error{
+				func() error {
+					_, err := connections.AcceptAdapterHello(context.Background(), "ses_lineage_corrupt", store.AdapterHello{CredentialGeneration: tc.active})
+					return err
+				},
+				func() error {
+					_, err := connections.PrepareAdapterCredentialRotation(context.Background(), "ses_lineage_corrupt", store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: tc.active, ExpectedEpoch: 1, PendingGeneration: tc.highWatermark + 1, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_new"})
+					return err
+				},
+				func() error {
+					_, err := connections.ActivateAdapterCredential(context.Background(), "ses_lineage_corrupt", store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: tc.active, ExpectedEpoch: 1, PendingGeneration: 1, RotationID: "rot_corrupt"})
+					return err
+				},
+			}
+			for index, mutation := range mutations {
+				if err := mutation(); err == nil {
+					t.Fatalf("mutation %d accepted corrupt credential lineage", index)
+				}
+			}
+			if after := connectionCorruptionSnapshot(t, db, "ses_lineage_corrupt"); after != before {
+				t.Fatalf("corrupt lineage mutation changed state: before=%q after=%q", before, after)
+			}
+		})
+	}
+}
+
+func connectionCorruptionSnapshot(t *testing.T, db *sql.DB, sessionID string) string {
+	t.Helper()
+	var snapshot string
+	if err := db.QueryRowContext(context.Background(), `
+SELECT printf('%d|%d|%d|%d|%s|%s|%s|%d', connection_epoch, accepted_fence,
+    active_credential_generation, credential_generation_high_watermark,
+    COALESCE(pending_credential_generation, 'null'), COALESCE(prior_recovery_credential_generation, 'null'),
+    COALESCE(rotation_id, 'null'), (SELECT next_fence FROM session_adapter_fence_allocator WHERE singleton = 1))
+FROM session_adapter_connections WHERE session_id = ?
+`, sessionID).Scan(&snapshot); err != nil {
+		t.Fatalf("snapshot adapter connection: %v", err)
+	}
+	return snapshot
 }
 
 func TestConnectionCorruptionAndForbiddenColumnsFailClosed(t *testing.T) {
