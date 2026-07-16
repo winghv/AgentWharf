@@ -290,7 +290,7 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocke
 		})
 	}
 	page, err := history.History(ctx, request.SessionID, request.BeforeSeq, request.Limit)
-	if err != nil {
+	if err != nil || !validHistoryPage(page, request) {
 		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
 		})
@@ -306,6 +306,27 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocke
 		RequestID: request.RequestID, SessionID: request.SessionID, Events: events,
 		LatestSeq: page.LatestSeq, NextBeforeSeq: page.NextBeforeSeq, RetentionState: page.RetentionState,
 	})
+}
+
+func validHistoryPage(page store.HistoryPage, request *protocol.HistoryPageRequest) bool {
+	if request == nil || request.Limit < 1 || request.Limit > protocol.HistoryPageMaxLimit ||
+		len(page.Events) > request.Limit || page.LatestSeq < 0 ||
+		(page.RetentionState != store.RetentionComplete && page.RetentionState != store.RetentionGap) {
+		return false
+	}
+	for index, event := range page.Events {
+		if event.SessionID != request.SessionID || event.Seq < 1 || event.Seq > page.LatestSeq ||
+			event.Type == "" || !json.Valid(event.Payload) ||
+			request.BeforeSeq != nil && event.Seq >= *request.BeforeSeq ||
+			index > 0 && page.Events[index-1].Seq >= event.Seq {
+			return false
+		}
+	}
+	if page.NextBeforeSeq != nil {
+		return *page.NextBeforeSeq > 0 && len(page.Events) == request.Limit &&
+			*page.NextBeforeSeq == page.Events[0].Seq
+	}
+	return true
 }
 
 func hasExactHistoryAccess(principal auth.Principal, sessionID string) bool {

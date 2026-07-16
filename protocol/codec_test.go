@@ -316,3 +316,26 @@ func TestEncodeHistoryPageResponse(t *testing.T) {
 		t.Fatalf("nested history event = %#v", event)
 	}
 }
+
+func TestDecodeHistoryPageResponseStrictly(t *testing.T) {
+	valid := `{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","events":[{"frame":"event","type":"session.message","session_id":"ses_1","seq":1,"time":1001,"payload":{}}],"latest_seq":1,"next_before_seq":null,"retention_state":"complete"}`
+	if frame, err := Decode([]byte(valid)); err != nil {
+		t.Fatalf("Decode(valid history response) error = %v", err)
+	} else if _, ok := frame.(*HistoryPageResponse); !ok {
+		t.Fatalf("Decode(valid history response) = %T", frame)
+	}
+	for _, raw := range []string{
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","events":null,"latest_seq":0,"next_before_seq":null,"retention_state":"complete"}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","events":[{"frame":"command","type":"x","session_id":"ses_1","seq":1,"time":1,"payload":{}}],"latest_seq":1,"next_before_seq":null,"retention_state":"complete"}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","events":[{"frame":"event","type":"x","session_id":"ses_1","seq":1,"time":1,"payload":{},"extra":true}],"latest_seq":1,"next_before_seq":null,"retention_state":"complete"}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","events":[{"frame":"event","type":"x","session_id":"ses_2","seq":1,"time":1,"payload":{}}],"latest_seq":1,"next_before_seq":null,"retention_state":"complete"}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","events":[{"frame":"event","type":"x","session_id":"ses_1","seq":2,"time":1,"payload":{}},{"frame":"event","type":"x","session_id":"ses_1","seq":1,"time":1,"payload":{}}],"latest_seq":2,"next_before_seq":null,"retention_state":"complete"}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","events":[{"frame":"event","type":"x","session_id":"ses_1","seq":2,"time":1,"payload":{}}],"latest_seq":1,"next_before_seq":null,"retention_state":"complete"}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","events":[{"frame":"event","type":"x","session_id":"ses_1","seq":1,"time":1,"payload":{}}],"latest_seq":1,"next_before_seq":2,"retention_state":"complete"}`,
+		`{"frame":"history.page","request_id":"hist_1","session_id":"ses_1","events":[],"latest_seq":0,"next_before_seq":null,"retention_state":"unknown"}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) unexpectedly succeeded", raw)
+		}
+	}
+}

@@ -92,7 +92,7 @@ func TestWebSocketServerAdvertisesAndServesAuthorizedHistory(t *testing.T) {
 		t.Fatalf("history capability = %+v", ack.Capabilities)
 	}
 	writeFrame(t, client, &protocol.HistoryPageRequest{
-		RequestID: "hist_1", SessionID: "ses_1", BeforeSeq: &before, Limit: 100,
+		RequestID: "hist_1", SessionID: "ses_1", BeforeSeq: &before, Limit: 1,
 	})
 	response := readFrame(t, client).(*protocol.HistoryPageResponse)
 	if response.RequestID != "hist_1" || response.SessionID != "ses_1" || response.LatestSeq != 57 ||
@@ -101,7 +101,7 @@ func TestWebSocketServerAdvertisesAndServesAuthorizedHistory(t *testing.T) {
 		t.Fatalf("history response = %+v", response)
 	}
 	call := events.historyCall(t)
-	if call.sessionID != "ses_1" || call.beforeSeq == nil || *call.beforeSeq != before || call.limit != 100 {
+	if call.sessionID != "ses_1" || call.beforeSeq == nil || *call.beforeSeq != before || call.limit != 1 {
 		t.Fatalf("history call = %+v", call)
 	}
 
@@ -161,6 +161,43 @@ func TestWebSocketServerHistoryAuthorizationAndAvailability(t *testing.T) {
 			writeFrame(t, client, &protocol.Ping{Nonce: "after-history-error"})
 			if pong := readFrame(t, client).(*protocol.Pong); pong.Nonce != "after-history-error" {
 				t.Fatalf("pong after history error = %+v", pong)
+			}
+		})
+	}
+}
+
+func TestWebSocketServerRejectsUntrustedHistoryPages(t *testing.T) {
+	t.Parallel()
+	event := func(sessionID string, seq int64) store.Event {
+		return store.Event{SessionID: sessionID, Seq: seq, Type: "session.message", Time: time.UnixMilli(1001), Payload: json.RawMessage(`{"n":1}`)}
+	}
+	nextTwo := int64(2)
+	for _, test := range []struct {
+		name   string
+		page   store.HistoryPage
+		before *int64
+	}{
+		{name: "cross session", page: store.HistoryPage{Events: []store.Event{event("ses_2", 1)}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
+		{name: "oversized", page: store.HistoryPage{Events: []store.Event{event("ses_1", 1), event("ses_1", 2)}, LatestSeq: 2, RetentionState: store.RetentionComplete}},
+		{name: "nonpositive sequence", page: store.HistoryPage{Events: []store.Event{event("ses_1", 0)}, RetentionState: store.RetentionComplete}},
+		{name: "descending sequence", page: store.HistoryPage{Events: []store.Event{event("ses_1", 2), event("ses_1", 1)}, LatestSeq: 2, RetentionState: store.RetentionComplete}},
+		{name: "cursor violation", page: store.HistoryPage{Events: []store.Event{event("ses_1", 2)}, LatestSeq: 2, RetentionState: store.RetentionComplete}, before: &nextTwo},
+		{name: "latest below event", page: store.HistoryPage{Events: []store.Event{event("ses_1", 2)}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
+		{name: "inconsistent next", page: store.HistoryPage{Events: []store.Event{event("ses_1", 1)}, LatestSeq: 2, NextBeforeSeq: &nextTwo, RetentionState: store.RetentionComplete}},
+		{name: "invalid retention", page: store.HistoryPage{LatestSeq: 1, RetentionState: "unknown"}},
+		{name: "invalid payload", page: store.HistoryPage{Events: []store.Event{{SessionID: "ses_1", Seq: 1, Type: "x", Payload: json.RawMessage(`{`)}}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			events := &fakeHistoryStore{fakeEventStore: newFakeEventStore(map[string]int64{"ses_1": 2}, nil), page: test.page}
+			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+			client := dialWebSocket(t, server.URL)
+			defer client.Close(websocket.StatusNormalClosure, "")
+			writeFrame(t, client, &protocol.Hello{ProtocolVersion: 2, Role: protocol.RoleClient, Token: "view-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+			_ = readFrame(t, client).(*protocol.HelloAck)
+			writeFrame(t, client, &protocol.HistoryPageRequest{RequestID: "hist_bad", SessionID: "ses_1", BeforeSeq: test.before, Limit: 1})
+			if got := readFrame(t, client).(*protocol.Error); got.Code != "history_unavailable" {
+				t.Fatalf("history error = %+v", got)
 			}
 		})
 	}

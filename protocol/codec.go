@@ -249,10 +249,14 @@ func decodeHistoryPage(data []byte) (Frame, error) {
 				return nil, fmt.Errorf("decode history.page: missing %s", key)
 			}
 		}
-		if err := json.Unmarshal(fields["events"], &out.Events); err != nil ||
+		if bytes.Equal(bytes.TrimSpace(fields["events"]), []byte("null")) ||
 			json.Unmarshal(fields["latest_seq"], &out.LatestSeq) != nil ||
 			json.Unmarshal(fields["next_before_seq"], &out.NextBeforeSeq) != nil ||
 			json.Unmarshal(fields["retention_state"], &out.RetentionState) != nil {
+			return nil, errors.New("decode history.page: invalid response")
+		}
+		out.Events, err = decodeHistoryPageEvents(fields["events"], out.SessionID)
+		if err != nil || !validHistoryPageResponse(&out) {
 			return nil, errors.New("decode history.page: invalid response")
 		}
 		return &out, nil
@@ -273,6 +277,55 @@ func decodeHistoryPage(data []byte) (Frame, error) {
 		}
 	}
 	return &out, nil
+}
+
+func decodeHistoryPageEvents(data []byte, sessionID string) ([]HistoryPageEvent, error) {
+	var rawEvents []json.RawMessage
+	if err := json.Unmarshal(data, &rawEvents); err != nil || len(rawEvents) > HistoryPageMaxLimit {
+		return nil, errors.New("invalid events")
+	}
+	events := make([]HistoryPageEvent, len(rawEvents))
+	for index, raw := range rawEvents {
+		fields, err := strictObject(raw)
+		if err != nil || len(fields) != 6 {
+			return nil, errors.New("invalid event")
+		}
+		for _, key := range []string{"frame", "type", "session_id", "seq", "time", "payload"} {
+			if fields[key] == nil {
+				return nil, errors.New("invalid event")
+			}
+		}
+		for key := range fields {
+			if key != "frame" && key != "type" && key != "session_id" && key != "seq" && key != "time" && key != "payload" {
+				return nil, errors.New("invalid event")
+			}
+		}
+		event := &events[index]
+		if json.Unmarshal(fields["frame"], &event.Frame) != nil || event.Frame != FrameEvent ||
+			json.Unmarshal(fields["type"], &event.Type) != nil || event.Type == "" ||
+			json.Unmarshal(fields["session_id"], &event.SessionID) != nil || event.SessionID != sessionID ||
+			json.Unmarshal(fields["seq"], &event.Seq) != nil || event.Seq < 1 ||
+			json.Unmarshal(fields["time"], &event.Time) != nil || !json.Valid(fields["payload"]) {
+			return nil, errors.New("invalid event")
+		}
+		event.Payload = append(event.Payload[:0], fields["payload"]...)
+	}
+	return events, nil
+}
+
+func validHistoryPageResponse(response *HistoryPageResponse) bool {
+	if response.LatestSeq < 0 || (response.RetentionState != "complete" && response.RetentionState != "retention_gap") {
+		return false
+	}
+	for index, event := range response.Events {
+		if event.Seq > response.LatestSeq || index > 0 && response.Events[index-1].Seq >= event.Seq {
+			return false
+		}
+	}
+	if response.NextBeforeSeq != nil {
+		return *response.NextBeforeSeq > 0 && len(response.Events) > 0 && *response.NextBeforeSeq == response.Events[0].Seq
+	}
+	return true
 }
 
 func decodeRequiredHistoryFields(fields map[string]json.RawMessage, requestID, sessionID *string) error {
