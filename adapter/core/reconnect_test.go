@@ -76,6 +76,9 @@ func TestAdapterConnectionStateRejectsInvalidConfigAndAck(t *testing.T) {
 	badAcks := []protocol.HelloAck{
 		{ProtocolVersion: protocol.ProtocolVersion},
 		{ProtocolVersion: 999, Sessions: []protocol.SessionSummary{{SessionID: "ses_1"}}},
+		{ProtocolVersion: protocol.ProtocolVersion,
+			Capabilities: &protocol.HelloCapabilities{HistoryPage: &protocol.HistoryPageCapability{MaxLimit: 100}},
+			Sessions:     []protocol.SessionSummary{{SessionID: "ses_1"}}},
 		{ProtocolVersion: protocol.ProtocolVersion, Sessions: []protocol.SessionSummary{{SessionID: "ses_other"}}},
 		{ProtocolVersion: protocol.ProtocolVersion, Sessions: []protocol.SessionSummary{{SessionID: "ses_1", Provider: "other"}}},
 	}

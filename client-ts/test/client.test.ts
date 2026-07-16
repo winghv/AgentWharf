@@ -56,7 +56,7 @@ test('connect sends client hello with the current replay cursor', async () => {
   })
 
   const ack = await ackPromise
-	assert.equal(ack.protocol_version, 1)
+  assert.equal(ack.protocol_version, 1)
   assert.equal(ack.sessions[0]?.replay_from, 5)
   client.close()
 })
@@ -67,6 +67,8 @@ test('rejects capabilities on a v1 fallback acknowledgement', async () => {
     url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_1' }],
     webSocketFactory: sockets.factory, reconnect: false,
   })
+  const seen: AgentWharfEvent[] = []
+  client.onEvent((event) => seen.push(event))
   const ackPromise = client.connect()
   sockets.last().open()
   sockets.last().receive({
@@ -74,7 +76,13 @@ test('rejects capabilities on a v1 fallback acknowledgement', async () => {
     capabilities: { history_page: { max_limit: 100 } },
   })
   await assert.rejects(ackPromise, /v1 hello\.ack must omit capabilities/)
-  client.close()
+  assert.equal(sockets.last().isClosed(), true)
+  await assert.rejects(client.sendMessage('ses_1', []), /client is not connected/)
+  sockets.last().receive({frame: 'hello.ack', protocol_version: 2, sessions: []})
+  sockets.last().receive({
+    frame: 'event', type: 'session.message', session_id: 'ses_1', seq: 1, time: 1, payload: {},
+  })
+  assert.deepEqual(seen, [])
 })
 
 test('tracks durable event sequence for reconnect replay', async () => {
@@ -192,6 +200,7 @@ class FakeSocket {
   onclose: ((event: CloseEvent) => void) | null = null
 
   private readonly sent: string[] = []
+  private closed = false
 
   constructor(readonly url: string) {}
 
@@ -200,6 +209,7 @@ class FakeSocket {
   }
 
   close(): void {
+    this.closed = true
     this.onclose?.({ wasClean: true } as CloseEvent)
   }
 
@@ -217,6 +227,10 @@ class FakeSocket {
 
   sentFrames(): any[] {
     return this.sent.map((line) => JSON.parse(line))
+  }
+
+  isClosed(): boolean {
+    return this.closed
   }
 }
 

@@ -234,6 +234,17 @@ func NegotiateHighestVersion(peerHighest, hubHighest int) (int, error) {
 	return hubHighest, nil
 }
 
+func EventTypeAllowed(version int, eventType string) bool {
+	switch eventType {
+	case "session.idle_warning":
+		return version == ProtocolVersion
+	case "x.vm.idle_warning":
+		return version == ProtocolVersionV2
+	default:
+		return true
+	}
+}
+
 func decodeInto(data []byte, out Frame) (Frame, error) {
 	var env map[string]json.RawMessage
 	if err := json.Unmarshal(data, &env); err != nil {

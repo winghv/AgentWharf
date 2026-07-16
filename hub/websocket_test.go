@@ -287,6 +287,42 @@ func TestWebSocketServerEmitsIdleWarningFromHostWithoutPersistence(t *testing.T)
 	}
 }
 
+func TestWebSocketServerDoesNotSendV1IdleWarningToV2Client(t *testing.T) {
+	t.Parallel()
+
+	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: testHandshake()})
+	broadcaster := handler.(hub.EphemeralBroadcaster)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	v1Client := dialWebSocket(t, server.URL)
+	defer v1Client.Close(websocket.StatusNormalClosure, "")
+	v2Client := dialWebSocket(t, server.URL)
+	defer v2Client.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, v1Client, "client-token", 0)
+	_ = readFrame(t, v1Client).(*protocol.HelloAck)
+	writeFrame(t, v2Client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2,
+		Role:            protocol.RoleClient,
+		Token:           "client-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_1"}},
+	})
+	_ = readFrame(t, v2Client).(*protocol.HelloAck)
+
+	if err := broadcaster.EmitEphemeralEvent(context.Background(), protocol.Event{
+		Type: "session.idle_warning", SessionID: "ses_1", Time: 2003,
+		Payload: json.RawMessage(`{"message":"legacy warning"}`),
+	}); err != nil {
+		t.Fatalf("emit v1 idle warning: %v", err)
+	}
+	if frame := readFrame(t, v1Client).(*protocol.Event); frame.Type != "session.idle_warning" {
+		t.Fatalf("v1 client event type = %q, want session.idle_warning", frame.Type)
+	}
+	if frame, err := readFrameWithin(v2Client, 100*time.Millisecond); err == nil {
+		t.Fatalf("v2 client received v1-only event: %+v", frame)
+	}
+}
+
 func TestWebSocketServerBroadcastsEphemeralEventWithoutEventStore(t *testing.T) {
 	t.Parallel()
 

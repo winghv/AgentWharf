@@ -304,7 +304,7 @@ func (h *webSocketHandler) registerPeer(conn *websocket.Conn, accepted AcceptedP
 	if accepted.Role != protocol.RoleClient {
 		return nil
 	}
-	peer := newClientConnection(conn, accepted.Subscribed, h.events != nil)
+	peer := newClientConnection(conn, accepted.ProtocolVersion, accepted.Subscribed, h.events != nil)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, sub := range accepted.Subscribed {
@@ -832,8 +832,9 @@ func isEphemeralEvent(eventType string) bool {
 }
 
 type clientConnection struct {
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+	conn            *websocket.Conn
+	protocolVersion int
+	writeMu         sync.Mutex
 
 	mu            sync.Mutex
 	subscriptions map[string]*subscriptionState
@@ -845,10 +846,11 @@ type subscriptionState struct {
 	buffered  []protocol.Event
 }
 
-func newClientConnection(conn *websocket.Conn, subscriptions []protocol.Subscription, replaying bool) *clientConnection {
+func newClientConnection(conn *websocket.Conn, protocolVersion int, subscriptions []protocol.Subscription, replaying bool) *clientConnection {
 	peer := &clientConnection{
-		conn:          conn,
-		subscriptions: make(map[string]*subscriptionState, len(subscriptions)),
+		conn:            conn,
+		protocolVersion: protocolVersion,
+		subscriptions:   make(map[string]*subscriptionState, len(subscriptions)),
 	}
 	for _, sub := range subscriptions {
 		peer.subscriptions[sub.SessionID] = &subscriptionState{
@@ -874,6 +876,9 @@ func (c *clientConnection) writeReplayEvent(ctx context.Context, ev protocol.Eve
 }
 
 func (c *clientConnection) sendLiveEvent(ctx context.Context, ev protocol.Event) error {
+	if !protocol.EventTypeAllowed(c.protocolVersion, ev.Type) {
+		return nil
+	}
 	c.mu.Lock()
 	state := c.subscriptions[ev.SessionID]
 	if state == nil {

@@ -237,3 +237,21 @@ func TestHelloAckOmitsUnavailableCapabilities(t *testing.T) {
 		t.Fatalf("unavailable capabilities advertised: %s", encoded)
 	}
 }
+
+func TestEventTypeAllowed(t *testing.T) {
+	for _, test := range []struct {
+		version   int
+		eventType string
+		want      bool
+	}{
+		{version: ProtocolVersion, eventType: "session.idle_warning", want: true},
+		{version: ProtocolVersionV2, eventType: "session.idle_warning", want: false},
+		{version: ProtocolVersion, eventType: "x.vm.idle_warning", want: false},
+		{version: ProtocolVersionV2, eventType: "x.vm.idle_warning", want: true},
+		{version: ProtocolVersionV2, eventType: "session.message", want: true},
+	} {
+		if got := EventTypeAllowed(test.version, test.eventType); got != test.want {
+			t.Fatalf("EventTypeAllowed(%d, %q) = %v, want %v", test.version, test.eventType, got, test.want)
+		}
+	}
+}

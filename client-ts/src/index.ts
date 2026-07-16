@@ -298,7 +298,12 @@ export class AgentWharfClient {
           const normalized = normalizeError(error)
           this.emitError(normalized)
           if (!handshakeComplete) {
+            if (this.socket === socket) {
+              this.socket = null
+            }
+            socket.onmessage = null
             reject(normalized)
+            socket.close()
           }
         }
       }

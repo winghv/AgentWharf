@@ -58,6 +58,9 @@ func (s *AdapterConnectionState) MarkAccepted(ack protocol.HelloAck) (protocol.S
 	if ack.ProtocolVersion != protocol.ProtocolVersion {
 		return protocol.SessionSummary{}, fmt.Errorf("%w: protocol version %d", ErrInvalidHelloAck, ack.ProtocolVersion)
 	}
+	if ack.Capabilities != nil {
+		return protocol.SessionSummary{}, fmt.Errorf("%w: v1 acknowledgement includes capabilities", ErrInvalidHelloAck)
+	}
 	if len(ack.Sessions) != 1 {
 		return protocol.SessionSummary{}, fmt.Errorf("%w: expected one session summary", ErrInvalidHelloAck)
 	}
