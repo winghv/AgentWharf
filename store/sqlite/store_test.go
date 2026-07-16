@@ -3,7 +3,9 @@ package sqlite_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +51,103 @@ func TestHistoryStoreContract(t *testing.T) {
 			}
 		},
 	})
+}
+
+func TestPendingCommandStoreContract(t *testing.T) {
+	storetest.PendingCommandContract(t, storetest.PendingCommandHarness{
+		Open: func(t *testing.T) store.CommandLedgerStore {
+			t.Helper()
+			path := filepath.Join(t.TempDir(), "events.db")
+			harness := &sqliteCommandHarness{Store: openStore(t, path), path: path}
+			seedCommandAuthorities(t, path)
+			return harness
+		},
+		Reopen: func(t *testing.T, current store.CommandLedgerStore) store.CommandLedgerStore {
+			t.Helper()
+			harness := current.(*sqliteCommandHarness)
+			if err := harness.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			harness.Store = openStore(t, harness.path)
+			return harness
+		},
+		Authority: func(t *testing.T, _ store.CommandLedgerStore) store.CommandAuthority {
+			t.Helper()
+			return store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+		},
+		Invalidate: invalidateCommandAuthority,
+	})
+}
+
+func TestPendingCommandLedgerStoresReferencesOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}
+	seedCommandAuthorities(t, path)
+	marker := "ledger-secret-marker"
+	request := store.PendingCommandRequest{CommandID: "cmd_reference_only", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, store.PendingEvent{
+		Type: "session.message", Time: testTime(1), Payload: []byte(fmt.Sprintf(`{"role":"user","content":[{"text":%q}]}`, marker)),
+	}, request); err != nil {
+		t.Fatalf("CommitPendingCommand() error = %v", err)
+	}
+
+	db := openRawSQLite(t, path)
+	rows, err := db.QueryContext(context.Background(), `PRAGMA table_info(session_pending_commands)`)
+	if err != nil {
+		t.Fatalf("read pending-command columns: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan pending-command column: %v", err)
+		}
+		lower := strings.ToLower(name)
+		for _, forbidden := range []string{"payload", "content", "secret", "token", "credential", "provider"} {
+			if strings.Contains(lower, forbidden) {
+				t.Fatalf("pending-command column %q contains forbidden concept %q", name, forbidden)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate pending-command columns: %v", err)
+	}
+
+	var values string
+	if err := db.QueryRowContext(context.Background(), `
+SELECT session_id || '|' || cmd_id || '|' || type || '|' || event_seq || '|' || status || '|' || expires_at_ms
+FROM session_pending_commands WHERE session_id = ? AND cmd_id = ?
+`, "ses_command_1", request.CommandID).Scan(&values); err != nil {
+		t.Fatalf("read pending-command values: %v", err)
+	}
+	if strings.Contains(values, marker) {
+		t.Fatalf("pending-command row copied event content: %q", values)
+	}
+}
+
+func TestPendingCommandCorruptStatusFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}
+	seedCommandAuthorities(t, path)
+	authority := store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+	request := store.PendingCommandRequest{CommandID: "cmd_corrupt", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, store.PendingEvent{
+		Type: "session.message", Time: testTime(1), Payload: []byte(`{"role":"user"}`),
+	}, request); err != nil {
+		t.Fatalf("CommitPendingCommand() error = %v", err)
+	}
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `PRAGMA ignore_check_constraints = ON`); err != nil {
+		t.Fatalf("enable corruption fixture: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `UPDATE session_pending_commands SET status = 'corrupt' WHERE cmd_id = ?`, request.CommandID); err != nil {
+		t.Fatalf("corrupt pending-command status: %v", err)
+	}
+	if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_1", authority, request.CommandID); err == nil {
+		t.Fatal("ClaimPendingCommand() accepted corrupt status")
+	}
 }
 
 func TestClosedStoreRejectsOperations(t *testing.T) {
@@ -127,4 +226,67 @@ func openStore(t *testing.T, path string) *sqlite.Store {
 		}
 	})
 	return st
+}
+
+type sqliteCommandHarness struct {
+	*sqlite.Store
+	path string
+}
+
+func seedCommandAuthorities(t *testing.T, path string) {
+	t.Helper()
+	db := openRawSQLite(t, path)
+	now := time.Now().UnixMilli()
+	for _, sessionID := range []string{
+		"ses_command_1", "ses_command_claim", "ses_command_stale",
+		"ses_command_expired", "ses_command_reopen", "ses_command_invalid",
+	} {
+		if _, err := db.ExecContext(context.Background(), `
+INSERT INTO session_adapter_connections (
+    session_id, connection_epoch, accepted_fence, active_credential_generation,
+    credential_generation_high_watermark, active_credential_expires_at_ms, created_at_ms, updated_at_ms
+) VALUES (?, 1, 1, 1, 1, ?, ?, ?)
+`, sessionID, now+int64(time.Hour/time.Millisecond), now, now); err != nil {
+			t.Fatalf("seed command authority for %s: %v", sessionID, err)
+		}
+	}
+}
+
+func invalidateCommandAuthority(t *testing.T, current store.CommandLedgerStore, kind storetest.CommandAuthorityFailure) {
+	t.Helper()
+	harness := current.(*sqliteCommandHarness)
+	db := openRawSQLite(t, harness.path)
+	now := time.Now().UnixMilli()
+	var statement string
+	var args []any
+	switch kind {
+	case storetest.CommandAuthoritySuperseded:
+		statement = `UPDATE session_adapter_connections SET connection_epoch = 2, updated_at_ms = ?`
+		args = []any{now}
+	case storetest.CommandAuthorityRevoked:
+		statement = `UPDATE session_adapter_connections SET revoked_at_ms = ?, updated_at_ms = ?`
+		args = []any{now, now}
+	case storetest.CommandAuthorityExpired:
+		statement = `UPDATE session_adapter_connections SET active_credential_expires_at_ms = ?, updated_at_ms = ?`
+		args = []any{now - 1, now}
+	case storetest.CommandAuthorityTerminal:
+		statement = `UPDATE session_adapter_connections SET terminal_at_ms = ?, updated_at_ms = ?`
+		args = []any{now, now}
+	default:
+		t.Fatalf("unknown command authority failure %q", kind)
+	}
+	if _, err := db.ExecContext(context.Background(), statement, args...); err != nil {
+		t.Fatalf("invalidate command authority %s: %v", kind, err)
+	}
+}
+
+func openRawSQLite(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw sqlite database: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	return db
 }
