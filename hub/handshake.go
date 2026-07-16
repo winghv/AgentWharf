@@ -41,12 +41,13 @@ type Handshake struct {
 }
 
 type AcceptedPeer struct {
-	Role       protocol.Role
-	Principal  auth.Principal
-	SessionID  string
-	Provider   string
-	Resume     bool
-	Subscribed []protocol.Subscription
+	Role            protocol.Role
+	ProtocolVersion int
+	Principal       auth.Principal
+	SessionID       string
+	Provider        string
+	Resume          bool
+	Subscribed      []protocol.Subscription
 }
 
 func NewHandshake(cfg HandshakeConfig) *Handshake {
@@ -69,8 +70,9 @@ func (h *Handshake) HandleHello(ctx context.Context, hello *protocol.Hello) (pro
 	if hello == nil || hello.Token == "" {
 		return protocol.HelloAck{}, AcceptedPeer{}, ErrInvalidHello
 	}
-	if hello.ProtocolVersion != protocol.ProtocolVersion {
-		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: peer=%d hub=%d", ErrVersionUnsupported, hello.ProtocolVersion, protocol.ProtocolVersion)
+	selectedVersion, err := negotiateHelloVersion(hello)
+	if err != nil {
+		return protocol.HelloAck{}, AcceptedPeer{}, err
 	}
 	if h.authenticator == nil {
 		return protocol.HelloAck{}, AcceptedPeer{}, errors.New("hub authenticator is nil")
@@ -83,26 +85,43 @@ func (h *Handshake) HandleHello(ctx context.Context, hello *protocol.Hello) (pro
 
 	switch hello.Role {
 	case protocol.RoleClient:
-		return h.handleClient(ctx, hello, principal)
+		return h.handleClient(ctx, hello, principal, selectedVersion)
 	case protocol.RoleAdapter:
-		return h.handleAdapter(ctx, hello, principal)
+		return h.handleAdapter(ctx, hello, principal, selectedVersion)
 	default:
 		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: unknown role %q", ErrInvalidHello, hello.Role)
 	}
 }
 
-func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, principal auth.Principal) (protocol.HelloAck, AcceptedPeer, error) {
+func negotiateHelloVersion(hello *protocol.Hello) (int, error) {
+	switch hello.Role {
+	case protocol.RoleClient:
+		selected, err := protocol.NegotiateHighestVersion(hello.ProtocolVersion, protocol.HubProtocolVersion)
+		if err != nil {
+			return 0, fmt.Errorf("%w: peer=%d hub=%d", ErrVersionUnsupported, hello.ProtocolVersion, protocol.HubProtocolVersion)
+		}
+		return selected, nil
+	case protocol.RoleAdapter:
+		if hello.ProtocolVersion != protocol.ProtocolVersion {
+			return 0, fmt.Errorf("%w: peer=%d adapter=%d", ErrVersionUnsupported, hello.ProtocolVersion, protocol.ProtocolVersion)
+		}
+		return protocol.ProtocolVersion, nil
+	default:
+		return 0, fmt.Errorf("%w: unknown role %q", ErrInvalidHello, hello.Role)
+	}
+}
+
+func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, principal auth.Principal, selectedVersion int) (protocol.HelloAck, AcceptedPeer, error) {
 	if len(hello.Subscriptions) == 0 {
 		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: client subscriptions are required", ErrInvalidHello)
 	}
 
 	ack := protocol.HelloAck{
-		ProtocolVersion: protocol.ProtocolVersion,
+		ProtocolVersion: selectedVersion,
 		Sessions:        make([]protocol.SessionSummary, 0, len(hello.Subscriptions)),
 	}
 	accepted := AcceptedPeer{
-		Role:       protocol.RoleClient,
-		Principal:  principal,
+		Role: protocol.RoleClient, ProtocolVersion: selectedVersion, Principal: principal,
 		Subscribed: append([]protocol.Subscription(nil), hello.Subscriptions...),
 	}
 
@@ -123,7 +142,7 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 	return ack, accepted, nil
 }
 
-func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, principal auth.Principal) (protocol.HelloAck, AcceptedPeer, error) {
+func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, principal auth.Principal, selectedVersion int) (protocol.HelloAck, AcceptedPeer, error) {
 	if hello.SessionID == "" || hello.Provider == "" {
 		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: adapter session_id and provider are required", ErrInvalidHello)
 	}
@@ -136,14 +155,11 @@ func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, pr
 	}
 
 	return protocol.HelloAck{
-			ProtocolVersion: protocol.ProtocolVersion,
+			ProtocolVersion: selectedVersion,
 			Sessions:        []protocol.SessionSummary{summary},
 		}, AcceptedPeer{
-			Role:      protocol.RoleAdapter,
-			Principal: principal,
-			SessionID: hello.SessionID,
-			Provider:  hello.Provider,
-			Resume:    hello.Resume,
+			Role: protocol.RoleAdapter, ProtocolVersion: selectedVersion, Principal: principal,
+			SessionID: hello.SessionID, Provider: hello.Provider, Resume: hello.Resume,
 		}, nil
 }
 

@@ -41,7 +41,7 @@ test('connect sends client hello with the current replay cursor', async () => {
 
   assert.deepEqual(socket.sentFrames()[0], {
     frame: 'hello',
-    protocol_version: 1,
+    protocol_version: 2,
     role: 'client',
     token: 'control-token',
     subscriptions: [{ session_id: 'ses_1', last_seq: 4 }],
@@ -56,7 +56,24 @@ test('connect sends client hello with the current replay cursor', async () => {
   })
 
   const ack = await ackPromise
+	assert.equal(ack.protocol_version, 1)
   assert.equal(ack.sessions[0]?.replay_from, 5)
+  client.close()
+})
+
+test('rejects capabilities on a v1 fallback acknowledgement', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_1' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const ackPromise = client.connect()
+  sockets.last().open()
+  sockets.last().receive({
+    frame: 'hello.ack', protocol_version: 1, sessions: [],
+    capabilities: { history_page: { max_limit: 100 } },
+  })
+  await assert.rejects(ackPromise, /v1 hello\.ack must omit capabilities/)
   client.close()
 })
 

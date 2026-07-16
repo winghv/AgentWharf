@@ -194,3 +194,46 @@ func TestNegotiateVersion(t *testing.T) {
 		t.Fatalf("NegotiateVersion() error = %v, want ErrNoCompatibleVersion", err)
 	}
 }
+
+func TestNegotiateHighestVersion(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		peerHighest      int
+		hubHighest       int
+		want             int
+		wantIncompatible bool
+	}{
+		{name: "v2", peerHighest: 2, hubHighest: 2, want: 2},
+		{name: "client fallback", peerHighest: 2, hubHighest: 1, want: 1},
+		{name: "hub fallback", peerHighest: 1, hubHighest: 2, want: 1},
+		{name: "invalid peer", peerHighest: 0, hubHighest: 2, wantIncompatible: true},
+		{name: "invalid hub", peerHighest: 2, hubHighest: 0, wantIncompatible: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := NegotiateHighestVersion(test.peerHighest, test.hubHighest)
+			if test.wantIncompatible {
+				if !errors.Is(err, ErrNoCompatibleVersion) {
+					t.Fatalf("NegotiateHighestVersion() error = %v, want ErrNoCompatibleVersion", err)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("NegotiateHighestVersion() = %d, %v; want %d, nil", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestHelloAckOmitsUnavailableCapabilities(t *testing.T) {
+	encoded, err := Encode(&HelloAck{ProtocolVersion: ProtocolVersionV2, Sessions: []SessionSummary{}})
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	if _, advertised := fields["capabilities"]; advertised {
+		t.Fatalf("unavailable capabilities advertised: %s", encoded)
+	}
+}

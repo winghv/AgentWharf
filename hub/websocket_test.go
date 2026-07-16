@@ -43,6 +43,25 @@ func TestWebSocketServerAcceptsHelloAndPing(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerNegotiatesV2WithoutHistoryCapability(t *testing.T) {
+	t.Parallel()
+
+	server := newWebSocketTestServer(t, testHandshake())
+	conn := dialWebSocket(t, server.URL)
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, conn, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2,
+		Role:            protocol.RoleClient,
+		Token:           "client-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_1"}},
+	})
+	ack := readFrame(t, conn).(*protocol.HelloAck)
+	if ack.ProtocolVersion != protocol.ProtocolVersionV2 || ack.Capabilities != nil {
+		t.Fatalf("v2 hello ack = %+v, want v2 with no capabilities", ack)
+	}
+}
+
 func TestWebSocketServerReplaysEventsAfterHelloAck(t *testing.T) {
 	t.Parallel()
 

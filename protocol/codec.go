@@ -6,7 +6,11 @@ import (
 	"fmt"
 )
 
-const ProtocolVersion = 1
+const (
+	ProtocolVersion    = 1
+	ProtocolVersionV2  = 2
+	HubProtocolVersion = ProtocolVersionV2
+)
 
 var (
 	ErrNoCompatibleVersion = errors.New("no compatible protocol version")
@@ -72,11 +76,20 @@ type Subscription struct {
 }
 
 type HelloAck struct {
-	ProtocolVersion int              `json:"protocol_version"`
-	Sessions        []SessionSummary `json:"sessions"`
+	ProtocolVersion int                `json:"protocol_version"`
+	Sessions        []SessionSummary   `json:"sessions"`
+	Capabilities    *HelloCapabilities `json:"capabilities,omitempty"`
 }
 
 func (*HelloAck) FrameName() FrameName { return FrameHelloAck }
+
+type HelloCapabilities struct {
+	HistoryPage *HistoryPageCapability `json:"history_page,omitempty"`
+}
+
+type HistoryPageCapability struct {
+	MaxLimit int `json:"max_limit"`
+}
 
 type SessionSummary struct {
 	SessionID  string `json:"session_id"`
@@ -209,6 +222,16 @@ func NegotiateVersion(peer []int, supported []int) (int, error) {
 		return 0, ErrNoCompatibleVersion
 	}
 	return best, nil
+}
+
+func NegotiateHighestVersion(peerHighest, hubHighest int) (int, error) {
+	if peerHighest < 1 || hubHighest < 1 {
+		return 0, ErrNoCompatibleVersion
+	}
+	if peerHighest < hubHighest {
+		return peerHighest, nil
+	}
+	return hubHighest, nil
 }
 
 func decodeInto(data []byte, out Frame) (Frame, error) {

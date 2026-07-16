@@ -1,4 +1,6 @@
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
+
+export type ProtocolVersion = 1 | 2
 
 export type Role = 'client' | 'adapter'
 export type CommandType = 'session.send' | 'permission.respond' | 'session.interrupt' | 'session.stop'
@@ -12,16 +14,23 @@ export interface Subscription {
   last_seq: number
 }
 
-export interface HelloFrame {
-  frame: 'hello'
-  protocol_version: 1
-  role: Role
-  token: string
-  subscriptions?: Subscription[]
-  session_id?: string
-  provider?: string
-  resume?: boolean
-}
+export type HelloFrame =
+  | {
+      frame: 'hello'
+      protocol_version: ProtocolVersion
+      role: 'client'
+      token: string
+      subscriptions: Subscription[]
+    }
+  | {
+      frame: 'hello'
+      protocol_version: 1
+      role: 'adapter'
+      token: string
+      session_id: string
+      provider: string
+      resume?: boolean
+    }
 
 export interface SessionSummary {
   session_id: string
@@ -33,8 +42,13 @@ export interface SessionSummary {
 
 export interface HelloAckFrame {
   frame: 'hello.ack'
-  protocol_version: 1
+  protocol_version: ProtocolVersion
   sessions: SessionSummary[]
+  capabilities?: HelloCapabilities
+}
+
+export interface HelloCapabilities {
+  history_page?: { max_limit: number }
 }
 
 export interface AgentWharfEvent {
@@ -273,9 +287,10 @@ export class AgentWharfClient {
         try {
           const frame = decodeFrame(event.data)
           if (frame.frame === 'hello.ack') {
+            const ack = validateHelloAck(frame)
             handshakeComplete = true
             this.reconnectDelayMs = this.reconnect?.initialDelayMs ?? 0
-            resolve(frame)
+            resolve(ack)
             return
           }
           this.handleFrame(frame)
@@ -418,4 +433,14 @@ function normalizeError(error: unknown): Error {
     return error
   }
   return new Error(String(error))
+}
+
+function validateHelloAck(frame: HelloAckFrame): HelloAckFrame {
+  if ((frame.protocol_version !== 1 && frame.protocol_version !== 2) || frame.protocol_version > PROTOCOL_VERSION) {
+    throw new Error(`unsupported hello.ack protocol version: ${String(frame.protocol_version)}`)
+  }
+  if (frame.protocol_version === 1 && frame.capabilities !== undefined) {
+    throw new Error('v1 hello.ack must omit capabilities')
+  }
+  return frame
 }

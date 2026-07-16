@@ -114,6 +114,30 @@ func TestHandshakeAdapterHello(t *testing.T) {
 	})
 }
 
+func TestHandshakeNegotiatesClientV2AndRetainsVersion(t *testing.T) {
+	t.Parallel()
+	core := hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator: fakeAuth{token: "client-token", principal: auth.Principal{
+			Subject: "client_1", Scopes: []auth.Scope{auth.SessionView("ses_1")},
+		}},
+		EventStore:    fakeStore{latest: map[string]int64{"ses_1": 1}},
+		SessionLookup: fakeSessions{"ses_1": {State: "ready", Provider: "claude-code"}},
+	})
+	ack, accepted, err := core.HandleHello(context.Background(), &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token",
+		Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}},
+	})
+	if err != nil {
+		t.Fatalf("HandleHello() error = %v", err)
+	}
+	if ack.ProtocolVersion != protocol.ProtocolVersionV2 || accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+		t.Fatalf("negotiated ack/peer versions = %d/%d, want 2/2", ack.ProtocolVersion, accepted.ProtocolVersion)
+	}
+	if ack.Capabilities != nil {
+		t.Fatalf("history capability advertised before handler readiness: %+v", ack.Capabilities)
+	}
+}
+
 func TestHandshakeRejectsInvalidHello(t *testing.T) {
 	t.Parallel()
 
@@ -135,13 +159,20 @@ func TestHandshakeRejectsInvalidHello(t *testing.T) {
 		want error
 	}{
 		{
-			name: "version incompatible",
+			name: "adapter v2 disabled",
 			in: &protocol.Hello{
 				ProtocolVersion: 2,
-				Role:            protocol.RoleClient,
+				Role:            protocol.RoleAdapter,
 				Token:           "client-token",
-				Subscriptions:   []protocol.Subscription{{SessionID: "ses_1"}},
+				SessionID:       "ses_1",
+				Provider:        "claude-code",
 			},
+			want: hub.ErrVersionUnsupported,
+		},
+		{
+			name: "version below one",
+			in: &protocol.Hello{ProtocolVersion: 0, Role: protocol.RoleClient, Token: "client-token",
+				Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}},
 			want: hub.ErrVersionUnsupported,
 		},
 		{
