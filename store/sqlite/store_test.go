@@ -81,6 +81,32 @@ func TestPendingCommandStoreContract(t *testing.T) {
 	})
 }
 
+func TestProposalStoreContract(t *testing.T) {
+	storetest.ProposalContract(t, storetest.ProposalHarness{
+		Open: func(t *testing.T) store.ProposedEventStore {
+			t.Helper()
+			path := filepath.Join(t.TempDir(), "events.db")
+			harness := &sqliteProposalHarness{Store: openStore(t, path), path: path}
+			seedProposalAuthorities(t, path)
+			return harness
+		},
+		Reopen: func(t *testing.T, current store.ProposedEventStore) store.ProposedEventStore {
+			t.Helper()
+			harness := current.(*sqliteProposalHarness)
+			if err := harness.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			harness.Store = openStore(t, harness.path)
+			return harness
+		},
+		Authority: func(t *testing.T, _ store.ProposedEventStore) store.CommandAuthority {
+			t.Helper()
+			return store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+		},
+		Invalidate: invalidateProposalAuthority,
+	})
+}
+
 func TestAttachmentStoreContract(t *testing.T) {
 	storetest.AttachmentContract(t, storetest.AttachmentHarness{
 		Open: func(t *testing.T) store.AttachmentStore {
@@ -630,9 +656,60 @@ type sqliteCommandHarness struct {
 	path string
 }
 
+type sqliteProposalHarness struct {
+	*sqlite.Store
+	path string
+}
+
 type sqliteAttachmentHarness struct {
 	*sqlite.Store
 	path string
+}
+
+func seedProposalAuthorities(t *testing.T, path string) {
+	t.Helper()
+	db := openRawSQLite(t, path)
+	now := time.Now().UnixMilli()
+	for _, sessionID := range []string{
+		"ses_proposal_1", "ses_proposal_conflict", "ses_proposal_snapshot", "ses_proposal_stale", "ses_proposal_reopen",
+	} {
+		if _, err := db.ExecContext(context.Background(), `
+INSERT INTO session_adapter_connections (
+    session_id, connection_epoch, accepted_fence, active_credential_generation,
+    credential_generation_high_watermark, active_credential_expires_at_ms, created_at_ms, updated_at_ms
+) VALUES (?, 1, 1, 1, 1, ?, ?, ?)
+`, sessionID, now+int64(time.Hour/time.Millisecond), now, now); err != nil {
+			t.Fatalf("seed proposal authority for %s: %v", sessionID, err)
+		}
+	}
+}
+
+func invalidateProposalAuthority(t *testing.T, current store.ProposedEventStore, kind storetest.CommandAuthorityFailure) {
+	t.Helper()
+	harness := current.(*sqliteProposalHarness)
+	db := openRawSQLite(t, harness.path)
+	now := time.Now().UnixMilli()
+	var statement string
+	var args []any
+	switch kind {
+	case storetest.CommandAuthoritySuperseded:
+		statement = `UPDATE session_adapter_connections SET connection_epoch = 2, updated_at_ms = ? WHERE session_id = 'ses_proposal_stale'`
+		args = []any{now}
+	case storetest.CommandAuthorityRevoked:
+		statement = `UPDATE session_adapter_connections SET revoked_at_ms = ?, updated_at_ms = ? WHERE session_id = 'ses_proposal_stale'`
+		args = []any{now, now}
+	case storetest.CommandAuthorityExpired:
+		statement = `UPDATE session_adapter_connections SET created_at_ms = ?, active_credential_expires_at_ms = ?, updated_at_ms = ? WHERE session_id = 'ses_proposal_stale'`
+		args = []any{now - int64((2*time.Minute)/time.Millisecond), now - 1, now}
+	case storetest.CommandAuthorityTerminal:
+		statement = `UPDATE session_adapter_connections SET terminal_at_ms = ?, updated_at_ms = ? WHERE session_id = 'ses_proposal_stale'`
+		args = []any{now, now}
+	default:
+		t.Fatalf("unknown proposal authority failure %q", kind)
+	}
+	if _, err := db.ExecContext(context.Background(), statement, args...); err != nil {
+		t.Fatalf("invalidate proposal authority %s: %v", kind, err)
+	}
 }
 
 func seedCommandAuthorities(t *testing.T, path string) {
