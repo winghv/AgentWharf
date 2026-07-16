@@ -107,6 +107,119 @@ func TestProposalStoreContract(t *testing.T) {
 	})
 }
 
+func TestProposalLedgerStoresReferencesOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	proposals := &sqliteProposalHarness{Store: openStore(t, path), path: path}
+	seedProposalAuthorities(t, path)
+	marker := "proposal-secret-marker"
+	if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_corrupt",
+		store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, store.ProposedEventRequest{
+			ProposalID: "proposal_reference_only",
+			Event:      store.PendingEvent{Type: "session.state", Time: testTime(1), Payload: []byte(fmt.Sprintf(`{"marker":%q}`, marker))},
+		}); err != nil {
+		t.Fatalf("CommitProposedEvent() error = %v", err)
+	}
+	db := openRawSQLite(t, path)
+	rows, err := db.QueryContext(context.Background(), `PRAGMA table_info(session_event_proposals)`)
+	if err != nil {
+		t.Fatalf("read proposal columns: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan proposal column: %v", err)
+		}
+		for _, forbidden := range []string{"payload", "content", "secret", "token", "credential", "provider"} {
+			if strings.Contains(strings.ToLower(name), forbidden) {
+				t.Fatalf("proposal column %q contains forbidden concept %q", name, forbidden)
+			}
+		}
+	}
+	var values string
+	if err := db.QueryRowContext(context.Background(), `
+SELECT session_id || '|' || proposal_id || '|' || event_seq FROM session_event_proposals WHERE proposal_id = ?
+`, "proposal_reference_only").Scan(&values); err != nil {
+		t.Fatalf("read proposal reference: %v", err)
+	}
+	if strings.Contains(values, marker) {
+		t.Fatalf("proposal reference copied event content: %q", values)
+	}
+}
+
+func TestProposalCorruptionFailsClosedWithoutMaterializingOversizedEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	proposals := &sqliteProposalHarness{Store: openStore(t, path), path: path}
+	seedProposalAuthorities(t, path)
+	authority := store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+	request := store.ProposedEventRequest{ProposalID: "proposal_corrupt", Event: store.PendingEvent{
+		Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`),
+	}}
+	if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_corrupt", authority, request); err != nil {
+		t.Fatalf("CommitProposedEvent() error = %v", err)
+	}
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `
+UPDATE session_events SET payload = zeroblob(8 * 1024 * 1024) WHERE session_id = ? AND seq = 1
+`, "ses_proposal_corrupt"); err != nil {
+		t.Fatalf("corrupt proposal event payload: %v", err)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_corrupt", authority, request); err == nil {
+		t.Fatal("duplicate CommitProposedEvent() accepted oversized referenced payload")
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 2*1024*1024 {
+		t.Fatalf("oversized corrupt proposal allocated %d bytes, want <= 2 MiB", allocated)
+	}
+}
+
+func TestProposalQueuedBehindAuthorityChangeWritesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	proposals := &sqliteProposalHarness{Store: openStore(t, path), path: path}
+	seedProposalAuthorities(t, path)
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("begin proposal authority change: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+UPDATE session_adapter_connections SET connection_epoch = 2, updated_at_ms = ? WHERE session_id = ?
+`, time.Now().UnixMilli(), "ses_proposal_queued"); err != nil {
+		t.Fatalf("stage proposal authority change: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := proposals.CommitProposedEvent(ctx, "ses_proposal_queued",
+			store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, store.ProposedEventRequest{
+				ProposalID: "proposal_queued", Event: store.PendingEvent{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)},
+			})
+		result <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := db.ExecContext(context.Background(), `COMMIT`); err != nil {
+		t.Fatalf("commit proposal authority change: %v", err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("queued stale CommitProposedEvent() unexpectedly succeeded")
+	}
+	if latest, err := proposals.LatestSeq(context.Background(), "ses_proposal_queued"); err != nil || latest != 0 {
+		t.Fatalf("queued stale proposal latest seq = %d, %v; want 0, nil", latest, err)
+	}
+	var receipts int
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM session_event_proposals WHERE session_id = ?`, "ses_proposal_queued").Scan(&receipts); err != nil {
+		t.Fatalf("count queued proposal receipts: %v", err)
+	}
+	if receipts != 0 {
+		t.Fatalf("queued stale proposal receipts = %d, want 0", receipts)
+	}
+}
+
 func TestAttachmentStoreContract(t *testing.T) {
 	storetest.AttachmentContract(t, storetest.AttachmentHarness{
 		Open: func(t *testing.T) store.AttachmentStore {
@@ -672,6 +785,7 @@ func seedProposalAuthorities(t *testing.T, path string) {
 	now := time.Now().UnixMilli()
 	for _, sessionID := range []string{
 		"ses_proposal_1", "ses_proposal_conflict", "ses_proposal_snapshot", "ses_proposal_stale", "ses_proposal_reopen",
+		"ses_proposal_corrupt", "ses_proposal_queued",
 	} {
 		if _, err := db.ExecContext(context.Background(), `
 INSERT INTO session_adapter_connections (
