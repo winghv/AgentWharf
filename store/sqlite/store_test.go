@@ -99,6 +99,83 @@ func TestAttachmentStoreContract(t *testing.T) {
 	})
 }
 
+func TestAttachmentCorruptionFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		statement string
+		args      func() []any
+	}{
+		{
+			name:      "future creation window",
+			statement: `UPDATE session_attachments SET created_at_ms = ?, updated_at_ms = ?, expires_at_ns = ? WHERE attach_id = ?`,
+			args: func() []any {
+				created := time.Now().Add(time.Minute).UnixMilli()
+				return []any{created, created, (created + 10000) * int64(time.Millisecond), "attach_corrupt"}
+			},
+		},
+		{
+			name:      "oversized queue reason",
+			statement: `UPDATE session_attachments SET status = 'queued', queue_reason = ?, blocking_session_id = ? WHERE attach_id = ?`,
+			args: func() []any {
+				return []any{strings.Repeat("x", 129), "ses_blocker", "attach_corrupt"}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "events.db")
+			ledger := &sqliteAttachmentHarness{Store: openStore(t, path), path: path}
+			request := store.AttachmentCreate{Identity: store.AttachmentIdentity{
+				AttachID: "attach_corrupt", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target",
+				TargetCredentialLineageRef: "lineage_attach_corrupt",
+			}, ExpiresAt: time.Now().Add(20 * time.Second)}
+			if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+				t.Fatalf("CreateAttachment() error = %v", err)
+			}
+			db := openRawSQLite(t, path)
+			if _, err := db.ExecContext(context.Background(), `PRAGMA ignore_check_constraints = ON`); err != nil {
+				t.Fatalf("enable corruption fixture: %v", err)
+			}
+			if _, err := db.ExecContext(context.Background(), test.statement, test.args()...); err != nil {
+				t.Fatalf("corrupt attachment row: %v", err)
+			}
+			if _, err := ledger.Attachment(context.Background(), request.Identity.AttachID); err == nil {
+				t.Fatal("Attachment() accepted corrupt row")
+			}
+		})
+	}
+}
+
+func TestAttachmentConflictAndCancellationLeaveNoPartialState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	ledger := &sqliteAttachmentHarness{Store: openStore(t, path), path: path}
+	first := store.AttachmentCreate{Identity: store.AttachmentIdentity{
+		AttachID: "attach_first", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target",
+		TargetCredentialLineageRef: "lineage_first",
+	}, ExpiresAt: time.Now().Add(20 * time.Second)}
+	if _, err := ledger.CreateAttachment(context.Background(), first); err != nil {
+		t.Fatalf("CreateAttachment() error = %v", err)
+	}
+	conflict := first
+	conflict.Identity.AttachID = "attach_conflict"
+	conflict.Identity.BootstrapSessionID = "ses_other_bootstrap"
+	conflict.Identity.TargetCredentialLineageRef = "lineage_conflict"
+	if _, err := ledger.CreateAttachment(context.Background(), conflict); err == nil {
+		t.Fatal("target-conflicting CreateAttachment() unexpectedly succeeded")
+	}
+	if _, err := ledger.Attachment(context.Background(), conflict.Identity.AttachID); err == nil {
+		t.Fatal("target-conflicting attachment left partial state")
+	}
+	cancel := store.AttachmentUpdate{Status: store.AttachmentCanceled, DeliveryState: store.AttachmentDeliveryPending,
+		Blocker: &store.AttachmentBlocker{Kind: store.AttachmentBlockerNewRunRequired}}
+	if _, err := ledger.UpdateAttachment(context.Background(), first.Identity.AttachID, 0, cancel); err != nil {
+		t.Fatalf("cancel UpdateAttachment() error = %v", err)
+	}
+	if _, err := ledger.UpdateAttachment(context.Background(), first.Identity.AttachID, 1,
+		store.AttachmentUpdate{Status: store.AttachmentStartReceived, DeliveryState: store.AttachmentDeliveryReceived}); err == nil {
+		t.Fatal("canceled attachment recorded start receipt")
+	}
+}
+
 func TestPendingCommandLedgerStoresReferencesOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}

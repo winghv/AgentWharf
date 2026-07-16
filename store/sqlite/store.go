@@ -473,6 +473,285 @@ func validatePendingCommandInput(event store.PendingEvent, request store.Pending
 	return nil
 }
 
+func (s *Store) CreateAttachment(ctx context.Context, request store.AttachmentCreate) (store.AttachmentCommit, error) {
+	if err := validateAttachmentIdentity(request.Identity); err != nil {
+		return store.AttachmentCommit{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.AttachmentCommit{}, fmt.Errorf("begin attachment create: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	existing, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, request.Identity.AttachID))
+	if err == nil {
+		if existing.Identity != request.Identity {
+			return store.AttachmentCommit{}, errors.New("attachment identity is immutable")
+		}
+		if err := tx.Commit(); err != nil {
+			return store.AttachmentCommit{}, fmt.Errorf("commit attachment no-op: %w", err)
+		}
+		return store.AttachmentCommit{Attachment: existing, Summary: sqliteAttachmentSummary(existing, nil), Noop: true}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return store.AttachmentCommit{}, fmt.Errorf("select attachment: %w", err)
+	}
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.AttachmentCommit{}, err
+	}
+	if !validAttachmentExpiry(request.ExpiresAt, time.UnixMilli(nowMS)) {
+		return store.AttachmentCommit{}, errors.New("attachment expiry is outside the Store-clock delivery window")
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO session_attachments (
+    attach_id, bootstrap_session_id, target_session_id, status, delivery_state,
+    delivery_version, expires_at_ns, target_credential_lineage_ref, created_at_ms, updated_at_ms
+) VALUES (?, ?, ?, 'join_pending', 'pending', 0, ?, ?, ?, ?)
+`, request.Identity.AttachID, request.Identity.BootstrapSessionID, request.Identity.TargetSessionID,
+		request.ExpiresAt.UnixNano(), request.Identity.TargetCredentialLineageRef, nowMS, nowMS); err != nil {
+		return store.AttachmentCommit{}, fmt.Errorf("insert attachment: %w", err)
+	}
+	created, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, request.Identity.AttachID))
+	if err != nil {
+		return store.AttachmentCommit{}, fmt.Errorf("read created attachment: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return store.AttachmentCommit{}, fmt.Errorf("commit attachment create: %w", err)
+	}
+	return store.AttachmentCommit{Attachment: created, Summary: sqliteAttachmentSummary(created, nil)}, nil
+}
+
+func (s *Store) Attachment(ctx context.Context, attachID string) (store.Attachment, error) {
+	attachment, err := queryAttachment(ctx, s.db.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, attachID))
+	if err != nil {
+		return store.Attachment{}, fmt.Errorf("select attachment: %w", err)
+	}
+	return attachment, nil
+}
+
+func (s *Store) AttachmentForTarget(ctx context.Context, targetSessionID string) (store.Attachment, error) {
+	attachment, err := queryAttachment(ctx, s.db.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE target_session_id = ?`, targetSessionID))
+	if err != nil {
+		return store.Attachment{}, fmt.Errorf("select target attachment: %w", err)
+	}
+	return attachment, nil
+}
+
+func (s *Store) UpdateAttachment(ctx context.Context, attachID string, expectedVersion int64, update store.AttachmentUpdate) (store.AttachmentMutation, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("begin attachment update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, attachID))
+	if err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("select attachment for update: %w", err)
+	}
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.AttachmentMutation{}, err
+	}
+	if current.DeliveryVersion != expectedVersion {
+		return store.AttachmentMutation{}, errors.New("stale attachment version")
+	}
+	if err := validateAttachmentUpdate(current, update, time.UnixMilli(nowMS)); err != nil {
+		return store.AttachmentMutation{}, err
+	}
+	result, err := tx.ExecContext(ctx, `
+UPDATE session_attachments SET
+    status = ?, delivery_state = ?, delivery_version = delivery_version + 1,
+    queue_reason = ?, expires_at_ns = ?, canceled_at_ms = CASE WHEN ? = 'canceled' THEN ? ELSE NULL END,
+    blocking_session_id = ?, updated_at_ms = ?
+WHERE attach_id = ? AND delivery_version = ?
+`, update.Status, update.DeliveryState, nullableString(update.QueueReason), nullableTimeNano(update.ExpiresAt),
+		update.Status, nowMS, nullableString(update.BlockingSessionID), nowMS, attachID, expectedVersion)
+	if err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("update attachment: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return store.AttachmentMutation{}, errors.New("attachment version conflict")
+	}
+	updated, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, attachID))
+	if err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("read updated attachment: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return store.AttachmentMutation{}, fmt.Errorf("commit attachment update: %w", err)
+	}
+	return store.AttachmentMutation{Attachment: updated, Summary: sqliteAttachmentSummary(updated, update.Blocker)}, nil
+}
+
+const attachmentColumns = `
+attach_id, bootstrap_session_id, target_session_id, status, delivery_state, delivery_version,
+queue_reason, expires_at_ns, canceled_at_ms, blocking_session_id, target_credential_lineage_ref,
+created_at_ms, updated_at_ms, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`
+
+type attachmentRow interface {
+	Scan(...any) error
+}
+
+func queryAttachment(_ context.Context, row attachmentRow) (store.Attachment, error) {
+	var attachment store.Attachment
+	var status, deliveryState string
+	var queueReason, blockingSessionID sql.NullString
+	var expiresAtNS, canceledAtMS sql.NullInt64
+	var createdAtMS, updatedAtMS, nowMS int64
+	err := row.Scan(
+		&attachment.Identity.AttachID, &attachment.Identity.BootstrapSessionID, &attachment.Identity.TargetSessionID,
+		&status, &deliveryState, &attachment.DeliveryVersion, &queueReason, &expiresAtNS, &canceledAtMS,
+		&blockingSessionID, &attachment.Identity.TargetCredentialLineageRef, &createdAtMS, &updatedAtMS, &nowMS,
+	)
+	if err != nil {
+		return store.Attachment{}, err
+	}
+	attachment.Status = store.AttachmentStatus(status)
+	attachment.DeliveryState = store.AttachmentDeliveryState(deliveryState)
+	attachment.QueueReason = nullStringPointer(queueReason)
+	attachment.ExpiresAt = nullNanoTimePointer(expiresAtNS)
+	attachment.CanceledAt = nullMilliTimePointer(canceledAtMS)
+	attachment.BlockingSessionID = nullStringPointer(blockingSessionID)
+	if validateAttachmentIdentity(attachment.Identity) != nil || attachment.DeliveryVersion < 0 ||
+		createdAtMS < 1 || createdAtMS > nowMS || updatedAtMS < createdAtMS || updatedAtMS > nowMS ||
+		!validAttachmentRowShape(attachment, createdAtMS, nowMS) {
+		return store.Attachment{}, errors.New("attachment row is invalid")
+	}
+	return attachment, nil
+}
+
+func validateAttachmentIdentity(identity store.AttachmentIdentity) error {
+	if !validAttachmentText(identity.AttachID, 255) || !validAttachmentText(identity.BootstrapSessionID, 255) ||
+		!validAttachmentText(identity.TargetSessionID, 255) || !validAttachmentText(identity.TargetCredentialLineageRef, 255) ||
+		identity.BootstrapSessionID == identity.TargetSessionID {
+		return errors.New("attachment identity is invalid")
+	}
+	return nil
+}
+
+func validateAttachmentUpdate(current store.Attachment, update store.AttachmentUpdate, storeNow time.Time) error {
+	if current.Status == store.AttachmentCanceled || (current.Status == store.AttachmentStartReceived && update.Status != store.AttachmentStartReceived) {
+		return errors.New("terminal attachment status cannot be reopened")
+	}
+	if update.Status == store.AttachmentStartReceived && current.Status != store.AttachmentStartReceived &&
+		(current.ExpiresAt == nil || !current.ExpiresAt.After(storeNow)) {
+		return errors.New("expired attachment cannot record start receipt")
+	}
+	if update.ExpiresAt != nil && (!validAttachmentExpiry(*update.ExpiresAt, storeNow) ||
+		(current.ExpiresAt != nil && update.ExpiresAt.After(*current.ExpiresAt))) {
+		return errors.New("attachment expiry is invalid")
+	}
+	matches := func(kind store.AttachmentBlockerKind, reason, expiry, blocking, operation bool) bool {
+		blocker := update.Blocker
+		if blocker == nil || blocker.Kind != kind || (!reason && blocker.Reason != nil) || (!expiry && blocker.ExpiresAt != nil) ||
+			(!blocking && blocker.BlockingSessionID != nil) || (!operation && blocker.Operation != nil) {
+			return false
+		}
+		return (!reason || blocker.Reason != nil && update.QueueReason != nil && *blocker.Reason == *update.QueueReason) &&
+			(!expiry || blocker.ExpiresAt != nil && update.ExpiresAt != nil && blocker.ExpiresAt.Equal(*update.ExpiresAt)) &&
+			(!blocking || blocker.BlockingSessionID != nil && update.BlockingSessionID != nil && *blocker.BlockingSessionID == *update.BlockingSessionID)
+	}
+	valid := false
+	switch update.Status {
+	case store.AttachmentQueued:
+		valid = update.DeliveryState == store.AttachmentDeliveryPending && update.QueueReason != nil && validAttachmentText(*update.QueueReason, 128) &&
+			update.ExpiresAt != nil && update.BlockingSessionID != nil && validAttachmentText(*update.BlockingSessionID, 255) &&
+			*update.BlockingSessionID != current.Identity.TargetSessionID && matches(store.AttachmentBlockerQueued, true, true, true, false)
+	case store.AttachmentStartReceived:
+		if update.QueueReason == nil && update.ExpiresAt == nil && update.BlockingSessionID == nil {
+			valid = update.DeliveryState == store.AttachmentDeliveryOutcomeUnknown && matches(store.AttachmentBlockerOutcomeUnknown, false, false, false, true) && validAttachmentOperation(update.Blocker.Operation) ||
+				(update.DeliveryState == store.AttachmentDeliveryReceived || update.DeliveryState == store.AttachmentDeliveryCompleted) && update.Blocker == nil
+		}
+	case store.AttachmentReauthorizationRequired:
+		if update.QueueReason == nil && update.ExpiresAt == nil && update.BlockingSessionID == nil {
+			valid = update.DeliveryState == store.AttachmentDeliveryOutcomeUnknown && matches(store.AttachmentBlockerOutcomeUnknown, false, false, false, true) && validAttachmentOperation(update.Blocker.Operation) ||
+				update.DeliveryState == store.AttachmentDeliveryPending && matches(store.AttachmentBlockerReauthorizationRequired, false, false, false, false)
+		}
+	case store.AttachmentCanceled:
+		valid = update.DeliveryState == store.AttachmentDeliveryPending && update.QueueReason == nil && update.ExpiresAt == nil &&
+			update.BlockingSessionID == nil && matches(store.AttachmentBlockerNewRunRequired, false, false, false, false)
+	}
+	if !valid {
+		return errors.New("invalid attachment update")
+	}
+	return nil
+}
+
+func validAttachmentRowShape(attachment store.Attachment, createdAtMS, nowMS int64) bool {
+	if attachment.QueueReason != nil && !validAttachmentText(*attachment.QueueReason, 128) ||
+		attachment.BlockingSessionID != nil && !validAttachmentText(*attachment.BlockingSessionID, 255) ||
+		attachment.ExpiresAt != nil && (attachment.ExpiresAt.UnixNano() <= createdAtMS*int64(time.Millisecond) ||
+			attachment.ExpiresAt.UnixNano() > (createdAtMS+30000)*int64(time.Millisecond)) ||
+		attachment.CanceledAt != nil && (attachment.CanceledAt.UnixMilli() < createdAtMS || attachment.CanceledAt.UnixMilli() > nowMS) {
+		return false
+	}
+	switch attachment.Status {
+	case store.AttachmentJoinPending:
+		return attachment.DeliveryState == store.AttachmentDeliveryPending && attachment.QueueReason == nil && attachment.ExpiresAt != nil && attachment.CanceledAt == nil && attachment.BlockingSessionID == nil
+	case store.AttachmentQueued:
+		return attachment.DeliveryState == store.AttachmentDeliveryPending && attachment.QueueReason != nil && attachment.ExpiresAt != nil && attachment.CanceledAt == nil && attachment.BlockingSessionID != nil
+	case store.AttachmentStartReceived:
+		return (attachment.DeliveryState == store.AttachmentDeliveryReceived || attachment.DeliveryState == store.AttachmentDeliveryCompleted || attachment.DeliveryState == store.AttachmentDeliveryOutcomeUnknown) && attachment.QueueReason == nil && attachment.ExpiresAt == nil && attachment.CanceledAt == nil && attachment.BlockingSessionID == nil
+	case store.AttachmentReauthorizationRequired:
+		return (attachment.DeliveryState == store.AttachmentDeliveryPending || attachment.DeliveryState == store.AttachmentDeliveryOutcomeUnknown) && attachment.QueueReason == nil && attachment.ExpiresAt == nil && attachment.CanceledAt == nil && attachment.BlockingSessionID == nil
+	case store.AttachmentCanceled:
+		return attachment.DeliveryState == store.AttachmentDeliveryPending && attachment.QueueReason == nil && attachment.ExpiresAt == nil && attachment.CanceledAt != nil && attachment.BlockingSessionID == nil
+	default:
+		return false
+	}
+}
+
+func validAttachmentExpiry(expiresAt, storeNow time.Time) bool {
+	return expiresAt.After(storeNow) && !expiresAt.After(storeNow.Add(30*time.Second))
+}
+
+func validAttachmentText(value string, limit int) bool { return len(value) > 0 && len(value) <= limit }
+
+func validAttachmentOperation(value *string) bool {
+	return value != nil && (*value == "start" || *value == "command")
+}
+
+func sqliteAttachmentSummary(attachment store.Attachment, blocker *store.AttachmentBlocker) store.AttachmentSummary {
+	return store.AttachmentSummary{AttachID: attachment.Identity.AttachID, TargetSessionID: attachment.Identity.TargetSessionID,
+		DeliveryVersion: attachment.DeliveryVersion, ExpiresAt: attachment.ExpiresAt, Blocker: blocker}
+}
+
+func nullableString(value *string) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func nullableTimeNano(value *time.Time) any {
+	if value == nil {
+		return nil
+	}
+	return value.UnixNano()
+}
+
+func nullStringPointer(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	copy := value.String
+	return &copy
+}
+
+func nullNanoTimePointer(value sql.NullInt64) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	copy := time.Unix(0, value.Int64)
+	return &copy
+}
+
+func nullMilliTimePointer(value sql.NullInt64) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	copy := time.UnixMilli(value.Int64)
+	return &copy
+}
+
 func (s *Store) init(ctx context.Context) error {
 	pragmas := []string{
 		`PRAGMA journal_mode = WAL`,
@@ -546,6 +825,29 @@ CREATE TABLE IF NOT EXISTS session_pending_commands (
 
 CREATE INDEX IF NOT EXISTS session_pending_commands_status_expiry_idx
 ON session_pending_commands (status, expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS session_attachments (
+    attach_id TEXT PRIMARY KEY CHECK (length(attach_id) BETWEEN 1 AND 255),
+    bootstrap_session_id TEXT NOT NULL CHECK (length(bootstrap_session_id) BETWEEN 1 AND 255),
+    target_session_id TEXT NOT NULL UNIQUE CHECK (length(target_session_id) BETWEEN 1 AND 255),
+    status TEXT NOT NULL CHECK (status IN ('join_pending', 'queued', 'start_received', 'reauthorization_required', 'canceled')),
+    delivery_state TEXT NOT NULL CHECK (delivery_state IN ('pending', 'received', 'completed', 'outcome_unknown')),
+    delivery_version INTEGER NOT NULL DEFAULT 0 CHECK (delivery_version >= 0),
+    queue_reason TEXT CHECK (queue_reason IS NULL OR length(queue_reason) BETWEEN 1 AND 128),
+    expires_at_ns INTEGER,
+    canceled_at_ms INTEGER,
+    blocking_session_id TEXT CHECK (blocking_session_id IS NULL OR length(blocking_session_id) BETWEEN 1 AND 255),
+    target_credential_lineage_ref TEXT NOT NULL CHECK (length(target_credential_lineage_ref) BETWEEN 1 AND 255),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    CHECK (bootstrap_session_id <> target_session_id),
+    CHECK (blocking_session_id IS NULL OR blocking_session_id <> target_session_id),
+    CHECK (expires_at_ns IS NULL OR expires_at_ns > created_at_ms * 1000000),
+    CHECK (canceled_at_ms IS NULL OR canceled_at_ms >= created_at_ms)
+);
+
+CREATE INDEX IF NOT EXISTS session_attachments_status_expiry_idx
+ON session_attachments (status, expires_at_ns);
 `); err != nil {
 		return fmt.Errorf("initialize sqlite event store schema: %w", err)
 	}
