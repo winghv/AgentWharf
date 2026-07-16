@@ -277,6 +277,74 @@ func TestHandshakeFreshTargetIsAttachOnly(t *testing.T) {
 	}
 }
 
+func TestHandshakeFreshTargetRejectsMixedAuthority(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		scopes        []auth.Scope
+		subscriptions []protocol.Subscription
+		truth         map[string]store.SessionAdmissionTruth
+	}{
+		{
+			name:          "api wildcard",
+			scopes:        []auth.Scope{auth.SessionControl("ses_fresh"), auth.API()},
+			subscriptions: []protocol.Subscription{{SessionID: "ses_fresh"}},
+			truth:         map[string]store.SessionAdmissionTruth{"ses_fresh": {SessionID: "ses_fresh"}},
+		},
+		{
+			name:          "group scope",
+			scopes:        []auth.Scope{auth.SessionControl("ses_fresh"), auth.GroupControl("grp_1")},
+			subscriptions: []protocol.Subscription{{SessionID: "ses_fresh"}},
+			truth:         map[string]store.SessionAdmissionTruth{"ses_fresh": {SessionID: "ses_fresh"}},
+		},
+		{
+			name:          "adapter scope",
+			scopes:        []auth.Scope{auth.SessionControl("ses_fresh"), auth.SessionAdapter("ses_fresh")},
+			subscriptions: []protocol.Subscription{{SessionID: "ses_fresh"}},
+			truth:         map[string]store.SessionAdmissionTruth{"ses_fresh": {SessionID: "ses_fresh"}},
+		},
+		{
+			name:          "view scope",
+			scopes:        []auth.Scope{auth.SessionControl("ses_fresh"), auth.SessionView("ses_fresh")},
+			subscriptions: []protocol.Subscription{{SessionID: "ses_fresh"}},
+			truth:         map[string]store.SessionAdmissionTruth{"ses_fresh": {SessionID: "ses_fresh"}},
+		},
+		{
+			name:          "other session scope",
+			scopes:        []auth.Scope{auth.SessionControl("ses_fresh"), auth.SessionControl("ses_other")},
+			subscriptions: []protocol.Subscription{{SessionID: "ses_fresh"}},
+			truth:         map[string]store.SessionAdmissionTruth{"ses_fresh": {SessionID: "ses_fresh"}},
+		},
+		{
+			name:          "mixed fresh and current subscriptions",
+			scopes:        []auth.Scope{auth.SessionControl("ses_fresh"), auth.SessionView("ses_current")},
+			subscriptions: []protocol.Subscription{{SessionID: "ses_fresh"}, {SessionID: "ses_current"}},
+			truth: map[string]store.SessionAdmissionTruth{
+				"ses_fresh":   {SessionID: "ses_fresh"},
+				"ses_current": {SessionID: "ses_current", Exists: true, Complete: true, Live: true},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			core := hub.NewHandshake(hub.HandshakeConfig{
+				Authenticator: fakeAuth{token: "fresh-token", principal: auth.Principal{Subject: "fresh", Scopes: test.scopes}},
+				EventStore:    fakeStore{latest: map[string]int64{}, truth: test.truth},
+			})
+			_, _, err := core.HandleHello(context.Background(), &protocol.Hello{
+				ProtocolVersion: protocol.ProtocolVersionV2,
+				Role:            protocol.RoleClient,
+				Token:           "fresh-token",
+				Subscriptions:   test.subscriptions,
+			})
+			if !errors.Is(err, auth.ErrUnauthorized) {
+				t.Fatalf("HandleHello() error = %v, want ErrUnauthorized", err)
+			}
+		})
+	}
+}
+
 func TestHandshakeFailsClosedOnAdmissionTruth(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {

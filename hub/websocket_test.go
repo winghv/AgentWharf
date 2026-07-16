@@ -315,6 +315,9 @@ func TestWebSocketServerAttachOnlyDeniesReadReplayLiveAndCommands(t *testing.T) 
 	if ack.Sessions[0].State != "attach_only" || base.replayCallCount() != 0 {
 		t.Fatalf("attach-only ack = %+v, replay calls = %d", ack.Sessions[0], base.replayCallCount())
 	}
+	if ack.Capabilities != nil {
+		t.Fatalf("attach-only capabilities = %+v, want nil", ack.Capabilities)
+	}
 	writeFrame(t, client, &protocol.HistoryPageRequest{RequestID: "hist_attach_only", SessionID: "ses_1", Limit: 1})
 	if got := readFrame(t, client).(*protocol.Error); got.Code != "history_unavailable" || events.historyCalls() != 0 {
 		t.Fatalf("history error = %+v, store calls = %d", got, events.historyCalls())
