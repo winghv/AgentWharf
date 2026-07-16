@@ -382,6 +382,11 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 		return err
 	}
+	if !protocol.PeerEventTypeAllowed(ev.Type) {
+		err := fmt.Errorf("event type %q is reserved for the trusted publisher", ev.Type)
+		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+		return err
+	}
 	if ev.SessionID != accepted.SessionID {
 		err := fmt.Errorf("adapter is not authorized for session %s", ev.SessionID)
 		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "unauthorized", Message: err.Error()})
@@ -868,6 +873,10 @@ func (c *clientConnection) writeFrame(ctx context.Context, frame protocol.Frame)
 }
 
 func (c *clientConnection) writeReplayEvent(ctx context.Context, ev protocol.Event) error {
+	if !protocol.EventTypeAllowed(c.protocolVersion, ev.Type, true) {
+		c.markSent(ev)
+		return nil
+	}
 	if err := c.writeFrame(ctx, &ev); err != nil {
 		return err
 	}
@@ -876,7 +885,8 @@ func (c *clientConnection) writeReplayEvent(ctx context.Context, ev protocol.Eve
 }
 
 func (c *clientConnection) sendLiveEvent(ctx context.Context, ev protocol.Event) error {
-	if !protocol.EventTypeAllowed(c.protocolVersion, ev.Type) {
+	if !protocol.EventTypeAllowed(c.protocolVersion, ev.Type, ev.Seq != nil) {
+		c.markSent(ev)
 		return nil
 	}
 	c.mu.Lock()

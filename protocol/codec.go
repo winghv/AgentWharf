@@ -234,15 +234,19 @@ func NegotiateHighestVersion(peerHighest, hubHighest int) (int, error) {
 	return hubHighest, nil
 }
 
-func EventTypeAllowed(version int, eventType string) bool {
+func EventTypeAllowed(version int, eventType string, durable bool) bool {
 	switch eventType {
 	case "session.idle_warning":
-		return version == ProtocolVersion
+		return version == ProtocolVersion && !durable
 	case "x.vm.idle_warning":
-		return version == ProtocolVersionV2
+		return false
 	default:
 		return true
 	}
+}
+
+func PeerEventTypeAllowed(eventType string) bool {
+	return eventType != "session.idle_warning" && eventType != "x.vm.idle_warning"
 }
 
 func decodeInto(data []byte, out Frame) (Frame, error) {

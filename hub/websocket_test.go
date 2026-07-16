@@ -99,6 +99,31 @@ func TestWebSocketServerReplaysEventsAfterHelloAck(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerDoesNotReplayV2IdleWarning(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 2}, map[string][]store.Event{
+		"ses_1": {
+			{SessionID: "ses_1", Seq: 1, Type: "x.vm.idle_warning", Time: time.UnixMilli(1001), Payload: json.RawMessage(`{}`)},
+			{SessionID: "ses_1", Seq: 2, Type: "session.message", Time: time.UnixMilli(1002), Payload: json.RawMessage(`{}`)},
+		},
+	})
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token",
+		Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}},
+	})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	if event := readFrame(t, client).(*protocol.Event); event.Type != "session.message" || event.Seq == nil || *event.Seq != 2 {
+		t.Fatalf("replayed event = %+v, want session.message seq=2", event)
+	}
+}
+
 func TestWebSocketServerPersistsAdapterDurableEventBeforeFanout(t *testing.T) {
 	t.Parallel()
 
@@ -320,6 +345,29 @@ func TestWebSocketServerDoesNotSendV1IdleWarningToV2Client(t *testing.T) {
 	}
 	if frame, err := readFrameWithin(v2Client, 100*time.Millisecond); err == nil {
 		t.Fatalf("v2 client received v1-only event: %+v", frame)
+	}
+}
+
+func TestWebSocketServerRejectsVersionOwnedWarningFromAdapter(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+	writeFrame(t, adapter, &protocol.Event{
+		Type: "x.vm.idle_warning", SessionID: "ses_1", Time: 2003, Payload: json.RawMessage(`{}`),
+	})
+	if frame := readFrame(t, adapter).(*protocol.Error); frame.Code != "invalid_event" {
+		t.Fatalf("adapter error = %+v, want invalid_event", frame)
+	}
+	if calls := events.appended(); len(calls) != 0 {
+		t.Fatalf("version-owned warning was persisted: %+v", calls)
 	}
 }
 

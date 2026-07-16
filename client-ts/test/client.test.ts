@@ -41,7 +41,7 @@ test('connect sends client hello with the current replay cursor', async () => {
 
   assert.deepEqual(socket.sentFrames()[0], {
     frame: 'hello',
-    protocol_version: 2,
+    protocol_version: 1,
     role: 'client',
     token: 'control-token',
     subscriptions: [{ session_id: 'ses_1', last_seq: 4 }],
@@ -61,11 +61,11 @@ test('connect sends client hello with the current replay cursor', async () => {
   client.close()
 })
 
-test('rejects capabilities on a v1 fallback acknowledgement', async () => {
+test('rejects capabilities on a v1 acknowledgement', async () => {
   const sockets = new FakeSocketFactory()
   const client = new AgentWharfClient({
     url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_1' }],
-    webSocketFactory: sockets.factory, reconnect: false,
+    webSocketFactory: sockets.factory, reconnect: { initialDelayMs: 1, maxDelayMs: 1 },
   })
   const seen: AgentWharfEvent[] = []
   client.onEvent((event) => seen.push(event))
@@ -83,6 +83,33 @@ test('rejects capabilities on a v1 fallback acknowledgement', async () => {
     frame: 'event', type: 'session.message', session_id: 'ses_1', seq: 1, time: 1, payload: {},
   })
   assert.deepEqual(seen, [])
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(sockets.all.length, 1)
+})
+
+test('stale protocol-failure close cannot reject a new connection command', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_1' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const rejected = client.connect()
+  const stale = sockets.last()
+  stale.deferCloseEvent()
+  stale.open()
+  stale.receive({frame: 'hello.ack', protocol_version: 3, sessions: []})
+  await assert.rejects(rejected, /unsupported hello\.ack protocol version/)
+
+  const connected = client.connect()
+  const current = sockets.last()
+  current.open()
+  current.receive({frame: 'hello.ack', protocol_version: 1, sessions: []})
+  await connected
+  const command = client.sendMessage('ses_1', [], {commandId: 'cmd_after_reconnect'})
+  stale.finishClose()
+  current.receive({frame: 'command.ack', cmd_id: 'cmd_after_reconnect', status: 'accepted', reason: ''})
+  assert.equal((await command).status, 'accepted')
+  client.close()
 })
 
 test('tracks durable event sequence for reconnect replay', async () => {
@@ -201,6 +228,7 @@ class FakeSocket {
 
   private readonly sent: string[] = []
   private closed = false
+  private deferClose = false
 
   constructor(readonly url: string) {}
 
@@ -210,7 +238,9 @@ class FakeSocket {
 
   close(): void {
     this.closed = true
-    this.onclose?.({ wasClean: true } as CloseEvent)
+    if (!this.deferClose) {
+      this.finishClose()
+    }
   }
 
   open(): void {
@@ -223,6 +253,14 @@ class FakeSocket {
 
   serverClose(): void {
     this.onclose?.({ wasClean: false } as CloseEvent)
+  }
+
+  deferCloseEvent(): void {
+    this.deferClose = true
+  }
+
+  finishClose(): void {
+    this.onclose?.({ wasClean: true } as CloseEvent)
   }
 
   sentFrames(): any[] {

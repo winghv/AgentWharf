@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 2
+export const PROTOCOL_VERSION = 1
 
 export type ProtocolVersion = 1 | 2
 
@@ -317,9 +317,10 @@ export class AgentWharfClient {
       }
 
       socket.onclose = () => {
-        if (this.socket === socket) {
-          this.socket = null
+        if (this.socket !== socket) {
+          return
         }
+        this.socket = null
         if (!handshakeComplete) {
           reject(new Error('websocket closed before hello.ack'))
         }
