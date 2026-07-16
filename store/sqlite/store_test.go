@@ -1184,6 +1184,28 @@ type sqliteConnectionHarness struct {
 	path string
 }
 
+func (h *sqliteConnectionHarness) AcceptAdapterHello(ctx context.Context, sessionID string, hello store.AdapterHello) (store.AdapterConnection, error) {
+	connection, err := h.Store.AcceptAdapterHello(ctx, sessionID, hello)
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	if fence, err := h.Store.AllocateAdapterGrantFence(ctx); err != nil || fence <= connection.AcceptedFence {
+		return store.AdapterConnection{}, fmt.Errorf("preallocate post-hello grant fence %d after %d: %v", fence, connection.AcceptedFence, err)
+	}
+	return connection, nil
+}
+
+func (h *sqliteConnectionHarness) ActivateAdapterCredential(ctx context.Context, sessionID string, activation store.AdapterCredentialActivation) (store.AdapterConnection, error) {
+	connection, err := h.Store.ActivateAdapterCredential(ctx, sessionID, activation)
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	if fence, err := h.Store.AllocateAdapterGrantFence(ctx); err != nil || fence <= connection.AcceptedFence {
+		return store.AdapterConnection{}, fmt.Errorf("preallocate post-activation grant fence %d after %d: %v", fence, connection.AcceptedFence, err)
+	}
+	return connection, nil
+}
+
 type sqliteAttachmentHarness struct {
 	*sqlite.Store
 	path string
