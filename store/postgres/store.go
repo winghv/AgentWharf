@@ -23,6 +23,7 @@ type Store struct {
 }
 
 const maxHistoryPageSize = 100
+const maxAttachAttemptTTL = 5 * time.Minute
 
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
@@ -644,6 +645,105 @@ func validateProposedEventInput(sessionID string, authority store.CommandAuthori
 
 func proposedEventReceipt(sessionID, proposalID string, seq int64) store.ProposedEventReceipt {
 	return store.ProposedEventReceipt{SessionID: sessionID, ProposalID: proposalID, Seq: seq, Status: store.ProposedEventAccepted}
+}
+
+func (s *Store) CommitAttachAttempt(ctx context.Context, request store.AttachAttemptRequest) (store.AttachAttemptCommit, error) {
+	if s.pool == nil {
+		return store.AttachAttemptCommit{}, errors.New("postgres event store pool is nil")
+	}
+	if err := validateAttachAttempt(request); err != nil {
+		return store.AttachAttemptCommit{}, err
+	}
+	queries := db.New(s.pool)
+	storeNow, err := queries.AttachAttemptStoreNow(ctx)
+	if err != nil {
+		return store.AttachAttemptCommit{}, fmt.Errorf("read attach attempt Store clock: %w", err)
+	}
+	if !request.ExpiresAt.After(storeNow.Time) || request.ExpiresAt.After(storeNow.Time.Add(maxAttachAttemptTTL)) {
+		return store.AttachAttemptCommit{}, errors.New("attach attempt expiry is outside the Store-clock admission window")
+	}
+	params := db.InsertAttachAttemptParams{
+		AttemptJtiHash: request.Identity.JTIHash[:], AttachID: request.Identity.AttachID,
+		BootstrapSessionID: request.Identity.BootstrapSessionID, TargetSessionID: request.Identity.TargetSessionID,
+		Provider: request.Identity.Provider, FingerprintDomain: request.Fingerprint.Domain,
+		FingerprintVersion: int32(request.Fingerprint.Version), FingerprintDigest: request.Fingerprint.Digest[:],
+		FingerprintKeyVersion: int32(request.Fingerprint.KeyVersion), ExpiresAt: pgtype.Timestamptz{Time: request.ExpiresAt, Valid: true},
+		AdmissionOutcome: string(request.Outcome), IssuedCredentialGeneration: nullableInt64(request.IssuedCredentialGeneration),
+	}
+	row, err := queries.InsertAttachAttempt(ctx, params)
+	if err == nil {
+		return store.AttachAttemptCommit{Attempt: attachAttempt(row)}, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.AttachAttemptCommit{}, fmt.Errorf("insert attach attempt: %w", err)
+	}
+	row, err = queries.AttachAttemptByJTIHash(ctx, request.Identity.JTIHash[:])
+	if err != nil {
+		return store.AttachAttemptCommit{}, fmt.Errorf("load existing attach attempt: %w", err)
+	}
+	current := attachAttempt(row)
+	if !sameAttachAttempt(current, request) {
+		return store.AttachAttemptCommit{}, errors.New("attach attempt is immutable")
+	}
+	return store.AttachAttemptCommit{Attempt: current, Duplicate: true}, nil
+}
+
+func (s *Store) AttachAttempt(ctx context.Context, jtiHash [32]byte) (store.AttachAttempt, error) {
+	if s.pool == nil {
+		return store.AttachAttempt{}, errors.New("postgres event store pool is nil")
+	}
+	if jtiHash == ([32]byte{}) {
+		return store.AttachAttempt{}, errors.New("attach attempt JTI hash is required")
+	}
+	row, err := db.New(s.pool).AttachAttemptByJTIHash(ctx, jtiHash[:])
+	if err != nil {
+		return store.AttachAttempt{}, fmt.Errorf("load attach attempt: %w", err)
+	}
+	return attachAttempt(row), nil
+}
+
+func validateAttachAttempt(request store.AttachAttemptRequest) error {
+	identity, fingerprint := request.Identity, request.Fingerprint
+	if identity.JTIHash == ([32]byte{}) || !validConnectionID(identity.AttachID) || !validConnectionID(identity.BootstrapSessionID) ||
+		!validConnectionID(identity.TargetSessionID) || identity.BootstrapSessionID == identity.TargetSessionID || identity.Provider == "" ||
+		len(identity.Provider) > 128 || fingerprint.Domain != "agentwharf.attach-request.v1" || fingerprint.Version != 1 ||
+		fingerprint.Digest == ([32]byte{}) || fingerprint.KeyVersion < 1 || fingerprint.KeyVersion > int64(^uint32(0)>>1) || request.ExpiresAt.IsZero() {
+		return errors.New("invalid attach attempt")
+	}
+	if request.Outcome == store.AttachAttemptAccepted && request.IssuedCredentialGeneration != nil && *request.IssuedCredentialGeneration > 0 {
+		return nil
+	}
+	if request.Outcome == store.AttachAttemptRejected && request.IssuedCredentialGeneration == nil {
+		return nil
+	}
+	return errors.New("invalid attach attempt outcome")
+}
+
+func attachAttempt(row db.SessionAttachAttempt) store.AttachAttempt {
+	var jtiHash, digest [32]byte
+	copy(jtiHash[:], row.AttemptJtiHash)
+	copy(digest[:], row.FingerprintDigest)
+	return store.AttachAttempt{
+		Identity: store.AttachAttemptIdentity{JTIHash: jtiHash, AttachID: row.AttachID, BootstrapSessionID: row.BootstrapSessionID,
+			TargetSessionID: row.TargetSessionID, Provider: row.Provider},
+		Fingerprint: store.AttachAttemptFingerprint{Domain: row.FingerprintDomain, Version: int64(row.FingerprintVersion),
+			Digest: digest, KeyVersion: int64(row.FingerprintKeyVersion)},
+		ExpiresAt: row.ExpiresAt.Time, Outcome: store.AttachAttemptOutcome(row.AdmissionOutcome),
+		IssuedCredentialGeneration: int64Pointer(row.IssuedCredentialGeneration),
+	}
+}
+
+func sameAttachAttempt(current store.AttachAttempt, request store.AttachAttemptRequest) bool {
+	return current.Identity == request.Identity && current.Fingerprint == request.Fingerprint && current.ExpiresAt.Equal(request.ExpiresAt) &&
+		current.Outcome == request.Outcome && ((current.IssuedCredentialGeneration == nil && request.IssuedCredentialGeneration == nil) ||
+		(current.IssuedCredentialGeneration != nil && request.IssuedCredentialGeneration != nil && *current.IssuedCredentialGeneration == *request.IssuedCredentialGeneration))
+}
+
+func nullableInt64(value *int64) pgtype.Int8 {
+	if value == nil {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: *value, Valid: true}
 }
 
 func (s *Store) CreateAttachment(ctx context.Context, request store.AttachmentCreate) (store.AttachmentCommit, error) {
