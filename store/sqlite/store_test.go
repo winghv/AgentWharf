@@ -117,7 +117,7 @@ func TestPendingCommandLedgerStoresReferencesOnly(t *testing.T) {
 
 	var values string
 	if err := db.QueryRowContext(context.Background(), `
-SELECT session_id || '|' || cmd_id || '|' || type || '|' || event_seq || '|' || status || '|' || expires_at_ms
+SELECT session_id || '|' || cmd_id || '|' || type || '|' || event_seq || '|' || status || '|' || expires_at_ns
 FROM session_pending_commands WHERE session_id = ? AND cmd_id = ?
 `, "ses_command_1", request.CommandID).Scan(&values); err != nil {
 		t.Fatalf("read pending-command values: %v", err)
@@ -147,6 +147,49 @@ func TestPendingCommandCorruptStatusFailsClosed(t *testing.T) {
 	}
 	if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_1", authority, request.CommandID); err == nil {
 		t.Fatal("ClaimPendingCommand() accepted corrupt status")
+	}
+}
+
+func TestPendingCommandQueuedBehindAuthorityChangeWritesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}
+	seedCommandAuthorities(t, path)
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("begin authority change: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `
+UPDATE session_adapter_connections SET connection_epoch = 2, updated_at_ms = ? WHERE session_id = ?
+`, time.Now().UnixMilli(), "ses_command_1"); err != nil {
+		t.Fatalf("stage authority change: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := ledger.CommitPendingCommand(ctx, "ses_command_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, store.PendingEvent{
+			Type: "session.message", Time: testTime(1), Payload: []byte(`{"role":"user"}`),
+		}, store.PendingCommandRequest{CommandID: "cmd_queued_stale", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)})
+		result <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := db.ExecContext(context.Background(), `COMMIT`); err != nil {
+		t.Fatalf("commit authority change: %v", err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("queued stale CommitPendingCommand() unexpectedly succeeded")
+	}
+	latest, err := ledger.LatestSeq(context.Background(), "ses_command_1")
+	if err != nil || latest != 0 {
+		t.Fatalf("queued stale latest seq = %d, %v; want 0, nil", latest, err)
+	}
+	var commands int
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM session_pending_commands WHERE session_id = ?`, "ses_command_1").Scan(&commands); err != nil {
+		t.Fatalf("count queued stale commands: %v", err)
+	}
+	if commands != 0 {
+		t.Fatalf("queued stale pending commands = %d, want 0", commands)
 	}
 }
 
@@ -267,8 +310,8 @@ func invalidateCommandAuthority(t *testing.T, current store.CommandLedgerStore, 
 		statement = `UPDATE session_adapter_connections SET revoked_at_ms = ?, updated_at_ms = ?`
 		args = []any{now, now}
 	case storetest.CommandAuthorityExpired:
-		statement = `UPDATE session_adapter_connections SET active_credential_expires_at_ms = ?, updated_at_ms = ?`
-		args = []any{now - 1, now}
+		statement = `UPDATE session_adapter_connections SET created_at_ms = ?, active_credential_expires_at_ms = ?, updated_at_ms = ?`
+		args = []any{now - int64((2*time.Minute)/time.Millisecond), now - 1, now}
 	case storetest.CommandAuthorityTerminal:
 		statement = `UPDATE session_adapter_connections SET terminal_at_ms = ?, updated_at_ms = ?`
 		args = []any{now, now}
