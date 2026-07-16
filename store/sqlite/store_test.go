@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -257,12 +258,43 @@ func TestConnectionGrantFenceSharesAllocatorAndRollback(t *testing.T) {
 		t.Fatalf("grant rollback error = %v, want %v", err, rollback)
 	}
 	reused, err := fences.AllocateAdapterGrantFence(context.Background())
-	if err != nil || reused != rolledBack {
-		t.Fatalf("post-rollback grant = %d, %v, want %d", reused, err, rolledBack)
+	if err != nil || reused <= rolledBack {
+		t.Fatalf("post-rollback grant = %d, %v, want > returned rollback fence %d", reused, err, rolledBack)
+	}
+	grants := make(chan int64, 8)
+	errs := make(chan error, 8)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fence, err := fences.AllocateAdapterGrantFence(context.Background())
+			grants <- fence
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(grants)
+	close(errs)
+	maxGrant := reused
+	seen := map[int64]bool{reused: true}
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent grant allocation: %v", err)
+		}
+	}
+	for fence := range grants {
+		if fence <= rolledBack || seen[fence] {
+			t.Fatalf("duplicate or stale concurrent grant fence %d after %d", fence, rolledBack)
+		}
+		seen[fence] = true
+		if fence > maxGrant {
+			maxGrant = fence
+		}
 	}
 	newer, err := connections.AcceptAdapterHello(context.Background(), record.SessionID, store.AdapterHello{CredentialGeneration: 1})
-	if err != nil || newer.AcceptedFence <= reused {
-		t.Fatalf("hello fence = %d, %v, want > committed grant %d", newer.AcceptedFence, err, reused)
+	if err != nil || newer.AcceptedFence <= maxGrant {
+		t.Fatalf("hello fence = %d, %v, want > committed grant %d", newer.AcceptedFence, err, maxGrant)
 	}
 	if _, err := connections.ValidateAdapterAdmission(context.Background(), record.SessionID, admission); err == nil {
 		t.Fatal("new hello did not fence the older grant")
