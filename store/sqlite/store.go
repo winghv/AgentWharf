@@ -711,7 +711,35 @@ func validAttachmentOperation(value *string) bool {
 
 func sqliteAttachmentSummary(attachment store.Attachment, blocker *store.AttachmentBlocker) store.AttachmentSummary {
 	return store.AttachmentSummary{AttachID: attachment.Identity.AttachID, TargetSessionID: attachment.Identity.TargetSessionID,
-		DeliveryVersion: attachment.DeliveryVersion, ExpiresAt: attachment.ExpiresAt, Blocker: blocker}
+		DeliveryVersion: attachment.DeliveryVersion, ExpiresAt: cloneAttachmentTime(attachment.ExpiresAt), Blocker: cloneSQLiteAttachmentBlocker(blocker)}
+}
+
+func cloneAttachmentTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func cloneSQLiteAttachmentBlocker(value *store.AttachmentBlocker) *store.AttachmentBlocker {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.Reason = cloneAttachmentString(value.Reason)
+	copy.ExpiresAt = cloneAttachmentTime(value.ExpiresAt)
+	copy.BlockingSessionID = cloneAttachmentString(value.BlockingSessionID)
+	copy.Operation = cloneAttachmentString(value.Operation)
+	return &copy
+}
+
+func cloneAttachmentString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func nullableString(value *string) any {
