@@ -1685,6 +1685,7 @@ INSERT INTO session_adapter_connections (
 			t.Fatalf("seed proposal authority for %s: %v", sessionID, err)
 		}
 	}
+	seedFixtureFence(t, path, 2)
 }
 
 func invalidateProposalAuthority(t *testing.T, current store.ProposedEventStore, kind storetest.CommandAuthorityFailure) {
@@ -1730,6 +1731,17 @@ INSERT INTO session_adapter_connections (
 ) VALUES (?, 1, 1, 1, 1, ?, ?, ?)
 `, sessionID, now+int64(time.Hour/time.Millisecond), now, now); err != nil {
 			t.Fatalf("seed command authority for %s: %v", sessionID, err)
+		}
+	}
+	seedFixtureFence(t, path, 2)
+}
+
+func seedFixtureFence(t *testing.T, path string, next int64) {
+	t.Helper()
+	for _, fixture := range []struct{ path, table string }{{path, "session_adapter_fence_allocator"}, {path + ".fences", "adapter_fence_allocator"}} {
+		db := openRawSQLite(t, fixture.path)
+		if _, err := db.ExecContext(context.Background(), `UPDATE `+fixture.table+` SET next_fence = ? WHERE singleton = 1`, next); err != nil {
+			t.Fatalf("seed fixture fence %s: %v", fixture.table, err)
 		}
 	}
 }
