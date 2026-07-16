@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -116,6 +117,131 @@ func TestConnectionStoreContract(t *testing.T) {
 		},
 		Invalidate: invalidateAdapterConnection,
 	})
+}
+
+func TestConnectionPreHelloLifecycleAndRollback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
+	init := store.AdapterConnectionInitialize{SessionID: "ses_prehello", ActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(50 * time.Millisecond)}
+	initial, err := connections.InitializeAdapterConnection(context.Background(), init)
+	if err != nil {
+		t.Fatalf("InitializeAdapterConnection() error = %v", err)
+	}
+	refresh := store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	if _, err := connections.RefreshAdapterCredentialBeforeHello(context.Background(), init.SessionID, refresh); err == nil {
+		t.Fatal("live pre-hello credential refresh unexpectedly succeeded")
+	}
+	time.Sleep(75 * time.Millisecond)
+	rollback := errors.New("rollback pre-hello refresh")
+	if err := connections.WithAdapterConnectionTransaction(context.Background(), func(tx store.AdapterConnectionStore) error {
+		if _, err := tx.RefreshAdapterCredentialBeforeHello(context.Background(), init.SessionID, refresh); err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatalf("refresh rollback error = %v, want %v", err, rollback)
+	}
+	if current, err := connections.AdapterConnection(context.Background(), init.SessionID); err != nil || !current.ActiveCredentialExpiresAt.Equal(initial.ActiveCredentialExpiresAt) {
+		t.Fatalf("refresh rollback connection = %+v, %v", current, err)
+	}
+	refreshed, err := connections.RefreshAdapterCredentialBeforeHello(context.Background(), init.SessionID, refresh)
+	if err != nil || !refreshed.ActiveCredentialExpiresAt.Equal(time.UnixMilli(refresh.ActiveCredentialExpiresAt.UnixMilli())) {
+		t.Fatalf("RefreshAdapterCredentialBeforeHello() = %+v, %v", refreshed, err)
+	}
+	if exact, err := connections.RefreshAdapterCredentialBeforeHello(context.Background(), init.SessionID, refresh); err != nil || !reflect.DeepEqual(exact, refreshed) {
+		t.Fatalf("exact pre-hello refresh = %+v, %v", exact, err)
+	}
+	if _, err := connections.AcceptAdapterHello(context.Background(), init.SessionID, store.AdapterHello{CredentialGeneration: 3}); err != nil {
+		t.Fatalf("AcceptAdapterHello() error = %v", err)
+	}
+	if _, err := connections.RefreshAdapterCredentialBeforeHello(context.Background(), init.SessionID, refresh); err == nil {
+		t.Fatal("post-hello credential refresh unexpectedly succeeded")
+	}
+	if _, err := connections.TerminateAdapterConnectionBeforeHello(context.Background(), init.SessionID, store.AdapterConnectionPreHelloTermination{ExpectedActiveCredentialGeneration: 3}); err == nil {
+		t.Fatal("post-hello termination unexpectedly succeeded")
+	}
+
+	terminate := store.AdapterConnectionInitialize{SessionID: "ses_prehello_terminate", ActiveCredentialGeneration: 4, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	if _, err := connections.InitializeAdapterConnection(context.Background(), terminate); err != nil {
+		t.Fatalf("initialize termination lineage: %v", err)
+	}
+	request := store.AdapterConnectionPreHelloTermination{ExpectedActiveCredentialGeneration: 4}
+	terminated, err := connections.TerminateAdapterConnectionBeforeHello(context.Background(), terminate.SessionID, request)
+	if err != nil || terminated.RevokedAt == nil || terminated.TerminalAt == nil || !terminated.RevokedAt.Equal(*terminated.TerminalAt) {
+		t.Fatalf("pre-hello termination = %+v, %v", terminated, err)
+	}
+	if exact, err := connections.TerminateAdapterConnectionBeforeHello(context.Background(), terminate.SessionID, request); err != nil || !reflect.DeepEqual(exact, terminated) {
+		t.Fatalf("exact pre-hello termination = %+v, %v", exact, err)
+	}
+	if _, err := connections.AcceptAdapterHello(context.Background(), terminate.SessionID, store.AdapterHello{CredentialGeneration: 4}); err == nil {
+		t.Fatal("terminated pre-hello lineage accepted hello")
+	}
+}
+
+func TestConnectionFenceAllocatorPersistsAcrossSessionsAndReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
+	for _, sessionID := range []string{"ses_fence_a", "ses_fence_b"} {
+		if _, err := connections.InitializeAdapterConnection(context.Background(), store.AdapterConnectionInitialize{
+			SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute),
+		}); err != nil {
+			t.Fatalf("initialize %s: %v", sessionID, err)
+		}
+	}
+	a1, err := connections.AcceptAdapterHello(context.Background(), "ses_fence_a", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b1, err := connections.AcceptAdapterHello(context.Background(), "ses_fence_b", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil || b1.AcceptedFence <= a1.AcceptedFence {
+		t.Fatalf("cross-session fences a=%d b=%d, err=%v", a1.AcceptedFence, b1.AcceptedFence, err)
+	}
+	if err := connections.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	connections.Store = openStore(t, path)
+	a2, err := connections.AcceptAdapterHello(context.Background(), "ses_fence_a", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil || a2.AcceptedFence <= b1.AcceptedFence || a2.ConnectionEpoch != a1.ConnectionEpoch+1 {
+		t.Fatalf("reopened fence = %+v after %+v, %v", a2, b1, err)
+	}
+}
+
+func TestConnectionCorruptionAndForbiddenColumnsFailClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
+	if _, err := connections.InitializeAdapterConnection(context.Background(), store.AdapterConnectionInitialize{
+		SessionID: "ses_connection_corrupt", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("InitializeAdapterConnection() error = %v", err)
+	}
+	db := openRawSQLite(t, path)
+	rows, err := db.QueryContext(context.Background(), `PRAGMA table_info(session_adapter_connections)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{"bearer", "token", "secret", "provider", "platform", "payload", "content"} {
+			if strings.Contains(strings.ToLower(name), forbidden) {
+				t.Fatalf("connection column %q contains forbidden concept %q", name, forbidden)
+			}
+		}
+	}
+	if _, err := db.ExecContext(context.Background(), `PRAGMA ignore_check_constraints = ON`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(context.Background(), `UPDATE session_adapter_fence_allocator SET next_fence = 0 WHERE singleton = 1`); err != nil {
+		t.Fatalf("corrupt connection fence allocator: %v", err)
+	}
+	if _, err := connections.AdapterConnection(context.Background(), "ses_connection_corrupt"); err == nil {
+		t.Fatal("AdapterConnection() accepted corrupt allocator fence")
+	}
 }
 
 func TestProposalLedgerStoresReferencesOnly(t *testing.T) {
@@ -899,7 +1025,10 @@ func invalidateAdapterConnection(t *testing.T, current store.AdapterConnectionSt
 	t.Helper()
 	harness := current.(*sqliteConnectionHarness)
 	db := openRawSQLite(t, harness.path)
-	now := time.Now().UnixMilli()
+	var now int64
+	if err := db.QueryRowContext(context.Background(), `SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`).Scan(&now); err != nil {
+		t.Fatalf("read invalidation Store clock: %v", err)
+	}
 	column := "revoked_at_ms"
 	if terminal {
 		column = "terminal_at_ms"
