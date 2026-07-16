@@ -224,9 +224,13 @@ CREATE TABLE session_workspace_leases (
     connection_epoch BIGINT NOT NULL CHECK (connection_epoch > 0),
     credential_generation BIGINT NOT NULL CHECK (credential_generation > 0),
     lease_id TEXT NOT NULL CHECK (char_length(lease_id) BETWEEN 1 AND 255),
+    child_parent_workspace_key TEXT CHECK (char_length(child_parent_workspace_key) BETWEEN 1 AND 255),
+    child_capability_digest BYTEA CHECK (octet_length(child_capability_digest) = 32),
+    child_scope_expires_at TIMESTAMPTZ,
     status TEXT NOT NULL CHECK (status IN ('reserved', 'start_received', 'quarantined', 'released')),
     version BIGINT NOT NULL CHECK (version > 0),
     expires_at TIMESTAMPTZ,
+    reservation_expires_at TIMESTAMPTZ NOT NULL,
     quarantine_reason TEXT CHECK (quarantine_reason IN ('authority_superseded', 'cleanup_uncertain', 'recovery_incomplete')),
     recovery_state TEXT NOT NULL CHECK (recovery_state IN ('not_required', 'pending', 'quiescent')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
@@ -237,6 +241,16 @@ CREATE TABLE session_workspace_leases (
         OR (status = 'start_received' AND expires_at IS NULL AND quarantine_reason IS NULL AND recovery_state = 'not_required' AND released_at IS NULL)
         OR (status = 'quarantined' AND expires_at IS NULL AND quarantine_reason IS NOT NULL AND recovery_state = 'pending' AND released_at IS NULL)
         OR (status = 'released' AND expires_at IS NOT NULL AND quarantine_reason IS NULL AND recovery_state = 'quiescent' AND released_at IS NOT NULL)
+    ),
+    CHECK (
+        (child_parent_workspace_key IS NULL AND child_capability_digest IS NULL AND child_scope_expires_at IS NULL)
+        OR (
+            child_parent_workspace_key IS NOT NULL
+            AND child_capability_digest IS NOT NULL
+            AND child_scope_expires_at IS NOT NULL
+            AND child_parent_workspace_key <> workspace_key
+            AND child_scope_expires_at > created_at
+        )
     )
 );
 

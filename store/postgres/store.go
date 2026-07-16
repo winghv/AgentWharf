@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -737,6 +738,192 @@ func sameAttachAttempt(current store.AttachAttempt, request store.AttachAttemptR
 	return current.Identity == request.Identity && current.Fingerprint == request.Fingerprint && current.ExpiresAt.Equal(request.ExpiresAt) &&
 		current.Outcome == request.Outcome && ((current.IssuedCredentialGeneration == nil && request.IssuedCredentialGeneration == nil) ||
 		(current.IssuedCredentialGeneration != nil && request.IssuedCredentialGeneration != nil && *current.IssuedCredentialGeneration == *request.IssuedCredentialGeneration))
+}
+
+func (s *Store) ReserveWorkspaceLease(ctx context.Context, reserve store.WorkspaceLeaseReserve) (store.WorkspaceLease, error) {
+	if s.pool == nil {
+		return store.WorkspaceLease{}, errors.New("postgres event store pool is nil")
+	}
+	if err := validateWorkspaceLeaseReserve(reserve); err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	queries := db.New(s.pool)
+	params := workspaceLeaseReserveParams(reserve)
+	row, err := queries.InsertWorkspaceLease(ctx, params)
+	if err == nil {
+		return workspaceLease(row)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.WorkspaceLease{}, fmt.Errorf("insert workspace lease: %w", err)
+	}
+	existing, err := queries.WorkspaceLeaseByKey(ctx, workspaceLeaseKeyText(reserve.Key))
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("read existing workspace lease: %w", err)
+	}
+	current, err := workspaceLease(existing)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	if current.Status == store.WorkspaceLeaseReserved && sameWorkspaceLeaseReserve(current, reserve) {
+		return current, nil
+	}
+	if current.Status != store.WorkspaceLeaseReleased {
+		return store.WorkspaceLease{}, errors.New("workspace lease already has a live owner")
+	}
+	row, err = queries.ReserveReleasedWorkspaceLease(ctx, db.ReserveReleasedWorkspaceLeaseParams{
+		WorkerID: params.WorkerID, SessionID: params.SessionID, ConnectionEpoch: params.ConnectionEpoch,
+		CredentialGeneration: params.CredentialGeneration, LeaseID: params.LeaseID,
+		ChildParentWorkspaceKey: params.ChildParentWorkspaceKey, ChildCapabilityDigest: params.ChildCapabilityDigest,
+		ChildScopeExpiresAt: params.ChildScopeExpiresAt, ExpiresAt: params.ExpiresAt, WorkspaceKey: params.WorkspaceKey,
+	})
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("reserve released workspace lease: %w", err)
+	}
+	return workspaceLease(row)
+}
+
+func (s *Store) WorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey) (store.WorkspaceLease, error) {
+	if s.pool == nil {
+		return store.WorkspaceLease{}, errors.New("postgres event store pool is nil")
+	}
+	if key == (store.WorkspaceLeaseKey{}) {
+		return store.WorkspaceLease{}, errors.New("workspace lease key is required")
+	}
+	row, err := db.New(s.pool).WorkspaceLeaseByKey(ctx, workspaceLeaseKeyText(key))
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("read workspace lease: %w", err)
+	}
+	return workspaceLease(row)
+}
+
+func (s *Store) RecordWorkspaceStartReceived(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64, owner store.WorkspaceLeaseOwner) (store.WorkspaceLease, error) {
+	if s.pool == nil {
+		return store.WorkspaceLease{}, errors.New("postgres event store pool is nil")
+	}
+	if key == (store.WorkspaceLeaseKey{}) || expectedVersion < 1 || !validWorkspaceLeaseOwner(owner) {
+		return store.WorkspaceLease{}, errors.New("invalid workspace start receipt")
+	}
+	row, err := db.New(s.pool).RecordWorkspaceStartReceived(ctx, db.RecordWorkspaceStartReceivedParams{
+		WorkspaceKey: workspaceLeaseKeyText(key), ExpectedVersion: expectedVersion, WorkerID: owner.WorkerID,
+		SessionID: owner.SessionID, ConnectionEpoch: owner.ConnectionEpoch,
+		CredentialGeneration: owner.CredentialGeneration, LeaseID: owner.LeaseID,
+	})
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("record workspace start receipt: %w", err)
+	}
+	return workspaceLease(row)
+}
+
+func (s *Store) QuarantineWorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64) (store.WorkspaceLease, error) {
+	if s.pool == nil {
+		return store.WorkspaceLease{}, errors.New("postgres event store pool is nil")
+	}
+	if key == (store.WorkspaceLeaseKey{}) || expectedVersion < 1 {
+		return store.WorkspaceLease{}, errors.New("invalid workspace quarantine")
+	}
+	row, err := db.New(s.pool).QuarantineWorkspaceLease(ctx, db.QuarantineWorkspaceLeaseParams{
+		WorkspaceKey: workspaceLeaseKeyText(key), ExpectedVersion: expectedVersion,
+	})
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("quarantine workspace lease: %w", err)
+	}
+	return workspaceLease(row)
+}
+
+func (s *Store) ReleaseWorkspaceLeaseAfterQuiescence(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64, owner store.WorkspaceLeaseOwner) (store.WorkspaceLease, error) {
+	if s.pool == nil {
+		return store.WorkspaceLease{}, errors.New("postgres event store pool is nil")
+	}
+	if key == (store.WorkspaceLeaseKey{}) || expectedVersion < 1 || !validWorkspaceLeaseOwner(owner) {
+		return store.WorkspaceLease{}, errors.New("invalid workspace quiescence release")
+	}
+	row, err := db.New(s.pool).ReleaseWorkspaceLeaseAfterQuiescence(ctx, db.ReleaseWorkspaceLeaseAfterQuiescenceParams{
+		WorkspaceKey: workspaceLeaseKeyText(key), ExpectedVersion: expectedVersion, WorkerID: owner.WorkerID,
+		SessionID: owner.SessionID, ConnectionEpoch: owner.ConnectionEpoch,
+		CredentialGeneration: owner.CredentialGeneration, LeaseID: owner.LeaseID,
+	})
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("release workspace lease after quiescence: %w", err)
+	}
+	return workspaceLease(row)
+}
+
+func validateWorkspaceLeaseReserve(reserve store.WorkspaceLeaseReserve) error {
+	if reserve.Key == (store.WorkspaceLeaseKey{}) || !validWorkspaceLeaseOwner(reserve.Owner) || reserve.ExpiresAt.IsZero() {
+		return errors.New("invalid workspace lease reserve")
+	}
+	if scope := reserve.ChildScope; scope != nil {
+		if scope.ParentKey == (store.WorkspaceLeaseKey{}) || scope.ParentKey == reserve.Key ||
+			scope.CapabilityDigest == ([32]byte{}) || scope.ExpiresAt.IsZero() {
+			return errors.New("invalid workspace child scope")
+		}
+	}
+	return nil
+}
+
+func validWorkspaceLeaseOwner(owner store.WorkspaceLeaseOwner) bool {
+	return validConnectionID(owner.WorkerID) && validConnectionID(owner.SessionID) && validConnectionID(owner.LeaseID) &&
+		owner.ConnectionEpoch > 0 && owner.CredentialGeneration > 0
+}
+
+func workspaceLeaseReserveParams(reserve store.WorkspaceLeaseReserve) db.InsertWorkspaceLeaseParams {
+	params := db.InsertWorkspaceLeaseParams{
+		WorkspaceKey: workspaceLeaseKeyText(reserve.Key), WorkerID: reserve.Owner.WorkerID, SessionID: reserve.Owner.SessionID,
+		ConnectionEpoch: reserve.Owner.ConnectionEpoch, CredentialGeneration: reserve.Owner.CredentialGeneration,
+		LeaseID: reserve.Owner.LeaseID, ExpiresAt: pgtype.Timestamptz{Time: reserve.ExpiresAt, Valid: true},
+	}
+	if scope := reserve.ChildScope; scope != nil {
+		params.ChildParentWorkspaceKey = pgtype.Text{String: workspaceLeaseKeyText(scope.ParentKey), Valid: true}
+		params.ChildCapabilityDigest = append([]byte(nil), scope.CapabilityDigest[:]...)
+		params.ChildScopeExpiresAt = pgtype.Timestamptz{Time: scope.ExpiresAt, Valid: true}
+	}
+	return params
+}
+
+func workspaceLeaseKeyText(key store.WorkspaceLeaseKey) string {
+	return hex.EncodeToString(key[:])
+}
+
+func workspaceLease(row db.SessionWorkspaceLease) (store.WorkspaceLease, error) {
+	key, err := workspaceLeaseKey(row.WorkspaceKey)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	lease := store.WorkspaceLease{
+		Key: key, Owner: store.WorkspaceLeaseOwner{WorkerID: row.WorkerID, SessionID: row.SessionID,
+			ConnectionEpoch: row.ConnectionEpoch, CredentialGeneration: row.CredentialGeneration, LeaseID: row.LeaseID},
+		Status: store.WorkspaceLeaseStatus(row.Status), Version: row.Version, ExpiresAt: row.ReservationExpiresAt.Time,
+	}
+	if !row.ChildParentWorkspaceKey.Valid && row.ChildCapabilityDigest == nil && !row.ChildScopeExpiresAt.Valid {
+		return lease, nil
+	}
+	parent, err := workspaceLeaseKey(row.ChildParentWorkspaceKey.String)
+	if err != nil || len(row.ChildCapabilityDigest) != 32 || !row.ChildScopeExpiresAt.Valid {
+		return store.WorkspaceLease{}, errors.New("invalid durable workspace child scope")
+	}
+	var digest [32]byte
+	copy(digest[:], row.ChildCapabilityDigest)
+	lease.ChildScope = &store.WorkspaceLeaseChildScope{ParentKey: parent, CapabilityDigest: digest, ExpiresAt: row.ChildScopeExpiresAt.Time}
+	return lease, nil
+}
+
+func workspaceLeaseKey(value string) (store.WorkspaceLeaseKey, error) {
+	var key store.WorkspaceLeaseKey
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != len(key) {
+		return key, errors.New("invalid durable workspace lease key")
+	}
+	copy(key[:], decoded)
+	return key, nil
+}
+
+func sameWorkspaceLeaseReserve(lease store.WorkspaceLease, reserve store.WorkspaceLeaseReserve) bool {
+	if lease.Key != reserve.Key || lease.Owner != reserve.Owner || !lease.ExpiresAt.Equal(reserve.ExpiresAt) {
+		return false
+	}
+	left, right := lease.ChildScope, reserve.ChildScope
+	return (left == nil && right == nil) || (left != nil && right != nil && left.ParentKey == right.ParentKey &&
+		left.CapabilityDigest == right.CapabilityDigest && left.ExpiresAt.Equal(right.ExpiresAt))
 }
 
 func nullableInt64(value *int64) pgtype.Int8 {
