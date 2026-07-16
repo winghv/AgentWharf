@@ -586,21 +586,25 @@ WHERE attach_id = ? AND delivery_version = ?
 }
 
 func executeAttachmentUpdate(ctx context.Context, tx *sql.Tx, statement string, args ...any) (sql.Result, error) {
-	deadline := time.Now().Add(2 * time.Second)
+	retryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	for {
-		result, err := tx.ExecContext(ctx, statement, args...)
+		result, err := tx.ExecContext(retryCtx, statement, args...)
 		if err == nil {
 			return result, nil
 		}
+		if retryCtx.Err() != nil {
+			return nil, retryCtx.Err()
+		}
 		var sqliteError *sqliteDriver.Error
-		if !errors.As(err, &sqliteError) || sqliteError.Code() != sqlite3.SQLITE_BUSY || !time.Now().Before(deadline) {
+		if !errors.As(err, &sqliteError) || sqliteError.Code() != sqlite3.SQLITE_BUSY {
 			return nil, err
 		}
 		timer := time.NewTimer(5 * time.Millisecond)
 		select {
-		case <-ctx.Done():
+		case <-retryCtx.Done():
 			timer.Stop()
-			return nil, ctx.Err()
+			return nil, retryCtx.Err()
 		case <-timer.C:
 		}
 	}
