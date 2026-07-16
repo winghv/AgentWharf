@@ -407,7 +407,11 @@ func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, autho
 	if err != nil {
 		return store.ProposedEventReceipt{}, err
 	}
-	if err := lockCommandAuthority(ctx, tx, sessionID, authority, nowMS); err != nil {
+	if err := lockCommandAuthority(ctx, tx, sessionID, authority); err != nil {
+		return store.ProposedEventReceipt{}, err
+	}
+	nowMS, err = sqliteNowMillis(ctx, tx)
+	if err != nil {
 		return store.ProposedEventReceipt{}, err
 	}
 
@@ -524,12 +528,13 @@ SELECT EXISTS (
 	return nil
 }
 
-func lockCommandAuthority(ctx context.Context, tx *sql.Tx, sessionID string, authority store.CommandAuthority, nowMS int64) error {
+func lockCommandAuthority(ctx context.Context, tx *sql.Tx, sessionID string, authority store.CommandAuthority) error {
 	result, err := tx.ExecContext(ctx, `
 UPDATE session_adapter_connections SET updated_at_ms = updated_at_ms
 WHERE session_id = ? AND connection_epoch = ? AND active_credential_generation = ?
-  AND active_credential_expires_at_ms > ? AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL
-`, sessionID, authority.ConnectionEpoch, authority.CredentialGeneration, nowMS)
+  AND active_credential_expires_at_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+  AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL
+`, sessionID, authority.ConnectionEpoch, authority.CredentialGeneration)
 	if err != nil {
 		return fmt.Errorf("lock command authority: %w", err)
 	}
