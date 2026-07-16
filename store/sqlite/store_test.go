@@ -1184,6 +1184,24 @@ type sqliteConnectionHarness struct {
 	path string
 }
 
+func (h *sqliteConnectionHarness) InitializeAdapterConnection(ctx context.Context, request store.AdapterConnectionInitialize) (store.AdapterConnection, error) {
+	request.ActiveCredentialExpiresAt = stableContractExpiry(request.ActiveCredentialExpiresAt)
+	return h.Store.InitializeAdapterConnection(ctx, request)
+}
+
+func (h *sqliteConnectionHarness) PrepareAdapterCredentialRotation(ctx context.Context, sessionID string, rotation store.AdapterCredentialRotation) (store.AdapterConnection, error) {
+	rotation.ExpiresAt = stableContractExpiry(rotation.ExpiresAt)
+	return h.Store.PrepareAdapterCredentialRotation(ctx, sessionID, rotation)
+}
+
+func stableContractExpiry(expiry time.Time) time.Time {
+	minimum := time.Now().Add(5 * time.Millisecond)
+	if expiry.Before(minimum) {
+		return minimum
+	}
+	return expiry
+}
+
 func (h *sqliteConnectionHarness) AcceptAdapterHello(ctx context.Context, sessionID string, hello store.AdapterHello) (store.AdapterConnection, error) {
 	connection, err := h.Store.AcceptAdapterHello(ctx, sessionID, hello)
 	if err != nil {
