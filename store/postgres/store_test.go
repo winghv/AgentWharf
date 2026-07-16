@@ -153,6 +153,38 @@ func TestAttachAttemptStoreContract(t *testing.T) {
 	})
 }
 
+func TestAttachAttemptFailureLeavesNoRow(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attempt_rollback_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	if _, err := pool.Exec(context.Background(), `INSERT INTO agent_sessions (id) VALUES ('ses_bootstrap')`); err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	request := store.AttachAttemptRequest{
+		Identity:    store.AttachAttemptIdentity{JTIHash: [32]byte{1}, AttachID: "att_rollback", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code"},
+		Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{2}, KeyVersion: 1},
+		ExpiresAt:   time.Now().Add(time.Minute), Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: &generation,
+	}
+	attempts := postgres.New(pool)
+	if _, err := attempts.CommitAttachAttempt(context.Background(), request); err == nil {
+		t.Fatal("missing target attempt unexpectedly committed")
+	}
+	if _, err := attempts.AttachAttempt(context.Background(), request.Identity.JTIHash); err == nil {
+		t.Fatal("failed attempt remained durable")
+	}
+	if _, err := pool.Exec(context.Background(), `INSERT INTO agent_sessions (id) VALUES ('ses_target')`); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := attempts.CommitAttachAttempt(context.Background(), request); err != nil || result.Duplicate {
+		t.Fatalf("retry after rollback = %+v, %v", result, err)
+	}
+}
+
 func TestAttachmentCreateRollback(t *testing.T) {
 	harness := newPostgresAttachmentHarness(t)
 	request := store.AttachmentCreate{
