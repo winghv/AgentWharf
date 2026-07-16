@@ -144,10 +144,7 @@ func TestAttachAttemptStoreContract(t *testing.T) {
 	pool := openPool(t, dsn, schemaName, nil)
 	t.Cleanup(pool.Close)
 	resetSchema(t, pool)
-	if _, err := pool.Exec(context.Background(), `
-INSERT INTO agent_sessions (id, host_type, host_id, provider, status, started_at) VALUES
-('ses_bootstrap', 'vm', 'opaque_host', 'claude-code', 'ready', statement_timestamp()),
-('ses_target', 'vm', 'opaque_host', 'claude-code', 'starting', statement_timestamp())`); err != nil {
+	if _, err := pool.Exec(context.Background(), `INSERT INTO agent_sessions (id) VALUES ('ses_bootstrap'), ('ses_target')`); err != nil {
 		t.Fatal(err)
 	}
 	storetest.AttachAttemptContract(t, storetest.AttachAttemptHarness{
