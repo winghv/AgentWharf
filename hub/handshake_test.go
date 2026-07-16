@@ -281,10 +281,18 @@ func TestHandshakeFreshTargetRejectsMixedAuthority(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name          string
+		version       int
 		scopes        []auth.Scope
 		subscriptions []protocol.Subscription
 		truth         map[string]store.SessionAdmissionTruth
 	}{
+		{
+			name:          "v1 protocol",
+			version:       protocol.ProtocolVersion,
+			scopes:        []auth.Scope{auth.SessionControl("ses_fresh")},
+			subscriptions: []protocol.Subscription{{SessionID: "ses_fresh"}},
+			truth:         map[string]store.SessionAdmissionTruth{"ses_fresh": {SessionID: "ses_fresh"}},
+		},
 		{
 			name:          "api wildcard",
 			scopes:        []auth.Scope{auth.SessionControl("ses_fresh"), auth.API()},
@@ -328,12 +336,16 @@ func TestHandshakeFreshTargetRejectsMixedAuthority(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
+			version := test.version
+			if version == 0 {
+				version = protocol.ProtocolVersionV2
+			}
 			core := hub.NewHandshake(hub.HandshakeConfig{
 				Authenticator: fakeAuth{token: "fresh-token", principal: auth.Principal{Subject: "fresh", Scopes: test.scopes}},
 				EventStore:    fakeStore{latest: map[string]int64{}, truth: test.truth},
 			})
 			_, _, err := core.HandleHello(context.Background(), &protocol.Hello{
-				ProtocolVersion: protocol.ProtocolVersionV2,
+				ProtocolVersion: version,
 				Role:            protocol.RoleClient,
 				Token:           "fresh-token",
 				Subscriptions:   test.subscriptions,
