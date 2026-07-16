@@ -136,6 +136,26 @@ func TestAttachmentStoreContract(t *testing.T) {
 	})
 }
 
+func TestAttachAttemptStoreContract(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attempt_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	if _, err := pool.Exec(context.Background(), `
+INSERT INTO agent_sessions (id, host_type, host_id, provider, status, started_at) VALUES
+('ses_bootstrap', 'vm', 'opaque_host', 'claude-code', 'ready', statement_timestamp()),
+('ses_target', 'vm', 'opaque_host', 'claude-code', 'starting', statement_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+	storetest.AttachAttemptContract(t, storetest.AttachAttemptHarness{
+		Open:   func(*testing.T) store.AttachAttemptStore { return postgres.New(pool) },
+		Reopen: func(*testing.T, store.AttachAttemptStore) store.AttachAttemptStore { return postgres.New(pool) },
+	})
+}
+
 func TestAttachmentCreateRollback(t *testing.T) {
 	harness := newPostgresAttachmentHarness(t)
 	request := store.AttachmentCreate{
