@@ -130,7 +130,8 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 			return protocol.HelloAck{}, AcceptedPeer{}, err
 		}
 		if decision.Mode == auth.SessionAdmissionAttachOnly &&
-			(len(hello.Subscriptions) != 1 || !isExclusiveAttachOnlyPrincipal(principal, sub.SessionID)) {
+			(selectedVersion != protocol.ProtocolVersionV2 || len(hello.Subscriptions) != 1 ||
+				!isExclusiveAttachOnlyPrincipal(principal, sub.SessionID)) {
 			return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
 		}
 		state := "ready"
