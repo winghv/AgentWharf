@@ -80,6 +80,25 @@ func TestPendingCommandStoreContract(t *testing.T) {
 	})
 }
 
+func TestAttachmentStoreContract(t *testing.T) {
+	storetest.AttachmentContract(t, storetest.AttachmentHarness{
+		Open: func(t *testing.T) store.AttachmentStore {
+			t.Helper()
+			path := filepath.Join(t.TempDir(), "events.db")
+			return &sqliteAttachmentHarness{Store: openStore(t, path), path: path}
+		},
+		Reopen: func(t *testing.T, current store.AttachmentStore) store.AttachmentStore {
+			t.Helper()
+			harness := current.(*sqliteAttachmentHarness)
+			if err := harness.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			harness.Store = openStore(t, harness.path)
+			return harness
+		},
+	})
+}
+
 func TestPendingCommandLedgerStoresReferencesOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}
@@ -397,6 +416,11 @@ func openStore(t *testing.T, path string) *sqlite.Store {
 }
 
 type sqliteCommandHarness struct {
+	*sqlite.Store
+	path string
+}
+
+type sqliteAttachmentHarness struct {
 	*sqlite.Store
 	path string
 }
