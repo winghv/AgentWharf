@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -224,6 +225,49 @@ func TestAttachmentStartReceiptRechecksExpiryAtWrite(t *testing.T) {
 	if attachment.Status != store.AttachmentJoinPending || attachment.DeliveryVersion != 0 ||
 		attachment.ExpiresAt == nil || !attachment.ExpiresAt.Equal(request.ExpiresAt) {
 		t.Fatalf("expired start receipt changed durable truth: %+v", attachment)
+	}
+}
+
+func TestAttachmentUpdateBusyRetryIsBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	ledger := &sqliteAttachmentHarness{Store: openStore(t, path), path: path}
+	request := store.AttachmentCreate{Identity: store.AttachmentIdentity{
+		AttachID: "attach_busy_deadline", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target",
+		TargetCredentialLineageRef: "lineage_busy_deadline",
+	}, ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+		t.Fatalf("CreateAttachment() error = %v", err)
+	}
+
+	db := openRawSQLite(t, path)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open lock connection: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("hold attachment write lock: %v", err)
+	}
+	started := time.Now()
+	_, updateErr := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0,
+		store.AttachmentUpdate{Status: store.AttachmentStartReceived, DeliveryState: store.AttachmentDeliveryReceived})
+	elapsed := time.Since(started)
+	if _, err := conn.ExecContext(context.Background(), `ROLLBACK`); err != nil {
+		t.Fatalf("release attachment write lock: %v", err)
+	}
+	if !errors.Is(updateErr, context.DeadlineExceeded) {
+		t.Fatalf("busy attachment update error = %v, want deadline exceeded", updateErr)
+	}
+	if elapsed < 1800*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("busy attachment update elapsed = %v, want bounded near two seconds", elapsed)
+	}
+
+	attachment, err := ledger.Attachment(context.Background(), request.Identity.AttachID)
+	if err != nil {
+		t.Fatalf("Attachment() error = %v", err)
+	}
+	if attachment.Status != store.AttachmentJoinPending || attachment.DeliveryVersion != 0 {
+		t.Fatalf("timed-out attachment update changed durable truth: %+v", attachment)
 	}
 }
 
