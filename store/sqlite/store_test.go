@@ -176,6 +176,44 @@ func TestAttachmentConflictAndCancellationLeaveNoPartialState(t *testing.T) {
 	}
 }
 
+func TestAttachmentSummaryDoesNotAliasCallerOrAttachment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	ledger := &sqliteAttachmentHarness{Store: openStore(t, path), path: path}
+	request := store.AttachmentCreate{Identity: store.AttachmentIdentity{
+		AttachID: "attach_alias", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target",
+		TargetCredentialLineageRef: "lineage_alias",
+	}, ExpiresAt: time.Now().Add(20 * time.Second)}
+	if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+		t.Fatalf("CreateAttachment() error = %v", err)
+	}
+	reason := "capacity"
+	blockingSessionID := "ses_blocker"
+	expiresAt := request.ExpiresAt
+	update := store.AttachmentUpdate{Status: store.AttachmentQueued, DeliveryState: store.AttachmentDeliveryPending,
+		QueueReason: &reason, ExpiresAt: &expiresAt, BlockingSessionID: &blockingSessionID,
+		Blocker: &store.AttachmentBlocker{Kind: store.AttachmentBlockerQueued, Reason: &reason,
+			ExpiresAt: &expiresAt, BlockingSessionID: &blockingSessionID}}
+	mutation, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0, update)
+	if err != nil {
+		t.Fatalf("UpdateAttachment() error = %v", err)
+	}
+	wantReason, wantBlocker, wantExpiry := reason, blockingSessionID, expiresAt
+	reason = "rewritten"
+	blockingSessionID = "ses_rewritten"
+	expiresAt = expiresAt.Add(-time.Second)
+	*mutation.Attachment.ExpiresAt = mutation.Attachment.ExpiresAt.Add(-time.Second)
+	if mutation.Summary.Blocker == nil || mutation.Summary.Blocker.Reason == nil || *mutation.Summary.Blocker.Reason != wantReason ||
+		mutation.Summary.Blocker.BlockingSessionID == nil || *mutation.Summary.Blocker.BlockingSessionID != wantBlocker ||
+		mutation.Summary.ExpiresAt == nil || !mutation.Summary.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("summary changed through pointer alias: %+v", mutation.Summary)
+	}
+	stored, err := ledger.Attachment(context.Background(), request.Identity.AttachID)
+	if err != nil || stored.QueueReason == nil || *stored.QueueReason != wantReason || stored.BlockingSessionID == nil ||
+		*stored.BlockingSessionID != wantBlocker || stored.ExpiresAt == nil || !stored.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("committed attachment changed through pointer alias: %+v, %v", stored, err)
+	}
+}
+
 func TestPendingCommandLedgerStoresReferencesOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	ledger := &sqliteCommandHarness{Store: openStore(t, path), path: path}
