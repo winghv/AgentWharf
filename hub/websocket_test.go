@@ -203,6 +203,37 @@ func TestWebSocketServerRejectsUntrustedHistoryPages(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerReauthenticatesHistoryBeforeAndAfterStore(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		validCalls int
+		storeCalls int
+	}{
+		{name: "expired before request", validCalls: 1, storeCalls: 0},
+		{name: "revoked during read", validCalls: 2, storeCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			events := &fakeHistoryStore{
+				fakeEventStore: newFakeEventStore(map[string]int64{"ses_1": 1}, nil),
+				page:           store.HistoryPage{Events: []store.Event{{SessionID: "ses_1", Seq: 1, Type: "x", Payload: json.RawMessage(`{}`)}}, LatestSeq: 1, RetentionState: store.RetentionComplete},
+			}
+			authenticator := &boundedWebsocketAuth{validCalls: test.validCalls, principal: auth.Principal{Subject: "viewer", Scopes: []auth.Scope{auth.SessionView("ses_1")}}}
+			handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events, SessionLookup: fakeSessions{"ses_1": {State: "ready"}}})
+			server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+			client := dialWebSocket(t, server.URL)
+			defer client.Close(websocket.StatusNormalClosure, "")
+			writeFrame(t, client, &protocol.Hello{ProtocolVersion: 2, Role: protocol.RoleClient, Token: "expiring-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+			_ = readFrame(t, client).(*protocol.HelloAck)
+			writeFrame(t, client, &protocol.HistoryPageRequest{RequestID: "hist_expired", SessionID: "ses_1", Limit: 1})
+			if got := readFrame(t, client).(*protocol.Error); got.Code != "history_unavailable" || events.historyCalls() != test.storeCalls {
+				t.Fatalf("history error = %+v, store calls = %d", got, events.historyCalls())
+			}
+		})
+	}
+}
+
 func TestWebSocketServerRejectsAdapterHistoryRequest(t *testing.T) {
 	t.Parallel()
 
@@ -1125,6 +1156,27 @@ func testHandshakeWithStore(events store.EventStore) *hub.Handshake {
 
 type websocketTestAuth struct {
 	principals map[string]auth.Principal
+}
+
+type boundedWebsocketAuth struct {
+	mu         sync.Mutex
+	validCalls int
+	calls      int
+	principal  auth.Principal
+}
+
+func (a *boundedWebsocketAuth) Authenticate(_ context.Context, _ string) (auth.Principal, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls++
+	if a.calls > a.validCalls {
+		return auth.Principal{}, auth.ErrInvalidToken
+	}
+	return a.principal, nil
+}
+
+func (a *boundedWebsocketAuth) Authorize(_ context.Context, principal auth.Principal, scope auth.Scope) error {
+	return auth.Authorize(principal, scope)
 }
 
 type recordingCommandActivityObserver struct {

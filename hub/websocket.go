@@ -140,7 +140,7 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	ctx := r.Context()
-	accepted, err := h.acceptPeer(ctx, conn)
+	accepted, historyToken, err := h.acceptPeer(ctx, conn)
 	if err != nil {
 		return
 	}
@@ -160,34 +160,34 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := h.replayAccepted(ctx, peer, accepted); err != nil {
 		return
 	}
-	h.readLoop(ctx, conn, accepted, peer, adapter)
+	h.readLoop(ctx, conn, accepted, historyToken, peer, adapter)
 }
 
-func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn) (AcceptedPeer, error) {
+func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn) (AcceptedPeer, string, error) {
 	frame, err := h.readHelloFrame(ctx, conn)
 	if err != nil {
 		_ = writeProtocolError(context.Background(), conn, "timeout", "waiting for hello", true)
 		_ = conn.Close(websocket.StatusPolicyViolation, "hello timeout")
-		return AcceptedPeer{}, err
+		return AcceptedPeer{}, "", err
 	}
 	hello, ok := frame.(*protocol.Hello)
 	if !ok {
 		_ = writeProtocolError(ctx, conn, "invalid_hello", "first frame must be hello", true)
 		_ = conn.Close(websocket.StatusPolicyViolation, "invalid hello")
-		return AcceptedPeer{}, ErrInvalidHello
+		return AcceptedPeer{}, "", ErrInvalidHello
 	}
 	if h.handshake == nil {
 		err := errors.New("websocket handshake is not configured")
 		_ = writeProtocolError(ctx, conn, "internal_error", err.Error(), true)
 		_ = conn.Close(websocket.StatusInternalError, "handshake not configured")
-		return AcceptedPeer{}, err
+		return AcceptedPeer{}, "", err
 	}
 	ack, accepted, err := h.handshake.HandleHello(ctx, hello)
 	if err != nil {
 		code := protocolErrorCode(err)
 		_ = writeProtocolError(ctx, conn, code, err.Error(), true)
 		_ = conn.Close(websocket.StatusPolicyViolation, code)
-		return AcceptedPeer{}, err
+		return AcceptedPeer{}, "", err
 	}
 	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
 		if _, ok := h.events.(store.HistoryStore); ok {
@@ -198,9 +198,13 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn)
 		}
 	}
 	if err := writeProtocolFrame(ctx, conn, &ack); err != nil {
-		return AcceptedPeer{}, err
+		return AcceptedPeer{}, "", err
 	}
-	return accepted, nil
+	historyToken := ""
+	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
+		historyToken = hello.Token
+	}
+	return accepted, historyToken, nil
 }
 
 func (h *webSocketHandler) readHelloFrame(ctx context.Context, conn *websocket.Conn) (protocol.Frame, error) {
@@ -227,7 +231,7 @@ func (h *webSocketHandler) readHelloFrame(ctx context.Context, conn *websocket.C
 	}
 }
 
-func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, peer *clientConnection, adapter *adapterConnection) {
+func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, historyToken string, peer *clientConnection, adapter *adapterConnection) {
 	for {
 		frame, err := readProtocolFrame(ctx, conn)
 		if err != nil {
@@ -244,7 +248,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 		case *protocol.Pong:
 			continue
 		case *protocol.HistoryPageRequest:
-			if err := h.handleHistoryPage(ctx, conn, accepted, peer, adapter, typed); err != nil {
+			if err := h.handleHistoryPage(ctx, conn, accepted, historyToken, peer, adapter, typed); err != nil {
 				return
 			}
 		case *protocol.Event:
@@ -275,7 +279,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 	}
 }
 
-func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, peer *clientConnection, adapter *adapterConnection, request *protocol.HistoryPageRequest) error {
+func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, historyToken string, peer *clientConnection, adapter *adapterConnection, request *protocol.HistoryPageRequest) error {
 	history, ready := h.events.(store.HistoryStore)
 	if accepted.Role != protocol.RoleClient || accepted.ProtocolVersion != protocol.ProtocolVersionV2 || !ready {
 		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
@@ -283,14 +287,13 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocke
 		})
 	}
 	if request == nil || peer == nil || !subscribesTo(accepted.Subscribed, request.SessionID) ||
-		!hasExactHistoryAccess(accepted.Principal, request.SessionID) || h.handshake == nil || h.handshake.authenticator == nil ||
-		h.handshake.authenticator.Authorize(ctx, accepted.Principal, auth.SessionView(request.SessionID)) != nil {
+		!h.authorizeHistory(ctx, historyToken, request.SessionID) {
 		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
 		})
 	}
 	page, err := history.History(ctx, request.SessionID, request.BeforeSeq, request.Limit)
-	if err != nil || !validHistoryPage(page, request) {
+	if err != nil || !validHistoryPage(page, request) || !h.authorizeHistory(ctx, historyToken, request.SessionID) {
 		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
 		})
@@ -306,6 +309,15 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocke
 		RequestID: request.RequestID, SessionID: request.SessionID, Events: events,
 		LatestSeq: page.LatestSeq, NextBeforeSeq: page.NextBeforeSeq, RetentionState: page.RetentionState,
 	})
+}
+
+func (h *webSocketHandler) authorizeHistory(ctx context.Context, token, sessionID string) bool {
+	if token == "" || h.handshake == nil || h.handshake.authenticator == nil {
+		return false
+	}
+	principal, err := h.handshake.authenticator.Authenticate(ctx, token)
+	return err == nil && hasExactHistoryAccess(principal, sessionID) &&
+		h.handshake.authenticator.Authorize(ctx, principal, auth.SessionView(sessionID)) == nil
 }
 
 func validHistoryPage(page store.HistoryPage, request *protocol.HistoryPageRequest) bool {
