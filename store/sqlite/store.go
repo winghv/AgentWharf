@@ -414,21 +414,33 @@ SELECT EXISTS (
 
 func queryPendingCommand(ctx context.Context, tx *sql.Tx, sessionID, commandID string) (store.PendingCommand, error) {
 	var command store.PendingCommand
-	var status string
-	var expiresAtNS int64
+	var status, eventType string
+	var expiresAtNS, createdAtMS int64
+	var eventPayload []byte
 	err := tx.QueryRowContext(ctx, `
-SELECT session_id, cmd_id, type, event_seq, status, expires_at_ns
-FROM session_pending_commands WHERE session_id = ? AND cmd_id = ?
+SELECT command.session_id, command.cmd_id, command.type, command.event_seq, command.status,
+       command.expires_at_ns, command.created_at_ms, event.type, event.payload
+FROM session_pending_commands AS command
+JOIN session_events AS event
+  ON event.session_id = command.session_id AND event.seq = command.event_seq
+WHERE command.session_id = ? AND command.cmd_id = ?
 `, sessionID, commandID).Scan(
-		&command.SessionID, &command.CommandID, &command.Type, &command.EventSeq, &status, &expiresAtNS,
+		&command.SessionID, &command.CommandID, &command.Type, &command.EventSeq, &status,
+		&expiresAtNS, &createdAtMS, &eventType, &eventPayload,
 	)
 	if err != nil {
 		return store.PendingCommand{}, err
 	}
 	command.Status = store.PendingCommandStatus(status)
 	command.ExpiresAt = time.Unix(0, expiresAtNS)
+	var payload struct {
+		Role string `json:"role"`
+	}
 	if command.SessionID == "" || len(command.SessionID) > 255 || command.CommandID == "" || len(command.CommandID) > 256 ||
-		command.Type != "session.send" || command.EventSeq < 1 || !validPendingCommandStatus(command.Status) || expiresAtNS < 1 {
+		command.Type != "session.send" || command.EventSeq < 1 || !validPendingCommandStatus(command.Status) ||
+		createdAtMS < 1 || expiresAtNS <= createdAtMS*int64(time.Millisecond) ||
+		expiresAtNS > (createdAtMS+30000)*int64(time.Millisecond) || eventType != "session.message" ||
+		json.Unmarshal(eventPayload, &payload) != nil || payload.Role != "user" {
 		return store.PendingCommand{}, errors.New("pending command row is invalid")
 	}
 	return command, nil
