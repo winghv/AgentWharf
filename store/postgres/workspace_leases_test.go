@@ -74,6 +74,38 @@ func TestWorkspaceLeaseChildScopeSurvivesReopen(t *testing.T) {
 	}
 }
 
+func TestWorkspaceLeaseExpiredReservationCanQuarantineOrRelease(t *testing.T) {
+	for name, transition := range map[string]func(context.Context, *postgresWorkspaceLeaseHarness, store.WorkspaceLeaseKey, int64, store.WorkspaceLeaseOwner) error{
+		"quarantine": func(ctx context.Context, harness *postgresWorkspaceLeaseHarness, key store.WorkspaceLeaseKey, version int64, _ store.WorkspaceLeaseOwner) error {
+			_, err := harness.QuarantineWorkspaceLease(ctx, key, version)
+			return err
+		},
+		"release": func(ctx context.Context, harness *postgresWorkspaceLeaseHarness, key store.WorkspaceLeaseKey, version int64, owner store.WorkspaceLeaseOwner) error {
+			_, err := harness.ReleaseWorkspaceLeaseAfterQuiescence(ctx, key, version, owner)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			harness := newPostgresWorkspaceLeaseHarness(t)
+			reserve := store.WorkspaceLeaseReserve{
+				Key: store.WorkspaceLeaseKey{9}, Owner: store.WorkspaceLeaseOwner{
+					WorkerID: "worker_expired", SessionID: "ses_workspace", ConnectionEpoch: 1,
+					CredentialGeneration: 1, LeaseID: "lease_expired",
+				},
+				ExpiresAt: time.Now().Add(20 * time.Millisecond),
+			}
+			lease, err := harness.ReserveWorkspaceLease(context.Background(), reserve)
+			if err != nil {
+				t.Fatalf("reserve expiring workspace lease: %v", err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			if err := transition(context.Background(), harness, reserve.Key, lease.Version, reserve.Owner); err != nil {
+				t.Fatalf("%s expired workspace lease: %v", name, err)
+			}
+		})
+	}
+}
+
 type postgresWorkspaceLeaseHarness struct {
 	*postgres.Store
 	pool       *pgxpool.Pool
