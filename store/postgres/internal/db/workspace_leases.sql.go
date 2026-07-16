@@ -190,7 +190,8 @@ func (q *Queries) RecordWorkspaceStartReceived(ctx context.Context, arg RecordWo
 const releaseWorkspaceLeaseAfterQuiescence = `-- name: ReleaseWorkspaceLeaseAfterQuiescence :one
 UPDATE session_workspace_leases AS lease
 SET status = 'released', version = lease.version + 1,
-    expires_at = COALESCE(lease.expires_at, clock_timestamp() + interval '5 minutes'),
+    expires_at = CASE WHEN lease.expires_at > clock_timestamp() THEN lease.expires_at
+                      ELSE clock_timestamp() + interval '5 minutes' END,
     quarantine_reason = NULL, recovery_state = 'quiescent', released_at = clock_timestamp()
 WHERE lease.workspace_key = $1
   AND lease.version = $2
