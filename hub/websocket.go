@@ -287,13 +287,14 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocke
 		})
 	}
 	if request == nil || peer == nil || !subscribesTo(accepted.Subscribed, request.SessionID) ||
-		!h.authorizeHistory(ctx, historyToken, request.SessionID) {
+		!h.authorizeHistory(ctx, historyToken, accepted.Principal.Subject, request.SessionID) {
 		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
 		})
 	}
 	page, err := history.History(ctx, request.SessionID, request.BeforeSeq, request.Limit)
-	if err != nil || !validHistoryPage(page, request) || !h.authorizeHistory(ctx, historyToken, request.SessionID) {
+	if err != nil || !validHistoryPage(page, request) ||
+		!h.authorizeHistory(ctx, historyToken, accepted.Principal.Subject, request.SessionID) {
 		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
 		})
@@ -311,12 +312,12 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocke
 	})
 }
 
-func (h *webSocketHandler) authorizeHistory(ctx context.Context, token, sessionID string) bool {
-	if token == "" || h.handshake == nil || h.handshake.authenticator == nil {
+func (h *webSocketHandler) authorizeHistory(ctx context.Context, token, subject, sessionID string) bool {
+	if token == "" || subject == "" || h.handshake == nil || h.handshake.authenticator == nil {
 		return false
 	}
 	principal, err := h.handshake.authenticator.Authenticate(ctx, token)
-	return err == nil && hasExactHistoryAccess(principal, sessionID) &&
+	return err == nil && principal.Subject == subject && hasExactHistoryAccess(principal, sessionID) &&
 		h.handshake.authenticator.Authorize(ctx, principal, auth.SessionView(sessionID)) == nil
 }
 
@@ -328,15 +329,36 @@ func validHistoryPage(page store.HistoryPage, request *protocol.HistoryPageReque
 	}
 	for index, event := range page.Events {
 		if event.SessionID != request.SessionID || event.Seq < 1 || event.Seq > page.LatestSeq ||
-			event.Type == "" || !json.Valid(event.Payload) ||
+			event.Type == "" || !json.Valid(event.Payload) || len(event.Payload) > protocol.MaxEventPayloadBytes ||
+			!protocol.EventTypeAllowed(protocol.ProtocolVersionV2, event.Type, true) ||
 			request.BeforeSeq != nil && event.Seq >= *request.BeforeSeq ||
 			index > 0 && page.Events[index-1].Seq >= event.Seq {
 			return false
 		}
 	}
 	if page.NextBeforeSeq != nil {
-		return *page.NextBeforeSeq > 0 && len(page.Events) == request.Limit &&
-			*page.NextBeforeSeq == page.Events[0].Seq
+		if *page.NextBeforeSeq < 1 || len(page.Events) != request.Limit || *page.NextBeforeSeq != page.Events[0].Seq {
+			return false
+		}
+	}
+	if page.RetentionState == store.RetentionComplete {
+		eligible := page.LatestSeq
+		if request.BeforeSeq != nil && *request.BeforeSeq-1 < eligible {
+			eligible = *request.BeforeSeq - 1
+		}
+		want := eligible
+		if want > int64(request.Limit) {
+			want = int64(request.Limit)
+		}
+		if int64(len(page.Events)) != want || (eligible > int64(request.Limit)) != (page.NextBeforeSeq != nil) {
+			return false
+		}
+		first := eligible - want + 1
+		for index, event := range page.Events {
+			if event.Seq != first+int64(index) {
+				return false
+			}
+		}
 	}
 	return true
 }

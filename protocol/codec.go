@@ -33,7 +33,10 @@ const (
 	FrameHistoryPage FrameName = "history.page"
 )
 
-const HistoryPageMaxLimit = 100
+const (
+	HistoryPageMaxLimit  = 100
+	MaxEventPayloadBytes = 64 * 1024
+)
 
 type Role string
 
@@ -305,7 +308,8 @@ func decodeHistoryPageEvents(data []byte, sessionID string) ([]HistoryPageEvent,
 			json.Unmarshal(fields["type"], &event.Type) != nil || event.Type == "" ||
 			json.Unmarshal(fields["session_id"], &event.SessionID) != nil || event.SessionID != sessionID ||
 			json.Unmarshal(fields["seq"], &event.Seq) != nil || event.Seq < 1 ||
-			json.Unmarshal(fields["time"], &event.Time) != nil || !json.Valid(fields["payload"]) {
+			json.Unmarshal(fields["time"], &event.Time) != nil || !json.Valid(fields["payload"]) ||
+			len(fields["payload"]) > MaxEventPayloadBytes || !EventTypeAllowed(ProtocolVersionV2, event.Type, true) {
 			return nil, errors.New("invalid event")
 		}
 		event.Payload = append(event.Payload[:0], fields["payload"]...)
@@ -427,6 +431,12 @@ func NegotiateHighestVersion(peerHighest, hubHighest int) (int, error) {
 }
 
 func EventTypeAllowed(version int, eventType string, durable bool) bool {
+	if durable {
+		switch eventType {
+		case "presence", "agent.activity", "log.tail", "resource.sample", "session.idle_warning", "x.vm.idle_warning":
+			return false
+		}
+	}
 	switch eventType {
 	case "session.idle_warning":
 		return version == ProtocolVersion && !durable

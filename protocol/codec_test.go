@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -257,6 +258,11 @@ func TestEventTypeAllowed(t *testing.T) {
 	if EventTypeAllowed(ProtocolVersion, "session.idle_warning", true) {
 		t.Fatal("durable legacy idle warning is allowed")
 	}
+	for _, eventType := range []string{"presence", "agent.activity", "log.tail", "resource.sample"} {
+		if EventTypeAllowed(ProtocolVersionV2, eventType, true) {
+			t.Fatalf("durable ephemeral event type %q is allowed", eventType)
+		}
+	}
 	for _, eventType := range []string{"session.idle_warning", "x.vm.idle_warning"} {
 		if PeerEventTypeAllowed(eventType) {
 			t.Fatalf("peer event type %q is allowed", eventType)
@@ -336,6 +342,13 @@ func TestDecodeHistoryPageResponseStrictly(t *testing.T) {
 	} {
 		if _, err := Decode([]byte(raw)); err == nil {
 			t.Fatalf("Decode(%s) unexpectedly succeeded", raw)
+		}
+	}
+	ephemeral := strings.Replace(valid, `"type":"session.message"`, `"type":"log.tail"`, 1)
+	oversized := strings.Replace(valid, `"payload":{}`, `"payload":"`+strings.Repeat("a", 64*1024)+`"`, 1)
+	for _, raw := range []string{ephemeral, oversized} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatal("Decode(malformed history response) unexpectedly succeeded")
 		}
 	}
 }

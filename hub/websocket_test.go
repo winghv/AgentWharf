@@ -171,11 +171,14 @@ func TestWebSocketServerRejectsUntrustedHistoryPages(t *testing.T) {
 	event := func(sessionID string, seq int64) store.Event {
 		return store.Event{SessionID: sessionID, Seq: seq, Type: "session.message", Time: time.UnixMilli(1001), Payload: json.RawMessage(`{"n":1}`)}
 	}
+	typedEvent := func(eventType string) store.Event { ev := event("ses_1", 1); ev.Type = eventType; return ev }
+	oversizedPayload := json.RawMessage(`"` + strings.Repeat("a", 64*1024) + `"`)
 	nextTwo := int64(2)
 	for _, test := range []struct {
 		name   string
 		page   store.HistoryPage
 		before *int64
+		limit  int
 	}{
 		{name: "cross session", page: store.HistoryPage{Events: []store.Event{event("ses_2", 1)}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
 		{name: "oversized", page: store.HistoryPage{Events: []store.Event{event("ses_1", 1), event("ses_1", 2)}, LatestSeq: 2, RetentionState: store.RetentionComplete}},
@@ -186,6 +189,13 @@ func TestWebSocketServerRejectsUntrustedHistoryPages(t *testing.T) {
 		{name: "inconsistent next", page: store.HistoryPage{Events: []store.Event{event("ses_1", 1)}, LatestSeq: 2, NextBeforeSeq: &nextTwo, RetentionState: store.RetentionComplete}},
 		{name: "invalid retention", page: store.HistoryPage{LatestSeq: 1, RetentionState: "unknown"}},
 		{name: "invalid payload", page: store.HistoryPage{Events: []store.Event{{SessionID: "ses_1", Seq: 1, Type: "x", Payload: json.RawMessage(`{`)}}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
+		{name: "oversized payload", page: store.HistoryPage{Events: []store.Event{{SessionID: "ses_1", Seq: 1, Type: "x", Payload: oversizedPayload}}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
+		{name: "omitted complete cursor", page: store.HistoryPage{Events: []store.Event{event("ses_1", 4), event("ses_1", 5)}, LatestSeq: 5, RetentionState: store.RetentionComplete}, limit: 2},
+		{name: "underfilled complete page", page: store.HistoryPage{Events: []store.Event{event("ses_1", 5)}, LatestSeq: 5, RetentionState: store.RetentionComplete}, limit: 2},
+		{name: "durable activity", page: store.HistoryPage{Events: []store.Event{typedEvent("agent.activity")}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
+		{name: "durable log tail", page: store.HistoryPage{Events: []store.Event{typedEvent("log.tail")}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
+		{name: "durable legacy warning", page: store.HistoryPage{Events: []store.Event{typedEvent("session.idle_warning")}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
+		{name: "durable v2 warning", page: store.HistoryPage{Events: []store.Event{typedEvent("x.vm.idle_warning")}, LatestSeq: 1, RetentionState: store.RetentionComplete}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -195,7 +205,11 @@ func TestWebSocketServerRejectsUntrustedHistoryPages(t *testing.T) {
 			defer client.Close(websocket.StatusNormalClosure, "")
 			writeFrame(t, client, &protocol.Hello{ProtocolVersion: 2, Role: protocol.RoleClient, Token: "view-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
 			_ = readFrame(t, client).(*protocol.HelloAck)
-			writeFrame(t, client, &protocol.HistoryPageRequest{RequestID: "hist_bad", SessionID: "ses_1", BeforeSeq: test.before, Limit: 1})
+			limit := test.limit
+			if limit == 0 {
+				limit = 1
+			}
+			writeFrame(t, client, &protocol.HistoryPageRequest{RequestID: "hist_bad", SessionID: "ses_1", BeforeSeq: test.before, Limit: limit})
 			if got := readFrame(t, client).(*protocol.Error); got.Code != "history_unavailable" {
 				t.Fatalf("history error = %+v", got)
 			}
@@ -231,6 +245,25 @@ func TestWebSocketServerReauthenticatesHistoryBeforeAndAfterStore(t *testing.T) 
 				t.Fatalf("history error = %+v, store calls = %d", got, events.historyCalls())
 			}
 		})
+	}
+}
+
+func TestWebSocketServerRejectsReboundHistoryPrincipal(t *testing.T) {
+	t.Parallel()
+	events := &fakeHistoryStore{fakeEventStore: newFakeEventStore(map[string]int64{"ses_1": 1}, nil), page: store.HistoryPage{Events: []store.Event{{SessionID: "ses_1", Seq: 1, Type: "x", Payload: json.RawMessage(`{}`)}}, LatestSeq: 1, RetentionState: store.RetentionComplete}}
+	authenticator := &reboundWebsocketAuth{principals: []auth.Principal{
+		{Subject: "viewer-a", Scopes: []auth.Scope{auth.SessionView("ses_1")}},
+		{Subject: "viewer-b", Scopes: []auth.Scope{auth.SessionView("ses_1")}},
+	}}
+	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events, SessionLookup: fakeSessions{"ses_1": {State: "ready"}}})
+	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: 2, Role: protocol.RoleClient, Token: "rebound-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeFrame(t, client, &protocol.HistoryPageRequest{RequestID: "hist_rebound", SessionID: "ses_1", Limit: 1})
+	if got := readFrame(t, client).(*protocol.Error); got.Code != "history_unavailable" || events.historyCalls() != 0 {
+		t.Fatalf("history error = %+v, store calls = %d", got, events.historyCalls())
 	}
 }
 
@@ -1163,6 +1196,27 @@ type boundedWebsocketAuth struct {
 	validCalls int
 	calls      int
 	principal  auth.Principal
+}
+
+type reboundWebsocketAuth struct {
+	mu         sync.Mutex
+	principals []auth.Principal
+	calls      int
+}
+
+func (a *reboundWebsocketAuth) Authenticate(_ context.Context, _ string) (auth.Principal, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	index := a.calls
+	if index >= len(a.principals) {
+		index = len(a.principals) - 1
+	}
+	a.calls++
+	return a.principals[index], nil
+}
+
+func (a *reboundWebsocketAuth) Authorize(_ context.Context, principal auth.Principal, scope auth.Scope) error {
+	return auth.Authorize(principal, scope)
 }
 
 func (a *boundedWebsocketAuth) Authenticate(_ context.Context, _ string) (auth.Principal, error) {
