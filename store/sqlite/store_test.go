@@ -583,8 +583,17 @@ func TestConnectionFenceStaleSameIdentitySidecarFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.AllocateAdapterGrantFence(ctx); err != nil {
-		t.Fatal(err)
+	rollback := errors.New("rollback before stale restore")
+	var returned int64
+	if err := st.WithAdapterConnectionTransaction(ctx, func(tx store.AdapterConnectionStore) error {
+		var err error
+		returned, err = tx.(store.AdapterGrantFenceStore).AllocateAdapterGrantFence(ctx)
+		if err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatalf("allocate returned rollback fence: %v", err)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
@@ -593,9 +602,53 @@ func TestConnectionFenceStaleSameIdentitySidecarFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if reopened, err := sqlite.Open(ctx, path); err == nil {
+		next, allocationErr := reopened.AllocateAdapterGrantFence(ctx)
 		_ = reopened.Close()
-		t.Fatal("stale same-identity fence sidecar was accepted")
+		t.Fatalf("stale same-identity sidecar was accepted: next=%d allocation_err=%v returned=%d", next, allocationErr, returned)
 	}
+}
+
+func TestConnectionFenceRuntimeDivergenceFailsClosed(t *testing.T) {
+	t.Run("sidecar rewind", func(t *testing.T) {
+		ctx := context.Background()
+		path := filepath.Join(t.TempDir(), "events.db")
+		st := openStore(t, path)
+		grant, err := st.AllocateAdapterGrantFence(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		side := openRawSQLite(t, path+".fences")
+		if _, err := side.ExecContext(ctx, `UPDATE adapter_fence_allocator SET next_fence = ? WHERE singleton = 1`, grant); err == nil {
+			if reused, err := st.AllocateAdapterGrantFence(ctx); err == nil {
+				t.Fatalf("runtime sidecar rewind reused fence %d after %d", reused, grant)
+			}
+		}
+	})
+	t.Run("main shadow inflation", func(t *testing.T) {
+		ctx := context.Background()
+		path := filepath.Join(t.TempDir(), "events.db")
+		st := openStore(t, path)
+		init := store.AdapterConnectionInitialize{SessionID: "ses_runtime_divergence", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+		if _, err := st.InitializeAdapterConnection(ctx, init); err != nil {
+			t.Fatal(err)
+		}
+		connection, err := st.AcceptAdapterHello(ctx, init.SessionID, store.AdapterHello{CredentialGeneration: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		grant, err := st.AllocateAdapterGrantFence(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		main := openRawSQLite(t, path)
+		forged := grant + 100
+		if _, err := main.ExecContext(ctx, `UPDATE session_adapter_fence_allocator SET next_fence = ? WHERE singleton = 1`, forged+1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ValidateAdapterAdmission(ctx, init.SessionID, store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: forged}); err == nil {
+			t.Fatal("runtime main-shadow inflation admitted an unallocated grant")
+		}
+	})
 }
 
 func TestConnectionTwoStoreOrderingAndExpiry(t *testing.T) {
