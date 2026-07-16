@@ -148,6 +148,11 @@ func TestPendingCommandCorruptStatusFailsClosed(t *testing.T) {
 	if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_1", authority, request.CommandID); err == nil {
 		t.Fatal("ClaimPendingCommand() accepted corrupt status")
 	}
+	if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_1", authority, store.PendingEvent{
+		Type: "session.message", Time: testTime(2), Payload: []byte(`{"role":"user"}`),
+	}, request); err == nil {
+		t.Fatal("duplicate CommitPendingCommand() returned corrupt ledger truth")
+	}
 }
 
 func TestPendingCommandQueuedBehindAuthorityChangeWritesNothing(t *testing.T) {
