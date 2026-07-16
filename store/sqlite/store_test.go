@@ -176,6 +176,57 @@ func TestAttachmentConflictAndCancellationLeaveNoPartialState(t *testing.T) {
 	}
 }
 
+func TestAttachmentStartReceiptRechecksExpiryAtWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	ledger := &sqliteAttachmentHarness{Store: openStore(t, path), path: path}
+	request := store.AttachmentCreate{Identity: store.AttachmentIdentity{
+		AttachID: "attach_expiry_race", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target",
+		TargetCredentialLineageRef: "lineage_expiry_race",
+	}, ExpiresAt: time.Now().Add(time.Second)}
+	if _, err := ledger.CreateAttachment(context.Background(), request); err != nil {
+		t.Fatalf("CreateAttachment() error = %v", err)
+	}
+
+	db := openRawSQLite(t, path)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open lock connection: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if _, err := conn.ExecContext(context.Background(), `PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatalf("set lock timeout: %v", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("hold attachment write lock: %v", err)
+	}
+
+	updated := make(chan error, 1)
+	go func() {
+		_, err := ledger.UpdateAttachment(context.Background(), request.Identity.AttachID, 0,
+			store.AttachmentUpdate{Status: store.AttachmentStartReceived, DeliveryState: store.AttachmentDeliveryReceived})
+		updated <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if delay := time.Until(request.ExpiresAt) + 50*time.Millisecond; delay > 0 {
+		time.Sleep(delay)
+	}
+	if _, err := conn.ExecContext(context.Background(), `ROLLBACK`); err != nil {
+		t.Fatalf("release attachment write lock: %v", err)
+	}
+	if err := <-updated; err == nil || !strings.Contains(err.Error(), "attachment version conflict") {
+		t.Fatalf("expired write-time start receipt error = %v, want attachment version conflict", err)
+	}
+
+	attachment, err := ledger.Attachment(context.Background(), request.Identity.AttachID)
+	if err != nil {
+		t.Fatalf("Attachment() error = %v", err)
+	}
+	if attachment.Status != store.AttachmentJoinPending || attachment.DeliveryVersion != 0 ||
+		attachment.ExpiresAt == nil || !attachment.ExpiresAt.Equal(request.ExpiresAt) {
+		t.Fatalf("expired start receipt changed durable truth: %+v", attachment)
+	}
+}
+
 func TestAttachmentSummaryDoesNotAliasCallerOrAttachment(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	ledger := &sqliteAttachmentHarness{Store: openStore(t, path), path: path}
