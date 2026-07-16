@@ -106,6 +106,34 @@ func TestWorkspaceLeaseExpiredReservationCanQuarantineOrRelease(t *testing.T) {
 	}
 }
 
+func TestWorkspaceLeaseExpiredReleaseAllowsReplacement(t *testing.T) {
+	harness := newPostgresWorkspaceLeaseHarness(t)
+	reserve := store.WorkspaceLeaseReserve{
+		Key: store.WorkspaceLeaseKey{10}, Owner: store.WorkspaceLeaseOwner{
+			WorkerID: "worker_expired", SessionID: "ses_workspace", ConnectionEpoch: 1,
+			CredentialGeneration: 1, LeaseID: "lease_expired",
+		},
+		ExpiresAt: time.Now().Add(20 * time.Millisecond),
+	}
+	lease, err := harness.ReserveWorkspaceLease(context.Background(), reserve)
+	if err != nil {
+		t.Fatalf("reserve expiring workspace lease: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := harness.ReleaseWorkspaceLeaseAfterQuiescence(context.Background(), reserve.Key, lease.Version, reserve.Owner); err != nil {
+		t.Fatalf("release expired workspace lease: %v", err)
+	}
+	replacement := reserve
+	replacement.Owner = store.WorkspaceLeaseOwner{
+		WorkerID: "worker_replacement", SessionID: "ses_workspace", ConnectionEpoch: 2,
+		CredentialGeneration: 2, LeaseID: "lease_replacement",
+	}
+	replacement.ExpiresAt = time.Now().Add(time.Minute)
+	if _, err := harness.ReserveWorkspaceLease(context.Background(), replacement); err != nil {
+		t.Fatalf("reserve released workspace replacement: %v", err)
+	}
+}
+
 type postgresWorkspaceLeaseHarness struct {
 	*postgres.Store
 	pool       *pgxpool.Pool
