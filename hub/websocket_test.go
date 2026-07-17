@@ -1376,6 +1376,23 @@ func TestAdapterDispatchClosesIdleSocketOnAuthorityLoss(t *testing.T) {
 	}
 }
 
+func TestAdapterDispatchDoesNotWriteErrorAfterAuthorityLoss(t *testing.T) {
+	events := newDispatchFenceStore()
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	events.mutateConnection(func(connection *store.AdapterConnection) {
+		now := time.Now()
+		connection.RevokedAt = &now
+	})
+	writeFrame(t, adapter, &protocol.Event{Type: "x.vm.idle_warning", SessionID: "ses_1", Payload: json.RawMessage(`{}`)})
+	if frame, err := readFrameWithin(adapter, 200*time.Millisecond); err == nil {
+		t.Fatalf("stale adapter received frame %+v", frame)
+	}
+}
+
 func TestAdapterDispatchRealSQLiteCommit(t *testing.T) {
 	ctx := context.Background()
 	events, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "events.db"))
