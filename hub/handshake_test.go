@@ -164,7 +164,7 @@ func TestHandshakeAuthorizesVerifiedAttachGrant(t *testing.T) {
 		Authenticator: fakeAuth{token: "client-token", principal: auth.Principal{
 			Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")},
 		}},
-		EventStore:          fakeStore{latest: map[string]int64{}},
+		EventStore:          fakeStore{latest: map[string]int64{}, connections: map[string]store.AdapterConnection{"ses_bootstrap": liveBootstrapConnection(1)}},
 		AttachGrantVerifier: fakeAttachGrantVerifier{raw: "signed-grant", audience: "deploy-attach", grant: grant},
 		AttachGrantAudience: "deploy-attach",
 	})
@@ -178,9 +178,7 @@ func TestHandshakeAuthorizesVerifiedAttachGrant(t *testing.T) {
 	if peer.Admissions["ses_target"].Mode != auth.SessionAdmissionAttachOnly {
 		t.Fatalf("admission = %+v, want attach_only", peer.Admissions["ses_target"])
 	}
-	got, err := core.AuthorizeAttach(context.Background(), peer, "signed-grant", auth.BootstrapAuthority{
-		SessionID: "ses_bootstrap", Provider: "claude-code", CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, Live: true,
-	})
+	got, err := core.AuthorizeAttach(context.Background(), peer, "signed-grant")
 	if err != nil || got != grant {
 		t.Fatalf("AuthorizeAttach() = %+v, %v; want %+v, nil", got, err, grant)
 	}
@@ -194,13 +192,13 @@ func TestHandshakeAttachAuthorizationFailsClosed(t *testing.T) {
 		IssuedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute),
 		DeliveryDeadline: now.Add(61 * time.Second), GrantFence: 2,
 	}
-	newPeer := func(t *testing.T, verifier auth.AttachGrantVerifier) (*hub.Handshake, hub.AcceptedPeer) {
+	newPeer := func(t *testing.T, verifier auth.AttachGrantVerifier, connection store.AdapterConnection) (*hub.Handshake, hub.AcceptedPeer) {
 		t.Helper()
 		core := hub.NewHandshake(hub.HandshakeConfig{
 			Authenticator: fakeAuth{token: "client-token", principal: auth.Principal{
 				Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")},
 			}},
-			EventStore: fakeStore{latest: map[string]int64{}}, AttachGrantVerifier: verifier, AttachGrantAudience: "deploy-attach",
+			EventStore: fakeStore{latest: map[string]int64{}, connections: map[string]store.AdapterConnection{"ses_bootstrap": connection}}, AttachGrantVerifier: verifier, AttachGrantAudience: "deploy-attach",
 		})
 		_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{
 			ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token",
@@ -211,30 +209,61 @@ func TestHandshakeAttachAuthorizationFailsClosed(t *testing.T) {
 		}
 		return core, peer
 	}
-	bootstrap := auth.BootstrapAuthority{SessionID: "ses_bootstrap", Provider: "claude-code", CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, Live: true}
-
 	for _, test := range []struct {
-		name     string
-		verifier auth.AttachGrantVerifier
-		raw      string
-		mutate   func(*auth.BootstrapAuthority)
+		name       string
+		verifier   auth.AttachGrantVerifier
+		raw        string
+		connection store.AdapterConnection
 	}{
-		{name: "missing verifier"},
-		{name: "invalid signature", verifier: fakeAttachGrantVerifier{raw: "signed-grant", err: errors.New("invalid signature")}, raw: "signed-grant"},
-		{name: "wrong raw grant", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: "forged"},
-		{name: "zero accepted fence", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: "signed-grant", mutate: func(b *auth.BootstrapAuthority) { b.AcceptedFence = 0 }},
-		{name: "oversized raw grant", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: strings.Repeat("x", 64*1024+1)},
+		{name: "missing verifier", connection: liveBootstrapConnection(1)},
+		{name: "invalid signature", verifier: fakeAttachGrantVerifier{raw: "signed-grant", err: errors.New("invalid signature")}, raw: "signed-grant", connection: liveBootstrapConnection(1)},
+		{name: "wrong raw grant", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: "forged", connection: liveBootstrapConnection(1)},
+		{name: "stale reconnect fence", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: "signed-grant", connection: liveBootstrapConnection(2)},
+		{name: "expired bootstrap", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: "signed-grant", connection: expiredBootstrapConnection()},
+		{name: "revoked bootstrap", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: "signed-grant", connection: revokedBootstrapConnection()},
+		{name: "terminal bootstrap", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: "signed-grant", connection: terminalBootstrapConnection()},
+		{name: "oversized raw grant", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: strings.Repeat("x", 64*1024+1), connection: liveBootstrapConnection(1)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			core, peer := newPeer(t, test.verifier)
-			candidate := bootstrap
-			if test.mutate != nil {
-				test.mutate(&candidate)
-			}
-			if _, err := core.AuthorizeAttach(context.Background(), peer, test.raw, candidate); !errors.Is(err, auth.ErrUnauthorized) {
+			core, peer := newPeer(t, test.verifier, test.connection)
+			if _, err := core.AuthorizeAttach(context.Background(), peer, test.raw); !errors.Is(err, auth.ErrUnauthorized) {
 				t.Fatalf("AuthorizeAttach() error = %v, want unauthorized", err)
 			}
 		})
+	}
+}
+
+func TestHandshakeAttachRejectsCurrentTarget(t *testing.T) {
+	now := time.Now()
+	grant := auth.AttachGrant{Audience: "deploy-attach", JTI: "jti_1", AttachID: "attach_1", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code", IssuedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute), DeliveryDeadline: now.Add(61 * time.Second), GrantFence: 2}
+	core := hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator:       fakeAuth{token: "client-token", principal: auth.Principal{Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")}}},
+		EventStore:          fakeStore{latest: map[string]int64{"ses_target": 1}, truth: map[string]store.SessionAdmissionTruth{"ses_target": {SessionID: "ses_target", Exists: true, Complete: true, Live: true}}, connections: map[string]store.AdapterConnection{"ses_bootstrap": liveBootstrapConnection(1)}},
+		AttachGrantVerifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, AttachGrantAudience: "deploy-attach",
+	})
+	_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}}})
+	if err != nil {
+		t.Fatalf("HandleHello() error = %v", err)
+	}
+	if _, err := core.AuthorizeAttach(context.Background(), peer, "signed-grant"); !errors.Is(err, auth.ErrUnauthorized) {
+		t.Fatalf("AuthorizeAttach() error = %v, want unauthorized", err)
+	}
+}
+
+func TestHandshakeAttachRejectsGrantForUnsubscribedTarget(t *testing.T) {
+	now := time.Now()
+	grant := auth.AttachGrant{Audience: "deploy-attach", JTI: "jti_1", AttachID: "attach_1", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_other", Provider: "claude-code", IssuedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute), DeliveryDeadline: now.Add(61 * time.Second), GrantFence: 2}
+	core := hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator:       fakeAuth{token: "client-token", principal: auth.Principal{Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")}}},
+		EventStore:          fakeStore{latest: map[string]int64{}, connections: map[string]store.AdapterConnection{"ses_bootstrap": liveBootstrapConnection(1)}},
+		AttachGrantVerifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, AttachGrantAudience: "deploy-attach",
+	})
+	_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}}})
+	if err != nil {
+		t.Fatalf("HandleHello() error = %v", err)
+	}
+	if _, err := core.AuthorizeAttach(context.Background(), peer, "signed-grant"); !errors.Is(err, auth.ErrUnauthorized) {
+		t.Fatalf("AuthorizeAttach() error = %v, want unauthorized", err)
 	}
 }
 
@@ -542,8 +571,9 @@ func (f fakeAuth) SessionAdmissionClaim(_ context.Context, _ auth.Principal, ses
 }
 
 type fakeStore struct {
-	latest map[string]int64
-	truth  map[string]store.SessionAdmissionTruth
+	latest      map[string]int64
+	truth       map[string]store.SessionAdmissionTruth
+	connections map[string]store.AdapterConnection
 }
 
 func (f fakeStore) LatestSeq(_ context.Context, sessionID string) (int64, error) {
@@ -556,4 +586,36 @@ func (f fakeStore) SessionAdmissionTruth(_ context.Context, sessionID string) (s
 	}
 	_, exists := f.latest[sessionID]
 	return store.SessionAdmissionTruth{SessionID: sessionID, Exists: exists, Complete: exists, Live: exists}, nil
+}
+
+func (f fakeStore) AdapterConnection(_ context.Context, sessionID string) (store.AdapterConnection, error) {
+	connection, ok := f.connections[sessionID]
+	if !ok {
+		return store.AdapterConnection{}, errors.New("adapter connection not found")
+	}
+	return connection, nil
+}
+
+func liveBootstrapConnection(acceptedFence int64) store.AdapterConnection {
+	return store.AdapterConnection{SessionID: "ses_bootstrap", ActiveCredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: acceptedFence, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+}
+
+func expiredBootstrapConnection() store.AdapterConnection {
+	connection := liveBootstrapConnection(1)
+	connection.ActiveCredentialExpiresAt = time.Now().Add(-time.Second)
+	return connection
+}
+
+func revokedBootstrapConnection() store.AdapterConnection {
+	connection := liveBootstrapConnection(1)
+	at := time.Now()
+	connection.RevokedAt = &at
+	return connection
+}
+
+func terminalBootstrapConnection() store.AdapterConnection {
+	connection := liveBootstrapConnection(1)
+	at := time.Now()
+	connection.TerminalAt = &at
+	return connection
 }

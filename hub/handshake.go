@@ -68,14 +68,19 @@ func NewHandshake(cfg HandshakeConfig) *Handshake {
 // AuthorizeAttach consumes the raw grant exactly at Client-to-Hub ingress.
 // It returns verified bounded claims only; T18B must repeat bootstrap checks
 // in its Store transaction before creating any durable attach state.
-func (h *Handshake) AuthorizeAttach(ctx context.Context, peer AcceptedPeer, rawGrant string, bootstrap auth.BootstrapAuthority) (auth.AttachGrant, error) {
+func (h *Handshake) AuthorizeAttach(ctx context.Context, peer AcceptedPeer, rawGrant string) (auth.AttachGrant, error) {
 	if h.attachGrantVerifier == nil || h.attachGrantAudience == "" || len(rawGrant) == 0 || len(rawGrant) > maxRawAttachGrantBytes ||
 		peer.Role != protocol.RoleClient || peer.ProtocolVersion != protocol.ProtocolVersionV2 {
 		return auth.AttachGrant{}, auth.ErrUnauthorized
 	}
 	grant, err := h.attachGrantVerifier.VerifyAttachGrant(ctx, rawGrant, h.attachGrantAudience)
-	if err != nil || !subscribesTo(peer.Subscribed, grant.TargetSessionID) ||
-		!peer.allows(grant.TargetSessionID, auth.SessionAdmissionAttach) {
+	decision, admitted := peer.Admissions[grant.TargetSessionID]
+	if err != nil || !subscribesTo(peer.Subscribed, grant.TargetSessionID) || !admitted ||
+		decision.Mode != auth.SessionAdmissionAttachOnly || decision.MayMutate {
+		return auth.AttachGrant{}, auth.ErrUnauthorized
+	}
+	bootstrap, err := h.currentBootstrapAuthority(ctx, grant.BootstrapSessionID, grant.Provider)
+	if err != nil {
 		return auth.AttachGrant{}, auth.ErrUnauthorized
 	}
 	if err := auth.EvaluateAttachAuthorization(auth.AttachAuthorizationRequest{
@@ -84,6 +89,27 @@ func (h *Handshake) AuthorizeAttach(ctx context.Context, peer AcceptedPeer, rawG
 		return auth.AttachGrant{}, auth.ErrUnauthorized
 	}
 	return grant, nil
+}
+
+type adapterConnectionReader interface {
+	AdapterConnection(context.Context, string) (store.AdapterConnection, error)
+}
+
+func (h *Handshake) currentBootstrapAuthority(ctx context.Context, sessionID, provider string) (auth.BootstrapAuthority, error) {
+	connections, ok := h.events.(adapterConnectionReader)
+	if !ok {
+		return auth.BootstrapAuthority{}, auth.ErrUnauthorized
+	}
+	connection, err := connections.AdapterConnection(ctx, sessionID)
+	if err != nil || connection.SessionID != sessionID || connection.ActiveCredentialGeneration <= 0 ||
+		connection.ConnectionEpoch <= 0 || connection.AcceptedFence <= 0 || !connection.ActiveCredentialExpiresAt.After(time.Now()) ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil {
+		return auth.BootstrapAuthority{}, auth.ErrUnauthorized
+	}
+	return auth.BootstrapAuthority{
+		SessionID: sessionID, Provider: provider, CredentialGeneration: connection.ActiveCredentialGeneration,
+		ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, Live: true,
+	}, nil
 }
 
 func (h *Handshake) HandleHello(ctx context.Context, hello *protocol.Hello) (protocol.HelloAck, AcceptedPeer, error) {
