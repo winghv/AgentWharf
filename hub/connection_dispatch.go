@@ -85,6 +85,21 @@ func (h *webSocketHandler) withAdapterEffect(ctx context.Context, adapter *adapt
 	}
 	return effect()
 }
+
+func (a *adapterDispatchAuthority) withAdmission(ctx context.Context, adapter *adapterConnection, effect func(context.Context) error) error {
+	transactor, ok := a.store.(store.AdapterConnectionTransactor)
+	if !ok {
+		return errAdapterAuthorityLost
+	}
+	effectCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+	defer cancel()
+	return transactor.WithAdapterConnectionTransaction(effectCtx, func(tx store.AdapterConnectionStore) error {
+		if _, err := tx.ValidateAdapterAdmission(effectCtx, adapter.sessionID, adapter.admission); err != nil {
+			return errAdapterAuthorityLost
+		}
+		return effect(effectCtx)
+	})
+}
 func (h *webSocketHandler) lockAdapterAdmission(sessionID string) (*adapterConnection, func()) {
 	h.adapterAdmissionMu.Lock()
 	previous := h.adapterAdmissionLocks[sessionID]

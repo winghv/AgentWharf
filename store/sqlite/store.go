@@ -661,6 +661,11 @@ func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, 
 		admission.AcceptedFence < 1 || admission.GrantFence <= admission.AcceptedFence {
 		return store.AdapterConnection{}, errors.New("invalid adapter admission")
 	}
+	if s.connectionTx != nil {
+		if _, err := s.connectionTx.ExecContext(ctx, `UPDATE session_adapter_connections SET updated_at_ms=updated_at_ms WHERE session_id=?`, sessionID); err != nil {
+			return store.AdapterConnection{}, fmt.Errorf("lock adapter admission: %w", err)
+		}
+	}
 	connection, err := queryAdapterConnectionWhere(ctx, s.connectionExecutor(), `connection.session_id = ? AND connection.active_credential_generation = ?
 AND connection.connection_epoch = ? AND connection.accepted_fence = ? AND ? > connection.accepted_fence AND ? < (SELECT next_fence FROM session_adapter_fence_allocator WHERE singleton = 1) AND ? < (SELECT next_fence FROM fence_store.adapter_fence_allocator WHERE singleton = 1)
 AND connection.active_credential_expires_at_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) AND connection.revoked_at_ms IS NULL AND connection.terminal_at_ms IS NULL`, sessionID, admission.CredentialGeneration, admission.ConnectionEpoch, admission.AcceptedFence,

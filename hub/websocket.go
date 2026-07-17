@@ -591,7 +591,12 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		Payload:   clonePayload(ev.Payload),
 	}
 	if isEphemeralEvent(ev.Type) {
-		return h.withAdapterEffect(ctx, adapter, func() error { h.broadcastEvent(ctx, out); return nil })
+		return h.withAdapterEffect(ctx, adapter, func() error {
+			return h.adapterAuthority.withAdmission(ctx, adapter, func(effectCtx context.Context) error {
+				h.broadcastEvent(effectCtx, out)
+				return nil
+			})
+		})
 	}
 	if h.events == nil {
 		err := errors.New("event store is not configured")

@@ -532,6 +532,11 @@ func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, 
 		admission.AcceptedFence < 1 || admission.GrantFence <= admission.AcceptedFence {
 		return store.AdapterConnection{}, errors.New("invalid adapter admission")
 	}
+	if s.connectionTx != nil {
+		if err := s.connectionTx.QueryRow(ctx, `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 AND active_credential_generation=$2 AND connection_epoch=$3 AND accepted_fence=$4 AND connection_epoch>0 AND accepted_fence>0 AND $5::BIGINT>accepted_fence AND active_credential_expires_at>clock_timestamp() AND revoked_at IS NULL AND terminal_at IS NULL FOR UPDATE`, sessionID, admission.CredentialGeneration, admission.ConnectionEpoch, admission.AcceptedFence, admission.GrantFence).Scan(new(int)); err != nil {
+			return store.AdapterConnection{}, fmt.Errorf("validate adapter admission: %w", err)
+		}
+	}
 	queries, err := s.adapterConnectionQueries()
 	if err != nil {
 		return store.AdapterConnection{}, err
