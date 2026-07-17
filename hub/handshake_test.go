@@ -180,8 +180,8 @@ func TestHandshakeAuthorizesVerifiedAttachGrant(t *testing.T) {
 		t.Fatalf("admission = %+v, want attach_only", peer.Admissions["ses_target"])
 	}
 	got, err := core.AuthorizeAttach(context.Background(), peer, "signed-grant")
-	if err != nil || got != grant {
-		t.Fatalf("AuthorizeAttach() = %+v, %v; want %+v, nil", got, err, grant)
+	if err != nil || got.Grant != grant || got.Bootstrap.SessionID != "ses_bootstrap" || got.Bootstrap.AcceptedFence != 1 {
+		t.Fatalf("AuthorizeAttach() = %+v, %v; want grant %+v and current bootstrap", got, err, grant)
 	}
 }
 

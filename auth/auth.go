@@ -123,6 +123,13 @@ type AttachAuthorizationRequest struct {
 	ExpectedAudience string
 }
 
+// AttachAuthorization is the non-durable ingress result. T18B must pass its
+// exact Bootstrap tuple to the Store transaction for final revalidation.
+type AttachAuthorization struct {
+	Grant     AttachGrant
+	Bootstrap BootstrapAuthority
+}
+
 // AttachGrantVerifier verifies one opaque Client-to-Hub attach grant and
 // returns only its bounded claims. Implementations must not persist or log the
 // raw grant. The Hub does not depend on a platform token format or signer.

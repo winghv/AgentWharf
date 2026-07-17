@@ -520,7 +520,7 @@ func (h *webSocketHandler) publishAdapter(ctx context.Context, adapter *adapterC
 	h.adapters[adapter.sessionID] = adapter
 	h.mu.Unlock()
 	unlock()
-	if previous != nil {
+	if previous != nil && previous.conn != nil {
 		previous.conn.CloseNow()
 	}
 	return nil
