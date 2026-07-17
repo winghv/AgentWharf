@@ -1301,6 +1301,9 @@ func TestAdapterDispatchRechecksBeforeDurableEffect(t *testing.T) {
 
 func TestAdapterActivityRechecksAuthorityInsideTransaction(t *testing.T) {
 	mutations := map[string]func(*store.AdapterConnection){
+		"expired": func(connection *store.AdapterConnection) {
+			connection.ActiveCredentialExpiresAt = time.Now().Add(-time.Second)
+		},
 		"generation": func(connection *store.AdapterConnection) { connection.ActiveCredentialGeneration++ },
 		"revoked":    func(connection *store.AdapterConnection) { now := time.Now(); connection.RevokedAt = &now },
 		"terminal":   func(connection *store.AdapterConnection) { now := time.Now(); connection.TerminalAt = &now },
