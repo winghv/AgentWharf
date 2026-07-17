@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/winghv/agentwharf/auth"
@@ -24,21 +25,28 @@ type SessionAdmissionAuthenticator interface {
 }
 
 type HandshakeConfig struct {
-	Authenticator       auth.Authenticator
-	AttachGrantVerifier auth.AttachGrantVerifier
-	AttachGrantAudience string
-	EventStore          interface {
+	Authenticator          auth.Authenticator
+	AttachGrantVerifier    auth.AttachGrantVerifier
+	AttachGrantAudience    string
+	LiveBootstrapAuthority LiveBootstrapAuthorityResolver
+	EventStore             interface {
 		LatestSeq(ctx context.Context, sessionID string) (int64, error)
 	}
 }
 
 type Handshake struct {
-	authenticator       auth.Authenticator
-	attachGrantVerifier auth.AttachGrantVerifier
-	attachGrantAudience string
-	events              interface {
+	authenticator          auth.Authenticator
+	attachGrantVerifier    auth.AttachGrantVerifier
+	attachGrantAudience    string
+	liveBootstrapAuthority LiveBootstrapAuthorityResolver
+	authorityMu            sync.RWMutex
+	events                 interface {
 		LatestSeq(ctx context.Context, sessionID string) (int64, error)
 	}
+}
+
+type LiveBootstrapAuthorityResolver interface {
+	CurrentBootstrapAuthority(context.Context, auth.AttachGrant) (auth.BootstrapAuthority, error)
 }
 
 type AcceptedPeer struct {
@@ -58,11 +66,18 @@ func NewHandshake(cfg HandshakeConfig) *Handshake {
 		events = noopEventStore{}
 	}
 	return &Handshake{
-		authenticator:       cfg.Authenticator,
-		attachGrantVerifier: cfg.AttachGrantVerifier,
-		attachGrantAudience: cfg.AttachGrantAudience,
-		events:              events,
+		authenticator:          cfg.Authenticator,
+		attachGrantVerifier:    cfg.AttachGrantVerifier,
+		attachGrantAudience:    cfg.AttachGrantAudience,
+		liveBootstrapAuthority: cfg.LiveBootstrapAuthority,
+		events:                 events,
 	}
+}
+
+func (h *Handshake) SetLiveBootstrapAuthorityResolver(resolver LiveBootstrapAuthorityResolver) {
+	h.authorityMu.Lock()
+	defer h.authorityMu.Unlock()
+	h.liveBootstrapAuthority = resolver
 }
 
 // AuthorizeAttach consumes the raw grant exactly at Client-to-Hub ingress.
@@ -79,7 +94,13 @@ func (h *Handshake) AuthorizeAttach(ctx context.Context, peer AcceptedPeer, rawG
 		decision.Mode != auth.SessionAdmissionAttachOnly || decision.MayMutate {
 		return auth.AttachGrant{}, auth.ErrUnauthorized
 	}
-	bootstrap, err := h.currentBootstrapAuthority(ctx, grant.BootstrapSessionID, grant.Provider)
+	h.authorityMu.RLock()
+	resolver := h.liveBootstrapAuthority
+	h.authorityMu.RUnlock()
+	if resolver == nil {
+		return auth.AttachGrant{}, auth.ErrUnauthorized
+	}
+	bootstrap, err := resolver.CurrentBootstrapAuthority(ctx, grant)
 	if err != nil {
 		return auth.AttachGrant{}, auth.ErrUnauthorized
 	}
@@ -89,27 +110,6 @@ func (h *Handshake) AuthorizeAttach(ctx context.Context, peer AcceptedPeer, rawG
 		return auth.AttachGrant{}, auth.ErrUnauthorized
 	}
 	return grant, nil
-}
-
-type adapterConnectionReader interface {
-	AdapterConnection(context.Context, string) (store.AdapterConnection, error)
-}
-
-func (h *Handshake) currentBootstrapAuthority(ctx context.Context, sessionID, provider string) (auth.BootstrapAuthority, error) {
-	connections, ok := h.events.(adapterConnectionReader)
-	if !ok {
-		return auth.BootstrapAuthority{}, auth.ErrUnauthorized
-	}
-	connection, err := connections.AdapterConnection(ctx, sessionID)
-	if err != nil || connection.SessionID != sessionID || connection.ActiveCredentialGeneration <= 0 ||
-		connection.ConnectionEpoch <= 0 || connection.AcceptedFence <= 0 || !connection.ActiveCredentialExpiresAt.After(time.Now()) ||
-		connection.RevokedAt != nil || connection.TerminalAt != nil {
-		return auth.BootstrapAuthority{}, auth.ErrUnauthorized
-	}
-	return auth.BootstrapAuthority{
-		SessionID: sessionID, Provider: provider, CredentialGeneration: connection.ActiveCredentialGeneration,
-		ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, Live: true,
-	}, nil
 }
 
 func (h *Handshake) HandleHello(ctx context.Context, hello *protocol.Hello) (protocol.HelloAck, AcceptedPeer, error) {

@@ -65,7 +65,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 	if timeout <= 0 {
 		timeout = defaultHandshakeTimeout
 	}
-	return &webSocketHandler{
+	handler := &webSocketHandler{
 		handshake:               cfg.Handshake,
 		events:                  cfg.EventStore,
 		handshakeTimeout:        timeout,
@@ -79,6 +79,10 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		acceptedCommands:        make(map[string]struct{}),
 		decisions:               make(map[string]struct{}),
 	}
+	if cfg.Handshake != nil {
+		cfg.Handshake.SetLiveBootstrapAuthorityResolver(handler)
+	}
+	return handler
 }
 
 func (h *webSocketHandler) EmitEphemeralEvent(ctx context.Context, ev protocol.Event) error {
@@ -128,6 +132,7 @@ type adapterConnection struct {
 	writeGate contextWriteGate
 	effectMu  sync.Mutex
 	sessionID string
+	provider  string
 	handler   *webSocketHandler
 	admission store.AdapterConnectionAdmission
 	events    *adapterEventBatcher
@@ -486,7 +491,7 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *websocket.
 	if err != nil {
 		return nil, err
 	}
-	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, handler: h, admission: admission}
+	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, handler: h, admission: admission}
 	if h.events != nil {
 		adapter.events = newAdapterEventBatcher(adapterEventBatcherConfig{
 			Store:     fencedAdapterEventStore{handler: h, adapter: adapter},
@@ -532,11 +537,38 @@ func (h *webSocketHandler) unregisterClient(peer *clientConnection) {
 }
 
 func (h *webSocketHandler) unregisterAdapter(adapter *adapterConnection) {
+	_, unlock := h.lockAdapterAdmission(adapter.sessionID)
+	defer unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if current := h.adapters[adapter.sessionID]; current == adapter {
 		delete(h.adapters, adapter.sessionID)
 	}
+}
+
+func (h *webSocketHandler) CurrentBootstrapAuthority(ctx context.Context, grant auth.AttachGrant) (auth.BootstrapAuthority, error) {
+	if h.adapterAuthority == nil {
+		return auth.BootstrapAuthority{}, errAdapterAuthorityLost
+	}
+	_, unlock := h.lockAdapterAdmission(grant.BootstrapSessionID)
+	defer unlock()
+	h.mu.Lock()
+	adapter := h.adapters[grant.BootstrapSessionID]
+	if adapter == nil || adapter.provider != grant.Provider {
+		h.mu.Unlock()
+		return auth.BootstrapAuthority{}, auth.ErrUnauthorized
+	}
+	admission := adapter.admission
+	h.mu.Unlock()
+	if _, err := h.adapterAuthority.store.ValidateAdapterAdmission(ctx, grant.BootstrapSessionID, store.AdapterConnectionAdmission{
+		CredentialGeneration: admission.CredentialGeneration, ConnectionEpoch: admission.ConnectionEpoch,
+		AcceptedFence: admission.AcceptedFence, GrantFence: grant.GrantFence,
+	}); err != nil {
+		return auth.BootstrapAuthority{}, auth.ErrUnauthorized
+	}
+	return auth.BootstrapAuthority{SessionID: grant.BootstrapSessionID, Provider: adapter.provider,
+		CredentialGeneration: admission.CredentialGeneration, ConnectionEpoch: admission.ConnectionEpoch,
+		AcceptedFence: admission.AcceptedFence, Live: true}, nil
 }
 
 func (a *adapterConnection) writeFrame(ctx context.Context, frame protocol.Frame) error {

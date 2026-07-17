@@ -164,9 +164,10 @@ func TestHandshakeAuthorizesVerifiedAttachGrant(t *testing.T) {
 		Authenticator: fakeAuth{token: "client-token", principal: auth.Principal{
 			Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")},
 		}},
-		EventStore:          fakeStore{latest: map[string]int64{}, connections: map[string]store.AdapterConnection{"ses_bootstrap": liveBootstrapConnection(1)}},
-		AttachGrantVerifier: fakeAttachGrantVerifier{raw: "signed-grant", audience: "deploy-attach", grant: grant},
-		AttachGrantAudience: "deploy-attach",
+		EventStore:             fakeStore{latest: map[string]int64{}, connections: map[string]store.AdapterConnection{"ses_bootstrap": liveBootstrapConnection(1)}},
+		AttachGrantVerifier:    fakeAttachGrantVerifier{raw: "signed-grant", audience: "deploy-attach", grant: grant},
+		AttachGrantAudience:    "deploy-attach",
+		LiveBootstrapAuthority: fakeLiveBootstrapAuthority{connection: liveBootstrapConnection(1), provider: "claude-code"},
 	})
 	_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{
 		ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token",
@@ -198,7 +199,7 @@ func TestHandshakeAttachAuthorizationFailsClosed(t *testing.T) {
 			Authenticator: fakeAuth{token: "client-token", principal: auth.Principal{
 				Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")},
 			}},
-			EventStore: fakeStore{latest: map[string]int64{}, connections: map[string]store.AdapterConnection{"ses_bootstrap": connection}}, AttachGrantVerifier: verifier, AttachGrantAudience: "deploy-attach",
+			EventStore: fakeStore{latest: map[string]int64{}, connections: map[string]store.AdapterConnection{"ses_bootstrap": connection}}, AttachGrantVerifier: verifier, AttachGrantAudience: "deploy-attach", LiveBootstrapAuthority: fakeLiveBootstrapAuthority{connection: connection, provider: "claude-code"},
 		})
 		_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{
 			ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token",
@@ -240,6 +241,7 @@ func TestHandshakeAttachRejectsCurrentTarget(t *testing.T) {
 		Authenticator:       fakeAuth{token: "client-token", principal: auth.Principal{Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")}}},
 		EventStore:          fakeStore{latest: map[string]int64{"ses_target": 1}, truth: map[string]store.SessionAdmissionTruth{"ses_target": {SessionID: "ses_target", Exists: true, Complete: true, Live: true}}, connections: map[string]store.AdapterConnection{"ses_bootstrap": liveBootstrapConnection(1)}},
 		AttachGrantVerifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, AttachGrantAudience: "deploy-attach",
+		LiveBootstrapAuthority: fakeLiveBootstrapAuthority{connection: liveBootstrapConnection(1), provider: "claude-code"},
 	})
 	_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}}})
 	if err != nil {
@@ -257,6 +259,7 @@ func TestHandshakeAttachRejectsGrantForUnsubscribedTarget(t *testing.T) {
 		Authenticator:       fakeAuth{token: "client-token", principal: auth.Principal{Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")}}},
 		EventStore:          fakeStore{latest: map[string]int64{}, connections: map[string]store.AdapterConnection{"ses_bootstrap": liveBootstrapConnection(1)}},
 		AttachGrantVerifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, AttachGrantAudience: "deploy-attach",
+		LiveBootstrapAuthority: fakeLiveBootstrapAuthority{connection: liveBootstrapConnection(1), provider: "claude-code"},
 	})
 	_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}}})
 	if err != nil {
@@ -543,6 +546,18 @@ type fakeAttachGrantVerifier struct {
 	audience string
 	grant    auth.AttachGrant
 	err      error
+}
+
+type fakeLiveBootstrapAuthority struct {
+	connection store.AdapterConnection
+	provider   string
+}
+
+func (f fakeLiveBootstrapAuthority) CurrentBootstrapAuthority(_ context.Context, grant auth.AttachGrant) (auth.BootstrapAuthority, error) {
+	if grant.BootstrapSessionID != f.connection.SessionID || grant.Provider != f.provider || f.connection.ActiveCredentialGeneration <= 0 || f.connection.ConnectionEpoch <= 0 || f.connection.AcceptedFence <= 0 || f.connection.AcceptedFence >= grant.GrantFence || !f.connection.ActiveCredentialExpiresAt.After(time.Now()) || f.connection.RevokedAt != nil || f.connection.TerminalAt != nil {
+		return auth.BootstrapAuthority{}, auth.ErrUnauthorized
+	}
+	return auth.BootstrapAuthority{SessionID: f.connection.SessionID, Provider: f.provider, CredentialGeneration: f.connection.ActiveCredentialGeneration, ConnectionEpoch: f.connection.ConnectionEpoch, AcceptedFence: f.connection.AcceptedFence, Live: true}, nil
 }
 
 func (f fakeAttachGrantVerifier) VerifyAttachGrant(_ context.Context, rawGrant, expectedAudience string) (auth.AttachGrant, error) {
