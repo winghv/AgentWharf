@@ -372,6 +372,8 @@ func TestHandshakeFailsClosedOnAdmissionTruth(t *testing.T) {
 		{name: "conflicting", principal: auth.Principal{Subject: "control", Scopes: []auth.Scope{auth.SessionControl("ses_1")}}, truth: store.SessionAdmissionTruth{SessionID: "ses_1", Exists: true, Complete: true, Live: true, Conflicting: true}},
 		{name: "offline", principal: auth.Principal{Subject: "control", Scopes: []auth.Scope{auth.SessionControl("ses_1")}}, truth: store.SessionAdmissionTruth{SessionID: "ses_1", Exists: true, Complete: true}},
 		{name: "providerless claim", principal: auth.Principal{Subject: "control", Scopes: []auth.Scope{auth.SessionControl("ses_1")}}, truth: store.SessionAdmissionTruth{SessionID: "ses_1", Exists: true, Complete: true, Live: true}, claim: &auth.SessionAdmissionClaim{SessionID: "ses_1", ExpiresAt: time.Now().Add(time.Minute)}},
+		{name: "expired claim", principal: auth.Principal{Subject: "control", Scopes: []auth.Scope{auth.SessionControl("ses_1")}}, truth: store.SessionAdmissionTruth{SessionID: "ses_1", Exists: true, Complete: true, Live: true}, claim: &auth.SessionAdmissionClaim{SessionID: "ses_1", Provider: "claude-code", ExpiresAt: time.Now().Add(-time.Minute)}},
+		{name: "wrong session claim", principal: auth.Principal{Subject: "control", Scopes: []auth.Scope{auth.SessionControl("ses_1")}}, truth: store.SessionAdmissionTruth{SessionID: "ses_1", Exists: true, Complete: true, Live: true}, claim: &auth.SessionAdmissionClaim{SessionID: "ses_other", Provider: "claude-code", ExpiresAt: time.Now().Add(time.Minute)}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
