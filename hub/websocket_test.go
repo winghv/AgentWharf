@@ -61,6 +61,19 @@ func TestWebSocketServerRejectsAdapterWithoutDispatchStore(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerAcceptsAdapterWithDispatchStore(t *testing.T) {
+	t.Parallel()
+
+	events := newDispatchFenceStore()
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	if _, ok := readFrame(t, adapter).(*protocol.HelloAck); !ok {
+		t.Fatal("adapter did not receive hello.ack")
+	}
+}
+
 func TestWebSocketServerNegotiatesV2WithoutHistoryCapability(t *testing.T) {
 	t.Parallel()
 
