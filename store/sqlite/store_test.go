@@ -313,6 +313,43 @@ VALUES (?, ?, ?, ?, 'claude-code', 'agentwharf.attach-request.v1', 1, zeroblob(3
 	}
 }
 
+func TestAttachAttemptRejectsExpiredTargetLeftAfterBoundedCleanup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attempts := openStore(t, path)
+	db := openRawSQLite(t, path)
+	expiresAt := time.Now().Add(-time.Minute)
+	createdAt := expiresAt.Add(-time.Minute).UnixMilli()
+	for index := 0; index <= 128; index++ {
+		jti := make([]byte, 32)
+		jti[0], jti[1] = byte(index), byte(index>>8)
+		if _, err := db.ExecContext(context.Background(), `
+	INSERT INTO session_attach_attempts
+	(attempt_jti_hash, attach_id, bootstrap_session_id, target_session_id, provider,
+	 fingerprint_domain, fingerprint_version, fingerprint_digest, fingerprint_key_version,
+	 expires_at_ns, admission_outcome, issued_credential_generation, created_at_ms)
+	VALUES (?, ?, ?, ?, 'claude-code', 'agentwharf.attach-request.v1', 1, zeroblob(32), 1, ?, 'accepted', 1, ?)
+	`, jti, fmt.Sprintf("att_expired_%d", index), fmt.Sprintf("ses_bootstrap_%d", index), fmt.Sprintf("ses_target_%d", index), expiresAt.UnixNano(), createdAt); err != nil {
+			t.Fatalf("seed expired attempt %d: %v", index, err)
+		}
+	}
+	target := [32]byte{255}
+	digest := make([]byte, 32)
+	digest[0] = 1
+	if _, err := db.ExecContext(context.Background(), `
+	INSERT INTO session_attach_attempts
+	(attempt_jti_hash, attach_id, bootstrap_session_id, target_session_id, provider,
+	 fingerprint_domain, fingerprint_version, fingerprint_digest, fingerprint_key_version,
+	 expires_at_ns, admission_outcome, issued_credential_generation, created_at_ms)
+	VALUES (?, 'att_expired_target', 'ses_bootstrap_target', 'ses_target_target', 'claude-code',
+	 'agentwharf.attach-request.v1', 1, ?, 1, ?, 'accepted', 1, ?)
+	`, target[:], digest, expiresAt.UnixNano(), createdAt); err != nil {
+		t.Fatalf("seed expired target: %v", err)
+	}
+	if _, err := attempts.AttachAttempt(context.Background(), target); err == nil {
+		t.Fatal("AttachAttempt() returned expired target left after bounded cleanup")
+	}
+}
+
 func TestConnectionPreHelloLifecycleAndRollback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}

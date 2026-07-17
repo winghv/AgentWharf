@@ -618,6 +618,16 @@ func (s *Store) AttachAttempt(ctx context.Context, jtiHash [32]byte) (store.Atta
 		}
 		return store.AttachAttempt{}, err
 	}
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.AttachAttempt{}, fmt.Errorf("refresh attach attempt Store clock: %w", err)
+	}
+	if !attempt.ExpiresAt.After(time.UnixMilli(nowMS)) {
+		if commitErr := tx.Commit(); commitErr != nil {
+			return store.AttachAttempt{}, fmt.Errorf("commit expired attach attempt cleanup: %w", commitErr)
+		}
+		return store.AttachAttempt{}, sql.ErrNoRows
+	}
 	if err := tx.Commit(); err != nil {
 		return store.AttachAttempt{}, fmt.Errorf("commit attach attempt read transaction: %w", err)
 	}
