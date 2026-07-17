@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -728,6 +729,202 @@ func sameSQLiteAttachAttempt(current store.AttachAttempt, request store.AttachAt
 	return current.Identity == request.Identity && current.Fingerprint == request.Fingerprint && current.ExpiresAt.Equal(request.ExpiresAt) &&
 		current.Outcome == request.Outcome && ((current.IssuedCredentialGeneration == nil && request.IssuedCredentialGeneration == nil) ||
 		(current.IssuedCredentialGeneration != nil && request.IssuedCredentialGeneration != nil && *current.IssuedCredentialGeneration == *request.IssuedCredentialGeneration))
+}
+
+func (s *Store) ReserveWorkspaceLease(ctx context.Context, reserve store.WorkspaceLeaseReserve) (store.WorkspaceLease, error) {
+	if s == nil || s.db == nil {
+		return store.WorkspaceLease{}, errors.New("sqlite event store is nil")
+	}
+	if err := validateSQLiteWorkspaceLeaseReserve(reserve); err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("begin workspace lease reserve: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	if reserve.ExpiresAt.UnixMilli() <= nowMS {
+		return store.WorkspaceLease{}, errors.New("workspace lease expiry is not in the future")
+	}
+	childParent, childDigest, childExpiry := nullableSQLiteWorkspaceChild(reserve.ChildScope)
+	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO session_workspace_leases
+(workspace_key, worker_id, session_id, connection_epoch, credential_generation, lease_id, child_parent_workspace_key, child_capability_digest, child_scope_expires_at_ns, status, version, expires_at_ns, created_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', 1, ?, ?, ?)`, reserve.Key[:], reserve.Owner.WorkerID, reserve.Owner.SessionID, reserve.Owner.ConnectionEpoch, reserve.Owner.CredentialGeneration, reserve.Owner.LeaseID, childParent, childDigest, childExpiry, reserve.ExpiresAt.UnixNano(), nowMS, nowMS)
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("insert workspace lease: %w", err)
+	}
+	lease, err := querySQLiteWorkspaceLease(ctx, tx, reserve.Key)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	if lease.Status == store.WorkspaceLeaseReserved && sameSQLiteWorkspaceLeaseReserve(lease, reserve) {
+		if err := tx.Commit(); err != nil {
+			return store.WorkspaceLease{}, fmt.Errorf("commit workspace lease reserve: %w", err)
+		}
+		return lease, nil
+	}
+	if lease.Status != store.WorkspaceLeaseReleased {
+		return store.WorkspaceLease{}, errors.New("workspace lease already has a live owner")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_workspace_leases SET worker_id=?, session_id=?, connection_epoch=?, credential_generation=?, lease_id=?, child_parent_workspace_key=?, child_capability_digest=?, child_scope_expires_at_ns=?, status='reserved', version=version+1, expires_at_ns=?, updated_at_ms=? WHERE workspace_key=? AND status='released'`, reserve.Owner.WorkerID, reserve.Owner.SessionID, reserve.Owner.ConnectionEpoch, reserve.Owner.CredentialGeneration, reserve.Owner.LeaseID, childParent, childDigest, childExpiry, reserve.ExpiresAt.UnixNano(), nowMS, reserve.Key[:])
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("reserve released workspace lease: %w", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return store.WorkspaceLease{}, errors.New("workspace lease reserve conflict")
+	}
+	lease, err = querySQLiteWorkspaceLease(ctx, tx, reserve.Key)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("commit workspace lease replacement: %w", err)
+	}
+	return lease, nil
+}
+
+func (s *Store) WorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey) (store.WorkspaceLease, error) {
+	if s == nil || s.db == nil {
+		return store.WorkspaceLease{}, errors.New("sqlite event store is nil")
+	}
+	if key == (store.WorkspaceLeaseKey{}) {
+		return store.WorkspaceLease{}, errors.New("workspace lease key is required")
+	}
+	lease, err := querySQLiteWorkspaceLease(ctx, s.db, key)
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("read workspace lease: %w", err)
+	}
+	return lease, nil
+}
+
+func (s *Store) RecordWorkspaceStartReceived(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64, owner store.WorkspaceLeaseOwner) (store.WorkspaceLease, error) {
+	return s.updateSQLiteWorkspaceLease(ctx, key, expectedVersion, owner, "reserved", "start_received", true)
+}
+
+func (s *Store) QuarantineWorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64) (store.WorkspaceLease, error) {
+	return s.updateSQLiteWorkspaceLease(ctx, key, expectedVersion, store.WorkspaceLeaseOwner{}, "reserved,start_received", "quarantined", false)
+}
+
+func (s *Store) ReleaseWorkspaceLeaseAfterQuiescence(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64, owner store.WorkspaceLeaseOwner) (store.WorkspaceLease, error) {
+	return s.updateSQLiteWorkspaceLease(ctx, key, expectedVersion, owner, "reserved,start_received,quarantined", "released", true)
+}
+
+func (s *Store) updateSQLiteWorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64, owner store.WorkspaceLeaseOwner, from, to string, requireAuthority bool) (store.WorkspaceLease, error) {
+	if s == nil || s.db == nil {
+		return store.WorkspaceLease{}, errors.New("sqlite event store is nil")
+	}
+	if key == (store.WorkspaceLeaseKey{}) || expectedVersion < 1 || (requireAuthority && !validSQLiteWorkspaceLeaseOwner(owner)) {
+		return store.WorkspaceLease{}, errors.New("invalid workspace lease transition")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("begin workspace lease transition: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	if requireAuthority {
+		if err := validateSQLiteWorkspaceLeaseAuthority(ctx, tx, owner, nowMS); err != nil {
+			return store.WorkspaceLease{}, err
+		}
+	}
+	ownerClause, args := "", []any{to, nowMS, key[:], expectedVersion}
+	if requireAuthority {
+		ownerClause = " AND worker_id=? AND session_id=? AND connection_epoch=? AND credential_generation=? AND lease_id=?"
+		args = append(args, owner.WorkerID, owner.SessionID, owner.ConnectionEpoch, owner.CredentialGeneration, owner.LeaseID)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_workspace_leases SET status=?, version=version+1, updated_at_ms=? WHERE workspace_key=? AND version=?`+ownerClause+` AND status IN (`+sqliteWorkspaceStatuses(from)+`)`, args...)
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("update workspace lease: %w", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return store.WorkspaceLease{}, errors.New("workspace lease transition conflict")
+	}
+	lease, err := querySQLiteWorkspaceLease(ctx, tx, key)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("commit workspace lease transition: %w", err)
+	}
+	return lease, nil
+}
+
+func sqliteWorkspaceStatuses(value string) string {
+	return "'" + strings.ReplaceAll(value, ",", "','") + "'"
+}
+
+func validateSQLiteWorkspaceLeaseReserve(reserve store.WorkspaceLeaseReserve) error {
+	if reserve.Key == (store.WorkspaceLeaseKey{}) || !validSQLiteWorkspaceLeaseOwner(reserve.Owner) || reserve.ExpiresAt.IsZero() {
+		return errors.New("invalid workspace lease reserve")
+	}
+	if scope := reserve.ChildScope; scope != nil && (scope.ParentKey == (store.WorkspaceLeaseKey{}) || scope.ParentKey == reserve.Key || scope.CapabilityDigest == ([32]byte{}) || scope.ExpiresAt.IsZero()) {
+		return errors.New("invalid workspace child scope")
+	}
+	return nil
+}
+func validSQLiteWorkspaceLeaseOwner(owner store.WorkspaceLeaseOwner) bool {
+	return validConnectionID(owner.WorkerID) && validConnectionID(owner.SessionID) && validConnectionID(owner.LeaseID) && owner.ConnectionEpoch > 0 && owner.CredentialGeneration > 0
+}
+func nullableSQLiteWorkspaceChild(scope *store.WorkspaceLeaseChildScope) (any, any, any) {
+	if scope == nil {
+		return nil, nil, nil
+	}
+	return scope.ParentKey[:], scope.CapabilityDigest[:], scope.ExpiresAt.UnixNano()
+}
+func sameSQLiteWorkspaceLeaseReserve(lease store.WorkspaceLease, reserve store.WorkspaceLeaseReserve) bool {
+	return lease.Key == reserve.Key && lease.Owner == reserve.Owner && lease.ExpiresAt.Equal(reserve.ExpiresAt) && ((lease.ChildScope == nil && reserve.ChildScope == nil) || (lease.ChildScope != nil && reserve.ChildScope != nil && lease.ChildScope.ParentKey == reserve.ChildScope.ParentKey && lease.ChildScope.CapabilityDigest == reserve.ChildScope.CapabilityDigest && lease.ChildScope.ExpiresAt.Equal(reserve.ChildScope.ExpiresAt)))
+}
+
+func validateSQLiteWorkspaceLeaseAuthority(ctx context.Context, tx *sql.Tx, owner store.WorkspaceLeaseOwner, nowMS int64) error {
+	var current bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM session_adapter_connections AS c JOIN session_attachments AS a ON a.target_session_id=c.session_id WHERE c.session_id=? AND c.connection_epoch=? AND c.active_credential_generation=? AND c.active_credential_expires_at_ms>? AND c.revoked_at_ms IS NULL AND c.terminal_at_ms IS NULL AND a.status IN ('queued','start_received') AND (a.expires_at_ns IS NULL OR a.expires_at_ns>?))`, owner.SessionID, owner.ConnectionEpoch, owner.CredentialGeneration, nowMS, nowMS*int64(time.Millisecond)).Scan(&current)
+	if err != nil {
+		return fmt.Errorf("validate workspace lease authority: %w", err)
+	}
+	if !current {
+		return errors.New("workspace lease authority is no longer current")
+	}
+	return nil
+}
+
+func querySQLiteWorkspaceLease(ctx context.Context, executor sqliteConnectionExecutor, key store.WorkspaceLeaseKey) (store.WorkspaceLease, error) {
+	var rawKey, rawParent, rawDigest []byte
+	var worker, session, leaseID, status string
+	var epoch, generation, version, expiryNS, createdMS, updatedMS int64
+	var childExpiry sql.NullInt64
+	err := executor.QueryRowContext(ctx, `SELECT workspace_key, worker_id, session_id, connection_epoch, credential_generation, lease_id, child_parent_workspace_key, child_capability_digest, child_scope_expires_at_ns, status, version, expires_at_ns, created_at_ms, updated_at_ms FROM session_workspace_leases WHERE workspace_key=?`, key[:]).Scan(&rawKey, &worker, &session, &epoch, &generation, &leaseID, &rawParent, &rawDigest, &childExpiry, &status, &version, &expiryNS, &createdMS, &updatedMS)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	if len(rawKey) != 32 || !bytes.Equal(rawKey, key[:]) || !validSQLiteWorkspaceLeaseOwner(store.WorkspaceLeaseOwner{WorkerID: worker, SessionID: session, ConnectionEpoch: epoch, CredentialGeneration: generation, LeaseID: leaseID}) || version < 1 || expiryNS <= createdMS*int64(time.Millisecond) || updatedMS < createdMS {
+		return store.WorkspaceLease{}, errors.New("workspace lease row is invalid")
+	}
+	out := store.WorkspaceLease{Key: key, Owner: store.WorkspaceLeaseOwner{WorkerID: worker, SessionID: session, ConnectionEpoch: epoch, CredentialGeneration: generation, LeaseID: leaseID}, Status: store.WorkspaceLeaseStatus(status), Version: version, ExpiresAt: time.Unix(0, expiryNS)}
+	if status != "reserved" && status != "start_received" && status != "quarantined" && status != "released" {
+		return store.WorkspaceLease{}, errors.New("workspace lease row is invalid")
+	}
+	if len(rawParent) == 0 && len(rawDigest) == 0 && !childExpiry.Valid {
+		return out, nil
+	}
+	if len(rawParent) != 32 || len(rawDigest) != 32 || !childExpiry.Valid {
+		return store.WorkspaceLease{}, errors.New("workspace lease row is invalid")
+	}
+	var parent store.WorkspaceLeaseKey
+	var digest [32]byte
+	copy(parent[:], rawParent)
+	copy(digest[:], rawDigest)
+	if parent == (store.WorkspaceLeaseKey{}) || parent == key || digest == ([32]byte{}) || childExpiry.Int64 <= createdMS*int64(time.Millisecond) {
+		return store.WorkspaceLease{}, errors.New("workspace lease child scope is invalid")
+	}
+	out.ChildScope = &store.WorkspaceLeaseChildScope{ParentKey: parent, CapabilityDigest: digest, ExpiresAt: time.Unix(0, childExpiry.Int64)}
+	return out, nil
 }
 
 type sqliteConnectionExecutor interface {
@@ -1637,6 +1834,27 @@ CREATE TABLE IF NOT EXISTS session_attachments (
 
 CREATE INDEX IF NOT EXISTS session_attachments_status_expiry_idx
 ON session_attachments (status, expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS session_workspace_leases (
+    workspace_key BLOB PRIMARY KEY CHECK (length(workspace_key) = 32),
+    worker_id TEXT NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 255),
+    session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
+    connection_epoch INTEGER NOT NULL CHECK (connection_epoch > 0),
+    credential_generation INTEGER NOT NULL CHECK (credential_generation > 0),
+    lease_id TEXT NOT NULL CHECK (length(lease_id) BETWEEN 1 AND 255),
+    child_parent_workspace_key BLOB CHECK (child_parent_workspace_key IS NULL OR length(child_parent_workspace_key) = 32),
+    child_capability_digest BLOB CHECK (child_capability_digest IS NULL OR length(child_capability_digest) = 32),
+    child_scope_expires_at_ns INTEGER,
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'start_received', 'quarantined', 'released')),
+    version INTEGER NOT NULL CHECK (version > 0),
+    expires_at_ns INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    CHECK (expires_at_ns > created_at_ms * 1000000),
+    CHECK ((child_parent_workspace_key IS NULL AND child_capability_digest IS NULL AND child_scope_expires_at_ns IS NULL) OR (child_parent_workspace_key IS NOT NULL AND child_capability_digest IS NOT NULL AND child_scope_expires_at_ns IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS session_workspace_leases_owner_idx
+ON session_workspace_leases (session_id, connection_epoch, credential_generation, status);
 `); err != nil {
 		return fmt.Errorf("initialize sqlite event store schema: %w", err)
 	}

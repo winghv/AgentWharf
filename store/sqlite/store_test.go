@@ -139,6 +139,87 @@ func TestAttachAttemptStoreContract(t *testing.T) {
 	})
 }
 
+func TestWorkspaceLeaseStoreContract(t *testing.T) {
+	storetest.WorkspaceLeaseContract(t, storetest.WorkspaceLeaseHarness{
+		Open: func(t *testing.T) store.WorkspaceLeaseStore {
+			t.Helper()
+			return newSQLiteWorkspaceLeaseHarness(t, filepath.Join(t.TempDir(), "events.db"))
+		},
+		Reopen: func(t *testing.T, current store.WorkspaceLeaseStore) store.WorkspaceLeaseStore {
+			t.Helper()
+			harness := current.(*sqliteWorkspaceLeaseHarness)
+			if err := harness.Close(); err != nil {
+				t.Fatalf("close workspace lease store: %v", err)
+			}
+			harness.Store = openStore(t, harness.path)
+			return harness
+		},
+		Invalidate: func(t *testing.T, current store.WorkspaceLeaseStore, _ store.WorkspaceLeaseKey, _ store.WorkspaceLeaseOwner, kind storetest.WorkspaceLeaseAuthorityFailure) {
+			harness := current.(*sqliteWorkspaceLeaseHarness)
+			statement := map[storetest.WorkspaceLeaseAuthorityFailure]string{
+				storetest.WorkspaceLeaseAuthoritySuperseded: "UPDATE session_adapter_connections SET connection_epoch = 2",
+				storetest.WorkspaceLeaseAuthorityRevoked:    "UPDATE session_adapter_connections SET revoked_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+				storetest.WorkspaceLeaseAuthorityExpired:    "UPDATE session_adapter_connections SET active_credential_expires_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+				storetest.WorkspaceLeaseAuthorityTerminal:   "UPDATE session_adapter_connections SET terminal_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+				storetest.WorkspaceLeaseAttachmentExpired:   "UPDATE session_attachments SET created_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 60000, expires_at_ns = (CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 1000) * 1000000",
+				storetest.WorkspaceLeaseAttachmentCanceled:  "UPDATE session_attachments SET status = 'canceled', expires_at_ns = NULL",
+			}[kind]
+			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), statement); err != nil {
+				t.Fatalf("invalidate workspace authority %s: %v", kind, err)
+			}
+		},
+	})
+}
+
+func TestWorkspaceLeaseRollsBackAndRejectsCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	harness := newSQLiteWorkspaceLeaseHarness(t, path)
+	reserve := store.WorkspaceLeaseReserve{Key: store.WorkspaceLeaseKey{9}, Owner: store.WorkspaceLeaseOwner{WorkerID: "worker_rollback", SessionID: "ses_workspace", ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_rollback"}, ExpiresAt: time.Now().Add(time.Minute)}
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `CREATE TRIGGER fail_workspace_lease BEFORE INSERT ON session_workspace_leases BEGIN SELECT RAISE(ABORT, 'workspace lease failpoint'); END`); err != nil {
+		t.Fatalf("create workspace lease failpoint: %v", err)
+	}
+	if _, err := harness.ReserveWorkspaceLease(context.Background(), reserve); err == nil {
+		t.Fatal("ReserveWorkspaceLease() survived failpoint")
+	}
+	if _, err := harness.WorkspaceLease(context.Background(), reserve.Key); err == nil {
+		t.Fatal("rollback left a workspace lease")
+	}
+	if _, err := db.ExecContext(context.Background(), `DROP TRIGGER fail_workspace_lease`); err != nil {
+		t.Fatalf("drop workspace lease failpoint: %v", err)
+	}
+	if _, err := harness.ReserveWorkspaceLease(context.Background(), reserve); err != nil {
+		t.Fatalf("reserve workspace lease: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `PRAGMA ignore_check_constraints = ON; UPDATE session_workspace_leases SET status = 'invalid' WHERE workspace_key = ?`, reserve.Key[:]); err != nil {
+		t.Fatalf("corrupt workspace lease: %v", err)
+	}
+	if _, err := harness.WorkspaceLease(context.Background(), reserve.Key); err == nil {
+		t.Fatal("WorkspaceLease() accepted corrupt row")
+	}
+}
+
+type sqliteWorkspaceLeaseHarness struct {
+	*sqlite.Store
+	path string
+}
+
+func newSQLiteWorkspaceLeaseHarness(t *testing.T, path string) *sqliteWorkspaceLeaseHarness {
+	t.Helper()
+	harness := &sqliteWorkspaceLeaseHarness{Store: openStore(t, path), path: path}
+	if _, err := harness.InitializeAdapterConnection(context.Background(), store.AdapterConnectionInitialize{SessionID: "ses_workspace", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatalf("initialize workspace authority: %v", err)
+	}
+	if _, err := harness.AcceptAdapterHello(context.Background(), "ses_workspace", store.AdapterHello{CredentialGeneration: 1}); err != nil {
+		t.Fatalf("accept workspace authority hello: %v", err)
+	}
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `INSERT INTO session_attachments (attach_id, bootstrap_session_id, target_session_id, status, delivery_state, queue_reason, expires_at_ns, blocking_session_id, target_credential_lineage_ref, created_at_ms, updated_at_ms) VALUES ('att_workspace', 'ses_workspace_blocker', 'ses_workspace', 'queued', 'pending', 'workspace_busy', ?, 'ses_workspace_blocker', 'lineage_workspace', ?, ?)`, time.Now().Add(time.Hour).UnixNano(), time.Now().UnixMilli(), time.Now().UnixMilli()); err != nil {
+		t.Fatalf("seed workspace attachment: %v", err)
+	}
+	return harness
+}
+
 func TestAttachAttemptRollsBackAndRejectsCorruption(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	attempts := openStore(t, path)
