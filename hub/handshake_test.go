@@ -3,6 +3,7 @@ package hub_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +149,92 @@ func TestHandshakeNegotiatesClientV2AndRetainsVersion(t *testing.T) {
 	}
 	if ack.Capabilities != nil {
 		t.Fatalf("history capability advertised before handler readiness: %+v", ack.Capabilities)
+	}
+}
+
+func TestHandshakeAuthorizesVerifiedAttachGrant(t *testing.T) {
+	now := time.Now()
+	grant := auth.AttachGrant{
+		Audience: "deploy-attach", JTI: "jti_1", AttachID: "attach_1",
+		BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code",
+		IssuedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute),
+		DeliveryDeadline: now.Add(61 * time.Second), GrantFence: 2,
+	}
+	core := hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator: fakeAuth{token: "client-token", principal: auth.Principal{
+			Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")},
+		}},
+		EventStore:          fakeStore{latest: map[string]int64{}},
+		AttachGrantVerifier: fakeAttachGrantVerifier{raw: "signed-grant", audience: "deploy-attach", grant: grant},
+		AttachGrantAudience: "deploy-attach",
+	})
+	_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token",
+		Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}},
+	})
+	if err != nil {
+		t.Fatalf("HandleHello() error = %v", err)
+	}
+	if peer.Admissions["ses_target"].Mode != auth.SessionAdmissionAttachOnly {
+		t.Fatalf("admission = %+v, want attach_only", peer.Admissions["ses_target"])
+	}
+	got, err := core.AuthorizeAttach(context.Background(), peer, "signed-grant", auth.BootstrapAuthority{
+		SessionID: "ses_bootstrap", Provider: "claude-code", CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, Live: true,
+	})
+	if err != nil || got != grant {
+		t.Fatalf("AuthorizeAttach() = %+v, %v; want %+v, nil", got, err, grant)
+	}
+}
+
+func TestHandshakeAttachAuthorizationFailsClosed(t *testing.T) {
+	now := time.Now()
+	grant := auth.AttachGrant{
+		Audience: "deploy-attach", JTI: "jti_1", AttachID: "attach_1",
+		BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code",
+		IssuedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute),
+		DeliveryDeadline: now.Add(61 * time.Second), GrantFence: 2,
+	}
+	newPeer := func(t *testing.T, verifier auth.AttachGrantVerifier) (*hub.Handshake, hub.AcceptedPeer) {
+		t.Helper()
+		core := hub.NewHandshake(hub.HandshakeConfig{
+			Authenticator: fakeAuth{token: "client-token", principal: auth.Principal{
+				Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")},
+			}},
+			EventStore: fakeStore{latest: map[string]int64{}}, AttachGrantVerifier: verifier, AttachGrantAudience: "deploy-attach",
+		})
+		_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{
+			ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token",
+			Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}},
+		})
+		if err != nil {
+			t.Fatalf("HandleHello() error = %v", err)
+		}
+		return core, peer
+	}
+	bootstrap := auth.BootstrapAuthority{SessionID: "ses_bootstrap", Provider: "claude-code", CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, Live: true}
+
+	for _, test := range []struct {
+		name     string
+		verifier auth.AttachGrantVerifier
+		raw      string
+		mutate   func(*auth.BootstrapAuthority)
+	}{
+		{name: "missing verifier"},
+		{name: "invalid signature", verifier: fakeAttachGrantVerifier{raw: "signed-grant", err: errors.New("invalid signature")}, raw: "signed-grant"},
+		{name: "wrong raw grant", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: "forged"},
+		{name: "zero accepted fence", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: "signed-grant", mutate: func(b *auth.BootstrapAuthority) { b.AcceptedFence = 0 }},
+		{name: "oversized raw grant", verifier: fakeAttachGrantVerifier{raw: "signed-grant", grant: grant}, raw: strings.Repeat("x", 64*1024+1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core, peer := newPeer(t, test.verifier)
+			candidate := bootstrap
+			if test.mutate != nil {
+				test.mutate(&candidate)
+			}
+			if _, err := core.AuthorizeAttach(context.Background(), peer, test.raw, candidate); !errors.Is(err, auth.ErrUnauthorized) {
+				t.Fatalf("AuthorizeAttach() error = %v, want unauthorized", err)
+			}
+		})
 	}
 }
 
@@ -420,6 +507,20 @@ type fakeAuth struct {
 	token     string
 	principal auth.Principal
 	claim     *auth.SessionAdmissionClaim
+}
+
+type fakeAttachGrantVerifier struct {
+	raw      string
+	audience string
+	grant    auth.AttachGrant
+	err      error
+}
+
+func (f fakeAttachGrantVerifier) VerifyAttachGrant(_ context.Context, rawGrant, expectedAudience string) (auth.AttachGrant, error) {
+	if f.err != nil || rawGrant != f.raw || (f.audience != "" && expectedAudience != f.audience) {
+		return auth.AttachGrant{}, f.err
+	}
+	return f.grant, nil
 }
 
 func (f fakeAuth) Authenticate(_ context.Context, token string) (auth.Principal, error) {

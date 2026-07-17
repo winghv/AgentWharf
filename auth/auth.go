@@ -123,6 +123,13 @@ type AttachAuthorizationRequest struct {
 	ExpectedAudience string
 }
 
+// AttachGrantVerifier verifies one opaque Client-to-Hub attach grant and
+// returns only its bounded claims. Implementations must not persist or log the
+// raw grant. The Hub does not depend on a platform token format or signer.
+type AttachGrantVerifier interface {
+	VerifyAttachGrant(ctx context.Context, rawGrant, expectedAudience string) (AttachGrant, error)
+}
+
 // EvaluateAttachAuthorization validates the non-durable half of session.attach.
 // It cannot authorize a delivery: T18B must repeat the Store-owned checks in its
 // atomic commit before any attempt, credential, outbox, or event exists.
@@ -147,7 +154,7 @@ func EvaluateAttachAuthorization(request AttachAuthorizationRequest) error {
 		return ErrUnauthorized
 	}
 	if !bootstrap.Live || bootstrap.SessionID != grant.BootstrapSessionID || bootstrap.Provider != grant.Provider ||
-		bootstrap.CredentialGeneration <= 0 || bootstrap.ConnectionEpoch <= 0 || bootstrap.AcceptedFence < 0 ||
+		bootstrap.CredentialGeneration <= 0 || bootstrap.ConnectionEpoch <= 0 || bootstrap.AcceptedFence <= 0 ||
 		grant.GrantFence <= bootstrap.AcceptedFence {
 		return ErrUnauthorized
 	}

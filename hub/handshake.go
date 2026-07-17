@@ -16,21 +16,27 @@ var (
 	ErrVersionUnsupported = errors.New("protocol version unsupported")
 )
 
+const maxRawAttachGrantBytes = 64 * 1024
+
 type SessionAdmissionAuthenticator interface {
 	auth.Authenticator
 	SessionAdmissionClaim(context.Context, auth.Principal, string) (auth.SessionAdmissionClaim, error)
 }
 
 type HandshakeConfig struct {
-	Authenticator auth.Authenticator
-	EventStore    interface {
+	Authenticator       auth.Authenticator
+	AttachGrantVerifier auth.AttachGrantVerifier
+	AttachGrantAudience string
+	EventStore          interface {
 		LatestSeq(ctx context.Context, sessionID string) (int64, error)
 	}
 }
 
 type Handshake struct {
-	authenticator auth.Authenticator
-	events        interface {
+	authenticator       auth.Authenticator
+	attachGrantVerifier auth.AttachGrantVerifier
+	attachGrantAudience string
+	events              interface {
 		LatestSeq(ctx context.Context, sessionID string) (int64, error)
 	}
 }
@@ -52,9 +58,32 @@ func NewHandshake(cfg HandshakeConfig) *Handshake {
 		events = noopEventStore{}
 	}
 	return &Handshake{
-		authenticator: cfg.Authenticator,
-		events:        events,
+		authenticator:       cfg.Authenticator,
+		attachGrantVerifier: cfg.AttachGrantVerifier,
+		attachGrantAudience: cfg.AttachGrantAudience,
+		events:              events,
 	}
+}
+
+// AuthorizeAttach consumes the raw grant exactly at Client-to-Hub ingress.
+// It returns verified bounded claims only; T18B must repeat bootstrap checks
+// in its Store transaction before creating any durable attach state.
+func (h *Handshake) AuthorizeAttach(ctx context.Context, peer AcceptedPeer, rawGrant string, bootstrap auth.BootstrapAuthority) (auth.AttachGrant, error) {
+	if h.attachGrantVerifier == nil || h.attachGrantAudience == "" || len(rawGrant) == 0 || len(rawGrant) > maxRawAttachGrantBytes ||
+		peer.Role != protocol.RoleClient || peer.ProtocolVersion != protocol.ProtocolVersionV2 {
+		return auth.AttachGrant{}, auth.ErrUnauthorized
+	}
+	grant, err := h.attachGrantVerifier.VerifyAttachGrant(ctx, rawGrant, h.attachGrantAudience)
+	if err != nil || !subscribesTo(peer.Subscribed, grant.TargetSessionID) ||
+		!peer.allows(grant.TargetSessionID, auth.SessionAdmissionAttach) {
+		return auth.AttachGrant{}, auth.ErrUnauthorized
+	}
+	if err := auth.EvaluateAttachAuthorization(auth.AttachAuthorizationRequest{
+		Principal: peer.Principal, Grant: grant, Bootstrap: bootstrap, ExpectedAudience: h.attachGrantAudience,
+	}); err != nil {
+		return auth.AttachGrant{}, auth.ErrUnauthorized
+	}
+	return grant, nil
 }
 
 func (h *Handshake) HandleHello(ctx context.Context, hello *protocol.Hello) (protocol.HelloAck, AcceptedPeer, error) {

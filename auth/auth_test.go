@@ -220,6 +220,7 @@ func TestEvaluateAttachAuthorizationFailsClosedAtTrustBoundaries(t *testing.T) {
 		"wrong provider":            func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.Provider = "other" },
 		"zero generation":           func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.CredentialGeneration = 0 },
 		"zero epoch":                func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.ConnectionEpoch = 0 },
+		"zero accepted fence":       func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.AcceptedFence = 0 },
 		"negative accepted fence":   func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.AcceptedFence = -1 },
 		"oversized jti": func(r *auth.AttachAuthorizationRequest) {
 			r.Grant.JTI = strings.Repeat("j", 257)
