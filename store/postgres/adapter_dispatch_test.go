@@ -168,7 +168,13 @@ func TestAdapterAdmissionTransactionLocksAuthorityThroughCallback(t *testing.T) 
 	transaction := make(chan error, 1)
 	go func() {
 		transaction <- harness.WithAdapterConnectionTransaction(ctx, func(tx store.AdapterConnectionStore) error {
-			if _, err := tx.ValidateAdapterAdmission(ctx, sessionID, store.AdapterConnectionAdmission{
+			validator, ok := tx.(interface {
+				ValidateAdapterEffectAdmission(context.Context, string, store.AdapterConnectionAdmission) (store.AdapterConnection, error)
+			})
+			if !ok {
+				return context.Canceled
+			}
+			if _, err := validator.ValidateAdapterEffectAdmission(ctx, sessionID, store.AdapterConnectionAdmission{
 				CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch,
 				AcceptedFence: connection.AcceptedFence, GrantFence: grant,
 			}); err != nil {

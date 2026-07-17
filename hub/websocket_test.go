@@ -515,7 +515,7 @@ func TestWebSocketServerDoesNotFanoutDurableEventWhenPersistenceFails(t *testing
 	}
 }
 
-func TestWebSocketServerBroadcastsEphemeralEventWithoutPersistence(t *testing.T) {
+func TestWebSocketServerBroadcastsAdapterEphemeralEventWithoutPersistence(t *testing.T) {
 	t.Parallel()
 
 	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
@@ -647,11 +647,13 @@ func TestWebSocketServerRejectsVersionOwnedWarningFromAdapter(t *testing.T) {
 	}
 }
 
-func TestWebSocketServerBroadcastsEphemeralEventWithoutEventStore(t *testing.T) {
+func TestWebSocketServerBroadcastsEphemeralEventWithoutPersistence(t *testing.T) {
 	t.Parallel()
 
 	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
-	server := newWebSocketTestServer(t, testHandshakeWithStore(events))
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
 	client := dialWebSocket(t, server.URL)
 	defer client.Close(websocket.StatusNormalClosure, "")
 	adapter := dialWebSocket(t, server.URL)
@@ -939,9 +941,10 @@ func TestWebSocketServerReportsAcceptedClientCommandActivity(t *testing.T) {
 func TestWebSocketServerReportsAdapterActivity(t *testing.T) {
 	t.Parallel()
 
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
 	observer := &recordingAdapterActivityObserver{}
-	server := newWebSocketTestServer(t, testHandshake(), func(cfg *hub.WebSocketConfig) {
-		cfg.AdapterActivityObserver = observer
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore, cfg.AdapterActivityObserver = events, observer
 	})
 	adapter := dialWebSocket(t, server.URL)
 	defer adapter.Close(websocket.StatusNormalClosure, "")
@@ -1980,6 +1983,10 @@ func (f *fakeEventStore) WithAdapterConnectionTransaction(_ context.Context, fn 
 		return errors.New("adapter connection transaction callback is nil")
 	}
 	return fn(f)
+}
+
+func (f *fakeEventStore) ValidateAdapterEffectAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
+	return f.ValidateAdapterAdmission(ctx, sessionID, admission)
 }
 
 func (f *fakeEventStore) AppendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (int64, error) {
