@@ -719,8 +719,10 @@ func (h *webSocketHandler) observeAdapterActivity(ctx context.Context, adapter *
 		return nil
 	}
 	return h.withAdapterEffect(ctx, adapter, func() error {
-		h.adapterActivityObserver.ObserveAdapterActivity(ctx, AdapterActivity{SessionID: adapter.sessionID, At: at.UTC()})
-		return nil
+		return h.adapterAuthority.withAdmission(ctx, adapter, func(effectCtx context.Context) error {
+			h.adapterActivityObserver.ObserveAdapterActivity(effectCtx, AdapterActivity{SessionID: adapter.sessionID, At: at.UTC()})
+			return nil
+		})
 	})
 }
 
