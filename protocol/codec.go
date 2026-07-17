@@ -52,6 +52,7 @@ const (
 	CommandPermissionRespond CommandType = "permission.respond"
 	CommandSessionInterrupt  CommandType = "session.interrupt"
 	CommandSessionStop       CommandType = "session.stop"
+	CommandSessionAttach     CommandType = "session.attach"
 )
 
 type AckStatus string

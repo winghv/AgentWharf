@@ -3,7 +3,9 @@ package auth_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/winghv/agentwharf/auth"
 )
@@ -148,6 +150,89 @@ func TestAuthenticatorInterface(t *testing.T) {
 	}
 	if err := authenticator.Authorize(context.Background(), principal, auth.SessionView("ses_1")); err != nil {
 		t.Fatalf("Authorize() error = %v", err)
+	}
+}
+
+func TestEvaluateAttachGrantRejectsInvalidAuthorization(t *testing.T) {
+	now := time.Now()
+	valid := auth.AttachGrant{
+		Audience: "deploy-attach", JTI: "jti_1", AttachID: "attach_1",
+		BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code",
+		IssuedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute),
+		DeliveryDeadline: now.Add(61 * time.Second), GrantFence: 2,
+	}
+	request := auth.AttachAuthorizationRequest{
+		Principal:        auth.Principal{Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")}},
+		Grant:            valid,
+		Bootstrap:        auth.BootstrapAuthority{SessionID: "ses_bootstrap", CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, Provider: "claude-code", Live: true},
+		ExpectedAudience: "deploy-attach",
+	}
+	if err := auth.EvaluateAttachAuthorization(request); err != nil {
+		t.Fatalf("valid authorization = %v", err)
+	}
+	for name, mutate := range map[string]func(*auth.AttachAuthorizationRequest){
+		"wrong audience":    func(r *auth.AttachAuthorizationRequest) { r.Grant.Audience = "other" },
+		"expired":           func(r *auth.AttachAuthorizationRequest) { r.Grant.ExpiresAt = time.Now().Add(-time.Second) },
+		"stale fence":       func(r *auth.AttachAuthorizationRequest) { r.Grant.GrantFence = r.Bootstrap.AcceptedFence },
+		"wrong target":      func(r *auth.AttachAuthorizationRequest) { r.Grant.TargetSessionID = "ses_other" },
+		"offline bootstrap": func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.Live = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := request
+			mutate(&r)
+			if err := auth.EvaluateAttachAuthorization(r); !errors.Is(err, auth.ErrUnauthorized) {
+				t.Fatalf("EvaluateAttachAuthorization() = %v, want unauthorized", err)
+			}
+		})
+	}
+}
+
+func TestEvaluateAttachAuthorizationFailsClosedAtTrustBoundaries(t *testing.T) {
+	now := time.Now()
+	request := auth.AttachAuthorizationRequest{
+		Principal: auth.Principal{Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")}},
+		Grant: auth.AttachGrant{
+			Audience: "deploy-attach", JTI: "jti_1", AttachID: "attach_1",
+			BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code",
+			IssuedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute),
+			DeliveryDeadline: now.Add(61 * time.Second), GrantFence: 2,
+		},
+		Bootstrap:        auth.BootstrapAuthority{SessionID: "ses_bootstrap", Provider: "claude-code", CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, Live: true},
+		ExpectedAudience: "deploy-attach",
+	}
+
+	for name, mutate := range map[string]func(*auth.AttachAuthorizationRequest){
+		"broader client scope":      func(r *auth.AttachAuthorizationRequest) { r.Principal.Scopes = append(r.Principal.Scopes, auth.API()) },
+		"target view scope":         func(r *auth.AttachAuthorizationRequest) { r.Principal.Scopes[0] = auth.SessionView("ses_target") },
+		"other target scope":        func(r *auth.AttachAuthorizationRequest) { r.Principal.Scopes[0] = auth.SessionControl("ses_other") },
+		"same bootstrap and target": func(r *auth.AttachAuthorizationRequest) { r.Grant.TargetSessionID = r.Grant.BootstrapSessionID },
+		"future issued at":          func(r *auth.AttachAuthorizationRequest) { r.Grant.IssuedAt = time.Now().Add(31 * time.Second) },
+		"zero ttl": func(r *auth.AttachAuthorizationRequest) {
+			r.Grant.ExpiresAt = r.Grant.IssuedAt
+		},
+		"maximum ttl exceeded": func(r *auth.AttachAuthorizationRequest) {
+			r.Grant.ExpiresAt = r.Grant.IssuedAt.Add(5*time.Minute + time.Nanosecond)
+		},
+		"late delivery deadline": func(r *auth.AttachAuthorizationRequest) {
+			r.Grant.DeliveryDeadline = r.Grant.ExpiresAt.Add(31 * time.Second)
+		},
+		"elapsed delivery deadline": func(r *auth.AttachAuthorizationRequest) { r.Grant.DeliveryDeadline = time.Now().Add(-time.Second) },
+		"wrong provider":            func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.Provider = "other" },
+		"zero generation":           func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.CredentialGeneration = 0 },
+		"zero epoch":                func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.ConnectionEpoch = 0 },
+		"negative accepted fence":   func(r *auth.AttachAuthorizationRequest) { r.Bootstrap.AcceptedFence = -1 },
+		"oversized jti": func(r *auth.AttachAuthorizationRequest) {
+			r.Grant.JTI = strings.Repeat("j", 257)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := request
+			r.Principal.Scopes = append([]auth.Scope(nil), request.Principal.Scopes...)
+			mutate(&r)
+			if err := auth.EvaluateAttachAuthorization(r); !errors.Is(err, auth.ErrUnauthorized) {
+				t.Fatalf("EvaluateAttachAuthorization() = %v, want ErrUnauthorized", err)
+			}
+		})
 	}
 }
 

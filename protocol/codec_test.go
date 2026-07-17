@@ -183,6 +183,21 @@ func TestDecodeRejectsUnknownFrame(t *testing.T) {
 	}
 }
 
+func TestCommandSessionAttachRoundTrips(t *testing.T) {
+	frame := &Command{CommandID: "attach_1", Type: CommandSessionAttach, SessionID: "ses_target", Payload: json.RawMessage(`{"grant":"opaque"}`)}
+	encoded, err := Encode(frame)
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if got := decoded.(*Command); got.Type != CommandSessionAttach {
+		t.Fatalf("command type = %q", got.Type)
+	}
+}
+
 func TestNegotiateVersion(t *testing.T) {
 	got, err := NegotiateVersion([]int{3, 2, 1}, []int{1})
 	if err != nil {

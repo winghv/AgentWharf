@@ -86,6 +86,91 @@ type SessionAdmissionDecision struct {
 	MayMutate bool
 }
 
+const attachGrantMaxTTL = 5 * time.Minute
+const attachGrantClockSkew = 30 * time.Second
+const maxAttachGrantStringBytes = 256
+
+// AttachGrant is verified at Client-to-Hub ingress. It intentionally contains
+// only bounded, platform-neutral authorization facts and never a raw bearer.
+type AttachGrant struct {
+	Audience           string
+	JTI                string
+	AttachID           string
+	BootstrapSessionID string
+	TargetSessionID    string
+	Provider           string
+	IssuedAt           time.Time
+	ExpiresAt          time.Time
+	DeliveryDeadline   time.Time
+	GrantFence         int64
+}
+
+// BootstrapAuthority is the Store-derived current normal-hello snapshot.
+// It must be reacquired by T18B inside its durable attach transaction.
+type BootstrapAuthority struct {
+	SessionID            string
+	Provider             string
+	CredentialGeneration int64
+	ConnectionEpoch      int64
+	AcceptedFence        int64
+	Live                 bool
+}
+
+type AttachAuthorizationRequest struct {
+	Principal        Principal
+	Grant            AttachGrant
+	Bootstrap        BootstrapAuthority
+	ExpectedAudience string
+}
+
+// EvaluateAttachAuthorization validates the non-durable half of session.attach.
+// It cannot authorize a delivery: T18B must repeat the Store-owned checks in its
+// atomic commit before any attempt, credential, outbox, or event exists.
+func EvaluateAttachAuthorization(request AttachAuthorizationRequest) error {
+	grant := request.Grant
+	bootstrap := request.Bootstrap
+	now := time.Now()
+
+	if request.ExpectedAudience == "" || grant.Audience != request.ExpectedAudience || !boundedAttachGrantStrings(
+		request.ExpectedAudience, grant.Audience, grant.JTI, grant.AttachID, grant.BootstrapSessionID, grant.TargetSessionID, grant.Provider,
+	) ||
+		grant.JTI == "" || grant.AttachID == "" || grant.BootstrapSessionID == "" ||
+		grant.TargetSessionID == "" || grant.Provider == "" ||
+		grant.BootstrapSessionID == grant.TargetSessionID || !hasOnlyExactSessionControl(request.Principal, grant.TargetSessionID) {
+		return ErrUnauthorized
+	}
+	if grant.IssuedAt.IsZero() || grant.ExpiresAt.IsZero() || grant.DeliveryDeadline.IsZero() ||
+		!grant.ExpiresAt.After(grant.IssuedAt) || grant.ExpiresAt.Sub(grant.IssuedAt) > attachGrantMaxTTL ||
+		grant.IssuedAt.After(now.Add(attachGrantClockSkew)) || grant.ExpiresAt.Before(now.Add(-attachGrantClockSkew)) ||
+		grant.DeliveryDeadline.Before(grant.IssuedAt) || grant.DeliveryDeadline.After(grant.ExpiresAt.Add(attachGrantClockSkew)) ||
+		now.After(grant.DeliveryDeadline) {
+		return ErrUnauthorized
+	}
+	if !bootstrap.Live || bootstrap.SessionID != grant.BootstrapSessionID || bootstrap.Provider != grant.Provider ||
+		bootstrap.CredentialGeneration <= 0 || bootstrap.ConnectionEpoch <= 0 || bootstrap.AcceptedFence < 0 ||
+		grant.GrantFence <= bootstrap.AcceptedFence {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
+func boundedAttachGrantStrings(values ...string) bool {
+	for _, value := range values {
+		if len(value) > maxAttachGrantStringBytes {
+			return false
+		}
+	}
+	return true
+}
+
+func hasOnlyExactSessionControl(principal Principal, sessionID string) bool {
+	if principal.Subject == "" || len(principal.Scopes) != 1 {
+		return false
+	}
+	scope := principal.Scopes[0]
+	return scope.Kind == KindSession && scope.ID == sessionID && scope.Access == AccessControl
+}
+
 // EvaluateSessionAdmission is limited to exact control scope, provider-bound
 // Auth claim, and Store-owned Session truth. It never consults platform state.
 func EvaluateSessionAdmission(request SessionAdmissionRequest) (SessionAdmissionDecision, error) {
