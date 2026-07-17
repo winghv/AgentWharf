@@ -1975,6 +1975,13 @@ func (f *fakeEventStore) ValidateAdapterAdmission(_ context.Context, sessionID s
 	return connection, nil
 }
 
+func (f *fakeEventStore) WithAdapterConnectionTransaction(_ context.Context, fn func(store.AdapterConnectionStore) error) error {
+	if fn == nil {
+		return errors.New("adapter connection transaction callback is nil")
+	}
+	return fn(f)
+}
+
 func (f *fakeEventStore) AppendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (int64, error) {
 	if _, err := f.ValidateAdapterAdmission(ctx, sessionID, admission); err != nil {
 		return 0, err

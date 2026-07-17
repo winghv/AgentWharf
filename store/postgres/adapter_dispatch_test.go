@@ -142,6 +142,63 @@ func TestAppendAdapterEventsLocksAuthorityBeforeEventStream(t *testing.T) {
 	}
 }
 
+func TestAdapterAdmissionTransactionLocksAuthorityThroughCallback(t *testing.T) {
+	harness := newPostgresConnectionHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const sessionID = "ses_dispatch_ephemeral_lock"
+	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ($1)`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := harness.AcceptAdapterHello(ctx, sessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := harness.AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	transaction := make(chan error, 1)
+	go func() {
+		transaction <- harness.WithAdapterConnectionTransaction(ctx, func(tx store.AdapterConnectionStore) error {
+			if _, err := tx.ValidateAdapterAdmission(ctx, sessionID, store.AdapterConnectionAdmission{
+				CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch,
+				AcceptedFence: connection.AcceptedFence, GrantFence: grant,
+			}); err != nil {
+				return err
+			}
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+	mutated := make(chan error, 1)
+	go func() {
+		_, err := harness.pool.Exec(ctx, `UPDATE session_adapter_connections SET revoked_at=clock_timestamp() WHERE session_id=$1`, sessionID)
+		mutated <- err
+	}()
+	select {
+	case err := <-mutated:
+		t.Fatalf("revoke escaped ephemeral authority lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-transaction; err != nil {
+		t.Fatalf("admission transaction: %v", err)
+	}
+	if err := <-mutated; err != nil {
+		t.Fatalf("revoke after callback: %v", err)
+	}
+}
+
 func TestAppendAdapterEventsRejectsExpiryAfterStreamLockWait(t *testing.T) {
 	harness := newPostgresConnectionHarness(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
