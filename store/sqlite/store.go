@@ -750,6 +750,9 @@ func (s *Store) ReserveWorkspaceLease(ctx context.Context, reserve store.Workspa
 	if reserve.ExpiresAt.UnixMilli() <= nowMS {
 		return store.WorkspaceLease{}, errors.New("workspace lease expiry is not in the future")
 	}
+	if reserve.ChildScope != nil && reserve.ChildScope.ExpiresAt.UnixMilli() <= nowMS {
+		return store.WorkspaceLease{}, errors.New("workspace lease child scope expiry is not in the future")
+	}
 	childParent, childDigest, childExpiry := nullableSQLiteWorkspaceChild(reserve.ChildScope)
 	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO session_workspace_leases
 (workspace_key, worker_id, session_id, connection_epoch, credential_generation, lease_id, child_parent_workspace_key, child_capability_digest, child_scope_expires_at_ns, status, version, expires_at_ns, created_at_ms, updated_at_ms)
@@ -802,22 +805,22 @@ func (s *Store) WorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey)
 }
 
 func (s *Store) RecordWorkspaceStartReceived(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64, owner store.WorkspaceLeaseOwner) (store.WorkspaceLease, error) {
-	return s.updateSQLiteWorkspaceLease(ctx, key, expectedVersion, owner, "reserved", "start_received", true)
+	return s.updateSQLiteWorkspaceLease(ctx, key, expectedVersion, owner, "reserved", "start_received", true, true)
 }
 
 func (s *Store) QuarantineWorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64) (store.WorkspaceLease, error) {
-	return s.updateSQLiteWorkspaceLease(ctx, key, expectedVersion, store.WorkspaceLeaseOwner{}, "reserved,start_received", "quarantined", false)
+	return s.updateSQLiteWorkspaceLease(ctx, key, expectedVersion, store.WorkspaceLeaseOwner{}, "reserved,start_received", "quarantined", false, false)
 }
 
 func (s *Store) ReleaseWorkspaceLeaseAfterQuiescence(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64, owner store.WorkspaceLeaseOwner) (store.WorkspaceLease, error) {
-	return s.updateSQLiteWorkspaceLease(ctx, key, expectedVersion, owner, "reserved,start_received,quarantined", "released", true)
+	return s.updateSQLiteWorkspaceLease(ctx, key, expectedVersion, owner, "reserved,start_received,quarantined", "released", true, false)
 }
 
-func (s *Store) updateSQLiteWorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64, owner store.WorkspaceLeaseOwner, from, to string, requireAuthority bool) (store.WorkspaceLease, error) {
+func (s *Store) updateSQLiteWorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64, owner store.WorkspaceLeaseOwner, from, to string, requireOwner, requireAuthority bool) (store.WorkspaceLease, error) {
 	if s == nil || s.db == nil {
 		return store.WorkspaceLease{}, errors.New("sqlite event store is nil")
 	}
-	if key == (store.WorkspaceLeaseKey{}) || expectedVersion < 1 || (requireAuthority && !validSQLiteWorkspaceLeaseOwner(owner)) {
+	if key == (store.WorkspaceLeaseKey{}) || expectedVersion < 1 || (requireOwner && !validSQLiteWorkspaceLeaseOwner(owner)) {
 		return store.WorkspaceLease{}, errors.New("invalid workspace lease transition")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -835,11 +838,22 @@ func (s *Store) updateSQLiteWorkspaceLease(ctx context.Context, key store.Worksp
 		}
 	}
 	ownerClause, args := "", []any{to, nowMS, key[:], expectedVersion}
-	if requireAuthority {
+	if requireOwner {
 		ownerClause = " AND worker_id=? AND session_id=? AND connection_epoch=? AND credential_generation=? AND lease_id=?"
 		args = append(args, owner.WorkerID, owner.SessionID, owner.ConnectionEpoch, owner.CredentialGeneration, owner.LeaseID)
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE session_workspace_leases SET status=?, version=version+1, updated_at_ms=? WHERE workspace_key=? AND version=?`+ownerClause+` AND status IN (`+sqliteWorkspaceStatuses(from)+`)`, args...)
+	expiryClause := ""
+	if to == "start_received" {
+		expiryClause = ` AND expires_at_ns > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 1000000
+AND (child_scope_expires_at_ns IS NULL OR child_scope_expires_at_ns > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 1000000)
+AND EXISTS (SELECT 1 FROM session_adapter_connections AS c JOIN session_attachments AS a ON a.target_session_id = c.session_id
+            WHERE c.session_id = session_workspace_leases.session_id AND c.connection_epoch = session_workspace_leases.connection_epoch
+              AND c.active_credential_generation = session_workspace_leases.credential_generation
+              AND c.active_credential_expires_at_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+              AND c.revoked_at_ms IS NULL AND c.terminal_at_ms IS NULL AND a.status IN ('queued', 'start_received')
+              AND (a.expires_at_ns IS NULL OR a.expires_at_ns > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 1000000))`
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_workspace_leases SET status=?, version=version+1, updated_at_ms=? WHERE workspace_key=? AND version=?`+ownerClause+expiryClause+` AND status IN (`+sqliteWorkspaceStatuses(from)+`)`, args...)
 	if err != nil {
 		return store.WorkspaceLease{}, fmt.Errorf("update workspace lease: %w", err)
 	}

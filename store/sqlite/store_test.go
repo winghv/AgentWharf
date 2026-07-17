@@ -159,7 +159,7 @@ func TestWorkspaceLeaseStoreContract(t *testing.T) {
 			statement := map[storetest.WorkspaceLeaseAuthorityFailure]string{
 				storetest.WorkspaceLeaseAuthoritySuperseded: "UPDATE session_adapter_connections SET connection_epoch = 2",
 				storetest.WorkspaceLeaseAuthorityRevoked:    "UPDATE session_adapter_connections SET revoked_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
-				storetest.WorkspaceLeaseAuthorityExpired:    "UPDATE session_adapter_connections SET active_credential_expires_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+				storetest.WorkspaceLeaseAuthorityExpired:    "UPDATE session_adapter_connections SET created_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 60000, active_credential_expires_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 1000",
 				storetest.WorkspaceLeaseAuthorityTerminal:   "UPDATE session_adapter_connections SET terminal_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
 				storetest.WorkspaceLeaseAttachmentExpired:   "UPDATE session_attachments SET created_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 60000, expires_at_ns = (CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 1000) * 1000000",
 				storetest.WorkspaceLeaseAttachmentCanceled:  "UPDATE session_attachments SET status = 'canceled', expires_at_ns = NULL",
@@ -197,6 +197,55 @@ func TestWorkspaceLeaseRollsBackAndRejectsCorruption(t *testing.T) {
 	if _, err := harness.WorkspaceLease(context.Background(), reserve.Key); err == nil {
 		t.Fatal("WorkspaceLease() accepted corrupt row")
 	}
+}
+
+func TestWorkspaceLeaseRejectsExpiredStartAndReleasesQuarantine(t *testing.T) {
+	t.Run("reservation expiry", func(t *testing.T) {
+		harness := newSQLiteWorkspaceLeaseHarness(t, filepath.Join(t.TempDir(), "events.db"))
+		reserve := store.WorkspaceLeaseReserve{Key: store.WorkspaceLeaseKey{10}, Owner: store.WorkspaceLeaseOwner{WorkerID: "worker_expiry", SessionID: "ses_workspace", ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_expiry"}, ExpiresAt: time.Now().Add(20 * time.Millisecond)}
+		lease, err := harness.ReserveWorkspaceLease(context.Background(), reserve)
+		if err != nil {
+			t.Fatalf("reserve expiring workspace lease: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if _, err := harness.RecordWorkspaceStartReceived(context.Background(), reserve.Key, lease.Version, reserve.Owner); err == nil {
+			t.Fatal("expired reservation entered start_received")
+		}
+	})
+	t.Run("child scope expiry", func(t *testing.T) {
+		harness := newSQLiteWorkspaceLeaseHarness(t, filepath.Join(t.TempDir(), "events.db"))
+		reserve := store.WorkspaceLeaseReserve{Key: store.WorkspaceLeaseKey{11}, ChildScope: &store.WorkspaceLeaseChildScope{ParentKey: store.WorkspaceLeaseKey{1}, CapabilityDigest: [32]byte{2}, ExpiresAt: time.Now().Add(20 * time.Millisecond)}, Owner: store.WorkspaceLeaseOwner{WorkerID: "worker_child_expiry", SessionID: "ses_workspace", ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_child_expiry"}, ExpiresAt: time.Now().Add(time.Minute)}
+		lease, err := harness.ReserveWorkspaceLease(context.Background(), reserve)
+		if err != nil {
+			t.Fatalf("reserve child workspace lease: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if _, err := harness.RecordWorkspaceStartReceived(context.Background(), reserve.Key, lease.Version, reserve.Owner); err == nil {
+			t.Fatal("expired child scope entered start_received")
+		}
+	})
+	t.Run("quarantine release", func(t *testing.T) {
+		harness := newSQLiteWorkspaceLeaseHarness(t, filepath.Join(t.TempDir(), "events.db"))
+		reserve := store.WorkspaceLeaseReserve{Key: store.WorkspaceLeaseKey{12}, Owner: store.WorkspaceLeaseOwner{WorkerID: "worker_quarantine", SessionID: "ses_workspace", ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_quarantine"}, ExpiresAt: time.Now().Add(time.Minute)}
+		lease, err := harness.ReserveWorkspaceLease(context.Background(), reserve)
+		if err != nil {
+			t.Fatalf("reserve quarantined workspace lease: %v", err)
+		}
+		if _, err := harness.TerminateAdapterConnectionBeforeHello(context.Background(), "ses_workspace", store.AdapterConnectionPreHelloTermination{ExpectedActiveCredentialGeneration: 1}); err == nil {
+			t.Fatal("terminate after hello unexpectedly succeeded")
+		}
+		db := openRawSQLite(t, harness.path)
+		if _, err := db.ExecContext(context.Background(), "UPDATE session_adapter_connections SET revoked_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"); err != nil {
+			t.Fatalf("revoke workspace authority: %v", err)
+		}
+		quarantined, err := harness.QuarantineWorkspaceLease(context.Background(), reserve.Key, lease.Version)
+		if err != nil {
+			t.Fatalf("quarantine workspace lease: %v", err)
+		}
+		if _, err := harness.ReleaseWorkspaceLeaseAfterQuiescence(context.Background(), reserve.Key, quarantined.Version, reserve.Owner); err != nil {
+			t.Fatalf("release quarantined workspace lease: %v", err)
+		}
+	})
 }
 
 type sqliteWorkspaceLeaseHarness struct {
