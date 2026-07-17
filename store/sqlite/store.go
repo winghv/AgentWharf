@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	maxHistoryPageSize  = 100
-	maxEventPayloadSize = 64 * 1024
-	maxAttachAttemptTTL = 5 * time.Minute
+	maxHistoryPageSize          = 100
+	maxEventPayloadSize         = 64 * 1024
+	maxAttachAttemptTTL         = 5 * time.Minute
+	maxAttachAttemptCleanupRows = 128
 )
 
 type Store struct {
@@ -624,14 +625,15 @@ func (s *Store) AttachAttempt(ctx context.Context, jtiHash [32]byte) (store.Atta
 }
 
 func cleanupExpiredSQLiteAttachAttempts(ctx context.Context, executor sqliteConnectionExecutor) error {
-	nowMS, err := sqliteNowMillis(ctx, executor)
-	if err != nil {
-		return fmt.Errorf("read attach attempt cleanup Store clock: %w", err)
-	}
-	_, err = executor.ExecContext(ctx, `
+	_, err := executor.ExecContext(ctx, `
 DELETE FROM session_attach_attempts
-WHERE expires_at_ns <= ?
-`, nowMS*int64(time.Millisecond))
+WHERE attempt_jti_hash IN (
+    SELECT attempt_jti_hash FROM session_attach_attempts
+    WHERE expires_at_ns <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 1000000
+    ORDER BY expires_at_ns, attempt_jti_hash
+    LIMIT ?
+)
+`, maxAttachAttemptCleanupRows)
 	if err != nil {
 		return fmt.Errorf("cleanup expired attach attempts: %w", err)
 	}
@@ -1599,6 +1601,9 @@ CREATE TABLE IF NOT EXISTS session_attach_attempts (
 
 CREATE INDEX IF NOT EXISTS session_attach_attempts_key_expiry_idx
 ON session_attach_attempts (fingerprint_key_version, expires_at_ns);
+
+CREATE INDEX IF NOT EXISTS session_attach_attempts_expiry_idx
+ON session_attach_attempts (expires_at_ns, attempt_jti_hash);
 
 CREATE TABLE IF NOT EXISTS session_attachments (
     attach_id TEXT PRIMARY KEY CHECK (length(attach_id) BETWEEN 1 AND 255),

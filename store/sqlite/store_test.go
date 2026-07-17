@@ -209,6 +209,42 @@ func TestAttachAttemptRechecksExpiryAfterWriterWait(t *testing.T) {
 	}
 }
 
+func TestAttachAttemptReadRechecksExpiryAfterWriterWait(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attempts := openStore(t, path)
+	request := store.AttachAttemptRequest{
+		Identity:    store.AttachAttemptIdentity{JTIHash: [32]byte{12}, AttachID: "att_expiry_read_wait", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code"},
+		Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{11}, KeyVersion: 1},
+		ExpiresAt:   time.Now().Add(150 * time.Millisecond), Outcome: store.AttachAttemptAccepted,
+	}
+	generation := int64(1)
+	request.IssuedCredentialGeneration = &generation
+	if _, err := attempts.CommitAttachAttempt(context.Background(), request); err != nil {
+		t.Fatalf("CommitAttachAttempt() error = %v", err)
+	}
+	db := openRawSQLite(t, path)
+	lock, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open writer lock: %v", err)
+	}
+	t.Cleanup(func() { _ = lock.Close() })
+	if _, err := lock.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("begin writer lock: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := attempts.AttachAttempt(context.Background(), request.Identity.JTIHash)
+		result <- err
+	}()
+	time.Sleep(175 * time.Millisecond)
+	if _, err := lock.ExecContext(context.Background(), `COMMIT`); err != nil {
+		t.Fatalf("release writer lock: %v", err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("expired writer-wait attach attempt was returned")
+	}
+}
+
 func TestAttachAttemptReadCleansExpiredRow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	attempts := openStore(t, path)
@@ -233,6 +269,47 @@ func TestAttachAttemptReadCleansExpiredRow(t *testing.T) {
 	}
 	if rows != 0 {
 		t.Fatalf("expired row count = %d, want 0", rows)
+	}
+}
+
+func TestAttachAttemptCleanupIsBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attempts := openStore(t, path)
+	db := openRawSQLite(t, path)
+	expiresAt := time.Now().Add(-time.Minute)
+	createdAt := expiresAt.Add(-time.Minute).UnixMilli()
+	for index := 0; index <= 128; index++ {
+		jti := make([]byte, 32)
+		jti[0], jti[1] = byte(index), byte(index>>8)
+		if _, err := db.ExecContext(context.Background(), `
+INSERT INTO session_attach_attempts
+(attempt_jti_hash, attach_id, bootstrap_session_id, target_session_id, provider,
+ fingerprint_domain, fingerprint_version, fingerprint_digest, fingerprint_key_version,
+ expires_at_ns, admission_outcome, issued_credential_generation, created_at_ms)
+VALUES (?, ?, ?, ?, 'claude-code', 'agentwharf.attach-request.v1', 1, zeroblob(32), 1, ?, 'accepted', 1, ?)
+`, jti, fmt.Sprintf("att_cleanup_%d", index), fmt.Sprintf("ses_bootstrap_%d", index), fmt.Sprintf("ses_target_%d", index), expiresAt.UnixNano(), createdAt); err != nil {
+			t.Fatalf("seed expired attempt %d: %v", index, err)
+		}
+	}
+	missing := [32]byte{255}
+	if _, err := attempts.AttachAttempt(context.Background(), missing); err == nil {
+		t.Fatal("missing attach attempt unexpectedly exists")
+	}
+	var rows int
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM session_attach_attempts`).Scan(&rows); err != nil {
+		t.Fatalf("count bounded cleanup rows: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("first cleanup rows = %d, want 1", rows)
+	}
+	if _, err := attempts.AttachAttempt(context.Background(), missing); err == nil {
+		t.Fatal("missing attach attempt unexpectedly exists after second cleanup")
+	}
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM session_attach_attempts`).Scan(&rows); err != nil {
+		t.Fatalf("count completed cleanup rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("second cleanup rows = %d, want 0", rows)
 	}
 }
 
