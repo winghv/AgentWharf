@@ -71,6 +71,8 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		handshakeTimeout:        timeout,
 		commandActivityObserver: cfg.CommandActivityObserver,
 		adapterActivityObserver: cfg.AdapterActivityObserver,
+		adapterAuthority:        newAdapterDispatchAuthority(cfg.Handshake, cfg.EventStore),
+		adapterAdmissionLocks:   make(map[string]chan struct{}),
 		subscribers:             make(map[string]map[*clientConnection]struct{}),
 		adapters:                make(map[string]*adapterConnection),
 		pendingCommands:         make(map[string][]queuedCommand),
@@ -105,6 +107,9 @@ type webSocketHandler struct {
 	handshakeTimeout        time.Duration
 	commandActivityObserver CommandActivityObserver
 	adapterActivityObserver AdapterActivityObserver
+	adapterAuthority        *adapterDispatchAuthority
+	adapterAdmissionMu      sync.Mutex
+	adapterAdmissionLocks   map[string]chan struct{}
 
 	mu          sync.Mutex
 	subscribers map[string]map[*clientConnection]struct{}
@@ -121,7 +126,10 @@ type webSocketHandler struct {
 type adapterConnection struct {
 	conn      *websocket.Conn
 	writeMu   sync.Mutex
+	effectMu  sync.Mutex
 	sessionID string
+	handler   *webSocketHandler
+	admission store.AdapterConnectionAdmission
 	events    *adapterEventBatcher
 }
 
@@ -140,7 +148,8 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	ctx := r.Context()
-	accepted, historyToken, err := h.acceptPeer(ctx, conn)
+	var adapter *adapterConnection
+	accepted, historyToken, err := h.acceptPeer(ctx, conn, &adapter)
 	if err != nil {
 		return
 	}
@@ -148,11 +157,13 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if peer != nil {
 		defer h.unregisterClient(peer)
 	}
-	adapter := h.registerAdapter(conn, accepted)
 	if adapter != nil {
-		h.observeAdapterActivity(ctx, accepted.SessionID, time.Now().UTC())
-		defer adapter.close()
 		defer h.unregisterAdapter(adapter)
+		defer adapter.close()
+		go h.watchAdapter(ctx, adapter)
+		if err := h.observeAdapterActivity(ctx, adapter, time.Now().UTC()); err != nil {
+			return
+		}
 		if err := h.deliverPendingCommands(ctx, adapter); err != nil {
 			return
 		}
@@ -163,7 +174,7 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.readLoop(ctx, conn, accepted, historyToken, peer, adapter)
 }
 
-func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn) (AcceptedPeer, string, error) {
+func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn, adapterOut **adapterConnection) (AcceptedPeer, string, error) {
 	frame, err := h.readHelloFrame(ctx, conn)
 	if err != nil {
 		_ = writeProtocolError(context.Background(), conn, "timeout", "waiting for hello", true)
@@ -198,9 +209,28 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn)
 			ack.Capabilities.HistoryPage = &protocol.HistoryPageCapability{MaxLimit: protocol.HistoryPageMaxLimit}
 		}
 	}
-	if err := writeProtocolFrame(ctx, conn, &ack); err != nil {
+	adapter, err := h.registerAdapter(ctx, conn, accepted, hello.Token)
+	if err != nil {
+		_ = writeProtocolError(ctx, conn, "unauthorized", err.Error(), true)
+		_ = conn.Close(websocket.StatusPolicyViolation, "adapter authority lost")
 		return AcceptedPeer{}, "", err
 	}
+	ackErr := writeProtocolFrame(ctx, conn, &ack)
+	if ackErr != nil {
+		if adapter != nil {
+			h.rejectAdapter(adapter)
+			adapter.close()
+		}
+		return AcceptedPeer{}, "", ackErr
+	}
+	if adapter != nil {
+		if err := h.publishAdapter(ctx, adapter); err != nil {
+			h.rejectAdapter(adapter)
+			adapter.close()
+			return AcceptedPeer{}, "", err
+		}
+	}
+	*adapterOut = adapter
 	historyToken := ""
 	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
 		historyToken = hello.Token
@@ -238,13 +268,20 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 		if err != nil {
 			return
 		}
+		if accepted.Role == protocol.RoleAdapter {
+			if err := h.validateAdapter(ctx, adapter); err != nil {
+				return
+			}
+		}
 		switch typed := frame.(type) {
 		case *protocol.Ping:
 			if err := writePongFrame(ctx, conn, peer, adapter, typed.Nonce); err != nil {
 				return
 			}
 			if accepted.Role == protocol.RoleAdapter {
-				h.observeAdapterActivity(ctx, accepted.SessionID, time.Now().UTC())
+				if err := h.observeAdapterActivity(ctx, adapter, time.Now().UTC()); err != nil {
+					return
+				}
 			}
 		case *protocol.Pong:
 			continue
@@ -260,7 +297,9 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			if err := h.handleAdapterEvent(ctx, adapter, accepted, typed); err != nil {
 				continue
 			}
-			h.observeAdapterActivity(ctx, accepted.SessionID, time.Now().UTC())
+			if err := h.observeAdapterActivity(ctx, adapter, time.Now().UTC()); err != nil {
+				return
+			}
 		case *protocol.Command:
 			if accepted.Role != protocol.RoleClient {
 				_ = writeProtocolError(ctx, conn, "unsupported_frame", "adapter command frames are not accepted", false)
@@ -391,7 +430,7 @@ func writePongFrame(ctx context.Context, conn *websocket.Conn, peer *clientConne
 		return peer.writeFrame(ctx, pong)
 	}
 	if adapter != nil {
-		return adapter.writeFrame(ctx, pong)
+		return adapter.handler.writeAdapterFrame(ctx, adapter, pong)
 	}
 	return writeProtocolFrame(ctx, conn, pong)
 }
@@ -439,30 +478,51 @@ func (h *webSocketHandler) registerPeer(conn *websocket.Conn, accepted AcceptedP
 	return peer
 }
 
-func (h *webSocketHandler) registerAdapter(conn *websocket.Conn, accepted AcceptedPeer) *adapterConnection {
+func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, token string) (*adapterConnection, error) {
 	if accepted.Role != protocol.RoleAdapter {
-		return nil
+		return nil, nil
 	}
-	adapter := &adapterConnection{conn: conn, sessionID: accepted.SessionID}
+	if h.adapterAuthority == nil {
+		return nil, errAdapterAuthorityLost
+	}
+	_, unlock := h.lockAdapterAdmission(accepted.SessionID)
+	defer unlock()
+	admission, err := h.adapterAuthority.admit(ctx, token, accepted.Principal, accepted.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	adapter := &adapterConnection{conn: conn, sessionID: accepted.SessionID, handler: h, admission: admission}
 	if h.events != nil {
 		adapter.events = newAdapterEventBatcher(adapterEventBatcherConfig{
-			Store:     h.events,
+			Store:     fencedAdapterEventStore{handler: h, adapter: adapter},
 			SessionID: accepted.SessionID,
 			Window:    adapterEventBatchWindow,
 			MaxEvents: adapterEventBatchMaxEvents,
 			Broadcast: h.broadcastEvent,
 			ReportError: func(ctx context.Context, err error) {
-				_ = adapter.writeFrame(ctx, &protocol.Error{
+				_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{
 					Code:    "persist_failed",
 					Message: err.Error(),
 				})
 			},
 		})
 	}
+	return adapter, nil
+}
+
+func (h *webSocketHandler) publishAdapter(ctx context.Context, adapter *adapterConnection) error {
+	previous, unlock := h.lockAdapterAdmission(adapter.sessionID)
+	defer unlock()
+	if _, err := h.adapterAuthority.store.ValidateAdapterAdmission(ctx, adapter.sessionID, adapter.admission); err != nil {
+		return errAdapterAuthorityLost
+	}
 	h.mu.Lock()
-	h.adapters[accepted.SessionID] = adapter
+	h.adapters[adapter.sessionID] = adapter
 	h.mu.Unlock()
-	return adapter
+	if previous != nil {
+		h.rejectAdapter(previous)
+	}
+	return nil
 }
 
 func (h *webSocketHandler) unregisterClient(peer *clientConnection) {
@@ -487,7 +547,9 @@ func (h *webSocketHandler) unregisterAdapter(adapter *adapterConnection) {
 func (a *adapterConnection) writeFrame(ctx context.Context, frame protocol.Frame) error {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
-	return writeProtocolFrame(ctx, a.conn, frame)
+	writeCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+	defer cancel()
+	return writeProtocolFrame(writeCtx, a.conn, frame)
 }
 
 func (a *adapterConnection) close() {
@@ -529,8 +591,7 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		Payload:   clonePayload(ev.Payload),
 	}
 	if isEphemeralEvent(ev.Type) {
-		h.broadcastEvent(ctx, out)
-		return nil
+		return h.withAdapterEffect(ctx, adapter, func() error { h.broadcastEvent(ctx, out); return nil })
 	}
 	if h.events == nil {
 		err := errors.New("event store is not configured")
@@ -650,13 +711,13 @@ func (h *webSocketHandler) observeCommandActivity(ctx context.Context, activity 
 	h.commandActivityObserver.ObserveCommandActivity(ctx, activity)
 }
 
-func (h *webSocketHandler) observeAdapterActivity(ctx context.Context, sessionID string, at time.Time) {
-	if h.adapterActivityObserver == nil || sessionID == "" || at.IsZero() {
-		return
+func (h *webSocketHandler) observeAdapterActivity(ctx context.Context, adapter *adapterConnection, at time.Time) error {
+	if h.adapterActivityObserver == nil {
+		return nil
 	}
-	h.adapterActivityObserver.ObserveAdapterActivity(ctx, AdapterActivity{
-		SessionID: sessionID,
-		At:        at.UTC(),
+	return h.withAdapterEffect(ctx, adapter, func() error {
+		h.adapterActivityObserver.ObserveAdapterActivity(ctx, AdapterActivity{SessionID: adapter.sessionID, At: at.UTC()})
+		return nil
 	})
 }
 
@@ -739,7 +800,7 @@ func (h *webSocketHandler) routeCommand(ctx context.Context, cmd *protocol.Comma
 		return errors.New("adapter_offline")
 	}
 	routed := cloneCommand(cmd)
-	if err := adapter.writeFrame(ctx, &routed); err != nil {
+	if err := h.writeAdapterFrame(ctx, adapter, &routed); err != nil {
 		h.unregisterAdapter(adapter)
 		return fmt.Errorf("adapter_offline: %w", err)
 	}
@@ -795,7 +856,7 @@ func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *
 			continue
 		}
 		routed := cloneCommand(&queued.command)
-		if err := adapter.writeFrame(ctx, &routed); err != nil {
+		if err := h.writeAdapterFrame(ctx, adapter, &routed); err != nil {
 			remaining = append(remaining, queued)
 			remaining = append(remaining, pending[i+1:]...)
 			h.pendingCommands[adapter.sessionID] = remaining
@@ -1037,10 +1098,6 @@ func (c *clientConnection) sendLiveEvent(ctx context.Context, ev protocol.Event)
 		return nil
 	}
 	if state.replaying {
-		if ev.Seq == nil {
-			c.mu.Unlock()
-			return nil
-		}
 		if len(state.buffered) >= maxReplayBufferedEvents {
 			c.mu.Unlock()
 			return errReplayBufferOverflow
