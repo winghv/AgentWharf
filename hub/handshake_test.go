@@ -109,6 +109,25 @@ func TestHandshakeAdapterHello(t *testing.T) {
 	})
 }
 
+func TestHandshakeAdapterRejectsExpiredAdmissionClaim(t *testing.T) {
+	t.Parallel()
+	core := hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator: fakeAuth{
+			token: "adapter-token", principal: auth.Principal{Subject: "adapter_1", Scopes: []auth.Scope{auth.SessionAdapter("ses_1")}},
+			claim: &auth.SessionAdmissionClaim{SessionID: "ses_1", Provider: "claude-code", ExpiresAt: time.Now().Add(-time.Minute)},
+		},
+		EventStore: fakeStore{latest: map[string]int64{"ses_1": 9}, truth: map[string]store.SessionAdmissionTruth{
+			"ses_1": {SessionID: "ses_1", Exists: true, Complete: true, Live: true},
+		}},
+	})
+	_, _, err := core.HandleHello(context.Background(), &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion, Role: protocol.RoleAdapter, Token: "adapter-token", SessionID: "ses_1", Provider: "claude-code",
+	})
+	if !errors.Is(err, auth.ErrUnauthorized) {
+		t.Fatalf("HandleHello() error = %v, want unauthorized", err)
+	}
+}
+
 func TestHandshakeNegotiatesClientV2AndRetainsVersion(t *testing.T) {
 	t.Parallel()
 	core := hub.NewHandshake(hub.HandshakeConfig{
