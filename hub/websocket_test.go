@@ -1337,6 +1337,9 @@ func TestAdapterActivityRechecksAuthorityInsideTransaction(t *testing.T) {
 			if got := observer.activities(); len(got) != 1 {
 				t.Fatalf("stale adapter activity reached observer: %+v", got)
 			}
+			if frame, err := readFrameWithin(adapter, time.Second); err == nil {
+				t.Fatalf("stale adapter remained open with frame %+v", frame)
+			}
 		})
 	}
 }
