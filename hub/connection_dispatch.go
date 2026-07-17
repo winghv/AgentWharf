@@ -89,7 +89,9 @@ func (a *adapterDispatchAuthority) withAdmission(ctx context.Context, adapter *a
 		validator, ok := tx.(interface {
 			ValidateAdapterEffectAdmission(context.Context, string, store.AdapterConnectionAdmission) (store.AdapterConnection, error)
 		})
-		if !ok { return errAdapterAuthorityLost }
+		if !ok {
+			return errAdapterAuthorityLost
+		}
 		if _, err := validator.ValidateAdapterEffectAdmission(effectCtx, adapter.sessionID, adapter.admission); err != nil {
 			return errAdapterAuthorityLost
 		}
@@ -125,7 +127,7 @@ func (h *webSocketHandler) lockAdapterAdmission(sessionID string) (*adapterConne
 }
 func (h *webSocketHandler) rejectAdapter(adapter *adapterConnection) {
 	if adapter != nil {
-		h.unregisterAdapter(adapter)
+		h.removeAdapter(adapter)
 		adapter.conn.CloseNow()
 	}
 }

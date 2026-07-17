@@ -58,6 +58,7 @@ type AcceptedPeer struct {
 	Resume          bool
 	Subscribed      []protocol.Subscription
 	Admissions      map[string]auth.SessionAdmissionDecision
+	AdmissionClaims map[string]auth.SessionAdmissionClaim
 }
 
 func NewHandshake(cfg HandshakeConfig) *Handshake {
@@ -90,7 +91,9 @@ func (h *Handshake) AuthorizeAttach(ctx context.Context, peer AcceptedPeer, rawG
 	}
 	grant, err := h.attachGrantVerifier.VerifyAttachGrant(ctx, rawGrant, h.attachGrantAudience)
 	decision, admitted := peer.Admissions[grant.TargetSessionID]
+	claim, claimed := peer.AdmissionClaims[grant.TargetSessionID]
 	if err != nil || !subscribesTo(peer.Subscribed, grant.TargetSessionID) || !admitted ||
+		!claimed || claim.Provider != grant.Provider || !claim.ExpiresAt.After(time.Now()) ||
 		decision.Mode != auth.SessionAdmissionAttachOnly || decision.MayMutate {
 		return auth.AttachGrant{}, auth.ErrUnauthorized
 	}
@@ -168,8 +171,9 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 	}
 	accepted := AcceptedPeer{
 		Role: protocol.RoleClient, ProtocolVersion: selectedVersion, Principal: principal,
-		Subscribed: append([]protocol.Subscription(nil), hello.Subscriptions...),
-		Admissions: make(map[string]auth.SessionAdmissionDecision, len(hello.Subscriptions)),
+		Subscribed:      append([]protocol.Subscription(nil), hello.Subscriptions...),
+		Admissions:      make(map[string]auth.SessionAdmissionDecision, len(hello.Subscriptions)),
+		AdmissionClaims: make(map[string]auth.SessionAdmissionClaim, len(hello.Subscriptions)),
 	}
 
 	for _, sub := range hello.Subscriptions {
@@ -202,6 +206,7 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 		}
 		ack.Sessions = append(ack.Sessions, summary)
 		accepted.Admissions[sub.SessionID] = decision
+		accepted.AdmissionClaims[sub.SessionID] = claim
 	}
 
 	return ack, accepted, nil

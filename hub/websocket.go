@@ -512,15 +512,16 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *websocket.
 
 func (h *webSocketHandler) publishAdapter(ctx context.Context, adapter *adapterConnection) error {
 	previous, unlock := h.lockAdapterAdmission(adapter.sessionID)
-	defer unlock()
 	if _, err := h.adapterAuthority.store.ValidateAdapterAdmission(ctx, adapter.sessionID, adapter.admission); err != nil {
+		unlock()
 		return errAdapterAuthorityLost
 	}
 	h.mu.Lock()
 	h.adapters[adapter.sessionID] = adapter
 	h.mu.Unlock()
+	unlock()
 	if previous != nil {
-		h.rejectAdapter(previous)
+		previous.conn.CloseNow()
 	}
 	return nil
 }
@@ -539,6 +540,10 @@ func (h *webSocketHandler) unregisterClient(peer *clientConnection) {
 func (h *webSocketHandler) unregisterAdapter(adapter *adapterConnection) {
 	_, unlock := h.lockAdapterAdmission(adapter.sessionID)
 	defer unlock()
+	h.removeAdapter(adapter)
+}
+
+func (h *webSocketHandler) removeAdapter(adapter *adapterConnection) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if current := h.adapters[adapter.sessionID]; current == adapter {
