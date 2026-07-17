@@ -1300,35 +1300,41 @@ func TestAdapterDispatchRechecksBeforeDurableEffect(t *testing.T) {
 }
 
 func TestAdapterActivityRechecksAuthorityInsideTransaction(t *testing.T) {
-	events := newDispatchFenceStore()
-	observer := &recordingAdapterActivityObserver{}
-	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
-		cfg.EventStore, cfg.AdapterActivityObserver = events, observer
-	})
-	adapter := dialWebSocket(t, server.URL)
-	defer adapter.Close(websocket.StatusNormalClosure, "")
-	writeAdapterHello(t, adapter, "adapter-token")
-	_ = readFrame(t, adapter).(*protocol.HelloAck)
-	_ = waitAdapterActivityCount(t, observer, 1)
+	mutations := map[string]func(*store.AdapterConnection){
+		"generation": func(connection *store.AdapterConnection) { connection.ActiveCredentialGeneration++ },
+		"revoked":    func(connection *store.AdapterConnection) { now := time.Now(); connection.RevokedAt = &now },
+		"terminal":   func(connection *store.AdapterConnection) { now := time.Now(); connection.TerminalAt = &now },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			events := newDispatchFenceStore()
+			observer := &recordingAdapterActivityObserver{}
+			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+				cfg.EventStore, cfg.AdapterActivityObserver = events, observer
+			})
+			adapter := dialWebSocket(t, server.URL)
+			defer adapter.Close(websocket.StatusNormalClosure, "")
+			writeAdapterHello(t, adapter, "adapter-token")
+			_ = readFrame(t, adapter).(*protocol.HelloAck)
+			_ = waitAdapterActivityCount(t, observer, 1)
 
-	started, release := events.blockNextEffect()
-	writeFrame(t, adapter, &protocol.Ping{Nonce: "activity-fence"})
-	if pong := readFrame(t, adapter).(*protocol.Pong); pong.Nonce != "activity-fence" {
-		t.Fatalf("pong = %+v", pong)
-	}
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("activity effect did not enter authority transaction")
-	}
-	events.mutateConnection(func(connection *store.AdapterConnection) {
-		now := time.Now()
-		connection.RevokedAt = &now
-	})
-	close(release)
-	time.Sleep(100 * time.Millisecond)
-	if got := observer.activities(); len(got) != 1 {
-		t.Fatalf("stale adapter activity reached observer: %+v", got)
+			started, release := events.blockNextEffect()
+			writeFrame(t, adapter, &protocol.Ping{Nonce: "activity-fence"})
+			if pong := readFrame(t, adapter).(*protocol.Pong); pong.Nonce != "activity-fence" {
+				t.Fatalf("pong = %+v", pong)
+			}
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("activity effect did not enter authority transaction")
+			}
+			events.mutateConnection(mutate)
+			close(release)
+			time.Sleep(100 * time.Millisecond)
+			if got := observer.activities(); len(got) != 1 {
+				t.Fatalf("stale adapter activity reached observer: %+v", got)
+			}
+		})
 	}
 }
 
