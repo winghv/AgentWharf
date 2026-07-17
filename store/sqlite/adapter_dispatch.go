@@ -9,6 +9,12 @@ import (
 	"github.com/winghv/agentwharf/store"
 )
 
+func (s *Store) ValidateAdapterEffectAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
+	if s == nil || s.connectionTx == nil { return store.AdapterConnection{}, errors.New("adapter authority transaction is required") }
+	if _, err := s.connectionTx.ExecContext(ctx, `UPDATE session_adapter_connections SET updated_at_ms=updated_at_ms WHERE session_id=?`, sessionID); err != nil { return store.AdapterConnection{}, fmt.Errorf("lock adapter admission: %w", err) }
+	return s.ValidateAdapterAdmission(ctx, sessionID, admission)
+}
+
 func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (firstSeq int64, err error) {
 	if s == nil || s.db == nil || len(events) == 0 {
 		return 0, errors.New("invalid sqlite adapter event commit")

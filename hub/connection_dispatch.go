@@ -15,7 +15,7 @@ const adapterAuthorityPollInterval = 250 * time.Millisecond
 var errAdapterAuthorityLost = errors.New("adapter authority lost")
 
 type adapterDispatchStore interface {
-	store.AdapterConnectionStore
+	store.AdapterConnectionTransactor
 	store.AdapterGrantFenceStore
 	AppendAdapterEvents(context.Context, string, store.AdapterConnectionAdmission, []store.PendingEvent) (int64, error)
 }
@@ -31,9 +31,6 @@ func newAdapterDispatchAuthority(handshake *Handshake, candidate any) *adapterDi
 	authenticator, authOK := handshake.authenticator.(interface {
 		AdapterCredential(context.Context, string, auth.Principal, string) (int64, int64, bool, error)
 	})
-	if candidate == nil {
-		candidate = handshake.events
-	}
 	dispatchStore, storeOK := candidate.(adapterDispatchStore)
 	if !authOK || !storeOK || dispatchStore == nil {
 		return nil
@@ -85,16 +82,15 @@ func (h *webSocketHandler) withAdapterEffect(ctx context.Context, adapter *adapt
 	}
 	return effect()
 }
-
 func (a *adapterDispatchAuthority) withAdmission(ctx context.Context, adapter *adapterConnection, effect func(context.Context) error) error {
-	transactor, ok := a.store.(store.AdapterConnectionTransactor)
-	if !ok {
-		return errAdapterAuthorityLost
-	}
 	effectCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
 	defer cancel()
-	return transactor.WithAdapterConnectionTransaction(effectCtx, func(tx store.AdapterConnectionStore) error {
-		if _, err := tx.ValidateAdapterAdmission(effectCtx, adapter.sessionID, adapter.admission); err != nil {
+	return a.store.WithAdapterConnectionTransaction(effectCtx, func(tx store.AdapterConnectionStore) error {
+		validator, ok := tx.(interface {
+			ValidateAdapterEffectAdmission(context.Context, string, store.AdapterConnectionAdmission) (store.AdapterConnection, error)
+		})
+		if !ok { return errAdapterAuthorityLost }
+		if _, err := validator.ValidateAdapterEffectAdmission(effectCtx, adapter.sessionID, adapter.admission); err != nil {
 			return errAdapterAuthorityLost
 		}
 		return effect(effectCtx)

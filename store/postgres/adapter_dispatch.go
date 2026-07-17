@@ -9,6 +9,12 @@ import (
 	"github.com/winghv/agentwharf/store/postgres/internal/db"
 )
 
+func (s *Store) ValidateAdapterEffectAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
+	if s == nil || s.connectionTx == nil { return store.AdapterConnection{}, errors.New("adapter authority transaction is required") }
+	if err := s.connectionTx.QueryRow(ctx, `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 FOR UPDATE`, sessionID).Scan(new(int)); err != nil { return store.AdapterConnection{}, errors.New("adapter authority lost") }
+	return s.ValidateAdapterAdmission(ctx, sessionID, admission)
+}
+
 func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (int64, error) {
 	if s == nil || s.pool == nil || len(events) == 0 {
 		return 0, errors.New("invalid postgres adapter event commit")

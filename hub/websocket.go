@@ -268,11 +268,6 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 		if err != nil {
 			return
 		}
-		if accepted.Role == protocol.RoleAdapter {
-			if err := h.validateAdapter(ctx, adapter); err != nil {
-				return
-			}
-		}
 		switch typed := frame.(type) {
 		case *protocol.Ping:
 			if err := writePongFrame(ctx, conn, peer, adapter, typed.Nonce); err != nil {
