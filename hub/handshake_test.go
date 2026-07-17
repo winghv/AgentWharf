@@ -185,6 +185,42 @@ func TestHandshakeAuthorizesVerifiedAttachGrant(t *testing.T) {
 	}
 }
 
+func TestHandshakeAttachRejectsMutatedAdmissionClaim(t *testing.T) {
+	now := time.Now()
+	grant := auth.AttachGrant{Audience: "deploy-attach", JTI: "jti_1", AttachID: "attach_1", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code", IssuedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute), DeliveryDeadline: now.Add(61 * time.Second), GrantFence: 2}
+	newPeer := func(t *testing.T) (*hub.Handshake, hub.AcceptedPeer) {
+		t.Helper()
+		core := hub.NewHandshake(hub.HandshakeConfig{
+			Authenticator:       fakeAuth{token: "client-token", principal: auth.Principal{Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")}}},
+			EventStore:          fakeStore{latest: map[string]int64{}, connections: map[string]store.AdapterConnection{"ses_bootstrap": liveBootstrapConnection(1)}},
+			AttachGrantVerifier: fakeAttachGrantVerifier{raw: "signed-grant", audience: "deploy-attach", grant: grant}, AttachGrantAudience: "deploy-attach",
+			LiveBootstrapAuthority: fakeLiveBootstrapAuthority{connection: liveBootstrapConnection(1), provider: "claude-code"},
+		})
+		_, peer, err := core.HandleHello(context.Background(), &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}}})
+		if err != nil {
+			t.Fatalf("HandleHello() error = %v", err)
+		}
+		return core, peer
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*auth.SessionAdmissionClaim)
+	}{
+		{name: "provider", mutate: func(claim *auth.SessionAdmissionClaim) { claim.Provider = "other" }},
+		{name: "expiry", mutate: func(claim *auth.SessionAdmissionClaim) { claim.ExpiresAt = now.Add(-time.Second) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			core, peer := newPeer(t)
+			claim := peer.AdmissionClaims[grant.TargetSessionID]
+			test.mutate(&claim)
+			peer.AdmissionClaims[grant.TargetSessionID] = claim
+			if _, err := core.AuthorizeAttach(context.Background(), peer, "signed-grant"); !errors.Is(err, auth.ErrUnauthorized) {
+				t.Fatalf("AuthorizeAttach() error = %v, want unauthorized", err)
+			}
+		})
+	}
+}
+
 func TestHandshakeAttachAuthorizationFailsClosed(t *testing.T) {
 	now := time.Now()
 	grant := auth.AttachGrant{
