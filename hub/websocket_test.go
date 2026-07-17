@@ -2,9 +2,12 @@ package hub_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +17,7 @@ import (
 	"github.com/winghv/agentwharf/hub"
 	"github.com/winghv/agentwharf/protocol"
 	"github.com/winghv/agentwharf/store"
+	"github.com/winghv/agentwharf/store/sqlite"
 	"nhooyr.io/websocket"
 )
 
@@ -1015,8 +1019,10 @@ func TestWebSocketServerBuffersLiveEventsUntilReplayCompletes(t *testing.T) {
 		close(replayStarted)
 		<-releaseReplay
 	}
+	observer := &recordingAdapterActivityObserver{}
 	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
 		cfg.EventStore = events
+		cfg.AdapterActivityObserver = observer
 	})
 	client := dialWebSocket(t, server.URL)
 	defer client.Close(websocket.StatusNormalClosure, "")
@@ -1034,6 +1040,13 @@ func TestWebSocketServerBuffersLiveEventsUntilReplayCompletes(t *testing.T) {
 	writeAdapterHello(t, adapter, "adapter-token")
 	_ = readFrame(t, adapter).(*protocol.HelloAck)
 	writeFrame(t, adapter, &protocol.Event{
+		Type:      "log.tail",
+		SessionID: "ses_1",
+		Time:      2001,
+		Payload:   json.RawMessage(`{"line":"during replay"}`),
+	})
+	_ = waitAdapterActivityCount(t, observer, 2)
+	writeFrame(t, adapter, &protocol.Event{
 		Type:      "session.message",
 		SessionID: "ses_1",
 		Time:      2002,
@@ -1041,6 +1054,10 @@ func TestWebSocketServerBuffersLiveEventsUntilReplayCompletes(t *testing.T) {
 	})
 	close(releaseReplay)
 
+	ephemeral := readFrame(t, client).(*protocol.Event)
+	if ephemeral.Seq != nil || ephemeral.Type != "log.tail" || string(ephemeral.Payload) != `{"line":"during replay"}` {
+		t.Fatalf("ephemeral event after replay = %+v payload=%s", ephemeral, string(ephemeral.Payload))
+	}
 	live := readFrame(t, client).(*protocol.Event)
 	if live.Seq == nil || *live.Seq != 2 || string(live.Payload) != `{"n":2}` {
 		t.Fatalf("live event after replay = %+v payload=%s", live, string(live.Payload))
@@ -1095,6 +1112,341 @@ func TestWebSocketServerTimesOutWaitingForHello(t *testing.T) {
 	}
 }
 
+func TestClientHelloAckIsFirstFrameDuringLivePublish(t *testing.T) {
+	const sessionCount = 32
+	latest := make(map[string]int64, sessionCount)
+	subscriptions := make([]protocol.Subscription, 0, sessionCount)
+	scopes := make([]auth.Scope, 0, sessionCount)
+	for index := 0; index < sessionCount; index++ {
+		sessionID := fmt.Sprintf("ses_ack_%02d", index)
+		latest[sessionID] = 0
+		subscriptions = append(subscriptions, protocol.Subscription{SessionID: sessionID})
+		scopes = append(scopes, auth.SessionView(sessionID))
+	}
+	events := newFakeEventStore(latest, nil)
+	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: websocketTestAuth{
+		principals: map[string]auth.Principal{"ack-client": {Subject: "ack-client", Scopes: scopes}},
+	}, EventStore: events})
+	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	for attempt := 0; attempt < 20; attempt++ {
+		client := dialWebSocket(t, server.URL)
+		stop := make(chan struct{})
+		var publishers sync.WaitGroup
+		for worker := 0; worker < 4; worker++ {
+			publishers.Add(1)
+			go func() {
+				defer publishers.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+						_ = handler.EmitEphemeralEvent(context.Background(), protocol.Event{Type: "agent.activity", SessionID: "ses_ack_00"})
+					}
+				}
+			}()
+		}
+		writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersion, Role: protocol.RoleClient, Token: "ack-client", Subscriptions: subscriptions})
+		first := readFrame(t, client)
+		close(stop)
+		publishers.Wait()
+		_ = client.Close(websocket.StatusNormalClosure, "")
+		if _, ok := first.(*protocol.HelloAck); !ok {
+			t.Fatalf("attempt %d first frame = %T, want hello.ack", attempt, first)
+		}
+	}
+}
+
+func TestAdapterDispatchFencesAuthorityLoss(t *testing.T) {
+	mutations := map[string]func(*store.AdapterConnection){
+		"epoch":      func(connection *store.AdapterConnection) { connection.ConnectionEpoch++ },
+		"generation": func(connection *store.AdapterConnection) { connection.ActiveCredentialGeneration++ },
+		"revoked":    func(connection *store.AdapterConnection) { now := time.Now(); connection.RevokedAt = &now },
+		"expired": func(connection *store.AdapterConnection) {
+			connection.ActiveCredentialExpiresAt = time.Now().Add(-time.Second)
+		},
+		"terminal": func(connection *store.AdapterConnection) { now := time.Now(); connection.TerminalAt = &now },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			events := newDispatchFenceStore()
+			observer := &recordingAdapterActivityObserver{}
+			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+				cfg.EventStore, cfg.AdapterActivityObserver = events, observer
+			})
+			adapter := dialWebSocket(t, server.URL)
+			defer adapter.Close(websocket.StatusNormalClosure, "")
+			writeAdapterHello(t, adapter, "adapter-token")
+			_ = readFrame(t, adapter).(*protocol.HelloAck)
+			_ = waitAdapterActivityCount(t, observer, 1)
+			events.mutateConnection(mutate)
+			writeFrame(t, adapter, &protocol.Ping{Nonce: "stale-ping"})
+			if frame, err := readFrameWithin(adapter, 100*time.Millisecond); err == nil {
+				t.Fatalf("stale adapter received frame %+v", frame)
+			}
+			if got := observer.activities(); len(got) != 1 {
+				t.Fatalf("stale heartbeat emitted activity %+v", got)
+			}
+		})
+	}
+}
+
+func TestAdapterDispatchReplacesOldSocket(t *testing.T) {
+	events := newDispatchFenceStore()
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	oldAdapter := dialWebSocket(t, server.URL)
+	defer oldAdapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, oldAdapter, "adapter-token")
+	_ = readFrame(t, oldAdapter).(*protocol.HelloAck)
+	newAdapter := dialWebSocket(t, server.URL)
+	defer newAdapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, newAdapter, "adapter-token")
+	_ = readFrame(t, newAdapter).(*protocol.HelloAck)
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeFrame(t, client, &protocol.Command{CommandID: "cmd_current", Type: protocol.CommandSessionInterrupt, SessionID: "ses_1", Payload: json.RawMessage(`{}`)})
+	if command := readFrame(t, newAdapter).(*protocol.Command); command.CommandID != "cmd_current" {
+		t.Fatalf("new adapter command = %+v", command)
+	}
+	if _, err := readFrameWithin(oldAdapter, 100*time.Millisecond); err == nil {
+		t.Fatal("replaced adapter remained readable")
+	}
+}
+
+func TestAdapterHelloAckIsFirstFrameDuringConcurrentCommand(t *testing.T) {
+	events := newDispatchFenceStore()
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	for index := 0; index < 16; index++ {
+		writeFrame(t, client, &protocol.Command{CommandID: fmt.Sprintf("cmd_ack_%02d", index), Type: protocol.CommandSessionInterrupt, SessionID: "ses_1", Payload: json.RawMessage(`{}`)})
+	}
+	if first := readFrame(t, adapter); first.FrameName() != protocol.FrameHelloAck {
+		t.Fatalf("first Adapter frame = %T, want hello.ack", first)
+	}
+}
+
+func TestAdapterDispatchDoesNotBlockCollidingSession(t *testing.T) {
+	events := newFakeEventStore(map[string]int64{"ses_1": 0, "ses_55": 0}, nil)
+	authenticator := websocketTestAuth{
+		principals: map[string]auth.Principal{
+			"adapter-token":    {Subject: "adapter-1", Scopes: []auth.Scope{auth.SessionAdapter("ses_1")}},
+			"adapter-token-55": {Subject: "adapter-55", Scopes: []auth.Scope{auth.SessionAdapter("ses_55")}},
+		},
+		credentials: map[string]adapterCredentialEvidence{
+			"adapter-1":  {Generation: 1, ExpiresAt: time.Now().Add(time.Hour)},
+			"adapter-55": {Generation: 1, ExpiresAt: time.Now().Add(time.Hour)},
+		},
+	}
+	observer := &blockingAdapterActivityObserver{sessionID: "ses_1", started: make(chan struct{}), release: make(chan struct{})}
+	defer close(observer.release)
+	server := newWebSocketTestServer(t, hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events}), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore, cfg.AdapterActivityObserver = events, observer
+	})
+	first := dialWebSocket(t, server.URL)
+	defer first.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloFor(t, first, "adapter-token", "ses_1")
+	_ = readFrame(t, first).(*protocol.HelloAck)
+	select {
+	case <-observer.started:
+	case <-time.After(time.Second):
+		t.Fatal("first Session did not enter the blocked observer")
+	}
+	second := dialWebSocket(t, server.URL)
+	defer second.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloFor(t, second, "adapter-token-55", "ses_55")
+	frame, err := readFrameWithin(second, 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("colliding Session admission was blocked: %v", err)
+	}
+	if _, ok := frame.(*protocol.HelloAck); !ok {
+		t.Fatalf("colliding Session first frame = %T", frame)
+	}
+}
+
+func TestAdapterDispatchRechecksBeforeDurableEffect(t *testing.T) {
+	events := newDispatchFenceStore()
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	started, release := events.blockNextEffect()
+	writeFrame(t, adapter, &protocol.Event{Type: "session.state", SessionID: "ses_1", Payload: json.RawMessage(`{"state":"working"}`)})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("durable effect did not reach dispatch barrier")
+	}
+	events.mutateConnection(func(connection *store.AdapterConnection) { connection.ActiveCredentialGeneration++ })
+	close(release)
+	time.Sleep(100 * time.Millisecond)
+	if appended := events.appended(); len(appended) != 0 {
+		t.Fatalf("stale enqueued event reached Store: %+v", appended)
+	}
+}
+
+func TestAdapterDispatchRejectsOldCredentialGeneration(t *testing.T) {
+	events := newDispatchFenceStore()
+	events.mutateConnection(func(connection *store.AdapterConnection) {
+		connection.ActiveCredentialGeneration = 2
+		connection.CredentialGenerationHighWatermark = 2
+	})
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	if frame, err := readFrameWithin(adapter, 200*time.Millisecond); err == nil {
+		if _, ok := frame.(*protocol.HelloAck); ok {
+			t.Fatalf("old generation received hello ack %+v", frame)
+		}
+	}
+}
+
+func TestAdapterDispatchRejectsGenerationAboveOneBeforeRotation(t *testing.T) {
+	events := newDispatchFenceStore()
+	events.mutateConnection(func(connection *store.AdapterConnection) {
+		connection.ActiveCredentialGeneration = 2
+		connection.CredentialGenerationHighWatermark = 2
+	})
+	handshake := testHandshakeWithCredential(events, adapterCredentialEvidence{Generation: 2, ExpiresAt: time.Now().Add(time.Hour)})
+	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	if frame, err := readFrameWithin(adapter, 200*time.Millisecond); err == nil {
+		if _, accepted := frame.(*protocol.HelloAck); accepted {
+			t.Fatalf("generation-2 Adapter received hello.ack before T18H")
+		}
+	}
+}
+
+func TestCommittedAdapterEventRemainsLiveAfterPostCommitFenceChange(t *testing.T) {
+	events := newDispatchFenceStore()
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	events.afterAppend = func() {
+		events.mutateConnection(func(connection *store.AdapterConnection) { now := time.Now(); connection.RevokedAt = &now })
+	}
+	writeFrame(t, adapter, &protocol.Event{Type: "session.state", SessionID: "ses_1", Payload: json.RawMessage(`{"state":"working"}`)})
+	frame, err := readFrameWithin(client, time.Second)
+	if err != nil {
+		t.Fatalf("committed event disappeared from live delivery: %v", err)
+	}
+	event, ok := frame.(*protocol.Event)
+	if !ok || event.Seq == nil || *event.Seq != 1 {
+		t.Fatalf("committed live event = %+v", frame)
+	}
+}
+
+func TestAdapterDispatchClosesIdleSocketOnAuthorityLoss(t *testing.T) {
+	events := newDispatchFenceStore()
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	events.mutateConnection(func(connection *store.AdapterConnection) {
+		now := time.Now()
+		connection.RevokedAt = &now
+	})
+	started := time.Now()
+	if _, err := readFrameWithin(adapter, 2*time.Second); err == nil || time.Since(started) >= time.Second {
+		t.Fatalf("idle adapter was not promptly closed after authority loss: %v", err)
+	}
+}
+
+func TestAdapterDispatchRealSQLiteCommit(t *testing.T) {
+	ctx := context.Background()
+	events, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "events.db"))
+	if err != nil {
+		t.Fatalf("open SQLite Store: %v", err)
+	}
+	defer events.Close()
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: "ses_sqlite_dispatch", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("initialize adapter connection: %v", err)
+	}
+	connection, err := events.AcceptAdapterHello(ctx, "ses_sqlite_dispatch", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("accept adapter hello: %v", err)
+	}
+	grant, err := events.AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatalf("allocate grant: %v", err)
+	}
+	seq, err := events.AppendAdapterEvents(ctx, connection.SessionID, store.AdapterConnectionAdmission{
+		CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch,
+		AcceptedFence: connection.AcceptedFence, GrantFence: grant,
+	}, []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: json.RawMessage(`{"state":"working"}`)}})
+	if err != nil || seq != 1 {
+		t.Fatalf("AppendAdapterEvents() = %d, %v", seq, err)
+	}
+}
+
+func TestAdapterDispatchRealSQLiteRejectsExpiryBeforeCommit(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "events.db")
+	events, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, `CREATE TRIGGER slow_adapter_event BEFORE INSERT ON session_events BEGIN SELECT length(randomblob(2000000)); END`); err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().Add(100 * time.Millisecond)
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: "ses_sqlite_expiry", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: expiresAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := events.AcceptAdapterHello(ctx, "ses_sqlite_expiry", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := events.AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := make([]store.PendingEvent, 64)
+	for index := range pending {
+		pending[index] = store.PendingEvent{Type: "session.state", Time: time.Now(), Payload: json.RawMessage(`{"state":"working"}`)}
+	}
+	if _, err := events.AppendAdapterEvents(ctx, connection.SessionID, store.AdapterConnectionAdmission{
+		CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch,
+		AcceptedFence: connection.AcceptedFence, GrantFence: grant,
+	}, pending); err == nil {
+		t.Fatal("SQLite append committed after authority expired before commit")
+	}
+	if latest, err := events.LatestSeq(ctx, connection.SessionID); err != nil || latest != 0 {
+		t.Fatalf("latest seq after expired SQLite append = %d, %v", latest, err)
+	}
+}
+
 func newWebSocketTestServer(t *testing.T, handshake *hub.Handshake, options ...func(*hub.WebSocketConfig)) *httptest.Server {
 	t.Helper()
 
@@ -1144,13 +1496,17 @@ func writeClientHello(t *testing.T, conn *websocket.Conn, token string, lastSeq 
 }
 
 func writeAdapterHello(t *testing.T, conn *websocket.Conn, token string) {
+	writeAdapterHelloFor(t, conn, token, "ses_1")
+}
+
+func writeAdapterHelloFor(t *testing.T, conn *websocket.Conn, token, sessionID string) {
 	t.Helper()
 
 	writeFrame(t, conn, &protocol.Hello{
 		ProtocolVersion: protocol.ProtocolVersion,
 		Role:            protocol.RoleAdapter,
 		Token:           token,
-		SessionID:       "ses_1",
+		SessionID:       sessionID,
 		Provider:        "claude-code",
 		Resume:          true,
 	})
@@ -1205,6 +1561,10 @@ func testHandshake() *hub.Handshake {
 }
 
 func testHandshakeWithStore(events store.EventStore) *hub.Handshake {
+	return testHandshakeWithCredential(events, adapterCredentialEvidence{Generation: 1, ExpiresAt: time.Now().Add(time.Hour)})
+}
+
+func testHandshakeWithCredential(events store.EventStore, credential adapterCredentialEvidence) *hub.Handshake {
 	return hub.NewHandshake(hub.HandshakeConfig{
 		Authenticator: websocketTestAuth{
 			principals: map[string]auth.Principal{
@@ -1225,13 +1585,23 @@ func testHandshakeWithStore(events store.EventStore) *hub.Handshake {
 					Scopes:  []auth.Scope{auth.API()},
 				},
 			},
+			credentials: map[string]adapterCredentialEvidence{
+				"adapter": credential,
+			},
 		},
 		EventStore: events,
 	})
 }
 
 type websocketTestAuth struct {
-	principals map[string]auth.Principal
+	principals  map[string]auth.Principal
+	credentials map[string]adapterCredentialEvidence
+}
+
+type adapterCredentialEvidence struct {
+	Generation      int64
+	ExpiresAt       time.Time
+	AllowInitialize bool
 }
 
 type boundedWebsocketAuth struct {
@@ -1297,6 +1667,19 @@ type recordingAdapterActivityObserver struct {
 	got []hub.AdapterActivity
 }
 
+type blockingAdapterActivityObserver struct {
+	sessionID string
+	started   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (o *blockingAdapterActivityObserver) ObserveAdapterActivity(_ context.Context, activity hub.AdapterActivity) {
+	if activity.SessionID == o.sessionID {
+		o.once.Do(func() { close(o.started); <-o.release })
+	}
+}
+
 func (o *recordingAdapterActivityObserver) ObserveAdapterActivity(_ context.Context, activity hub.AdapterActivity) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -1334,19 +1717,148 @@ func (a websocketTestAuth) Authorize(_ context.Context, principal auth.Principal
 	return auth.Authorize(principal, scope)
 }
 
+func (a websocketTestAuth) AdapterCredential(_ context.Context, _ string, principal auth.Principal, _ string) (int64, int64, bool, error) {
+	evidence, ok := a.credentials[principal.Subject]
+	if !ok {
+		return 0, 0, false, auth.ErrUnauthorized
+	}
+	return evidence.Generation, evidence.ExpiresAt.UnixNano(), evidence.AllowInitialize, nil
+}
+
 func (a websocketTestAuth) SessionAdmissionClaim(_ context.Context, _ auth.Principal, sessionID string) (auth.SessionAdmissionClaim, error) {
 	return auth.SessionAdmissionClaim{SessionID: sessionID, Provider: "claude-code", ExpiresAt: time.Now().Add(time.Minute)}, nil
 }
 
 type fakeEventStore struct {
+	store.AdapterConnectionStore
 	mu            sync.Mutex
 	latest        map[string]int64
 	events        map[string][]store.Event
+	connections   map[string]store.AdapterConnection
+	nextFence     int64
 	appendErr     error
 	appendCalls   []appendCall
 	onReplayEvent func()
 	truth         map[string]store.SessionAdmissionTruth
 	replayCalls   int
+}
+
+type dispatchFenceStore struct {
+	*fakeEventStore
+	authorityMu sync.Mutex
+	connection  store.AdapterConnection
+	nextFence   int64
+	effectOnce  sync.Once
+	effectStart chan struct{}
+	effectGo    chan struct{}
+	afterAppend func()
+}
+
+func newDispatchFenceStore() *dispatchFenceStore {
+	return &dispatchFenceStore{
+		fakeEventStore: newFakeEventStore(map[string]int64{"ses_1": 0}, nil),
+		connection: store.AdapterConnection{
+			SessionID: "ses_1", ConnectionEpoch: 1, AcceptedFence: 1, ActiveCredentialGeneration: 1,
+			CredentialGenerationHighWatermark: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+		},
+		nextFence: 2,
+	}
+}
+
+func (s *dispatchFenceStore) AdapterConnection(_ context.Context, sessionID string) (store.AdapterConnection, error) {
+	s.authorityMu.Lock()
+	defer s.authorityMu.Unlock()
+	if sessionID != s.connection.SessionID {
+		return store.AdapterConnection{}, errors.New("adapter connection not found")
+	}
+	return s.connection, nil
+}
+
+func (s *dispatchFenceStore) AllocateAdapterGrantFence(context.Context) (int64, error) {
+	s.authorityMu.Lock()
+	defer s.authorityMu.Unlock()
+	fence := s.nextFence
+	s.nextFence++
+	return fence, nil
+}
+
+func (s *dispatchFenceStore) AcceptAdapterHello(_ context.Context, sessionID string, hello store.AdapterHello) (store.AdapterConnection, error) {
+	s.authorityMu.Lock()
+	defer s.authorityMu.Unlock()
+	if sessionID != s.connection.SessionID || hello.CredentialGeneration != s.connection.ActiveCredentialGeneration ||
+		s.connection.RevokedAt != nil || s.connection.TerminalAt != nil || !s.connection.ActiveCredentialExpiresAt.After(time.Now()) {
+		return store.AdapterConnection{}, errors.New("adapter hello rejected")
+	}
+	s.connection.ConnectionEpoch++
+	s.connection.AcceptedFence = s.nextFence
+	s.nextFence++
+	return s.connection, nil
+}
+
+func (s *dispatchFenceStore) ValidateAdapterAdmission(_ context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
+	s.authorityMu.Lock()
+	defer s.authorityMu.Unlock()
+	connection := s.connection
+	if sessionID != connection.SessionID || admission.CredentialGeneration != connection.ActiveCredentialGeneration ||
+		admission.ConnectionEpoch != connection.ConnectionEpoch || admission.AcceptedFence != connection.AcceptedFence ||
+		admission.GrantFence <= connection.AcceptedFence || admission.GrantFence >= s.nextFence ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil || !connection.ActiveCredentialExpiresAt.After(time.Now()) {
+		return store.AdapterConnection{}, errors.New("adapter authority lost")
+	}
+	return connection, nil
+}
+
+func (s *dispatchFenceStore) WithAdapterConnectionTransaction(ctx context.Context, fn func(store.AdapterConnectionStore) error) error {
+	s.waitEffect()
+	return fn(s)
+}
+
+func (s *dispatchFenceStore) Append(ctx context.Context, sessionID string, events []store.PendingEvent) (int64, error) {
+	s.waitEffect()
+	return s.fakeEventStore.Append(ctx, sessionID, events)
+}
+
+func (s *dispatchFenceStore) AppendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (int64, error) {
+	s.waitEffect()
+	if _, err := s.ValidateAdapterAdmission(ctx, sessionID, admission); err != nil {
+		return 0, err
+	}
+	firstSeq, err := s.fakeEventStore.Append(ctx, sessionID, events)
+	if err == nil && s.afterAppend != nil {
+		s.afterAppend()
+	}
+	return firstSeq, err
+}
+
+func (s *dispatchFenceStore) Replay(ctx context.Context, sessionID string, afterSeq int64, fn func(store.Event) error) error {
+	return s.fakeEventStore.Replay(ctx, sessionID, afterSeq, fn)
+}
+
+func (s *dispatchFenceStore) LatestSeq(ctx context.Context, sessionID string) (int64, error) {
+	return s.fakeEventStore.LatestSeq(ctx, sessionID)
+}
+
+func (s *dispatchFenceStore) mutateConnection(mutate func(*store.AdapterConnection)) {
+	s.authorityMu.Lock()
+	defer s.authorityMu.Unlock()
+	mutate(&s.connection)
+}
+
+func (s *dispatchFenceStore) blockNextEffect() (<-chan struct{}, chan<- struct{}) {
+	s.effectStart = make(chan struct{})
+	s.effectGo = make(chan struct{})
+	s.effectOnce = sync.Once{}
+	return s.effectStart, s.effectGo
+}
+
+func (s *dispatchFenceStore) waitEffect() {
+	if s.effectStart == nil {
+		return
+	}
+	s.effectOnce.Do(func() {
+		close(s.effectStart)
+		<-s.effectGo
+	})
 }
 
 type historyCall struct {
@@ -1404,10 +1916,70 @@ func newFakeEventStore(latest map[string]int64, events map[string][]store.Event)
 		events = make(map[string][]store.Event)
 	}
 	truth := make(map[string]store.SessionAdmissionTruth, len(latest))
+	connections := make(map[string]store.AdapterConnection, len(latest))
+	nextFence := int64(1)
 	for sessionID := range latest {
 		truth[sessionID] = store.SessionAdmissionTruth{SessionID: sessionID, Exists: true, Complete: true, Live: true}
+		connections[sessionID] = store.AdapterConnection{
+			SessionID: sessionID, ConnectionEpoch: 1, AcceptedFence: nextFence, ActiveCredentialGeneration: 1,
+			CredentialGenerationHighWatermark: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+		}
+		nextFence++
 	}
-	return &fakeEventStore{latest: latest, events: events, truth: truth}
+	return &fakeEventStore{latest: latest, events: events, truth: truth, connections: connections, nextFence: nextFence}
+}
+
+func (f *fakeEventStore) AdapterConnection(_ context.Context, sessionID string) (store.AdapterConnection, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	connection, ok := f.connections[sessionID]
+	if !ok {
+		return store.AdapterConnection{}, errors.New("adapter connection not found")
+	}
+	return connection, nil
+}
+
+func (f *fakeEventStore) AcceptAdapterHello(_ context.Context, sessionID string, hello store.AdapterHello) (store.AdapterConnection, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	connection, ok := f.connections[sessionID]
+	if !ok || hello.CredentialGeneration != connection.ActiveCredentialGeneration ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil || !connection.ActiveCredentialExpiresAt.After(time.Now()) {
+		return store.AdapterConnection{}, errors.New("adapter hello rejected")
+	}
+	connection.ConnectionEpoch++
+	connection.AcceptedFence = f.nextFence
+	f.nextFence++
+	f.connections[sessionID] = connection
+	return connection, nil
+}
+
+func (f *fakeEventStore) AllocateAdapterGrantFence(context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fence := f.nextFence
+	f.nextFence++
+	return fence, nil
+}
+
+func (f *fakeEventStore) ValidateAdapterAdmission(_ context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	connection, ok := f.connections[sessionID]
+	if !ok || admission.CredentialGeneration != connection.ActiveCredentialGeneration ||
+		admission.ConnectionEpoch != connection.ConnectionEpoch || admission.AcceptedFence != connection.AcceptedFence ||
+		admission.GrantFence <= connection.AcceptedFence || admission.GrantFence >= f.nextFence ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil || !connection.ActiveCredentialExpiresAt.After(time.Now()) {
+		return store.AdapterConnection{}, errors.New("adapter authority lost")
+	}
+	return connection, nil
+}
+
+func (f *fakeEventStore) AppendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (int64, error) {
+	if _, err := f.ValidateAdapterAdmission(ctx, sessionID, admission); err != nil {
+		return 0, err
+	}
+	return f.Append(ctx, sessionID, events)
 }
 
 func (f *fakeEventStore) setAdmissionTruth(sessionID string, truth store.SessionAdmissionTruth) {
