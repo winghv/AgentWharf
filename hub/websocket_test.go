@@ -1304,6 +1304,7 @@ func TestAdapterActivityRechecksAuthorityInsideTransaction(t *testing.T) {
 		"expired": func(connection *store.AdapterConnection) {
 			connection.ActiveCredentialExpiresAt = time.Now().Add(-time.Second)
 		},
+		"epoch":      func(connection *store.AdapterConnection) { connection.ConnectionEpoch++ },
 		"generation": func(connection *store.AdapterConnection) { connection.ActiveCredentialGeneration++ },
 		"revoked":    func(connection *store.AdapterConnection) { now := time.Now(); connection.RevokedAt = &now },
 		"terminal":   func(connection *store.AdapterConnection) { now := time.Now(); connection.TerminalAt = &now },
