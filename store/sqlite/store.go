@@ -18,6 +18,7 @@ import (
 const (
 	maxHistoryPageSize  = 100
 	maxEventPayloadSize = 64 * 1024
+	maxAttachAttemptTTL = 5 * time.Minute
 )
 
 type Store struct {
@@ -527,6 +528,149 @@ func validateProposedEventInput(sessionID string, authority store.CommandAuthori
 
 func proposedEventReceipt(sessionID, proposalID string, seq int64) store.ProposedEventReceipt {
 	return store.ProposedEventReceipt{SessionID: sessionID, ProposalID: proposalID, Seq: seq, Status: store.ProposedEventAccepted}
+}
+
+func (s *Store) CommitAttachAttempt(ctx context.Context, request store.AttachAttemptRequest) (store.AttachAttemptCommit, error) {
+	if s == nil || s.db == nil {
+		return store.AttachAttemptCommit{}, errors.New("sqlite event store is nil")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.AttachAttemptCommit{}, fmt.Errorf("begin attach attempt transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.AttachAttemptCommit{}, fmt.Errorf("read attach attempt Store clock: %w", err)
+	}
+	now := time.UnixMilli(nowMS)
+	if err := validateSQLiteAttachAttempt(request, now); err != nil {
+		return store.AttachAttemptCommit{}, err
+	}
+	result, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO session_attach_attempts
+(attempt_jti_hash, attach_id, bootstrap_session_id, target_session_id, provider,
+ fingerprint_domain, fingerprint_version, fingerprint_digest, fingerprint_key_version,
+ expires_at_ns, admission_outcome, issued_credential_generation, created_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, request.Identity.JTIHash[:], request.Identity.AttachID, request.Identity.BootstrapSessionID,
+		request.Identity.TargetSessionID, request.Identity.Provider, request.Fingerprint.Domain,
+		request.Fingerprint.Version, request.Fingerprint.Digest[:], request.Fingerprint.KeyVersion,
+		request.ExpiresAt.UnixNano(), string(request.Outcome), nullableAttachGeneration(request.IssuedCredentialGeneration), nowMS)
+	if err != nil {
+		return store.AttachAttemptCommit{}, fmt.Errorf("insert attach attempt: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return store.AttachAttemptCommit{}, fmt.Errorf("read attach attempt insert result: %w", err)
+	}
+	current, err := querySQLiteAttachAttempt(ctx, tx, request.Identity.JTIHash)
+	if err != nil {
+		return store.AttachAttemptCommit{}, fmt.Errorf("read attach attempt: %w", err)
+	}
+	if changed == 1 {
+		if err := tx.Commit(); err != nil {
+			return store.AttachAttemptCommit{}, fmt.Errorf("commit attach attempt: %w", err)
+		}
+		return store.AttachAttemptCommit{Attempt: current}, nil
+	}
+	if !sameSQLiteAttachAttempt(current, request) {
+		return store.AttachAttemptCommit{}, errors.New("attach attempt is immutable")
+	}
+	if err := tx.Commit(); err != nil {
+		return store.AttachAttemptCommit{}, fmt.Errorf("commit duplicate attach attempt: %w", err)
+	}
+	return store.AttachAttemptCommit{Attempt: current, Duplicate: true}, nil
+}
+
+func (s *Store) AttachAttempt(ctx context.Context, jtiHash [32]byte) (store.AttachAttempt, error) {
+	if s == nil || s.db == nil {
+		return store.AttachAttempt{}, errors.New("sqlite event store is nil")
+	}
+	if jtiHash == ([32]byte{}) {
+		return store.AttachAttempt{}, errors.New("attach attempt JTI hash is required")
+	}
+	return querySQLiteAttachAttempt(ctx, s.db, jtiHash)
+}
+
+func querySQLiteAttachAttempt(ctx context.Context, executor sqliteConnectionExecutor, jtiHash [32]byte) (store.AttachAttempt, error) {
+	var rawJTI, rawDigest []byte
+	var identity store.AttachAttemptIdentity
+	var fingerprint store.AttachAttemptFingerprint
+	var expiresNS, createdMS int64
+	var outcome string
+	var issued sql.NullInt64
+	err := executor.QueryRowContext(ctx, `
+SELECT attempt_jti_hash, attach_id, bootstrap_session_id, target_session_id, provider,
+ fingerprint_domain, fingerprint_version, fingerprint_digest, fingerprint_key_version,
+ expires_at_ns, admission_outcome, issued_credential_generation, created_at_ms
+FROM session_attach_attempts WHERE attempt_jti_hash = ?
+`, jtiHash[:]).Scan(&rawJTI, &identity.AttachID, &identity.BootstrapSessionID, &identity.TargetSessionID,
+		&identity.Provider, &fingerprint.Domain, &fingerprint.Version, &rawDigest, &fingerprint.KeyVersion,
+		&expiresNS, &outcome, &issued, &createdMS)
+	if err != nil {
+		return store.AttachAttempt{}, err
+	}
+	if len(rawJTI) != len(jtiHash) || !bytes.Equal(rawJTI, jtiHash[:]) || len(rawDigest) != len(fingerprint.Digest) ||
+		createdMS < 1 || expiresNS <= createdMS*int64(time.Millisecond) || identity.JTIHash != ([32]byte{}) {
+		return store.AttachAttempt{}, errors.New("attach attempt row is invalid")
+	}
+	copy(identity.JTIHash[:], rawJTI)
+	copy(fingerprint.Digest[:], rawDigest)
+	attempt := store.AttachAttempt{Identity: identity, Fingerprint: fingerprint, ExpiresAt: time.Unix(0, expiresNS), Outcome: store.AttachAttemptOutcome(outcome), IssuedCredentialGeneration: nullableAttachPointer(issued)}
+	if !validStoredSQLiteAttachAttempt(attempt) {
+		return store.AttachAttempt{}, errors.New("attach attempt row is invalid")
+	}
+	return attempt, nil
+}
+
+func validateSQLiteAttachAttempt(request store.AttachAttemptRequest, now time.Time) error {
+	identity, fingerprint := request.Identity, request.Fingerprint
+	if identity.JTIHash == ([32]byte{}) || !validConnectionID(identity.AttachID) || !validConnectionID(identity.BootstrapSessionID) ||
+		!validConnectionID(identity.TargetSessionID) || identity.BootstrapSessionID == identity.TargetSessionID || len(identity.Provider) == 0 || len(identity.Provider) > 128 ||
+		fingerprint.Domain != "agentwharf.attach-request.v1" || fingerprint.Version != 1 || fingerprint.Digest == ([32]byte{}) ||
+		fingerprint.KeyVersion < 1 || fingerprint.KeyVersion > int64(^uint32(0)>>1) || request.ExpiresAt.IsZero() || !request.ExpiresAt.After(now) || request.ExpiresAt.After(now.Add(maxAttachAttemptTTL)) {
+		return errors.New("invalid attach attempt")
+	}
+	if request.Outcome == store.AttachAttemptAccepted && request.IssuedCredentialGeneration != nil && *request.IssuedCredentialGeneration > 0 {
+		return nil
+	}
+	if request.Outcome == store.AttachAttemptRejected && request.IssuedCredentialGeneration == nil {
+		return nil
+	}
+	return errors.New("invalid attach attempt outcome")
+}
+
+func validStoredSQLiteAttachAttempt(attempt store.AttachAttempt) bool {
+	if attempt.Identity.JTIHash == ([32]byte{}) || !validConnectionID(attempt.Identity.AttachID) || !validConnectionID(attempt.Identity.BootstrapSessionID) ||
+		!validConnectionID(attempt.Identity.TargetSessionID) || attempt.Identity.BootstrapSessionID == attempt.Identity.TargetSessionID || len(attempt.Identity.Provider) == 0 || len(attempt.Identity.Provider) > 128 ||
+		attempt.Fingerprint.Domain != "agentwharf.attach-request.v1" || attempt.Fingerprint.Version != 1 || attempt.Fingerprint.Digest == ([32]byte{}) || attempt.Fingerprint.KeyVersion < 1 || attempt.Fingerprint.KeyVersion > int64(^uint32(0)>>1) ||
+		attempt.ExpiresAt.IsZero() || attempt.ExpiresAt.UnixNano() < 1 {
+		return false
+	}
+	return (attempt.Outcome == store.AttachAttemptAccepted && attempt.IssuedCredentialGeneration != nil && *attempt.IssuedCredentialGeneration > 0) ||
+		(attempt.Outcome == store.AttachAttemptRejected && attempt.IssuedCredentialGeneration == nil)
+}
+
+func nullableAttachGeneration(value *int64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func nullableAttachPointer(value sql.NullInt64) *int64 {
+	if !value.Valid {
+		return nil
+	}
+	copy := value.Int64
+	return &copy
+}
+
+func sameSQLiteAttachAttempt(current store.AttachAttempt, request store.AttachAttemptRequest) bool {
+	return current.Identity == request.Identity && current.Fingerprint == request.Fingerprint && current.ExpiresAt.Equal(request.ExpiresAt) &&
+		current.Outcome == request.Outcome && ((current.IssuedCredentialGeneration == nil && request.IssuedCredentialGeneration == nil) ||
+		(current.IssuedCredentialGeneration != nil && request.IssuedCredentialGeneration != nil && *current.IssuedCredentialGeneration == *request.IssuedCredentialGeneration))
 }
 
 type sqliteConnectionExecutor interface {
@@ -1388,6 +1532,28 @@ CREATE TABLE IF NOT EXISTS session_event_proposals (
     UNIQUE (session_id, event_seq),
     FOREIGN KEY (session_id, event_seq) REFERENCES session_events(session_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS session_attach_attempts (
+    attempt_jti_hash BLOB PRIMARY KEY CHECK (length(attempt_jti_hash) = 32),
+    attach_id TEXT NOT NULL CHECK (length(attach_id) BETWEEN 1 AND 255),
+    bootstrap_session_id TEXT NOT NULL CHECK (length(bootstrap_session_id) BETWEEN 1 AND 255),
+    target_session_id TEXT NOT NULL CHECK (length(target_session_id) BETWEEN 1 AND 255),
+    provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
+    fingerprint_domain TEXT NOT NULL CHECK (fingerprint_domain = 'agentwharf.attach-request.v1'),
+    fingerprint_version INTEGER NOT NULL CHECK (fingerprint_version = 1),
+    fingerprint_digest BLOB NOT NULL CHECK (length(fingerprint_digest) = 32),
+    fingerprint_key_version INTEGER NOT NULL CHECK (fingerprint_key_version > 0),
+    expires_at_ns INTEGER NOT NULL CHECK (expires_at_ns > created_at_ms * 1000000),
+    admission_outcome TEXT NOT NULL CHECK (admission_outcome IN ('accepted', 'rejected')),
+    issued_credential_generation INTEGER,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    CHECK (bootstrap_session_id <> target_session_id),
+    CHECK ((admission_outcome = 'accepted' AND issued_credential_generation > 0) OR
+        (admission_outcome = 'rejected' AND issued_credential_generation IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS session_attach_attempts_key_expiry_idx
+ON session_attach_attempts (fingerprint_key_version, expires_at_ns);
 
 CREATE TABLE IF NOT EXISTS session_attachments (
     attach_id TEXT PRIMARY KEY CHECK (length(attach_id) BETWEEN 1 AND 255),

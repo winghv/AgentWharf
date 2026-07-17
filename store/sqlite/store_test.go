@@ -122,6 +122,57 @@ func TestConnectionStoreContract(t *testing.T) {
 	})
 }
 
+func TestAttachAttemptStoreContract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	storetest.AttachAttemptContract(t, storetest.AttachAttemptHarness{
+		Open: func(t *testing.T) store.AttachAttemptStore {
+			t.Helper()
+			return openStore(t, path)
+		},
+		Reopen: func(t *testing.T, current store.AttachAttemptStore) store.AttachAttemptStore {
+			t.Helper()
+			if err := current.(*sqlite.Store).Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			return openStore(t, path)
+		},
+	})
+}
+
+func TestAttachAttemptRollsBackAndRejectsCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attempts := openStore(t, path)
+	request := store.AttachAttemptRequest{
+		Identity:    store.AttachAttemptIdentity{JTIHash: [32]byte{9}, AttachID: "att_rollback", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code"},
+		Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{8}, KeyVersion: 1},
+		ExpiresAt:   time.Now().Add(time.Minute), Outcome: store.AttachAttemptAccepted,
+	}
+	generation := int64(1)
+	request.IssuedCredentialGeneration = &generation
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(context.Background(), `CREATE TRIGGER fail_attach_attempt BEFORE INSERT ON session_attach_attempts BEGIN SELECT RAISE(ABORT, 'attach attempt failpoint'); END`); err != nil {
+		t.Fatalf("create attach attempt failpoint: %v", err)
+	}
+	if _, err := attempts.CommitAttachAttempt(context.Background(), request); err == nil {
+		t.Fatal("CommitAttachAttempt() survived failpoint")
+	}
+	if _, err := attempts.AttachAttempt(context.Background(), request.Identity.JTIHash); err == nil {
+		t.Fatal("rollback left an attach attempt")
+	}
+	if _, err := db.ExecContext(context.Background(), `DROP TRIGGER fail_attach_attempt`); err != nil {
+		t.Fatalf("drop attach attempt failpoint: %v", err)
+	}
+	if _, err := attempts.CommitAttachAttempt(context.Background(), request); err != nil {
+		t.Fatalf("CommitAttachAttempt() error = %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `PRAGMA ignore_check_constraints = ON; UPDATE session_attach_attempts SET fingerprint_digest = zeroblob(31)`); err != nil {
+		t.Fatalf("corrupt attach attempt row: %v", err)
+	}
+	if _, err := attempts.AttachAttempt(context.Background(), request.Identity.JTIHash); err == nil {
+		t.Fatal("AttachAttempt() accepted corrupt row")
+	}
+}
+
 func TestConnectionPreHelloLifecycleAndRollback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
