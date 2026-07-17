@@ -125,7 +125,7 @@ type webSocketHandler struct {
 
 type adapterConnection struct {
 	conn      *websocket.Conn
-	writeMu   sync.Mutex
+	writeGate contextWriteGate
 	effectMu  sync.Mutex
 	sessionID string
 	handler   *webSocketHandler
@@ -486,7 +486,7 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *websocket.
 	if err != nil {
 		return nil, err
 	}
-	adapter := &adapterConnection{conn: conn, sessionID: accepted.SessionID, handler: h, admission: admission}
+	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, handler: h, admission: admission}
 	if h.events != nil {
 		adapter.events = newAdapterEventBatcher(adapterEventBatcherConfig{
 			Store:     fencedAdapterEventStore{handler: h, adapter: adapter},
@@ -540,10 +540,13 @@ func (h *webSocketHandler) unregisterAdapter(adapter *adapterConnection) {
 }
 
 func (a *adapterConnection) writeFrame(ctx context.Context, frame protocol.Frame) error {
-	a.writeMu.Lock()
-	defer a.writeMu.Unlock()
 	writeCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
 	defer cancel()
+	release, err := a.writeGate.lock(writeCtx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	return writeProtocolFrame(writeCtx, a.conn, frame)
 }
 
@@ -559,22 +562,22 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 	}
 	if ev == nil || ev.Type == "" || ev.SessionID == "" {
 		err := errors.New("event type and session_id are required")
-		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 		return err
 	}
 	if !protocol.PeerEventTypeAllowed(ev.Type) {
 		err := fmt.Errorf("event type %q is reserved for the trusted publisher", ev.Type)
-		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 		return err
 	}
 	if ev.SessionID != accepted.SessionID {
 		err := fmt.Errorf("adapter is not authorized for session %s", ev.SessionID)
-		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "unauthorized", Message: err.Error()})
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "unauthorized", Message: err.Error()})
 		return err
 	}
 	if ev.Seq != nil {
 		err := errors.New("adapter events must not include seq")
-		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 		return err
 	}
 
@@ -595,12 +598,12 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 	}
 	if h.events == nil {
 		err := errors.New("event store is not configured")
-		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
 		return err
 	}
 	if adapter.events == nil {
 		err := errors.New("adapter event batcher is not configured")
-		_ = adapter.writeFrame(ctx, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
 		return err
 	}
 	return adapter.events.Enqueue(ctx, out, store.PendingEvent{
@@ -1041,7 +1044,7 @@ func isEphemeralEvent(eventType string) bool {
 type clientConnection struct {
 	conn            *websocket.Conn
 	protocolVersion int
-	writeMu         sync.Mutex
+	writeGate       contextWriteGate
 
 	mu            sync.Mutex
 	subscriptions map[string]*subscriptionState
@@ -1057,6 +1060,7 @@ func newClientConnection(conn *websocket.Conn, protocolVersion int, subscription
 	peer := &clientConnection{
 		conn:            conn,
 		protocolVersion: protocolVersion,
+		writeGate:       newContextWriteGate(),
 		subscriptions:   make(map[string]*subscriptionState, len(subscriptions)),
 	}
 	for _, sub := range subscriptions {
@@ -1069,9 +1073,29 @@ func newClientConnection(conn *websocket.Conn, protocolVersion int, subscription
 }
 
 func (c *clientConnection) writeFrame(ctx context.Context, frame protocol.Frame) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	release, err := c.writeGate.lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	return writeProtocolFrame(ctx, c.conn, frame)
+}
+
+type contextWriteGate chan struct{}
+
+func newContextWriteGate() contextWriteGate {
+	gate := make(contextWriteGate, 1)
+	gate <- struct{}{}
+	return gate
+}
+
+func (g contextWriteGate) lock(ctx context.Context) (func(), error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-g:
+		return func() { g <- struct{}{} }, nil
+	}
 }
 
 func (c *clientConnection) writeReplayEvent(ctx context.Context, ev protocol.Event) error {
