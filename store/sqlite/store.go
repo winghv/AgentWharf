@@ -547,6 +547,16 @@ func (s *Store) CommitAttachAttempt(ctx context.Context, request store.AttachAtt
 	if err := validateSQLiteAttachAttempt(request, now); err != nil {
 		return store.AttachAttemptCommit{}, err
 	}
+	if err := cleanupExpiredSQLiteAttachAttempts(ctx, tx); err != nil {
+		return store.AttachAttemptCommit{}, err
+	}
+	nowMS, err = sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.AttachAttemptCommit{}, fmt.Errorf("refresh attach attempt Store clock: %w", err)
+	}
+	if err := validateSQLiteAttachAttempt(request, time.UnixMilli(nowMS)); err != nil {
+		return store.AttachAttemptCommit{}, err
+	}
 	result, err := tx.ExecContext(ctx, `
 INSERT OR IGNORE INTO session_attach_attempts
 (attempt_jti_hash, attach_id, bootstrap_session_id, target_session_id, provider,
@@ -590,7 +600,42 @@ func (s *Store) AttachAttempt(ctx context.Context, jtiHash [32]byte) (store.Atta
 	if jtiHash == ([32]byte{}) {
 		return store.AttachAttempt{}, errors.New("attach attempt JTI hash is required")
 	}
-	return querySQLiteAttachAttempt(ctx, s.db, jtiHash)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.AttachAttempt{}, fmt.Errorf("begin attach attempt read transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := cleanupExpiredSQLiteAttachAttempts(ctx, tx); err != nil {
+		return store.AttachAttempt{}, err
+	}
+	attempt, err := querySQLiteAttachAttempt(ctx, tx, jtiHash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if commitErr := tx.Commit(); commitErr != nil {
+				return store.AttachAttempt{}, fmt.Errorf("commit expired attach attempt cleanup: %w", commitErr)
+			}
+		}
+		return store.AttachAttempt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.AttachAttempt{}, fmt.Errorf("commit attach attempt read transaction: %w", err)
+	}
+	return attempt, nil
+}
+
+func cleanupExpiredSQLiteAttachAttempts(ctx context.Context, executor sqliteConnectionExecutor) error {
+	nowMS, err := sqliteNowMillis(ctx, executor)
+	if err != nil {
+		return fmt.Errorf("read attach attempt cleanup Store clock: %w", err)
+	}
+	_, err = executor.ExecContext(ctx, `
+DELETE FROM session_attach_attempts
+WHERE expires_at_ns <= ?
+`, nowMS*int64(time.Millisecond))
+	if err != nil {
+		return fmt.Errorf("cleanup expired attach attempts: %w", err)
+	}
+	return nil
 }
 
 func querySQLiteAttachAttempt(ctx context.Context, executor sqliteConnectionExecutor, jtiHash [32]byte) (store.AttachAttempt, error) {

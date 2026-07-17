@@ -173,6 +173,69 @@ func TestAttachAttemptRollsBackAndRejectsCorruption(t *testing.T) {
 	}
 }
 
+func TestAttachAttemptRechecksExpiryAfterWriterWait(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attempts := openStore(t, path)
+	db := openRawSQLite(t, path)
+	lock, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open writer lock: %v", err)
+	}
+	t.Cleanup(func() { _ = lock.Close() })
+	if _, err := lock.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("begin writer lock: %v", err)
+	}
+	request := store.AttachAttemptRequest{
+		Identity:    store.AttachAttemptIdentity{JTIHash: [32]byte{10}, AttachID: "att_expiry_wait", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code"},
+		Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{9}, KeyVersion: 1},
+		ExpiresAt:   time.Now().Add(50 * time.Millisecond), Outcome: store.AttachAttemptAccepted,
+	}
+	generation := int64(1)
+	request.IssuedCredentialGeneration = &generation
+	result := make(chan error, 1)
+	go func() {
+		_, err := attempts.CommitAttachAttempt(context.Background(), request)
+		result <- err
+	}()
+	time.Sleep(75 * time.Millisecond)
+	if _, err := lock.ExecContext(context.Background(), `COMMIT`); err != nil {
+		t.Fatalf("release writer lock: %v", err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("expired writer-wait attach attempt committed")
+	}
+	if _, err := attempts.AttachAttempt(context.Background(), request.Identity.JTIHash); err == nil {
+		t.Fatal("expired writer-wait attach attempt persisted")
+	}
+}
+
+func TestAttachAttemptReadCleansExpiredRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attempts := openStore(t, path)
+	request := store.AttachAttemptRequest{
+		Identity:    store.AttachAttemptIdentity{JTIHash: [32]byte{11}, AttachID: "att_expiry_cleanup", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code"},
+		Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{10}, KeyVersion: 1},
+		ExpiresAt:   time.Now().Add(50 * time.Millisecond), Outcome: store.AttachAttemptAccepted,
+	}
+	generation := int64(1)
+	request.IssuedCredentialGeneration = &generation
+	if _, err := attempts.CommitAttachAttempt(context.Background(), request); err != nil {
+		t.Fatalf("CommitAttachAttempt() error = %v", err)
+	}
+	time.Sleep(75 * time.Millisecond)
+	if _, err := attempts.AttachAttempt(context.Background(), request.Identity.JTIHash); err == nil {
+		t.Fatal("AttachAttempt() returned expired row")
+	}
+	db := openRawSQLite(t, path)
+	var rows int
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM session_attach_attempts WHERE attempt_jti_hash = ?`, request.Identity.JTIHash[:]).Scan(&rows); err != nil {
+		t.Fatalf("count expired row: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("expired row count = %d, want 0", rows)
+	}
+}
+
 func TestConnectionPreHelloLifecycleAndRollback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
