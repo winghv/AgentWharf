@@ -286,7 +286,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			}
 		case *protocol.Event:
 			if accepted.Role != protocol.RoleAdapter {
-				_ = writeProtocolError(ctx, conn, "unsupported_frame", "client event frames are not accepted", false)
+				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "client event frames are not accepted"})
 				continue
 			}
 			if err := h.handleAdapterEvent(ctx, adapter, accepted, typed); err != nil {
@@ -297,7 +297,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			}
 		case *protocol.Command:
 			if accepted.Role != protocol.RoleClient {
-				_ = writeProtocolError(ctx, conn, "unsupported_frame", "adapter command frames are not accepted", false)
+				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "adapter command frames are not accepted"})
 				continue
 			}
 			if err := h.handleClientCommand(ctx, conn, accepted, typed); err != nil {
@@ -305,11 +305,11 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 			}
 		case *protocol.CommandAck:
 			if accepted.Role != protocol.RoleAdapter {
-				_ = writeProtocolError(ctx, conn, "unsupported_frame", "client command ack frames are not accepted", false)
+				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "client command ack frames are not accepted"})
 			}
 			continue
 		default:
-			_ = writeProtocolError(ctx, conn, "unsupported_frame", fmt.Sprintf("unsupported frame %s", typed.FrameName()), false)
+			_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: fmt.Sprintf("unsupported frame %s", typed.FrameName())})
 		}
 	}
 }
@@ -317,21 +317,21 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, historyToken string, peer *clientConnection, adapter *adapterConnection, request *protocol.HistoryPageRequest) error {
 	history, ready := h.events.(store.HistoryStore)
 	if accepted.Role != protocol.RoleClient || accepted.ProtocolVersion != protocol.ProtocolVersionV2 || !ready {
-		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
+		return h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unsupported", Message: "history pagination is unavailable",
 		})
 	}
 	if request == nil || peer == nil || !subscribesTo(accepted.Subscribed, request.SessionID) ||
 		!accepted.allows(request.SessionID, auth.SessionAdmissionHistory) ||
 		!h.authorizeHistory(ctx, historyToken, accepted.Principal.Subject, request.SessionID) {
-		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
+		return h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
 		})
 	}
 	page, err := history.History(ctx, request.SessionID, request.BeforeSeq, request.Limit)
 	if err != nil || !validHistoryPage(page, request) ||
 		!h.authorizeHistory(ctx, historyToken, accepted.Principal.Subject, request.SessionID) {
-		return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
+		return h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
 		})
 	}
@@ -342,7 +342,7 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocke
 			Time: event.Time.UnixMilli(), Payload: clonePayload(event.Payload),
 		}
 	}
-	return writeConnectionFrame(ctx, conn, peer, adapter, &protocol.HistoryPageResponse{
+	return h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.HistoryPageResponse{
 		RequestID: request.RequestID, SessionID: request.SessionID, Events: events,
 		LatestSeq: page.LatestSeq, NextBeforeSeq: page.NextBeforeSeq, RetentionState: page.RetentionState,
 	})
@@ -409,12 +409,12 @@ func hasExactHistoryAccess(principal auth.Principal, sessionID string) bool {
 	return false
 }
 
-func writeConnectionFrame(ctx context.Context, conn *websocket.Conn, peer *clientConnection, adapter *adapterConnection, frame protocol.Frame) error {
+func (h *webSocketHandler) writeConnectionFrame(ctx context.Context, conn *websocket.Conn, peer *clientConnection, adapter *adapterConnection, frame protocol.Frame) error {
 	if peer != nil {
 		return peer.writeFrame(ctx, frame)
 	}
 	if adapter != nil {
-		return adapter.writeFrame(ctx, frame)
+		return h.writeAdapterFrame(ctx, adapter, frame)
 	}
 	return writeProtocolFrame(ctx, conn, frame)
 }
