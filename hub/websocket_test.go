@@ -1299,6 +1299,39 @@ func TestAdapterDispatchRechecksBeforeDurableEffect(t *testing.T) {
 	}
 }
 
+func TestAdapterActivityRechecksAuthorityInsideTransaction(t *testing.T) {
+	events := newDispatchFenceStore()
+	observer := &recordingAdapterActivityObserver{}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore, cfg.AdapterActivityObserver = events, observer
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	_ = waitAdapterActivityCount(t, observer, 1)
+
+	started, release := events.blockNextEffect()
+	writeFrame(t, adapter, &protocol.Ping{Nonce: "activity-fence"})
+	if pong := readFrame(t, adapter).(*protocol.Pong); pong.Nonce != "activity-fence" {
+		t.Fatalf("pong = %+v", pong)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("activity effect did not enter authority transaction")
+	}
+	events.mutateConnection(func(connection *store.AdapterConnection) {
+		now := time.Now()
+		connection.RevokedAt = &now
+	})
+	close(release)
+	time.Sleep(100 * time.Millisecond)
+	if got := observer.activities(); len(got) != 1 {
+		t.Fatalf("stale adapter activity reached observer: %+v", got)
+	}
+}
+
 func TestAdapterDispatchRejectsOldCredentialGeneration(t *testing.T) {
 	events := newDispatchFenceStore()
 	events.mutateConnection(func(connection *store.AdapterConnection) {
@@ -1826,6 +1859,10 @@ func (s *dispatchFenceStore) ValidateAdapterAdmission(_ context.Context, session
 		return store.AdapterConnection{}, errors.New("adapter authority lost")
 	}
 	return connection, nil
+}
+
+func (s *dispatchFenceStore) ValidateAdapterEffectAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
+	return s.ValidateAdapterAdmission(ctx, sessionID, admission)
 }
 
 func (s *dispatchFenceStore) WithAdapterConnectionTransaction(ctx context.Context, fn func(store.AdapterConnectionStore) error) error {
