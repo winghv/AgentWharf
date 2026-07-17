@@ -47,6 +47,20 @@ func TestWebSocketServerAcceptsHelloAndPing(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerRejectsAdapterWithoutDispatchStore(t *testing.T) {
+	t.Parallel()
+
+	server := newWebSocketTestServer(t, testHandshake())
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	if frame, err := readFrameWithin(adapter, time.Second); err != nil {
+		t.Fatalf("read adapter rejection: %v", err)
+	} else if _, ok := frame.(*protocol.HelloAck); ok {
+		t.Fatalf("adapter without dispatch store received hello.ack: %+v", frame)
+	}
+}
+
 func TestWebSocketServerNegotiatesV2WithoutHistoryCapability(t *testing.T) {
 	t.Parallel()
 
