@@ -26,6 +26,182 @@ func TestEventStoreContract(t *testing.T) {
 	})
 }
 
+func TestAttentionSummaryStoreContract(t *testing.T) {
+	var _ store.AttentionSummaryStore = (*sqlite.Store)(nil)
+}
+
+func TestAttentionSnapshotPersistsEventsLedgerAndTerminalFence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attention := openStore(t, path)
+	ctx := context.Background()
+	if _, err := attention.Append(ctx, "ses_attention", []store.PendingEvent{
+		{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"starting"}`)},
+		{Type: "session.state", Time: testTime(2), Payload: []byte(`{"state":"working"}`)},
+		{Type: "session.message", Time: testTime(3), Payload: []byte(`{"role":"agent"}`)},
+	}); err != nil {
+		t.Fatalf("append attention events: %v", err)
+	}
+	summary, err := attention.AttentionSnapshot(ctx, []string{"ses_attention", "ses_missing"})
+	if err != nil || len(summary) != 1 || summary[0].LatestSeq != 3 || summary[0].State != "busy" ||
+		summary[0].LatestChangeSeq == nil || *summary[0].LatestChangeSeq != 2 || summary[0].LastDurableEventAt == nil ||
+		summary[0].StateOfProjection != store.AttentionProjectionComplete {
+		t.Fatalf("event attention snapshot = %+v, %v", summary, err)
+	}
+	if err := attention.Close(); err != nil {
+		t.Fatalf("close attention store: %v", err)
+	}
+	attention = openStore(t, path)
+	reopened, err := attention.AttentionSnapshot(ctx, []string{"ses_attention"})
+	if err != nil || len(reopened) != 1 || !reflect.DeepEqual(reopened[0], summary[0]) {
+		t.Fatalf("reopened attention snapshot = %+v, %v; want %+v", reopened, err, summary)
+	}
+}
+
+func TestAttentionSnapshotProjectsClientLedgerAttachmentAndTerminal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attention := openStore(t, path)
+	seedCommandAuthorities(t, path)
+	ctx := context.Background()
+	request := store.PendingCommandRequest{CommandID: "cmd_attention", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := attention.CommitPendingCommand(ctx, "ses_command_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, store.PendingEvent{Type: "session.message", Time: testTime(1), Payload: []byte(`{"role":"user"}`)}, request); err != nil {
+		t.Fatalf("commit attention command: %v", err)
+	}
+	summary, err := attention.AttentionSnapshot(ctx, []string{"ses_command_1"})
+	if err != nil || len(summary) != 1 || summary[0].LatestSeq != 1 || summary[0].SummaryVersion != 1 || summary[0].LastClientCommandAt == nil || summary[0].Blocker != nil {
+		t.Fatalf("command attention snapshot = %+v, %v", summary, err)
+	}
+	attachment := store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_attention", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_command_1", TargetCredentialLineageRef: "lineage_attention"}, ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := attention.CreateAttachment(ctx, attachment); err != nil {
+		t.Fatalf("create attention attachment: %v", err)
+	}
+	summary, err = attention.AttentionSnapshot(ctx, []string{"ses_command_1"})
+	if err != nil || len(summary) != 1 || summary[0].SummaryVersion != 2 || summary[0].Blocker == nil || summary[0].Blocker.Kind != store.AttentionBlockerQueued || summary[0].LastClientCommandAt == nil {
+		t.Fatalf("attachment attention snapshot = %+v, %v", summary, err)
+	}
+	if _, err := attention.Append(ctx, "ses_command_1", []store.PendingEvent{{Type: "session.state", Time: testTime(2), Payload: []byte(`{"state":"ended"}`)}}); err != nil {
+		t.Fatalf("append terminal attention event: %v", err)
+	}
+	summary, err = attention.AttentionSnapshot(ctx, []string{"ses_command_1"})
+	if err != nil || len(summary) != 1 || summary[0].TerminalOutcome == nil || *summary[0].TerminalOutcome != "ended" {
+		t.Fatalf("terminal attention snapshot = %+v, %v", summary, err)
+	}
+	connection, err := attention.AdapterConnection(ctx, "ses_command_1")
+	if err != nil || connection.TerminalAt == nil || connection.RevokedAt == nil {
+		t.Fatalf("terminal attention fence = %+v, %v", connection, err)
+	}
+}
+
+func TestAttentionSnapshotProjectsUnknownCommandOutcome(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attention := openStore(t, path)
+	seedCommandAuthorities(t, path)
+	ctx := context.Background()
+	authority := store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+	request := store.PendingCommandRequest{CommandID: "cmd_attention_unknown", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := attention.CommitPendingCommand(ctx, "ses_command_1", authority, store.PendingEvent{Type: "session.message", Time: testTime(1), Payload: []byte(`{"role":"user"}`)}, request); err != nil {
+		t.Fatalf("commit attention command: %v", err)
+	}
+	if _, err := attention.ClaimPendingCommand(ctx, "ses_command_1", authority, request.CommandID); err != nil {
+		t.Fatalf("claim attention command: %v", err)
+	}
+	if _, err := attention.ResolvePendingCommand(ctx, "ses_command_1", authority, request.CommandID, store.PendingCommandOutcomeUnknown); err != nil {
+		t.Fatalf("resolve unknown attention command: %v", err)
+	}
+	summary, err := attention.AttentionSnapshot(ctx, []string{"ses_command_1"})
+	if err != nil || len(summary) != 1 || summary[0].SummaryVersion != 2 || summary[0].Blocker == nil || summary[0].Blocker.Kind != store.AttentionBlockerOutcomeUnknown || summary[0].Blocker.Operation == nil || *summary[0].Blocker.Operation != "command" {
+		t.Fatalf("unknown command attention snapshot = %+v, %v", summary, err)
+	}
+}
+
+func TestAttentionSnapshotProjectsProposedTerminal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attention := openStore(t, path)
+	seedProposalAuthorities(t, path)
+	ctx := context.Background()
+	receipt, err := attention.CommitProposedEvent(ctx, "ses_proposal_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, store.ProposedEventRequest{
+		ProposalID: "proposal_attention_terminal",
+		Event:      store.PendingEvent{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ended"}`)},
+	})
+	if err != nil || receipt.Seq != 1 {
+		t.Fatalf("commit terminal proposal = %+v, %v", receipt, err)
+	}
+	summary, err := attention.AttentionSnapshot(ctx, []string{"ses_proposal_1"})
+	if err != nil || len(summary) != 1 || summary[0].TerminalOutcome == nil || *summary[0].TerminalOutcome != "ended" || summary[0].StateOfProjection != store.AttentionProjectionComplete {
+		t.Fatalf("terminal proposal attention snapshot = %+v, %v", summary, err)
+	}
+	connection, err := attention.AdapterConnection(ctx, "ses_proposal_1")
+	if err != nil || connection.TerminalAt == nil || connection.RevokedAt == nil {
+		t.Fatalf("terminal proposal fence = %+v, %v", connection, err)
+	}
+}
+
+func TestAttentionSnapshotProjectsPermissionAndValidatesInput(t *testing.T) {
+	attention := openStore(t, filepath.Join(t.TempDir(), "events.db"))
+	ctx := context.Background()
+	for _, sessionIDs := range [][]string{nil, {"ses_attention", "ses_attention"}} {
+		if _, err := attention.AttentionSnapshot(ctx, sessionIDs); err == nil {
+			t.Fatalf("invalid attention snapshot %v succeeded", sessionIDs)
+		}
+	}
+	if _, err := attention.Append(ctx, "ses_attention_permission", []store.PendingEvent{
+		{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)},
+		{Type: "permission.request", Time: testTime(2), Payload: []byte(`{"request_id":"permission_1"}`)},
+	}); err != nil {
+		t.Fatalf("append attention permission request: %v", err)
+	}
+	summary, err := attention.AttentionSnapshot(ctx, []string{"ses_attention_permission"})
+	if err != nil || len(summary) != 1 || summary[0].Permission == nil || summary[0].Permission.ID != "permission_1" || summary[0].Permission.Status != store.AttentionPermissionPending {
+		t.Fatalf("permission request attention snapshot = %+v, %v", summary, err)
+	}
+	if _, err := attention.Append(ctx, "ses_attention_permission", []store.PendingEvent{{Type: "permission.decision", Time: testTime(3), Payload: []byte(`{"request_id":"permission_1","decision":"approve"}`)}}); err != nil {
+		t.Fatalf("append attention permission decision: %v", err)
+	}
+	summary, err = attention.AttentionSnapshot(ctx, []string{"ses_attention_permission"})
+	if err != nil || len(summary) != 1 || summary[0].Permission != nil {
+		t.Fatalf("permission decision attention snapshot = %+v, %v", summary, err)
+	}
+}
+
+func TestAttentionSnapshotConcurrentAppend(t *testing.T) {
+	attention := openStore(t, filepath.Join(t.TempDir(), "events.db"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const events = 24
+	appendDone := make(chan error, 1)
+	go func() {
+		for index := 0; index < events; index++ {
+			state := "ready"
+			if index%2 == 1 {
+				state = "working"
+			}
+			if _, err := attention.Append(ctx, "ses_attention_concurrent", []store.PendingEvent{{Type: "session.state", Time: testTime(int64(index + 1)), Payload: []byte(`{"state":"` + state + `"}`)}}); err != nil {
+				appendDone <- err
+				return
+			}
+		}
+		appendDone <- nil
+	}()
+	for {
+		select {
+		case err := <-appendDone:
+			if err != nil {
+				t.Fatalf("concurrent attention append: %v", err)
+			}
+			goto complete
+		default:
+			if _, err := attention.AttentionSnapshot(ctx, []string{"ses_attention_concurrent"}); err != nil {
+				t.Fatalf("concurrent attention snapshot: %v", err)
+			}
+		}
+	}
+
+complete:
+	summary, err := attention.AttentionSnapshot(context.Background(), []string{"ses_attention_concurrent"})
+	if err != nil || len(summary) != 1 || summary[0].LatestSeq != events || summary[0].State != "busy" || summary[0].StateOfProjection != store.AttentionProjectionComplete {
+		t.Fatalf("final concurrent attention snapshot = %+v, %v", summary, err)
+	}
+}
+
 func TestHistoryStoreContract(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	storetest.HistoryContract(t, storetest.HistoryHarness{

@@ -115,6 +115,19 @@ VALUES (?, ?, ?, ?, ?, ?)
 		if _, err := stmt.ExecContext(ctx, sessionID, seq, ev.Type, []byte(ev.Payload), ev.Time.UnixMilli(), createdAt); err != nil {
 			return 0, fmt.Errorf("append event seq %d: %w", seq, err)
 		}
+		nowMS, err := sqliteNowMillis(ctx, tx)
+		if err != nil {
+			return 0, err
+		}
+		terminal, err := projectSQLiteAttentionEvent(ctx, tx, sessionID, seq, ev, nowMS)
+		if err != nil {
+			return 0, fmt.Errorf("project attention event seq %d: %w", seq, err)
+		}
+		if terminal {
+			if _, err := tx.ExecContext(ctx, `UPDATE session_adapter_connections SET revoked_at_ms = ?, terminal_at_ms = ?, updated_at_ms = ? WHERE session_id = ? AND terminal_at_ms IS NULL`, nowMS, nowMS, nowMS, sessionID); err != nil {
+				return 0, fmt.Errorf("fence terminal attention event: %w", err)
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -123,6 +136,155 @@ VALUES (?, ?, ?, ?, ?, ?)
 	return firstSeq, nil
 }
 
+func (s *Store) AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]store.SessionAttentionSummary, error) {
+	if len(sessionIDs) == 0 || len(sessionIDs) > 100 {
+		return nil, errors.New("attention snapshot session IDs are out of range")
+	}
+	seen := make(map[string]struct{}, len(sessionIDs))
+	args := make([]any, len(sessionIDs))
+	for index, sessionID := range sessionIDs {
+		if !validConnectionID(sessionID) {
+			return nil, errors.New("attention snapshot session ID is invalid")
+		}
+		if _, exists := seen[sessionID]; exists {
+			return nil, errors.New("attention snapshot session IDs must be unique")
+		}
+		seen[sessionID] = struct{}{}
+		args[index] = sessionID
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id IN (`+sqlitePlaceholders(len(args))+`) ORDER BY session_id ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("select attention snapshot: %w", err)
+	}
+	defer rows.Close()
+	summaries := make([]store.SessionAttentionSummary, 0, len(sessionIDs))
+	for rows.Next() {
+		summary, err := querySQLiteAttentionSummary(ctx, rows)
+		if err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate attention snapshot: %w", err)
+	}
+	return summaries, nil
+}
+
+type sqliteAttentionProjection struct {
+	state                *string
+	stateObserved        bool
+	permissionID         *string
+	permissionDecisionID *string
+	permissionChange     bool
+	terminalOutcome      *string
+	projectionIncomplete bool
+	terminal             bool
+}
+
+func projectSQLiteAttentionEvent(ctx context.Context, tx *sql.Tx, sessionID string, seq int64, event store.PendingEvent, nowMS int64) (bool, error) {
+	summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, sessionID))
+	created := false
+	if errors.Is(err, sql.ErrNoRows) {
+		summary = store.SessionAttentionSummary{SessionID: sessionID, State: "starting", StateOfProjection: store.AttentionProjectionIncomplete}
+		created = true
+	} else if err != nil {
+		return false, fmt.Errorf("load attention summary: %w", err)
+	}
+	projection := sqliteAttentionEventProjection(event)
+	if summary.LatestSeq > 0 && seq != summary.LatestSeq+1 {
+		projection.projectionIncomplete = true
+	}
+	summary.LatestSeq = seq
+	if projection.state != nil {
+		summary.State = *projection.state
+		change := seq
+		summary.LatestChangeSeq = &change
+	}
+	if projection.permissionChange {
+		if projection.permissionID != nil {
+			summary.Permission = &store.AttentionPermission{ID: *projection.permissionID, Status: store.AttentionPermissionPending}
+		} else if summary.Permission != nil && projection.permissionDecisionID != nil && summary.Permission.ID == *projection.permissionDecisionID {
+			summary.Permission = nil
+		}
+	}
+	if summary.TerminalOutcome == nil && projection.terminalOutcome != nil {
+		outcome := *projection.terminalOutcome
+		summary.TerminalOutcome = &outcome
+	}
+	if summary.LatestSeq == 1 && (!projection.stateObserved || projection.state == nil) {
+		projection.projectionIncomplete = true
+	}
+	if (!created && summary.StateOfProjection == store.AttentionProjectionIncomplete) || projection.projectionIncomplete ||
+		(projection.stateObserved && projection.state == nil) {
+		summary.StateOfProjection = store.AttentionProjectionIncomplete
+	} else {
+		summary.StateOfProjection = store.AttentionProjectionComplete
+	}
+	durableAt := time.UnixMilli(nowMS)
+	summary.LastDurableEventAt = &durableAt
+	if err := upsertSQLiteAttentionSummary(ctx, tx, summary, nowMS); err != nil {
+		return false, err
+	}
+	return projection.terminal, nil
+}
+func sqliteAttentionEventProjection(event store.PendingEvent) sqliteAttentionProjection {
+	projection := sqliteAttentionProjection{}
+	if event.Type == "permission.request" {
+		var payload struct {
+			RequestID string `json:"request_id"`
+		}
+		if json.Unmarshal(event.Payload, &payload) != nil || !validConnectionID(payload.RequestID) {
+			projection.projectionIncomplete = true
+			return projection
+		}
+		projection.permissionID, projection.permissionChange = &payload.RequestID, true
+		return projection
+	}
+	if event.Type == "permission.decision" {
+		var payload struct {
+			RequestID string `json:"request_id"`
+			Decision  string `json:"decision"`
+		}
+		if json.Unmarshal(event.Payload, &payload) != nil || !validConnectionID(payload.RequestID) ||
+			(payload.Decision != "approve" && payload.Decision != "deny" && payload.Decision != "expired") {
+			projection.projectionIncomplete = true
+			return projection
+		}
+		projection.permissionDecisionID, projection.permissionChange = &payload.RequestID, true
+		return projection
+	}
+	if event.Type == "session.error" {
+		state, outcome := "error", "error"
+		return sqliteAttentionProjection{state: &state, stateObserved: true, terminalOutcome: &outcome, terminal: true}
+	}
+	if event.Type != "session.state" {
+		return projection
+	}
+	projection.stateObserved = true
+	var payload struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(event.Payload, &payload) != nil {
+		projection.projectionIncomplete = true
+		return projection
+	}
+	switch payload.State {
+	case "working":
+		state := "busy"
+		projection.state = &state
+	case "starting", "ready", "busy", "waiting_permission", "recovering", "ended", "error":
+		projection.state = &payload.State
+	default:
+		projection.projectionIncomplete = true
+		return projection
+	}
+	if *projection.state == "ended" || *projection.state == "error" {
+		outcome := *projection.state
+		projection.terminal, projection.terminalOutcome = true, &outcome
+	}
+	return projection
+}
 func (s *Store) Replay(ctx context.Context, sessionID string, afterSeq int64, fn func(store.Event) error) (err error) {
 	if fn == nil {
 		return errors.New("replay callback is nil")
@@ -296,6 +458,11 @@ VALUES (?, ?, ?, ?, ?, ?)
 `, sessionID, seq, event.Type, []byte(event.Payload), event.Time.UnixMilli(), nowMS); err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("append pending command event: %w", err)
 	}
+	if terminal, err := projectSQLiteAttentionEvent(ctx, tx, sessionID, seq, event, nowMS); err != nil {
+		return store.PendingCommandCommit{}, fmt.Errorf("project pending command attention event: %w", err)
+	} else if terminal {
+		return store.PendingCommandCommit{}, errors.New("pending command event must not be terminal")
+	}
 
 	nowMS, err = sqliteNowMillis(ctx, tx)
 	if err != nil {
@@ -313,6 +480,9 @@ INSERT INTO session_pending_commands (
 ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
 `, sessionID, request.CommandID, request.Type, seq, request.ExpiresAt.UnixNano(), nowMS, nowMS); err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("insert pending command: %w", err)
+	}
+	if err := upsertSQLiteAttentionLedger(ctx, tx, sessionID, nil, &nowMS); err != nil {
+		return store.PendingCommandCommit{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("commit pending command: %w", err)
@@ -414,6 +584,12 @@ WHERE session_id = ? AND cmd_id = ? AND status = 'received'
 	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 		return store.PendingCommand{}, errors.New("pending command resolution lost authority")
 	}
+	if status == store.PendingCommandOutcomeUnknown {
+		operation := "command"
+		if err := upsertSQLiteAttentionLedger(ctx, tx, sessionID, &store.AttentionBlocker{Kind: store.AttentionBlockerOutcomeUnknown, Operation: &operation}, nil); err != nil {
+			return store.PendingCommand{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return store.PendingCommand{}, fmt.Errorf("commit pending command resolution: %w", err)
 	}
@@ -469,6 +645,10 @@ VALUES (?, ?, ?, ?, ?, ?)
 `, sessionID, seq, event.Type, event.Payload, event.Time.UnixMilli(), nowMS); err != nil {
 		return store.ProposedEventReceipt{}, fmt.Errorf("append proposed event: %w", err)
 	}
+	terminal, err := projectSQLiteAttentionEvent(ctx, tx, sessionID, seq, event, nowMS)
+	if err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("project proposed attention event: %w", err)
+	}
 	nowMS, err = sqliteNowMillis(ctx, tx)
 	if err != nil {
 		return store.ProposedEventReceipt{}, err
@@ -484,6 +664,11 @@ WHERE session_id = ? AND connection_epoch = ? AND active_credential_generation =
 	}
 	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 		return store.ProposedEventReceipt{}, errors.New("proposed event lost authority")
+	}
+	if terminal {
+		if _, err := tx.ExecContext(ctx, `UPDATE session_adapter_connections SET revoked_at_ms = ?, terminal_at_ms = ?, updated_at_ms = ? WHERE session_id = ? AND terminal_at_ms IS NULL`, nowMS, nowMS, nowMS, sessionID); err != nil {
+			return store.ProposedEventReceipt{}, fmt.Errorf("fence terminal proposed event: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return store.ProposedEventReceipt{}, fmt.Errorf("commit proposed event: %w", err)
@@ -1415,6 +1600,9 @@ INSERT INTO session_attachments (
 	if err != nil {
 		return store.AttachmentCommit{}, fmt.Errorf("read created attachment: %w", err)
 	}
+	if err := upsertSQLiteAttentionLedger(ctx, tx, created.Identity.TargetSessionID, sqliteAttentionBlockerForAttachment(created, nil), nil); err != nil {
+		return store.AttachmentCommit{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return store.AttachmentCommit{}, fmt.Errorf("commit attachment create: %w", err)
 	}
@@ -1477,6 +1665,9 @@ WHERE attach_id = ? AND delivery_version = ?
 	updated, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, attachID))
 	if err != nil {
 		return store.AttachmentMutation{}, fmt.Errorf("read updated attachment: %w", err)
+	}
+	if err := upsertSQLiteAttentionLedger(ctx, tx, updated.Identity.TargetSessionID, sqliteAttentionBlockerForAttachment(updated, update.Blocker), nil); err != nil {
+		return store.AttachmentMutation{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return store.AttachmentMutation{}, fmt.Errorf("commit attachment update: %w", err)
@@ -1669,6 +1860,147 @@ func cloneAttachmentString(value *string) *string {
 	copy := *value
 	return &copy
 }
+func sqliteAttentionBlockerForAttachment(attachment store.Attachment, explicit *store.AttachmentBlocker) *store.AttentionBlocker {
+	if explicit != nil {
+		return &store.AttentionBlocker{Kind: string(explicit.Kind), Reason: cloneAttachmentString(explicit.Reason),
+			ExpiresAt: cloneAttachmentTime(explicit.ExpiresAt), BlockingSessionID: cloneAttachmentString(explicit.BlockingSessionID), Operation: cloneAttachmentString(explicit.Operation)}
+	}
+	if attachment.Status != store.AttachmentJoinPending {
+		return nil
+	}
+	reason := "join_pending"
+	return &store.AttentionBlocker{Kind: store.AttentionBlockerQueued, Reason: &reason, ExpiresAt: cloneAttachmentTime(attachment.ExpiresAt)}
+}
+
+const sqliteAttentionSummaryColumns = `
+session_id, latest_seq, state, permission_id, permission_status, terminal_outcome, latest_change_seq,
+blocker_kind, blocker_reason, blocker_expires_at_ns, blocking_session_id, blocker_operation,
+summary_version, last_durable_event_at_ms, last_client_command_at_ms, projection_state, created_at_ms, updated_at_ms`
+
+type sqliteAttentionSummaryRow interface{ Scan(...any) error }
+
+func querySQLiteAttentionSummary(_ context.Context, row sqliteAttentionSummaryRow) (store.SessionAttentionSummary, error) {
+	var summary store.SessionAttentionSummary
+	var permissionID, permissionStatus, terminalOutcome sql.NullString
+	var latestChangeSeq sql.NullInt64
+	var blockerKind, blockerReason, blockingSessionID, blockerOperation sql.NullString
+	var blockerExpiresAtNS, lastDurableAtMS, lastClientAtMS sql.NullInt64
+	var createdAtMS, updatedAtMS int64
+	if err := row.Scan(&summary.SessionID, &summary.LatestSeq, &summary.State, &permissionID, &permissionStatus, &terminalOutcome, &latestChangeSeq,
+		&blockerKind, &blockerReason, &blockerExpiresAtNS, &blockingSessionID, &blockerOperation,
+		&summary.SummaryVersion, &lastDurableAtMS, &lastClientAtMS, &summary.StateOfProjection, &createdAtMS, &updatedAtMS); err != nil {
+		return store.SessionAttentionSummary{}, err
+	}
+	if !validConnectionID(summary.SessionID) || summary.LatestSeq < 0 || summary.SummaryVersion < 0 ||
+		(summary.StateOfProjection != store.AttentionProjectionComplete && summary.StateOfProjection != store.AttentionProjectionIncomplete) ||
+		createdAtMS < 1 || updatedAtMS < createdAtMS {
+		return store.SessionAttentionSummary{}, errors.New("attention summary row is invalid")
+	}
+	if permissionID.Valid != permissionStatus.Valid || (permissionID.Valid && (permissionStatus.String != store.AttentionPermissionPending || !validConnectionID(permissionID.String))) {
+		return store.SessionAttentionSummary{}, errors.New("attention permission row is invalid")
+	}
+	if permissionID.Valid {
+		summary.Permission = &store.AttentionPermission{ID: permissionID.String, Status: permissionStatus.String}
+	}
+	summary.TerminalOutcome = nullStringPointer(terminalOutcome)
+	summary.LatestChangeSeq = nullInt64Pointer(latestChangeSeq)
+	if blockerKind.Valid {
+		summary.Blocker = &store.AttentionBlocker{Kind: blockerKind.String, Reason: nullStringPointer(blockerReason),
+			ExpiresAt: nullNanoTimePointer(blockerExpiresAtNS), BlockingSessionID: nullStringPointer(blockingSessionID), Operation: nullStringPointer(blockerOperation)}
+	} else if blockerReason.Valid || blockerExpiresAtNS.Valid || blockingSessionID.Valid || blockerOperation.Valid {
+		return store.SessionAttentionSummary{}, errors.New("attention blocker row is invalid")
+	}
+	summary.LastDurableEventAt = nullMilliTimePointer(lastDurableAtMS)
+	summary.LastClientCommandAt = nullMilliTimePointer(lastClientAtMS)
+	return summary, nil
+}
+func upsertSQLiteAttentionSummary(ctx context.Context, tx *sql.Tx, summary store.SessionAttentionSummary, nowMS int64) error {
+	if !validConnectionID(summary.SessionID) || summary.LatestSeq < 0 || summary.SummaryVersion < 0 ||
+		(summary.StateOfProjection != store.AttentionProjectionComplete && summary.StateOfProjection != store.AttentionProjectionIncomplete) {
+		return errors.New("invalid attention summary")
+	}
+	var permissionID, permissionStatus any
+	if summary.Permission != nil {
+		permissionID, permissionStatus = summary.Permission.ID, summary.Permission.Status
+	}
+	var blockerKind, blockerReason, blockerExpiry, blockingSession, blockerOperation any
+	if summary.Blocker != nil {
+		blockerKind, blockerReason, blockerExpiry = summary.Blocker.Kind, nullableString(summary.Blocker.Reason), nullableTimeNano(summary.Blocker.ExpiresAt)
+		blockingSession, blockerOperation = nullableString(summary.Blocker.BlockingSessionID), nullableString(summary.Blocker.Operation)
+	}
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO session_attention_summaries (
+    session_id, latest_seq, state, permission_id, permission_status, terminal_outcome, latest_change_seq,
+    blocker_kind, blocker_reason, blocker_expires_at_ns, blocking_session_id, blocker_operation,
+    summary_version, last_durable_event_at_ms, last_client_command_at_ms, projection_state, created_at_ms, updated_at_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (session_id) DO UPDATE SET
+    latest_seq = excluded.latest_seq, state = excluded.state, permission_id = excluded.permission_id,
+    permission_status = excluded.permission_status, terminal_outcome = excluded.terminal_outcome,
+    latest_change_seq = excluded.latest_change_seq, blocker_kind = excluded.blocker_kind,
+    blocker_reason = excluded.blocker_reason, blocker_expires_at_ns = excluded.blocker_expires_at_ns,
+    blocking_session_id = excluded.blocking_session_id, blocker_operation = excluded.blocker_operation,
+    summary_version = excluded.summary_version, last_durable_event_at_ms = excluded.last_durable_event_at_ms,
+    last_client_command_at_ms = excluded.last_client_command_at_ms, projection_state = excluded.projection_state,
+    updated_at_ms = excluded.updated_at_ms
+`, summary.SessionID, summary.LatestSeq, summary.State, permissionID, permissionStatus, nullableString(summary.TerminalOutcome), nullableInt64Pointer(summary.LatestChangeSeq),
+		blockerKind, blockerReason, blockerExpiry, blockingSession, blockerOperation, summary.SummaryVersion,
+		nullableMilliTime(summary.LastDurableEventAt), nullableMilliTime(summary.LastClientCommandAt), summary.StateOfProjection, nowMS, nowMS)
+	if err != nil {
+		return fmt.Errorf("upsert attention summary: %w", err)
+	}
+	return nil
+}
+func upsertSQLiteAttentionLedger(ctx context.Context, tx *sql.Tx, sessionID string, blocker *store.AttentionBlocker, clientAtMS *int64) error {
+	summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, sessionID))
+	if errors.Is(err, sql.ErrNoRows) {
+		summary = store.SessionAttentionSummary{SessionID: sessionID, State: "starting", SummaryVersion: 1, StateOfProjection: store.AttentionProjectionIncomplete}
+	} else if err != nil {
+		return fmt.Errorf("load attention ledger: %w", err)
+	} else {
+		summary.SummaryVersion++
+	}
+	summary.Blocker = cloneSQLiteAttentionBlocker(blocker)
+	if clientAtMS != nil {
+		activity := time.UnixMilli(*clientAtMS)
+		summary.LastClientCommandAt = &activity
+	}
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return err
+	}
+	return upsertSQLiteAttentionSummary(ctx, tx, summary, nowMS)
+}
+
+func sqlitePlaceholders(count int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
+}
+
+func cloneSQLiteAttentionBlocker(value *store.AttentionBlocker) *store.AttentionBlocker {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.Reason = cloneAttachmentString(value.Reason)
+	copy.ExpiresAt = cloneAttachmentTime(value.ExpiresAt)
+	copy.BlockingSessionID = cloneAttachmentString(value.BlockingSessionID)
+	copy.Operation = cloneAttachmentString(value.Operation)
+	return &copy
+}
+
+func nullableInt64Pointer(value *int64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func nullableMilliTime(value *time.Time) any {
+	if value == nil {
+		return nil
+	}
+	return value.UnixMilli()
+}
 
 func nullableString(value *string) any {
 	if value == nil {
@@ -1727,7 +2059,6 @@ func (s *Store) init(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('session_adapter_fence_allocator', 'session_adapter_fence_identity')) + (SELECT count(*) FROM fence_store.sqlite_master WHERE type = 'table' AND name IN ('adapter_fence_allocator', 'adapter_fence_identity'))`).Scan(&fenceTables); err != nil || (fenceTables != 0 && fenceTables != 4) {
 		return errors.New("sqlite fence store schema is incomplete")
 	}
-
 	if _, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS session_events (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1742,6 +2073,18 @@ CREATE TABLE IF NOT EXISTS session_events (
 
 CREATE INDEX IF NOT EXISTS session_events_session_seq_idx
 ON session_events (session_id, seq);
+
+CREATE TABLE IF NOT EXISTS session_attention_summaries (session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 255), latest_seq INTEGER NOT NULL DEFAULT 0 CHECK (latest_seq >= 0),
+    state TEXT NOT NULL CHECK (state IN ('starting', 'ready', 'busy', 'waiting_permission', 'recovering', 'ended', 'error')), permission_id TEXT, permission_status TEXT, terminal_outcome TEXT, latest_change_seq INTEGER, blocker_kind TEXT, blocker_reason TEXT, blocker_expires_at_ns INTEGER, blocking_session_id TEXT, blocker_operation TEXT, summary_version INTEGER NOT NULL DEFAULT 0 CHECK (summary_version >= 0),
+    last_durable_event_at_ms INTEGER, last_client_command_at_ms INTEGER, projection_state TEXT NOT NULL CHECK (projection_state IN ('complete', 'incomplete')), created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, CHECK (latest_change_seq IS NULL OR (latest_change_seq > 0 AND latest_change_seq <= latest_seq)),
+    CHECK ((permission_id IS NULL AND permission_status IS NULL) OR (length(permission_id) BETWEEN 1 AND 255 AND permission_status = 'pending')), CHECK (terminal_outcome IS NULL OR length(terminal_outcome) BETWEEN 1 AND 128), CHECK (blocking_session_id IS NULL OR length(blocking_session_id) BETWEEN 1 AND 255),
+    CHECK (blocker_reason IS NULL OR length(blocker_reason) BETWEEN 1 AND 128), CHECK (blocker_operation IS NULL OR length(blocker_operation) BETWEEN 1 AND 128),
+    CHECK ((blocker_kind IS NULL AND blocker_reason IS NULL AND blocker_expires_at_ns IS NULL AND blocking_session_id IS NULL AND blocker_operation IS NULL)
+        OR (blocker_kind = 'queued' AND blocker_operation IS NULL)
+        OR (blocker_kind = 'outcome_unknown' AND blocker_reason IS NULL AND blocker_expires_at_ns IS NULL AND blocking_session_id IS NULL)
+        OR (blocker_kind IN ('reauthorization_required', 'new_run_required') AND blocker_reason IS NULL AND blocker_expires_at_ns IS NULL AND blocking_session_id IS NULL AND blocker_operation IS NULL))
+);
+CREATE INDEX IF NOT EXISTS session_attention_summaries_projection_state_session_idx ON session_attention_summaries (projection_state, session_id);
 
 CREATE TABLE IF NOT EXISTS session_adapter_connections (
     session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 255),
