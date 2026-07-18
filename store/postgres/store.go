@@ -36,6 +36,38 @@ func NewAdapterConnectionTx(tx pgx.Tx) *Store {
 	return &Store{connectionTx: tx}
 }
 
+func (s *Store) AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]store.SessionAttentionSummary, error) {
+	if s.pool == nil {
+		return nil, errors.New("postgres event store pool is nil")
+	}
+	if len(sessionIDs) == 0 || len(sessionIDs) > 100 {
+		return nil, errors.New("attention snapshot session IDs are out of range")
+	}
+	seen := make(map[string]struct{}, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if !validConnectionID(sessionID) {
+			return nil, errors.New("attention snapshot session ID is invalid")
+		}
+		seen[sessionID] = struct{}{}
+	}
+	if len(seen) != len(sessionIDs) {
+		return nil, errors.New("attention snapshot session IDs must be unique")
+	}
+	rows, err := db.New(s.pool).AttentionSnapshot(ctx, sessionIDs)
+	if err != nil {
+		return nil, fmt.Errorf("select attention snapshot: %w", err)
+	}
+	summaries := make([]store.SessionAttentionSummary, len(rows))
+	for index, row := range rows {
+		summary, err := attentionSummary(row)
+		if err != nil {
+			return nil, err
+		}
+		summaries[index] = summary
+	}
+	return summaries, nil
+}
+
 func (s *Store) Append(ctx context.Context, sessionID string, evs []store.PendingEvent) (firstSeq int64, err error) {
 	if len(evs) == 0 {
 		return 0, nil
@@ -56,9 +88,14 @@ func (s *Store) Append(ctx context.Context, sessionID string, evs []store.Pendin
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
 		return 0, fmt.Errorf("lock session event stream: %w", err)
 	}
-	firstSeq, err = appendEventsLocked(ctx, queries, sessionID, evs)
+	firstSeq, terminal, err := appendEventsLocked(ctx, queries, sessionID, evs)
 	if err != nil {
 		return 0, err
+	}
+	if terminal {
+		if err := queries.FenceAttentionTerminal(ctx, sessionID); err != nil {
+			return 0, fmt.Errorf("fence terminal append event: %w", err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -67,14 +104,16 @@ func (s *Store) Append(ctx context.Context, sessionID string, evs []store.Pendin
 	return firstSeq, nil
 }
 
-func appendEventsLocked(ctx context.Context, queries *db.Queries, sessionID string, evs []store.PendingEvent) (int64, error) {
+func appendEventsLocked(ctx context.Context, queries *db.Queries, sessionID string, evs []store.PendingEvent) (int64, bool, error) {
 	latest, err := queries.LatestSessionEventSeq(ctx, sessionID)
 	if err != nil {
-		return 0, fmt.Errorf("select latest seq: %w", err)
+		return 0, false, fmt.Errorf("select latest seq: %w", err)
 	}
 	firstSeq := latest + 1
+	terminal := false
 	for index, event := range evs {
 		seq := firstSeq + int64(index)
+		projection := attentionEventProjection(event)
 		if err := queries.InsertSessionEvent(ctx, db.InsertSessionEventParams{
 			SessionID: sessionID,
 			Seq:       seq,
@@ -82,10 +121,99 @@ func appendEventsLocked(ctx context.Context, queries *db.Queries, sessionID stri
 			Payload:   event.Payload,
 			CreatedAt: pgtype.Timestamptz{Time: event.Time, Valid: true},
 		}); err != nil {
-			return 0, fmt.Errorf("append event seq %d: %w", seq, err)
+			return 0, false, fmt.Errorf("append event seq %d: %w", seq, err)
 		}
+		storeNow, err := queries.AttentionStoreNow(ctx)
+		if err != nil {
+			return 0, false, fmt.Errorf("read attention Store clock: %w", err)
+		}
+		if err := projectAttentionEvent(ctx, queries, sessionID, seq, projection, storeNow.Time); err != nil {
+			return 0, false, fmt.Errorf("project attention event seq %d: %w", seq, err)
+		}
+		terminal = terminal || projection.terminal
 	}
-	return firstSeq, nil
+	return firstSeq, terminal, nil
+}
+
+type attentionProjection struct {
+	state                any
+	stateObserved        bool
+	permissionID         pgtype.Text
+	permissionDecisionID pgtype.Text
+	permissionChange     bool
+	terminalOutcome      pgtype.Text
+	projectionIncomplete bool
+	terminal             bool
+}
+
+func projectAttentionEvent(ctx context.Context, queries *db.Queries, sessionID string, seq int64, projection attentionProjection, at time.Time) error {
+	latestChangeSeq := pgtype.Int8{}
+	if projection.state != nil {
+		latestChangeSeq = pgtype.Int8{Int64: seq, Valid: true}
+	}
+	return queries.UpsertAttentionEvent(ctx, db.UpsertAttentionEventParams{
+		SessionID: sessionID, LatestSeq: seq, EventState: projection.state, PermissionID: projection.permissionID,
+		PermissionDecisionID: projection.permissionDecisionID, PermissionChange: projection.permissionChange,
+		TerminalOutcome: projection.terminalOutcome, LatestChangeSeq: latestChangeSeq,
+		EventTime: pgtype.Timestamptz{Time: at, Valid: true}, StateObserved: projection.stateObserved,
+		ProjectionIncomplete: projection.projectionIncomplete,
+	})
+}
+
+func attentionEventProjection(event store.PendingEvent) attentionProjection {
+	projection := attentionProjection{}
+	if event.Type == "permission.request" {
+		var payload struct {
+			RequestID string `json:"request_id"`
+		}
+		if json.Unmarshal(event.Payload, &payload) != nil || !validConnectionID(payload.RequestID) {
+			projection.projectionIncomplete = true
+			return projection
+		}
+		projection.permissionID, projection.permissionChange = pgtype.Text{String: payload.RequestID, Valid: true}, true
+		return projection
+	}
+	if event.Type == "permission.decision" {
+		var payload struct {
+			RequestID string `json:"request_id"`
+			Decision  string `json:"decision"`
+		}
+		if json.Unmarshal(event.Payload, &payload) != nil || !validConnectionID(payload.RequestID) ||
+			(payload.Decision != "approve" && payload.Decision != "deny" && payload.Decision != "expired") {
+			projection.projectionIncomplete = true
+			return projection
+		}
+		projection.permissionDecisionID, projection.permissionChange = pgtype.Text{String: payload.RequestID, Valid: true}, true
+		return projection
+	}
+	if event.Type == "session.error" {
+		return attentionProjection{state: "error", stateObserved: true, terminalOutcome: pgtype.Text{String: "error", Valid: true}, terminal: true}
+	}
+	if event.Type != "session.state" {
+		return projection
+	}
+	projection.stateObserved = true
+	var payload struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(event.Payload, &payload) != nil {
+		projection.projectionIncomplete = true
+		return projection
+	}
+	switch payload.State {
+	case "working":
+		projection.state = "busy"
+	case "starting", "ready", "busy", "waiting_permission", "recovering", "ended", "error":
+		projection.state = payload.State
+	default:
+		projection.projectionIncomplete = true
+		return projection
+	}
+	if projection.state == "ended" || projection.state == "error" {
+		projection.terminal = true
+		projection.terminalOutcome = pgtype.Text{String: projection.state.(string), Valid: true}
+	}
+	return projection
 }
 
 func (s *Store) Replay(ctx context.Context, sessionID string, afterSeq int64, fn func(store.Event) error) (err error) {
@@ -270,7 +398,7 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return store.PendingCommandCommit{}, fmt.Errorf("select pending command: %w", err)
 	}
-	seq, err := appendEventsLocked(ctx, queries, sessionID, []store.PendingEvent{event})
+	seq, terminal, err := appendEventsLocked(ctx, queries, sessionID, []store.PendingEvent{event})
 	if err != nil {
 		return store.PendingCommandCommit{}, err
 	}
@@ -286,10 +414,33 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 	if err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("insert pending command: %w", err)
 	}
+	if err := upsertAttentionLedger(ctx, queries, sessionID, nil, storeNow.Time); err != nil {
+		return store.PendingCommandCommit{}, err
+	}
+	if terminal {
+		if err := queries.FenceAttentionTerminal(ctx, sessionID); err != nil {
+			return store.PendingCommandCommit{}, fmt.Errorf("fence terminal pending command event: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("commit pending command: %w", err)
 	}
 	return store.PendingCommandCommit{Command: pendingCommand(row)}, nil
+}
+
+func upsertAttentionLedger(ctx context.Context, queries *db.Queries, sessionID string, blocker *store.AttentionBlocker, at time.Time) error {
+	params := db.UpsertAttentionLedgerParams{SessionID: sessionID, ClientCommandAt: pgtype.Timestamptz{Time: at, Valid: true}}
+	if blocker != nil {
+		params.BlockerKind = pgtype.Text{String: blocker.Kind, Valid: true}
+		params.BlockerReason = textValue(blocker.Reason)
+		params.BlockerExpiresAt = timeValue(blocker.ExpiresAt)
+		params.BlockingSessionID = textValue(blocker.BlockingSessionID)
+		params.BlockerOperation = textValue(blocker.Operation)
+	}
+	if err := queries.UpsertAttentionLedger(ctx, params); err != nil {
+		return fmt.Errorf("project attention ledger: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) ClaimPendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, commandID string) (store.PendingCommandClaim, error) {
@@ -326,6 +477,9 @@ func (s *Store) ClaimPendingCommand(ctx context.Context, sessionID string, autho
 		}
 		command = pendingCommand(updated)
 		claimed = true
+		if err := upsertAttentionLedger(ctx, queries, sessionID, nil, storeNow.Time); err != nil {
+			return store.PendingCommandClaim{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.PendingCommandClaim{}, fmt.Errorf("commit pending command claim: %w", err)
@@ -360,6 +514,18 @@ func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, aut
 	})
 	if err != nil {
 		return store.PendingCommand{}, fmt.Errorf("resolve pending command: %w", err)
+	}
+	storeNow, err := queries.CommandStoreNow(ctx)
+	if err != nil {
+		return store.PendingCommand{}, fmt.Errorf("read resolution Store clock: %w", err)
+	}
+	var blocker *store.AttentionBlocker
+	if status == store.PendingCommandOutcomeUnknown {
+		operation := "command"
+		blocker = &store.AttentionBlocker{Kind: store.AttentionBlockerOutcomeUnknown, Operation: &operation}
+	}
+	if err := upsertAttentionLedger(ctx, queries, sessionID, blocker, storeNow.Time); err != nil {
+		return store.PendingCommand{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.PendingCommand{}, fmt.Errorf("commit pending command resolution: %w", err)
@@ -418,6 +584,19 @@ func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, autho
 	})
 	if err != nil {
 		return store.ProposedEventReceipt{}, fmt.Errorf("insert proposed event: %w", err)
+	}
+	projection := attentionEventProjection(event)
+	storeNow, err := queries.AttentionStoreNow(ctx)
+	if err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("read proposed attention Store clock: %w", err)
+	}
+	if err := projectAttentionEvent(ctx, queries, row.SessionID, row.Seq, projection, storeNow.Time); err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("project proposed attention event seq %d: %w", row.Seq, err)
+	}
+	if projection.terminal {
+		if err := queries.FenceAttentionTerminal(ctx, row.SessionID); err != nil {
+			return store.ProposedEventReceipt{}, fmt.Errorf("fence terminal proposed event seq %d: %w", row.Seq, err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.ProposedEventReceipt{}, fmt.Errorf("commit proposed event: %w", err)
@@ -639,6 +818,31 @@ func int64Pointer(value pgtype.Int8) *int64 {
 	}
 	copy := value.Int64
 	return &copy
+}
+
+func attentionSummary(row db.SessionAttentionSummary) (store.SessionAttentionSummary, error) {
+	if !validConnectionID(row.SessionID) || row.LatestSeq < 0 || row.SummaryVersion < 0 ||
+		(row.ProjectionState != store.AttentionProjectionComplete && row.ProjectionState != store.AttentionProjectionIncomplete) {
+		return store.SessionAttentionSummary{}, errors.New("attention summary row is invalid")
+	}
+	summary := store.SessionAttentionSummary{SessionID: row.SessionID, LatestSeq: row.LatestSeq, State: row.State,
+		SummaryVersion: row.SummaryVersion, StateOfProjection: row.ProjectionState,
+		LastDurableEventAt: timePointer(row.LastDurableEventAt), LastClientCommandAt: timePointer(row.LastClientCommandAt),
+		TerminalOutcome: textPointer(row.TerminalOutcome), LatestChangeSeq: int64Pointer(row.LatestChangeSeq)}
+	if row.PermissionID.Valid != row.PermissionStatus.Valid || (row.PermissionID.Valid && row.PermissionStatus.String != store.AttentionPermissionPending) {
+		return store.SessionAttentionSummary{}, errors.New("attention permission row is invalid")
+	}
+	if row.PermissionID.Valid {
+		summary.Permission = &store.AttentionPermission{ID: row.PermissionID.String, Status: row.PermissionStatus.String}
+	}
+	if !row.BlockerKind.Valid && (row.BlockerReason.Valid || row.BlockerExpiresAt.Valid || row.BlockingSessionID.Valid || row.BlockerOperation.Valid) {
+		return store.SessionAttentionSummary{}, errors.New("attention blocker row is invalid")
+	}
+	if row.BlockerKind.Valid {
+		summary.Blocker = &store.AttentionBlocker{Kind: row.BlockerKind.String, Reason: textPointer(row.BlockerReason),
+			ExpiresAt: timePointer(row.BlockerExpiresAt), BlockingSessionID: textPointer(row.BlockingSessionID), Operation: textPointer(row.BlockerOperation)}
+	}
+	return summary, nil
 }
 
 func validateProposedEventInput(sessionID string, authority store.CommandAuthority, proposalID string, event store.PendingEvent) error {
@@ -981,10 +1185,13 @@ func (s *Store) CreateAttachment(ctx context.Context, request store.AttachmentCr
 	if err != nil {
 		return store.AttachmentCommit{}, fmt.Errorf("insert attachment: %w", err)
 	}
+	created := attachment(row)
+	if err := upsertAttentionLedger(ctx, queries, created.Identity.TargetSessionID, attentionBlockerForAttachment(created, nil), storeNow.Time); err != nil {
+		return store.AttachmentCommit{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.AttachmentCommit{}, fmt.Errorf("commit attachment create: %w", err)
 	}
-	created := attachment(row)
 	return store.AttachmentCommit{Attachment: created, Summary: attachmentSummary(created, nil)}, nil
 }
 
@@ -1044,11 +1251,26 @@ func (s *Store) UpdateAttachment(ctx context.Context, attachID string, expectedV
 	if err != nil {
 		return store.AttachmentMutation{}, fmt.Errorf("update attachment: %w", err)
 	}
+	updated := attachment(row)
+	if err := upsertAttentionLedger(ctx, queries, updated.Identity.TargetSessionID, attentionBlockerForAttachment(updated, update.Blocker), storeNow.Time); err != nil {
+		return store.AttachmentMutation{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.AttachmentMutation{}, fmt.Errorf("commit attachment update: %w", err)
 	}
-	updated := attachment(row)
 	return store.AttachmentMutation{Attachment: updated, Summary: attachmentSummary(updated, update.Blocker)}, nil
+}
+
+func attentionBlockerForAttachment(attachment store.Attachment, explicit *store.AttachmentBlocker) *store.AttentionBlocker {
+	if explicit != nil {
+		return &store.AttentionBlocker{Kind: string(explicit.Kind), Reason: explicit.Reason, ExpiresAt: explicit.ExpiresAt,
+			BlockingSessionID: explicit.BlockingSessionID, Operation: explicit.Operation}
+	}
+	if attachment.Status != store.AttachmentJoinPending {
+		return nil
+	}
+	reason := "join_pending"
+	return &store.AttentionBlocker{Kind: store.AttentionBlockerQueued, Reason: &reason, ExpiresAt: attachment.ExpiresAt}
 }
 
 func validateAttachmentIdentity(identity store.AttachmentIdentity) error {

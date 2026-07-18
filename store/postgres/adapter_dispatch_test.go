@@ -67,6 +67,57 @@ func TestAppendAdapterEventsRevalidatesInsidePostgresTransaction(t *testing.T) {
 	}
 }
 
+func TestAppendAdapterEventsCommitsTerminalAttentionAndFencesAuthority(t *testing.T) {
+	for _, event := range []struct {
+		name    string
+		pending store.PendingEvent
+		outcome string
+	}{
+		{name: "ended", pending: store.PendingEvent{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ended"}`)}, outcome: "ended"},
+		{name: "error state", pending: store.PendingEvent{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"error"}`)}, outcome: "error"},
+		{name: "error event", pending: store.PendingEvent{Type: "session.error", Time: time.Now(), Payload: []byte(`{"ignored":"by attention"}`)}, outcome: "error"},
+	} {
+		event := event
+		t.Run(event.name, func(t *testing.T) {
+			harness := newPostgresConnectionHarness(t)
+			ctx := context.Background()
+			sessionID := "ses_dispatch_terminal_" + strings.ReplaceAll(event.name, " ", "_")
+			if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ($1)`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+				SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			connection, err := harness.AcceptAdapterHello(ctx, sessionID, store.AdapterHello{CredentialGeneration: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant, err := harness.AllocateAdapterGrantFence(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if seq, err := harness.AppendAdapterEvents(ctx, sessionID, store.AdapterConnectionAdmission{
+				CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grant,
+			}, []store.PendingEvent{event.pending}); err != nil || seq != 1 {
+				t.Fatalf("terminal AppendAdapterEvents() = %d, %v", seq, err)
+			}
+			summaries, err := harness.AttentionSnapshot(ctx, []string{sessionID})
+			if err != nil || len(summaries) != 1 || summaries[0].TerminalOutcome == nil || *summaries[0].TerminalOutcome != event.outcome {
+				t.Fatalf("terminal attention summary = %+v, %v", summaries, err)
+			}
+			persisted, err := harness.AdapterConnection(ctx, sessionID)
+			if err != nil || persisted.RevokedAt == nil || persisted.TerminalAt == nil {
+				t.Fatalf("terminal adapter connection = %+v, %v", persisted, err)
+			}
+			if latest, err := harness.LatestSeq(ctx, sessionID); err != nil || latest != 1 {
+				t.Fatalf("terminal latest sequence = %d, %v", latest, err)
+			}
+		})
+	}
+}
+
 func TestAppendAdapterEventsLocksAuthorityBeforeEventStream(t *testing.T) {
 	harness := newPostgresConnectionHarness(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

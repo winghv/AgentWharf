@@ -23,6 +23,130 @@ import (
 
 var schemaSeq atomic.Uint64
 
+func TestAttentionSummaryStoreContract(t *testing.T) {
+	var _ store.AttentionSummaryStore = (*postgres.Store)(nil)
+}
+
+func TestAttentionSnapshotProjectsDurableEvents(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	events := postgres.New(pool)
+	before := time.Now()
+	first := time.Now().UTC().Add(-time.Second).Truncate(time.Microsecond)
+	if _, err := events.Append(context.Background(), "ses_attention_1", []store.PendingEvent{
+		{Type: "session.state", Time: first, Payload: []byte(`{"state":"starting"}`)},
+		{Type: "session.state", Time: first.Add(time.Millisecond), Payload: []byte(`{"state":"working"}`)},
+		{Type: "session.message", Time: first.Add(2 * time.Millisecond), Payload: []byte(`{"role":"agent"}`)},
+	}); err != nil {
+		t.Fatalf("append attention events: %v", err)
+	}
+
+	snapshot, err := events.AttentionSnapshot(context.Background(), []string{"ses_attention_1", "ses_missing"})
+	if err != nil {
+		t.Fatalf("attention snapshot: %v", err)
+	}
+	if len(snapshot) != 1 {
+		t.Fatalf("attention snapshot length = %d, want 1", len(snapshot))
+	}
+	summary := snapshot[0]
+	if summary.SessionID != "ses_attention_1" || summary.LatestSeq != 3 || summary.State != "busy" || summary.LatestChangeSeq == nil || *summary.LatestChangeSeq != 2 || summary.LastDurableEventAt == nil || summary.LastDurableEventAt.Before(before) || summary.StateOfProjection != store.AttentionProjectionComplete {
+		t.Fatalf("attention summary = %+v, want complete busy durable projection", summary)
+	}
+}
+
+func TestAttentionSnapshotProjectsClientCommandLedger(t *testing.T) {
+	harness := newPostgresCommandHarness(t, "agentwharf_attention_command", nil)
+	request := store.PendingCommandRequest{CommandID: "cmd_attention", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := harness.CommitPendingCommand(context.Background(), "ses_command_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+		store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"user"}`)}, request); err != nil {
+		t.Fatalf("commit pending command: %v", err)
+	}
+	snapshot, err := harness.AttentionSnapshot(context.Background(), []string{"ses_command_1"})
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("attention snapshot = %+v, %v", snapshot, err)
+	}
+	summary := snapshot[0]
+	if summary.LatestSeq != 1 || summary.SummaryVersion != 1 || summary.LastClientCommandAt == nil || summary.Blocker != nil {
+		t.Fatalf("command attention summary = %+v, want independent ledger version and Store-clock activity", summary)
+	}
+}
+
+func TestAttentionProjectionRollsBackAndSurvivesReopen(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_restart_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	resetSchema(t, pool)
+	attention := postgres.New(pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION reject_attention_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'attention projection failpoint'; END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TRIGGER reject_attention_projection BEFORE INSERT ON session_attention_summaries FOR EACH ROW EXECUTE FUNCTION reject_attention_projection()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attention.Append(ctx, "ses_attention_rollback", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err == nil {
+		t.Fatal("append unexpectedly committed after attention projection failure")
+	}
+	if latest, err := attention.LatestSeq(ctx, "ses_attention_rollback"); err != nil || latest != 0 {
+		t.Fatalf("rolled-back latest sequence = %d, %v", latest, err)
+	}
+	if snapshot, err := attention.AttentionSnapshot(ctx, []string{"ses_attention_rollback"}); err != nil || len(snapshot) != 0 {
+		t.Fatalf("rolled-back attention snapshot = %+v, %v", snapshot, err)
+	}
+	if _, err := pool.Exec(ctx, `DROP TRIGGER reject_attention_projection ON session_attention_summaries`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attention.Append(ctx, "ses_attention_rollback", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatalf("append after rollback: %v", err)
+	}
+	pool.Close()
+	pool = openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	attention = postgres.New(pool)
+	snapshot, err := attention.AttentionSnapshot(ctx, []string{"ses_attention_rollback"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].LatestSeq != 1 || snapshot[0].State != "ready" {
+		t.Fatalf("reopened attention snapshot = %+v, %v", snapshot, err)
+	}
+}
+
+func TestAttentionSnapshotConcurrentAppend(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_concurrent_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	attention := postgres.New(pool)
+	ctx := context.Background()
+	const sessionID = "ses_attention_concurrent"
+	const appends = 20
+	errs := make(chan error, appends)
+	for index := 0; index < appends; index++ {
+		go func() {
+			_, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"agent"}`)}})
+			errs <- err
+		}()
+	}
+	for index := 0; index < appends; index++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent append: %v", err)
+		}
+	}
+	snapshot, err := attention.AttentionSnapshot(ctx, []string{sessionID})
+	if err != nil || len(snapshot) != 1 || snapshot[0].LatestSeq != appends || snapshot[0].LastDurableEventAt == nil || snapshot[0].StateOfProjection != store.AttentionProjectionIncomplete {
+		t.Fatalf("concurrent attention snapshot = %+v, %v", snapshot, err)
+	}
+}
+
 func TestEventStoreContract(t *testing.T) {
 	storetest.Contract(t, func(t *testing.T) store.EventStore {
 		t.Helper()
@@ -325,6 +449,153 @@ BEFORE INSERT ON session_events FOR EACH ROW EXECUTE FUNCTION reject_test_propos
 		t.Fatal("CommitProposedEvent() unexpectedly succeeded through failpoint")
 	}
 	assertProposedEventRollback(t, harness, "ses_proposal_1")
+}
+
+func TestProposedEventProjectsAttention(t *testing.T) {
+	harness := newPostgresProposalHarness(t)
+	before := time.Now()
+	receipt, err := harness.CommitProposedEvent(context.Background(), "ses_proposal_1",
+		store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+		store.ProposedEventRequest{ProposalID: "proposal_attention", Event: store.PendingEvent{Type: "session.state", Time: time.Unix(1, 0), Payload: []byte(`{"state":"working"}`)}})
+	if err != nil || receipt.Seq != 1 {
+		t.Fatalf("commit proposed attention event = %+v, %v", receipt, err)
+	}
+	snapshot, err := harness.AttentionSnapshot(context.Background(), []string{"ses_proposal_1"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].LatestSeq != receipt.Seq || snapshot[0].State != "busy" || snapshot[0].LatestChangeSeq == nil || *snapshot[0].LatestChangeSeq != receipt.Seq || snapshot[0].LastDurableEventAt == nil || snapshot[0].LastDurableEventAt.Before(before) {
+		t.Fatalf("proposed event attention snapshot = %+v, %v", snapshot, err)
+	}
+}
+
+func TestAttentionProjectionUsesStoreClockAndNeverRepairsIncomplete(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_clock_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	events := postgres.New(pool)
+	before := time.Now()
+	if _, err := events.Append(context.Background(), "ses_attention_clock", []store.PendingEvent{{Type: "session.state", Time: time.Unix(1, 0), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := events.Append(context.Background(), "ses_attention_incomplete", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"unknown"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := events.Append(context.Background(), "ses_attention_incomplete", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := events.AttentionSnapshot(context.Background(), []string{"ses_attention_clock", "ses_attention_incomplete"})
+	if err != nil || len(snapshot) != 2 || snapshot[0].LastDurableEventAt == nil || snapshot[0].LastDurableEventAt.Before(before) || snapshot[1].StateOfProjection != store.AttentionProjectionIncomplete {
+		t.Fatalf("clock/incomplete attention snapshot = %+v, %v", snapshot, err)
+	}
+}
+
+func TestAttentionProjectionDoesNotFabricateHistoricalCompleteness(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_historical_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ('ses_attention_historical')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO session_events (session_id, seq, type, payload, created_at) VALUES
+    ('ses_attention_historical', 1, 'session.message', '{}', clock_timestamp()),
+    ('ses_attention_historical', 2, 'session.message', '{}', clock_timestamp())
+`); err != nil {
+		t.Fatal(err)
+	}
+	attention := postgres.New(pool)
+	if seq, err := attention.Append(ctx, "ses_attention_historical", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil || seq != 3 {
+		t.Fatalf("append historical attention event = %d, %v", seq, err)
+	}
+	summaries, err := attention.AttentionSnapshot(ctx, []string{"ses_attention_historical"})
+	if err != nil || len(summaries) != 1 || summaries[0].LatestSeq != 3 || summaries[0].State != "ready" || summaries[0].StateOfProjection != store.AttentionProjectionIncomplete {
+		t.Fatalf("historical attention summary = %+v, %v", summaries, err)
+	}
+}
+
+func TestAttentionProjectionTracksPermissionAndTerminalFence(t *testing.T) {
+	harness := newPostgresProposalHarness(t)
+	ctx := context.Background()
+	if _, err := harness.Append(ctx, "ses_proposal_conflict", []store.PendingEvent{{Type: "permission.request", Time: time.Now(), Payload: []byte(`{"request_id":"pr_attention"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.Append(ctx, "ses_proposal_conflict", []store.PendingEvent{{Type: "permission.decision", Time: time.Now(), Payload: []byte(`{"request_id":"pr_attention","decision":"approve"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	permission, err := harness.AttentionSnapshot(ctx, []string{"ses_proposal_conflict"})
+	if err != nil || len(permission) != 1 || permission[0].Permission != nil {
+		t.Fatalf("resolved permission attention snapshot = %+v, %v", permission, err)
+	}
+	if _, err := harness.CommitProposedEvent(ctx, "ses_proposal_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+		store.ProposedEventRequest{ProposalID: "proposal_terminal", Event: store.PendingEvent{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ended"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := harness.AttentionSnapshot(ctx, []string{"ses_proposal_1"})
+	if err != nil || len(terminal) != 1 || terminal[0].TerminalOutcome == nil || *terminal[0].TerminalOutcome != "ended" {
+		t.Fatalf("terminal attention snapshot = %+v, %v", terminal, err)
+	}
+	connection, err := harness.AdapterConnection(ctx, "ses_proposal_1")
+	if err != nil || connection.TerminalAt == nil || connection.RevokedAt == nil {
+		t.Fatalf("terminal adapter connection = %+v, %v", connection, err)
+	}
+	if _, err := harness.CommitProposedEvent(ctx, "ses_proposal_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+		store.ProposedEventRequest{ProposalID: "proposal_after_terminal", Event: store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"agent"}`)}}); err == nil {
+		t.Fatal("terminal adapter accepted a later proposed event")
+	}
+}
+
+func TestAttentionSnapshotConcurrentClientCommands(t *testing.T) {
+	harness := newPostgresCommandHarness(t, "agentwharf_attention_concurrent_command", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const commits = 12
+	errs := make(chan error, commits)
+	done := make(chan struct{})
+	scanErr := make(chan error, 1)
+	go func() {
+		defer close(scanErr)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				if _, err := harness.AttentionSnapshot(ctx, []string{"ses_command_1"}); err != nil {
+					scanErr <- err
+					return
+				}
+			}
+		}
+	}()
+	for index := 0; index < commits; index++ {
+		go func(index int) {
+			_, err := harness.CommitPendingCommand(ctx, "ses_command_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+				store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"user"}`)},
+				store.PendingCommandRequest{CommandID: fmt.Sprintf("cmd_attention_concurrent_%d", index), Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)})
+			errs <- err
+		}(index)
+	}
+	for index := 0; index < commits; index++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent command commit: %v", err)
+		}
+	}
+	close(done)
+	for err := range scanErr {
+		if err != nil {
+			t.Fatalf("concurrent attention snapshot: %v", err)
+		}
+	}
+	snapshot, err := harness.AttentionSnapshot(context.Background(), []string{"ses_command_1"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].LatestSeq != commits || snapshot[0].SummaryVersion != commits || snapshot[0].LastClientCommandAt == nil {
+		t.Fatalf("concurrent command attention snapshot = %+v, %v", snapshot, err)
+	}
 }
 
 func TestProposedEventRejectsQueuedAuthorityChange(t *testing.T) {

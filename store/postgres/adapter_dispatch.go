@@ -31,12 +31,17 @@ func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admis
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
 		return 0, fmt.Errorf("lock session event stream: %w", err)
 	}
-	firstSeq, err := appendEventsLocked(ctx, queries, sessionID, events)
+	firstSeq, terminal, err := appendEventsLocked(ctx, queries, sessionID, events)
 	if err != nil {
 		return 0, err
 	}
 	if _, err = queries.ValidateAdapterAdmission(ctx, db.ValidateAdapterAdmissionParams{SessionID: sessionID, CredentialGeneration: admission.CredentialGeneration, ConnectionEpoch: admission.ConnectionEpoch, AcceptedFence: admission.AcceptedFence, GrantFence: admission.GrantFence}); err != nil {
 		return 0, errors.New("adapter authority lost")
+	}
+	if terminal {
+		if err := queries.FenceAttentionTerminal(ctx, sessionID); err != nil {
+			return 0, fmt.Errorf("fence terminal adapter event: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit adapter events: %w", err)
