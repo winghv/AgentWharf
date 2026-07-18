@@ -32,6 +32,60 @@ func TestAttentionSummaryStoreContract(t *testing.T) {
 
 func TestWarmAttachStoreContract(t *testing.T) {
 	var _ store.WarmAttachStore = (*sqlite.Store)(nil)
+	storetest.WarmAttachContract(t, storetest.WarmAttachHarness{
+		Open: func(t *testing.T) store.WarmAttachStore {
+			path := filepath.Join(t.TempDir(), "warm-contract.db")
+			harness := &sqliteWarmAttachHarness{Store: openStore(t, path), path: path}
+			ctx := context.Background()
+			if _, err := harness.Append(ctx, "ses_target", []store.PendingEvent{{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_bootstrap", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.AcceptAdapterHello(ctx, "ses_bootstrap", store.AdapterHello{CredentialGeneration: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if fence, err := harness.AllocateAdapterGrantFence(ctx); err != nil || fence != 2 {
+				t.Fatalf("warm grant fence = %d, %v", fence, err)
+			}
+			return harness
+		},
+		Fail: func(t *testing.T, warm store.WarmAttachStore, failure storetest.WarmAttachFailure) {
+			table := map[storetest.WarmAttachFailure]string{storetest.WarmAttachFailureAttempt: "session_attach_attempts", storetest.WarmAttachFailureAttachment: "session_attachments", storetest.WarmAttachFailureOutbox: "session_pending_commands", storetest.WarmAttachFailureSummary: "session_attention_summaries"}[failure]
+			if table == "" {
+				t.Fatalf("unknown warm failure %q", failure)
+			}
+			db := openRawSQLite(t, warm.(*sqliteWarmAttachHarness).path)
+			if _, err := db.Exec(`CREATE TRIGGER warm_attach_failpoint BEFORE INSERT ON ` + table + ` BEGIN SELECT RAISE(ABORT, 'warm attach failpoint'); END`); err != nil {
+				t.Fatal(err)
+			}
+		},
+		Expire: func(t *testing.T, warm store.WarmAttachStore) {
+			db := openRawSQLite(t, warm.(*sqliteWarmAttachHarness).path)
+			if _, err := db.Exec(`UPDATE session_attachments SET expires_at_ns = created_at_ms * 1000000 + 1 WHERE attach_id = 'att_warm'`); err != nil {
+				t.Fatal(err)
+			}
+		},
+		Absent: func(t *testing.T, warm store.WarmAttachStore, _ store.WarmAttachRequest) {
+			db := openRawSQLite(t, warm.(*sqliteWarmAttachHarness).path)
+			if _, err := db.Exec(`DROP TRIGGER IF EXISTS warm_attach_failpoint`); err != nil {
+				t.Fatal(err)
+			}
+			var attempts, attachments, commands, references int
+			if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM session_attach_attempts WHERE attach_id = 'att_warm'), (SELECT COUNT(*) FROM session_attachments WHERE attach_id = 'att_warm'), (SELECT COUNT(*) FROM session_pending_commands WHERE cmd_id = 'cmd_warm'), (SELECT COUNT(*) FROM session_events WHERE session_id = 'ses_target' AND seq > 1)`).Scan(&attempts, &attachments, &commands, &references); err != nil {
+				t.Fatal(err)
+			}
+			if attempts+attachments+commands+references != 0 {
+				t.Fatalf("warm rollback left %d/%d/%d/%d", attempts, attachments, commands, references)
+			}
+		},
+	})
+}
+
+type sqliteWarmAttachHarness struct {
+	*sqlite.Store
+	path string
 }
 
 func TestWarmAttachCommitDuplicateAndExpiry(t *testing.T) {
@@ -79,6 +133,46 @@ func TestWarmAttachCommitDuplicateAndExpiry(t *testing.T) {
 	expired, err := warm.ExpireWarmAttach(ctx, "att_warm", 0)
 	if err != nil || expired.Attachment.Status != store.AttachmentReauthorizationRequired || expired.Summary.Blocker == nil || expired.Summary.Blocker.Kind != store.AttentionBlockerReauthorizationRequired {
 		t.Fatalf("expire warm attach = %+v, %v", expired, err)
+	}
+}
+
+func TestWarmAttachRejectsMissingOrIncompleteTargetWithoutWrites(t *testing.T) {
+	for _, target := range []string{"ses_warm_missing", "ses_warm_incomplete"} {
+		t.Run(target, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "warm-attach-reject.db")
+			warm := openStore(t, path)
+			ctx := context.Background()
+			if target == "ses_warm_incomplete" {
+				db := openRawSQLite(t, path)
+				if _, err := db.Exec(`INSERT INTO session_attention_summaries (session_id, latest_seq, state, summary_version, projection_state, created_at_ms, updated_at_ms) VALUES (?, 0, 'starting', 0, 'incomplete', 1, 1)`, target); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := warm.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_warm_bootstrap", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+				t.Fatal(err)
+			}
+			connection, err := warm.AcceptAdapterHello(ctx, "ses_warm_bootstrap", store.AdapterHello{CredentialGeneration: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant, err := warm.AllocateAdapterGrantFence(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expires := time.Now().Add(10 * time.Second)
+			request := store.WarmAttachRequest{Attempt: store.AttachAttemptRequest{Identity: store.AttachAttemptIdentity{JTIHash: [32]byte{9}, AttachID: "att_reject", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: target, Provider: "claude-code"}, Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{8}, KeyVersion: 1}, ExpiresAt: time.Now().Add(time.Minute), Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: int64Pointer(1)}, Attachment: store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_reject", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: target, TargetCredentialLineageRef: "lineage_reject"}, ExpiresAt: expires}, BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grant}, FirstDelivery: store.WarmAttachFirstDelivery{CommandID: "cmd_reject", ReferenceID: "ref_reject", ReferenceDigest: [32]byte{7}, ExpiresAt: expires}}
+			if _, err := warm.CommitWarmAttach(ctx, request); err == nil {
+				t.Fatal("untrusted target committed warm attach")
+			}
+			db := openRawSQLite(t, path)
+			var attempts, attachments, events, commands int
+			if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM session_attach_attempts WHERE attach_id = 'att_reject'), (SELECT COUNT(*) FROM session_attachments WHERE attach_id = 'att_reject'), (SELECT COUNT(*) FROM session_events WHERE session_id = ?), (SELECT COUNT(*) FROM session_pending_commands WHERE cmd_id = 'cmd_reject')`, target).Scan(&attempts, &attachments, &events, &commands); err != nil {
+				t.Fatal(err)
+			}
+			if attempts+attachments+events+commands != 0 {
+				t.Fatalf("rejected warm attach wrote attempts=%d attachments=%d events=%d commands=%d", attempts, attachments, events, commands)
+			}
+		})
 	}
 }
 

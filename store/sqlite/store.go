@@ -1067,10 +1067,15 @@ func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRe
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return store.WarmAttachCommit{}, fmt.Errorf("load sqlite warm attach target: %w", err)
 	}
-	if summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, request.Attachment.Identity.TargetSessionID)); err == nil && summary.TerminalOutcome != nil {
-		return store.WarmAttachCommit{}, errors.New("warm attach target is terminal")
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, request.Attachment.Identity.TargetSessionID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.WarmAttachCommit{}, errors.New("warm attach target is missing")
+	}
+	if err != nil {
 		return store.WarmAttachCommit{}, err
+	}
+	if summary.StateOfProjection != store.AttentionProjectionComplete || summary.TerminalOutcome != nil || summary.State == "ended" || summary.State == "error" {
+		return store.WarmAttachCommit{}, errors.New("warm attach target is not attachable")
 	}
 	nowMS, err = sqliteNowMillis(ctx, tx)
 	if err != nil || !validSQLiteWarmAttachExpiry(request, time.UnixMilli(nowMS)) || validateSQLiteAttachAttempt(request.Attempt, time.UnixMilli(nowMS)) != nil {
@@ -1104,7 +1109,7 @@ func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRe
 	if err := upsertSQLiteAttentionLedger(ctx, tx, attachment.Identity.TargetSessionID, sqliteAttentionBlockerForAttachment(attachment, nil), &nowMS); err != nil {
 		return store.WarmAttachCommit{}, err
 	}
-	summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, attachment.Identity.TargetSessionID))
+	summary, err = querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, attachment.Identity.TargetSessionID))
 	if err != nil {
 		return store.WarmAttachCommit{}, err
 	}
@@ -1115,7 +1120,7 @@ func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRe
 	if err := tx.Commit(); err != nil {
 		return store.WarmAttachCommit{}, fmt.Errorf("commit sqlite warm attach: %w", err)
 	}
-	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, Outbox: store.WarmAttachOutbox{TargetSessionID: attachment.Identity.TargetSessionID, CommandID: request.FirstDelivery.CommandID, EventSeq: seq, ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: request.FirstDelivery.ExpiresAt}, Summary: summary}, nil
+	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, Outbox: store.WarmAttachOutbox{TargetSessionID: attachment.Identity.TargetSessionID, CommandID: request.FirstDelivery.CommandID, EventSeq: seq, ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: *attachment.ExpiresAt}, Summary: summary}, nil
 }
 
 func (s *Store) ExpireWarmAttach(ctx context.Context, attachID string, expectedDeliveryVersion int64) (store.WarmAttachExpiry, error) {
@@ -1132,7 +1137,7 @@ func (s *Store) ExpireWarmAttach(ctx context.Context, attachID string, expectedD
 		return store.WarmAttachExpiry{}, err
 	}
 	nowMS, err := sqliteNowMillis(ctx, tx)
-	if err != nil || current.DeliveryVersion != expectedDeliveryVersion || current.Status != store.AttachmentJoinPending || current.DeliveryState != store.AttachmentDeliveryPending || current.ExpiresAt == nil || current.ExpiresAt.After(time.UnixMilli(nowMS)) {
+	if err != nil || current.DeliveryVersion != expectedDeliveryVersion || current.Status != store.AttachmentJoinPending || current.DeliveryState != store.AttachmentDeliveryPending || current.ExpiresAt == nil || !current.ExpiresAt.Before(time.UnixMilli(nowMS)) {
 		return store.WarmAttachExpiry{}, errors.New("sqlite warm attach is not expirable")
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE session_attachments SET status = 'reauthorization_required', delivery_version = delivery_version + 1, expires_at_ns = NULL, updated_at_ms = ? WHERE attach_id = ? AND delivery_version = ?`, nowMS, attachID, expectedDeliveryVersion)
