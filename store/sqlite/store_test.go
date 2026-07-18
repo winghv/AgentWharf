@@ -30,6 +30,60 @@ func TestAttentionSummaryStoreContract(t *testing.T) {
 	var _ store.AttentionSummaryStore = (*sqlite.Store)(nil)
 }
 
+func TestWarmAttachStoreContract(t *testing.T) {
+	var _ store.WarmAttachStore = (*sqlite.Store)(nil)
+}
+
+func TestWarmAttachCommitDuplicateAndExpiry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "warm-attach.db")
+	warm := openStore(t, path)
+	ctx := context.Background()
+	if _, err := warm.Append(ctx, "ses_warm_target", []store.PendingEvent{{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatalf("seed warm target: %v", err)
+	}
+	if _, err := warm.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_warm_bootstrap", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatalf("seed warm bootstrap: %v", err)
+	}
+	connection, err := warm.AcceptAdapterHello(ctx, "ses_warm_bootstrap", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("accept warm bootstrap: %v", err)
+	}
+	grantFence, err := warm.AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatalf("allocate warm grant fence: %v", err)
+	}
+	expiresAt := time.Now().Add(10 * time.Second)
+	request := store.WarmAttachRequest{
+		Attempt:            store.AttachAttemptRequest{Identity: store.AttachAttemptIdentity{JTIHash: [32]byte{1}, AttachID: "att_warm", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: "ses_warm_target", Provider: "claude-code"}, Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{2}, KeyVersion: 1}, ExpiresAt: time.Now().Add(time.Minute), Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: int64Pointer(1)},
+		Attachment:         store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_warm", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: "ses_warm_target", TargetCredentialLineageRef: "lineage_warm"}, ExpiresAt: expiresAt},
+		BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grantFence},
+		FirstDelivery:      store.WarmAttachFirstDelivery{CommandID: "cmd_warm", ReferenceID: "ref_warm", ReferenceDigest: [32]byte{3}, ExpiresAt: expiresAt},
+	}
+	commit, err := warm.CommitWarmAttach(ctx, request)
+	if err != nil || commit.Duplicate || commit.Attachment.Status != store.AttachmentJoinPending || commit.Summary.Blocker == nil || commit.Summary.Blocker.Kind != store.AttentionBlockerQueued {
+		t.Fatalf("commit warm attach = %+v, %v", commit, err)
+	}
+	retry, err := warm.CommitWarmAttach(ctx, request)
+	if err != nil || !retry.Duplicate || retry.Attempt.Identity != commit.Attempt.Identity || retry.Attachment.Identity != commit.Attachment.Identity || retry.Attachment.DeliveryVersion != commit.Attachment.DeliveryVersion || retry.Outbox.EventSeq != commit.Outbox.EventSeq || retry.Outbox.CommandID != commit.Outbox.CommandID || retry.Outbox.ReferenceID != commit.Outbox.ReferenceID || retry.Summary.SessionID != commit.Summary.SessionID || retry.Summary.SummaryVersion != commit.Summary.SummaryVersion {
+		t.Fatalf("retry warm attach = %+v, %v", retry, err)
+	}
+	changed := request
+	changed.FirstDelivery.ReferenceDigest[0]++
+	if _, err := warm.CommitWarmAttach(ctx, changed); err == nil {
+		t.Fatal("changed warm attach retry succeeded")
+	}
+	db := openRawSQLite(t, path)
+	if _, err := db.Exec(`UPDATE session_attachments SET expires_at_ns = created_at_ms * 1000000 + 1 WHERE attach_id = 'att_warm'`); err != nil {
+		t.Fatalf("expire warm attach: %v", err)
+	}
+	expired, err := warm.ExpireWarmAttach(ctx, "att_warm", 0)
+	if err != nil || expired.Attachment.Status != store.AttachmentReauthorizationRequired || expired.Summary.Blocker == nil || expired.Summary.Blocker.Kind != store.AttentionBlockerReauthorizationRequired {
+		t.Fatalf("expire warm attach = %+v, %v", expired, err)
+	}
+}
+
+func int64Pointer(value int64) *int64 { return &value }
+
 func TestAttentionSnapshotPersistsEventsLedgerAndTerminalFence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	attention := openStore(t, path)

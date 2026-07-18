@@ -1021,6 +1021,188 @@ func sameSQLiteAttachAttempt(current store.AttachAttempt, request store.AttachAt
 		(current.IssuedCredentialGeneration != nil && request.IssuedCredentialGeneration != nil && *current.IssuedCredentialGeneration == *request.IssuedCredentialGeneration))
 }
 
+func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRequest) (store.WarmAttachCommit, error) {
+	if s == nil || s.db == nil {
+		return store.WarmAttachCommit{}, errors.New("sqlite event store is nil")
+	}
+	if err := validateSQLiteWarmAttach(request); err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("begin sqlite warm attach: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	if !validSQLiteWarmAttachExpiry(request, time.UnixMilli(nowMS)) {
+		return store.WarmAttachCommit{}, errors.New("warm attach expiry is outside the Store-clock window")
+	}
+	if err := validateSQLiteAttachAttempt(request.Attempt, time.UnixMilli(nowMS)); err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	if err := cleanupExpiredSQLiteAttachAttempts(ctx, tx); err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	if existing, lookupErr := querySQLiteAttachAttempt(ctx, tx, request.Attempt.Identity.JTIHash); lookupErr == nil {
+		commit, duplicateErr := sqliteWarmAttachDuplicate(ctx, tx, existing, request, nowMS)
+		if duplicateErr != nil {
+			return store.WarmAttachCommit{}, duplicateErr
+		}
+		if err := tx.Commit(); err != nil {
+			return store.WarmAttachCommit{}, fmt.Errorf("commit sqlite warm attach duplicate: %w", err)
+		}
+		return commit, nil
+	} else if !errors.Is(lookupErr, sql.ErrNoRows) {
+		return store.WarmAttachCommit{}, fmt.Errorf("load sqlite warm attach: %w", lookupErr)
+	}
+	bound := &Store{db: s.db, fenceDB: s.fenceDB, connectionTx: tx}
+	if _, err := bound.ValidateAdapterAdmission(ctx, request.Attempt.Identity.BootstrapSessionID, request.BootstrapAdmission); err != nil {
+		return store.WarmAttachCommit{}, errors.New("warm attach bootstrap admission lost")
+	}
+	if _, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE target_session_id = ?`, request.Attachment.Identity.TargetSessionID)); err == nil {
+		return store.WarmAttachCommit{}, errors.New("warm attach target already has an attachment")
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return store.WarmAttachCommit{}, fmt.Errorf("load sqlite warm attach target: %w", err)
+	}
+	if summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, request.Attachment.Identity.TargetSessionID)); err == nil && summary.TerminalOutcome != nil {
+		return store.WarmAttachCommit{}, errors.New("warm attach target is terminal")
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return store.WarmAttachCommit{}, err
+	}
+	nowMS, err = sqliteNowMillis(ctx, tx)
+	if err != nil || !validSQLiteWarmAttachExpiry(request, time.UnixMilli(nowMS)) || validateSQLiteAttachAttempt(request.Attempt, time.UnixMilli(nowMS)) != nil {
+		return store.WarmAttachCommit{}, errors.New("warm attach expiry is outside the Store-clock window")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_attach_attempts (attempt_jti_hash, attach_id, bootstrap_session_id, target_session_id, provider, fingerprint_domain, fingerprint_version, fingerprint_digest, fingerprint_key_version, expires_at_ns, admission_outcome, issued_credential_generation, created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)`, request.Attempt.Identity.JTIHash[:], request.Attempt.Identity.AttachID, request.Attempt.Identity.BootstrapSessionID, request.Attempt.Identity.TargetSessionID, request.Attempt.Identity.Provider, request.Attempt.Fingerprint.Domain, request.Attempt.Fingerprint.Version, request.Attempt.Fingerprint.Digest[:], request.Attempt.Fingerprint.KeyVersion, request.Attempt.ExpiresAt.UnixNano(), *request.Attempt.IssuedCredentialGeneration, nowMS); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("insert sqlite warm attach attempt: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_attachments (attach_id, bootstrap_session_id, target_session_id, status, delivery_state, delivery_version, expires_at_ns, target_credential_lineage_ref, created_at_ms, updated_at_ms) VALUES (?, ?, ?, 'join_pending', 'pending', 0, ?, ?, ?, ?)`, request.Attachment.Identity.AttachID, request.Attachment.Identity.BootstrapSessionID, request.Attachment.Identity.TargetSessionID, request.Attachment.ExpiresAt.UnixNano(), request.Attachment.Identity.TargetCredentialLineageRef, nowMS, nowMS); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("insert sqlite warm attach attachment: %w", err)
+	}
+	var latest int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM session_events WHERE session_id = ?`, request.Attachment.Identity.TargetSessionID).Scan(&latest); err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	seq := latest + 1
+	event := store.PendingEvent{Type: "session.message", Time: time.UnixMilli(nowMS), Payload: sqliteWarmAttachPayload(request.FirstDelivery)}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_events (session_id, seq, type, payload, event_time_ms, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)`, request.Attachment.Identity.TargetSessionID, seq, event.Type, event.Payload, nowMS, nowMS); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("append sqlite warm attach reference: %w", err)
+	}
+	if terminal, err := projectSQLiteAttentionEvent(ctx, tx, request.Attachment.Identity.TargetSessionID, seq, event, nowMS); err != nil || terminal {
+		return store.WarmAttachCommit{}, errors.New("sqlite warm attach reference event is invalid")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_pending_commands (session_id, cmd_id, type, event_seq, status, expires_at_ns, created_at_ms, updated_at_ms) VALUES (?, ?, 'session.send', ?, 'pending', ?, ?, ?)`, request.Attachment.Identity.TargetSessionID, request.FirstDelivery.CommandID, seq, request.FirstDelivery.ExpiresAt.UnixNano(), nowMS, nowMS); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("insert sqlite warm attach outbox: %w", err)
+	}
+	attachment, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, request.Attachment.Identity.AttachID))
+	if err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	if err := upsertSQLiteAttentionLedger(ctx, tx, attachment.Identity.TargetSessionID, sqliteAttentionBlockerForAttachment(attachment, nil), &nowMS); err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, attachment.Identity.TargetSessionID))
+	if err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	attempt, err := querySQLiteAttachAttempt(ctx, tx, request.Attempt.Identity.JTIHash)
+	if err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("commit sqlite warm attach: %w", err)
+	}
+	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, Outbox: store.WarmAttachOutbox{TargetSessionID: attachment.Identity.TargetSessionID, CommandID: request.FirstDelivery.CommandID, EventSeq: seq, ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: request.FirstDelivery.ExpiresAt}, Summary: summary}, nil
+}
+
+func (s *Store) ExpireWarmAttach(ctx context.Context, attachID string, expectedDeliveryVersion int64) (store.WarmAttachExpiry, error) {
+	if !validConnectionID(attachID) || expectedDeliveryVersion < 0 {
+		return store.WarmAttachExpiry{}, errors.New("invalid sqlite warm attach expiry")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.WarmAttachExpiry{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, attachID))
+	if err != nil {
+		return store.WarmAttachExpiry{}, err
+	}
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil || current.DeliveryVersion != expectedDeliveryVersion || current.Status != store.AttachmentJoinPending || current.DeliveryState != store.AttachmentDeliveryPending || current.ExpiresAt == nil || current.ExpiresAt.After(time.UnixMilli(nowMS)) {
+		return store.WarmAttachExpiry{}, errors.New("sqlite warm attach is not expirable")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_attachments SET status = 'reauthorization_required', delivery_version = delivery_version + 1, expires_at_ns = NULL, updated_at_ms = ? WHERE attach_id = ? AND delivery_version = ?`, nowMS, attachID, expectedDeliveryVersion)
+	if err != nil {
+		return store.WarmAttachExpiry{}, err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return store.WarmAttachExpiry{}, errors.New("sqlite warm attach expiry conflict")
+	}
+	updated, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, attachID))
+	if err != nil {
+		return store.WarmAttachExpiry{}, err
+	}
+	if err := upsertSQLiteAttentionLedger(ctx, tx, updated.Identity.TargetSessionID, &store.AttentionBlocker{Kind: store.AttentionBlockerReauthorizationRequired}, nil); err != nil {
+		return store.WarmAttachExpiry{}, err
+	}
+	summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, updated.Identity.TargetSessionID))
+	if err != nil {
+		return store.WarmAttachExpiry{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.WarmAttachExpiry{}, err
+	}
+	return store.WarmAttachExpiry{Attachment: updated, Summary: summary}, nil
+}
+
+func validateSQLiteWarmAttach(request store.WarmAttachRequest) error {
+	if request.Attempt.Identity.JTIHash == ([32]byte{}) || request.Attempt.Identity.Provider == "" || request.Attempt.Fingerprint.Domain != "agentwharf.attach-request.v1" || request.Attempt.Fingerprint.Version != 1 || request.Attempt.Fingerprint.Digest == ([32]byte{}) || request.Attempt.Fingerprint.KeyVersion < 1 || request.Attempt.Outcome != store.AttachAttemptAccepted || request.Attempt.IssuedCredentialGeneration == nil || *request.Attempt.IssuedCredentialGeneration != request.BootstrapAdmission.CredentialGeneration || request.Attachment.Identity.AttachID != request.Attempt.Identity.AttachID || request.Attachment.Identity.BootstrapSessionID != request.Attempt.Identity.BootstrapSessionID || request.Attachment.Identity.TargetSessionID != request.Attempt.Identity.TargetSessionID || validateAttachmentIdentity(request.Attachment.Identity) != nil || request.BootstrapAdmission.CredentialGeneration < 1 || request.BootstrapAdmission.ConnectionEpoch < 1 || request.BootstrapAdmission.AcceptedFence < 1 || request.BootstrapAdmission.GrantFence <= request.BootstrapAdmission.AcceptedFence || !validAttachmentText(request.FirstDelivery.CommandID, 256) || !validAttachmentText(request.FirstDelivery.ReferenceID, 255) || request.FirstDelivery.ReferenceDigest == ([32]byte{}) || !request.FirstDelivery.ExpiresAt.Equal(request.Attachment.ExpiresAt) {
+		return errors.New("invalid sqlite warm attach request")
+	}
+	return nil
+}
+
+func validSQLiteWarmAttachExpiry(request store.WarmAttachRequest, now time.Time) bool {
+	return request.Attempt.ExpiresAt.After(now) && request.Attempt.ExpiresAt.Before(now.Add(maxAttachAttemptTTL).Add(time.Nanosecond)) && validAttachmentExpiry(request.Attachment.ExpiresAt, now) && !request.Attachment.ExpiresAt.After(request.Attempt.ExpiresAt)
+}
+
+func sqliteWarmAttachPayload(delivery store.WarmAttachFirstDelivery) []byte {
+	payload, _ := json.Marshal(struct {
+		Role            string `json:"role"`
+		ReferenceID     string `json:"reference_id"`
+		ReferenceDigest string `json:"reference_digest"`
+	}{Role: "user", ReferenceID: delivery.ReferenceID, ReferenceDigest: fmt.Sprintf("%x", delivery.ReferenceDigest)})
+	return payload
+}
+
+func sqliteWarmAttachDuplicate(ctx context.Context, tx *sql.Tx, attempt store.AttachAttempt, request store.WarmAttachRequest, nowMS int64) (store.WarmAttachCommit, error) {
+	if !sameSQLiteAttachAttempt(attempt, request.Attempt) {
+		return store.WarmAttachCommit{}, errors.New("sqlite warm attach is immutable")
+	}
+	attachment, err := queryAttachment(ctx, tx.QueryRowContext(ctx, `SELECT `+attachmentColumns+` FROM session_attachments WHERE attach_id = ?`, request.Attachment.Identity.AttachID))
+	if err != nil || attachment.Identity != request.Attachment.Identity {
+		return store.WarmAttachCommit{}, errors.New("sqlite warm attach attachment is immutable")
+	}
+	command, err := queryPendingCommand(ctx, tx, attachment.Identity.TargetSessionID, request.FirstDelivery.CommandID, nowMS)
+	if err != nil || command.Type != "session.send" || !command.ExpiresAt.Equal(request.FirstDelivery.ExpiresAt) {
+		return store.WarmAttachCommit{}, errors.New("sqlite warm attach outbox is immutable")
+	}
+	var eventType string
+	var payload []byte
+	if err := tx.QueryRowContext(ctx, `SELECT type, payload FROM session_events WHERE session_id = ? AND seq = ?`, attachment.Identity.TargetSessionID, command.EventSeq).Scan(&eventType, &payload); err != nil || !bytes.Equal(payload, sqliteWarmAttachPayload(request.FirstDelivery)) || eventType != "session.message" {
+		return store.WarmAttachCommit{}, errors.New("sqlite warm attach reference is immutable")
+	}
+	summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, attachment.Identity.TargetSessionID))
+	if err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, Outbox: store.WarmAttachOutbox{TargetSessionID: attachment.Identity.TargetSessionID, CommandID: command.CommandID, EventSeq: command.EventSeq, ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: command.ExpiresAt}, Summary: summary, Duplicate: true}, nil
+}
+
 func (s *Store) ReserveWorkspaceLease(ctx context.Context, reserve store.WorkspaceLeaseReserve) (store.WorkspaceLease, error) {
 	if s == nil || s.db == nil {
 		return store.WorkspaceLease{}, errors.New("sqlite event store is nil")
