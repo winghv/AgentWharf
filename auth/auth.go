@@ -152,6 +152,22 @@ type AttachCommitMaterial struct {
 	TargetCredentialLineageRef   string
 	FirstDeliveryReferenceID     string
 	FirstDeliveryReferenceDigest [32]byte
+	proof                        *attachCommitProof
+}
+
+type attachCommitProof struct {
+	grant                        attachGrantSnapshot
+	JTIHash                      [32]byte
+	Fingerprint                  AttachCommitFingerprint
+	TargetCredentialLineageRef   string
+	FirstDeliveryReferenceID     string
+	FirstDeliveryReferenceDigest [32]byte
+}
+
+type attachGrantSnapshot struct {
+	Audience, JTI, AttachID, BootstrapSessionID, TargetSessionID, Provider string
+	IssuedAt, ExpiresAt, DeliveryDeadline                                  time.Time
+	GrantFence                                                             int64
 }
 
 // AttachCommitFingerprint identifies the key and protocol domain used for a
@@ -163,7 +179,7 @@ type AttachCommitFingerprint struct {
 	KeyVersion int64
 }
 
-const attachCommitFingerprintDomain = "agentwharf.attach"
+const attachCommitFingerprintDomain = "agentwharf.attach-request.v1"
 
 // HMACAttachCommitDeriver lets an Auth verifier derive Store-safe material
 // from verified claims while keeping its HMAC key private.
@@ -191,7 +207,7 @@ func (d *HMACAttachCommitDeriver) DeriveAttachCommit(_ context.Context, grant At
 		fmt.Sprintf("%d", grant.DeliveryDeadline.UnixNano()), fmt.Sprintf("%d", grant.GrantFence),
 	}
 	lineage := d.digest("target-lineage/v1", grant.BootstrapSessionID, grant.TargetSessionID, grant.AttachID, grant.JTI)
-	return AttachCommitMaterial{
+	material := AttachCommitMaterial{
 		JTIHash: d.digest("jti/v1", grant.JTI),
 		Fingerprint: AttachCommitFingerprint{
 			Domain: attachCommitFingerprintDomain, Version: 1, KeyVersion: d.keyVersion,
@@ -200,7 +216,42 @@ func (d *HMACAttachCommitDeriver) DeriveAttachCommit(_ context.Context, grant At
 		TargetCredentialLineageRef:   "hmac-v1:" + hex.EncodeToString(lineage[:]),
 		FirstDeliveryReferenceID:     grant.AttachID,
 		FirstDeliveryReferenceDigest: d.digest("first-delivery/v1", grantFields...),
-	}, nil
+	}
+	material.proof = &attachCommitProof{
+		grant: attachGrantSnapshotFrom(grant), JTIHash: material.JTIHash, Fingerprint: material.Fingerprint,
+		TargetCredentialLineageRef:   material.TargetCredentialLineageRef,
+		FirstDeliveryReferenceID:     material.FirstDeliveryReferenceID,
+		FirstDeliveryReferenceDigest: material.FirstDeliveryReferenceDigest,
+	}
+	return material, nil
+}
+
+// ValidateAttachCommitMaterial accepts only a material value produced by the
+// Auth HMAC derivation capability for these exact verified grant claims.
+func ValidateAttachCommitMaterial(grant AttachGrant) error {
+	material := grant.Commit
+	proof := material.proof
+	if proof == nil || proof.grant != attachGrantSnapshotFrom(grant) || proof.JTIHash != material.JTIHash ||
+		proof.Fingerprint != material.Fingerprint || proof.TargetCredentialLineageRef != material.TargetCredentialLineageRef ||
+		proof.FirstDeliveryReferenceID != material.FirstDeliveryReferenceID ||
+		proof.FirstDeliveryReferenceDigest != material.FirstDeliveryReferenceDigest ||
+		material.Fingerprint.Domain != attachCommitFingerprintDomain || material.Fingerprint.Version != 1 ||
+		material.Fingerprint.KeyVersion < 1 || material.JTIHash == ([32]byte{}) ||
+		material.Fingerprint.Digest == ([32]byte{}) || material.TargetCredentialLineageRef == "" ||
+		len(material.TargetCredentialLineageRef) > maxAttachGrantStringBytes ||
+		material.FirstDeliveryReferenceID != grant.AttachID || material.FirstDeliveryReferenceDigest == ([32]byte{}) {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
+func attachGrantSnapshotFrom(grant AttachGrant) attachGrantSnapshot {
+	return attachGrantSnapshot{
+		Audience: grant.Audience, JTI: grant.JTI, AttachID: grant.AttachID,
+		BootstrapSessionID: grant.BootstrapSessionID, TargetSessionID: grant.TargetSessionID, Provider: grant.Provider,
+		IssuedAt: grant.IssuedAt, ExpiresAt: grant.ExpiresAt, DeliveryDeadline: grant.DeliveryDeadline,
+		GrantFence: grant.GrantFence,
+	}
 }
 
 func (d *HMACAttachCommitDeriver) digest(domain string, fields ...string) [32]byte {

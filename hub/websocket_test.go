@@ -1994,6 +1994,11 @@ func (s *recordingWarmAttachStore) AttentionSnapshot(context.Context, []string) 
 func (s *recordingWarmAttachStore) CommitWarmAttach(_ context.Context, request store.WarmAttachRequest) (store.WarmAttachCommit, error) {
 	s.warmMu.Lock()
 	defer s.warmMu.Unlock()
+	if request.Attempt.Fingerprint.Domain != "agentwharf.attach-request.v1" ||
+		request.Attempt.IssuedCredentialGeneration == nil ||
+		*request.Attempt.IssuedCredentialGeneration != request.BootstrapAdmission.CredentialGeneration {
+		return store.WarmAttachCommit{}, errors.New("invalid T17H warm attach contract")
+	}
 	duplicate := len(s.warmSeen) > 0
 	s.warmSeen = append(s.warmSeen, request)
 	return store.WarmAttachCommit{

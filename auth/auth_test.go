@@ -256,10 +256,22 @@ func TestHMACAttachCommitDeriverProducesBoundedNonSecretMaterial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeriveAttachCommit() retry error = %v", err)
 	}
-	if first != second || first.Fingerprint.Domain == "" || first.Fingerprint.Version != 1 ||
+	if first.JTIHash != second.JTIHash || first.Fingerprint != second.Fingerprint ||
+		first.TargetCredentialLineageRef != second.TargetCredentialLineageRef ||
+		first.FirstDeliveryReferenceID != second.FirstDeliveryReferenceID ||
+		first.FirstDeliveryReferenceDigest != second.FirstDeliveryReferenceDigest ||
+		first.Fingerprint.Domain == "" || first.Fingerprint.Version != 1 ||
 		first.Fingerprint.KeyVersion != 7 || first.TargetCredentialLineageRef == "" ||
 		first.FirstDeliveryReferenceID != grant.AttachID {
 		t.Fatalf("derived material = %+v", first)
+	}
+	grant.Commit = first
+	if err := auth.ValidateAttachCommitMaterial(grant); err != nil {
+		t.Fatalf("ValidateAttachCommitMaterial() error = %v", err)
+	}
+	grant.Commit.TargetCredentialLineageRef = "raw-grant-must-not-escape"
+	if err := auth.ValidateAttachCommitMaterial(grant); !errors.Is(err, auth.ErrUnauthorized) {
+		t.Fatalf("ValidateAttachCommitMaterial(mutated) error = %v, want unauthorized", err)
 	}
 	changed := grant
 	changed.JTI = "jti_2"

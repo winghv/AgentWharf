@@ -746,7 +746,7 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 		return err
 	}
 	authorization, err := h.handshake.AuthorizeAttach(ctx, accepted, rawGrant)
-	if err != nil || authorization.Grant.TargetSessionID != cmd.SessionID || !validAttachCommitMaterial(authorization.Grant.Commit, authorization.Grant) {
+	if err != nil || authorization.Grant.TargetSessionID != cmd.SessionID || auth.ValidateAttachCommitMaterial(authorization.Grant) != nil {
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return auth.ErrUnauthorized
 	}
@@ -756,6 +756,7 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "internal_error")
 		return err
 	}
+	issuedGeneration := authorization.Bootstrap.CredentialGeneration
 	commit, err := warmStore.CommitWarmAttach(ctx, store.WarmAttachRequest{
 		Attempt: store.AttachAttemptRequest{
 			Identity: store.AttachAttemptIdentity{
@@ -768,6 +769,7 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 				Digest: authorization.Grant.Commit.Fingerprint.Digest, KeyVersion: authorization.Grant.Commit.Fingerprint.KeyVersion,
 			},
 			ExpiresAt: authorization.Grant.ExpiresAt, Outcome: store.AttachAttemptAccepted,
+			IssuedCredentialGeneration: &issuedGeneration,
 		},
 		Attachment: store.AttachmentCreate{
 			Identity: store.AttachmentIdentity{
@@ -796,20 +798,6 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 		status = protocol.AckDuplicate
 	}
 	return writeCommandAck(ctx, conn, cmd.CommandID, status, "")
-}
-
-func validAttachCommitMaterial(material auth.AttachCommitMaterial, grant auth.AttachGrant) bool {
-	if material.Fingerprint.Domain == "" || material.Fingerprint.Version <= 0 || material.Fingerprint.KeyVersion <= 0 ||
-		material.TargetCredentialLineageRef == "" || len(material.TargetCredentialLineageRef) > 256 ||
-		material.FirstDeliveryReferenceID != grant.AttachID || zeroDigest(material.JTIHash) ||
-		zeroDigest(material.Fingerprint.Digest) || zeroDigest(material.FirstDeliveryReferenceDigest) {
-		return false
-	}
-	return true
-}
-
-func zeroDigest(digest [32]byte) bool {
-	return digest == [32]byte{}
 }
 
 func commandAdmissionAction(commandType protocol.CommandType) auth.SessionAdmissionAction {
