@@ -152,7 +152,7 @@ func (s *Store) AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]s
 		seen[sessionID] = struct{}{}
 		args[index] = sessionID
 	}
-	pending, err := s.attentionMigrationPending(ctx)
+	pending, err := s.attentionMigrationPending(ctx, s.db)
 	if err != nil {
 		return nil, err
 	}
@@ -182,9 +182,9 @@ func (s *Store) AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]s
 	return summaries, nil
 }
 
-func (s *Store) attentionMigrationPending(ctx context.Context) (bool, error) {
+func (s *Store) attentionMigrationPending(ctx context.Context, executor sqliteConnectionExecutor) (bool, error) {
 	var state string
-	if err := s.db.QueryRowContext(ctx, `SELECT state FROM session_attention_migration WHERE singleton = 1`).Scan(&state); err != nil {
+	if err := executor.QueryRowContext(ctx, `SELECT state FROM session_attention_migration WHERE singleton = 1`).Scan(&state); err != nil {
 		return false, fmt.Errorf("read sqlite attention migration marker: %w", err)
 	}
 	if state != "pending" && state != "complete" {
@@ -1355,7 +1355,7 @@ func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, 
 		admission.AcceptedFence < 1 || admission.GrantFence <= admission.AcceptedFence {
 		return store.AdapterConnection{}, errors.New("invalid adapter admission")
 	}
-	pending, err := s.attentionMigrationPending(ctx)
+	pending, err := s.attentionMigrationPending(ctx, s.connectionExecutor())
 	if err != nil {
 		return store.AdapterConnection{}, err
 	}

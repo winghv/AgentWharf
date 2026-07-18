@@ -214,6 +214,38 @@ func TestAttentionMigrationRecoversSchemaCreatedBeforeMarker(t *testing.T) {
 	}
 }
 
+func TestAttentionMigrationMarkerUsesActiveAdapterTransaction(t *testing.T) {
+	attention := openStore(t, filepath.Join(t.TempDir(), "events.db"))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	connection, err := attention.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: "ses_marker_tx", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("initialize marker transaction connection: %v", err)
+	}
+	connection, err = attention.AcceptAdapterHello(ctx, connection.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("accept marker transaction hello: %v", err)
+	}
+	grantFence, err := attention.AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatalf("allocate marker transaction grant fence: %v", err)
+	}
+	admission := store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grantFence}
+	if err := attention.WithAdapterConnectionTransaction(ctx, func(current store.AdapterConnectionStore) error {
+		_, err := current.(*sqlite.Store).ValidateAdapterEffectAdmission(ctx, connection.SessionID, admission)
+		return err
+	}); err != nil {
+		t.Fatalf("validate marker effect admission: %v", err)
+	}
+	if _, err := attention.AppendAdapterEvents(ctx, connection.SessionID, admission, []store.PendingEvent{
+		{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)},
+	}); err != nil {
+		t.Fatalf("append marker transaction event: %v", err)
+	}
+}
+
 func TestAttentionSnapshotProjectsProposedTerminal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	attention := openStore(t, path)
