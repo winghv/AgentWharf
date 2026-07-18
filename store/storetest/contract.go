@@ -606,11 +606,11 @@ func ConnectionContract(t *testing.T, harness ConnectionHarness) {
 	if err != nil {
 		t.Fatalf("hello pending expiry: %v", err)
 	}
-	expiringRotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Millisecond), RotationID: "rot_expired"}
+	expiringRotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(50 * time.Millisecond), RotationID: "rot_expired"}
 	if _, err := connections.PrepareAdapterCredentialRotation(context.Background(), init.SessionID, expiringRotation); err != nil {
 		t.Fatalf("prepare expiring rotation: %v", err)
 	}
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(75 * time.Millisecond)
 	if _, err := connections.ActivateAdapterCredential(context.Background(), init.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, RotationID: "rot_expired"}); err == nil {
 		t.Fatal("expired pending credential unexpectedly activated")
 	}
@@ -1193,11 +1193,11 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 	t.Run("expired pending command cannot be claimed", func(t *testing.T) {
 		ledger := harness.Open(t)
 		authority := harness.Authority(t, ledger)
-		request := store.PendingCommandRequest{CommandID: "cmd_contract_claim_expired", Type: "session.send", ExpiresAt: time.Now().Add(20 * time.Millisecond)}
+		request := store.PendingCommandRequest{CommandID: "cmd_contract_claim_expired", Type: "session.send", ExpiresAt: time.Now().Add(50 * time.Millisecond)}
 		if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_expired", authority, userCommandEvent(1), request); err != nil {
 			t.Fatalf("prepare expiry claim: %v", err)
 		}
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(75 * time.Millisecond)
 		if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_expired", authority, request.CommandID); err == nil {
 			t.Fatal("expired ClaimPendingCommand() unexpectedly succeeded")
 		}

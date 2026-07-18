@@ -88,6 +88,67 @@ func TestAttentionSnapshotProjectsClientCommandLedger(t *testing.T) {
 	}
 }
 
+func TestAttentionSnapshotPreservesClientActivityForNonClientCallbacks(t *testing.T) {
+	harness := newPostgresCommandHarness(t, "agentwharf_attention_callbacks", nil)
+	ctx := context.Background()
+	authority := store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}
+	firstRequest := store.PendingCommandRequest{CommandID: "cmd_attention_callback_first", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := harness.CommitPendingCommand(ctx, "ses_command_1", authority,
+		store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"user"}`)}, firstRequest); err != nil {
+		t.Fatalf("commit first pending command: %v", err)
+	}
+	snapshot, err := harness.AttentionSnapshot(ctx, []string{"ses_command_1"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].LastClientCommandAt == nil {
+		t.Fatalf("first command attention snapshot = %+v, %v", snapshot, err)
+	}
+	originalActivity := *snapshot[0].LastClientCommandAt
+	originalVersion := snapshot[0].SummaryVersion
+
+	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ($1)`, "ses_attention_callback_bootstrap"); err != nil {
+		t.Fatalf("seed attachment bootstrap session: %v", err)
+	}
+	attachmentRequest := store.AttachmentCreate{Identity: store.AttachmentIdentity{
+		AttachID: "attach_attention_callback", BootstrapSessionID: "ses_attention_callback_bootstrap",
+		TargetSessionID: "ses_command_1", TargetCredentialLineageRef: "lineage_attention_callback",
+	}, ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := harness.CreateAttachment(ctx, attachmentRequest); err != nil {
+		t.Fatalf("create attachment callback: %v", err)
+	}
+	operation := "start"
+	if _, err := harness.UpdateAttachment(ctx, attachmentRequest.Identity.AttachID, 0, store.AttachmentUpdate{
+		Status: store.AttachmentReauthorizationRequired, DeliveryState: store.AttachmentDeliveryOutcomeUnknown,
+		Blocker: &store.AttachmentBlocker{Kind: store.AttachmentBlockerOutcomeUnknown, Operation: &operation},
+	}); err != nil {
+		t.Fatalf("record attachment outcome unknown: %v", err)
+	}
+	snapshot, err = harness.AttentionSnapshot(ctx, []string{"ses_command_1"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].SummaryVersion != originalVersion+2 || snapshot[0].LastClientCommandAt == nil || !snapshot[0].LastClientCommandAt.Equal(originalActivity) {
+		t.Fatalf("attachment callbacks changed client activity = %+v, %v", snapshot, err)
+	}
+
+	secondRequest := store.PendingCommandRequest{CommandID: "cmd_attention_callback_unknown", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+	if _, err := harness.CommitPendingCommand(ctx, "ses_command_1", authority,
+		store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"user"}`)}, secondRequest); err != nil {
+		t.Fatalf("commit outcome-unknown pending command: %v", err)
+	}
+	snapshot, err = harness.AttentionSnapshot(ctx, []string{"ses_command_1"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].LastClientCommandAt == nil {
+		t.Fatalf("outcome-unknown command attention snapshot = %+v, %v", snapshot, err)
+	}
+	originalActivity = *snapshot[0].LastClientCommandAt
+	originalVersion = snapshot[0].SummaryVersion
+	if _, err := harness.ClaimPendingCommand(ctx, "ses_command_1", authority, secondRequest.CommandID); err != nil {
+		t.Fatalf("claim outcome-unknown pending command: %v", err)
+	}
+	if _, err := harness.ResolvePendingCommand(ctx, "ses_command_1", authority, secondRequest.CommandID, store.PendingCommandOutcomeUnknown); err != nil {
+		t.Fatalf("resolve outcome-unknown pending command: %v", err)
+	}
+	snapshot, err = harness.AttentionSnapshot(ctx, []string{"ses_command_1"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].SummaryVersion != originalVersion+1 || snapshot[0].LastClientCommandAt == nil || !snapshot[0].LastClientCommandAt.Equal(originalActivity) {
+		t.Fatalf("outcome-unknown callback changed client activity = %+v, %v", snapshot, err)
+	}
+}
+
 func TestAttentionProjectionRollsBackAndSurvivesReopen(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_attention_restart_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
@@ -133,48 +194,85 @@ func TestAttentionSnapshotConcurrentAppend(t *testing.T) {
 	schemaName := fmt.Sprintf("agentwharf_attention_concurrent_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
 	setupSchema(t, dsn, schemaName)
 	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
-	pool := openPool(t, dsn, schemaName, nil)
+	appendLockStarted := newQueryStartSignal("pg_advisory_xact_lock")
+	pool := openPool(t, dsn, schemaName, appendLockStarted)
 	t.Cleanup(pool.Close)
 	resetSchema(t, pool)
 	attention := postgres.New(pool)
 	ctx := context.Background()
 	const sessionID = "ses_attention_concurrent"
-	const appends = 20
-	errs := make(chan error, appends)
 	done := make(chan struct{})
 	scanErr := make(chan error, 1)
+	scanStarted := make(chan struct{})
+	scanDuringAppend := make(chan struct{})
+	scannerDone := make(chan struct{})
+	var scannerStarted sync.Once
+	var scannerOverlap sync.Once
+	var appendWaiting atomic.Bool
 	go func() {
+		defer close(scannerDone)
 		for {
+			if _, err := attention.AttentionSnapshot(ctx, []string{sessionID}); err != nil {
+				scanErr <- err
+				return
+			}
+			scannerStarted.Do(func() { close(scanStarted) })
+			if appendWaiting.Load() {
+				scannerOverlap.Do(func() { close(scanDuringAppend) })
+			}
 			select {
 			case <-done:
 				return
 			default:
-				if _, err := attention.AttentionSnapshot(ctx, []string{sessionID}); err != nil {
-					scanErr <- err
-					return
-				}
 			}
 		}
 	}()
-	for index := 0; index < appends; index++ {
-		go func() {
-			_, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"agent"}`)}})
-			errs <- err
-		}()
+	select {
+	case <-scanStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attention scanner did not complete its startup snapshot")
 	}
-	for index := 0; index < appends; index++ {
-		if err := <-errs; err != nil {
-			t.Fatalf("concurrent append: %v", err)
-		}
+	blocker := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(blocker.Close)
+	blockerTx, err := blocker.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin append stream blocker: %v", err)
+	}
+	defer func() { _ = blockerTx.Rollback(ctx) }()
+	if _, err := blockerTx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, commandAdvisoryLockKey(sessionID)); err != nil {
+		t.Fatalf("lock append event stream: %v", err)
+	}
+	appendResult := make(chan error, 1)
+	go func() {
+		_, appendErr := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"agent"}`)}})
+		appendResult <- appendErr
+	}()
+	select {
+	case <-appendLockStarted.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("append did not reach the locked event stream")
+	}
+	appendWaiting.Store(true)
+	select {
+	case <-scanDuringAppend:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attention scanner did not complete a snapshot while append was blocked")
+	}
+	if err := blockerTx.Commit(ctx); err != nil {
+		t.Fatalf("release append event stream: %v", err)
+	}
+	if err := <-appendResult; err != nil {
+		t.Fatalf("concurrent append: %v", err)
 	}
 	close(done)
+	<-scannerDone
 	select {
 	case err := <-scanErr:
 		t.Fatalf("concurrent attention snapshot: %v", err)
 	default:
 	}
 	snapshot, err := attention.AttentionSnapshot(ctx, []string{sessionID})
-	if err != nil || len(snapshot) != 1 || snapshot[0].LatestSeq != appends || snapshot[0].LastDurableEventAt == nil || snapshot[0].StateOfProjection != store.AttentionProjectionIncomplete {
+	if err != nil || len(snapshot) != 1 || snapshot[0].LatestSeq != 1 || snapshot[0].LastDurableEventAt == nil || snapshot[0].StateOfProjection != store.AttentionProjectionIncomplete {
 		t.Fatalf("concurrent attention snapshot = %+v, %v", snapshot, err)
 	}
 }
