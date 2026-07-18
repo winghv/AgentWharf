@@ -655,6 +655,9 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websoc
 		_ = writeCommandAck(ctx, conn, commandID(cmd), protocol.AckRejected, "invalid_command")
 		return err
 	}
+	if cmd.Type == protocol.CommandSessionAttach {
+		return h.handleWarmAttach(ctx, conn, accepted, cmd)
+	}
 	if !subscribesTo(accepted.Subscribed, cmd.SessionID) {
 		err := fmt.Errorf("client is not subscribed to session %s", cmd.SessionID)
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
@@ -729,6 +732,84 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websoc
 		return err
 	}
 	return nil
+}
+
+func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, cmd *protocol.Command) error {
+	rawGrant, err := protocol.DecodeAttachGrantPayload(cmd.Payload)
+	if err != nil {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "invalid_command")
+		return err
+	}
+	if h.handshake == nil {
+		err := errors.New("hub handshake is not configured")
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "internal_error")
+		return err
+	}
+	authorization, err := h.handshake.AuthorizeAttach(ctx, accepted, rawGrant)
+	if err != nil || authorization.Grant.TargetSessionID != cmd.SessionID || !validAttachCommitMaterial(authorization.Grant.Commit, authorization.Grant) {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
+		return auth.ErrUnauthorized
+	}
+	warmStore, ok := h.events.(store.WarmAttachStore)
+	if !ok {
+		err := errors.New("warm attach store is not configured")
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "internal_error")
+		return err
+	}
+	commit, err := warmStore.CommitWarmAttach(ctx, store.WarmAttachRequest{
+		Attempt: store.AttachAttemptRequest{
+			Identity: store.AttachAttemptIdentity{
+				JTIHash: authorization.Grant.Commit.JTIHash, AttachID: authorization.Grant.AttachID,
+				BootstrapSessionID: authorization.Grant.BootstrapSessionID, TargetSessionID: authorization.Grant.TargetSessionID,
+				Provider: authorization.Grant.Provider,
+			},
+			Fingerprint: store.AttachAttemptFingerprint{
+				Domain: authorization.Grant.Commit.Fingerprint.Domain, Version: authorization.Grant.Commit.Fingerprint.Version,
+				Digest: authorization.Grant.Commit.Fingerprint.Digest, KeyVersion: authorization.Grant.Commit.Fingerprint.KeyVersion,
+			},
+			ExpiresAt: authorization.Grant.ExpiresAt, Outcome: store.AttachAttemptAccepted,
+		},
+		Attachment: store.AttachmentCreate{
+			Identity: store.AttachmentIdentity{
+				AttachID: authorization.Grant.AttachID, BootstrapSessionID: authorization.Grant.BootstrapSessionID,
+				TargetSessionID:            authorization.Grant.TargetSessionID,
+				TargetCredentialLineageRef: authorization.Grant.Commit.TargetCredentialLineageRef,
+			},
+			ExpiresAt: authorization.Grant.DeliveryDeadline,
+		},
+		BootstrapAdmission: store.AdapterConnectionAdmission{
+			CredentialGeneration: authorization.Bootstrap.CredentialGeneration,
+			ConnectionEpoch:      authorization.Bootstrap.ConnectionEpoch, AcceptedFence: authorization.Bootstrap.AcceptedFence,
+			GrantFence: authorization.Grant.GrantFence,
+		},
+		FirstDelivery: store.WarmAttachFirstDelivery{
+			CommandID: cmd.CommandID, ReferenceID: authorization.Grant.Commit.FirstDeliveryReferenceID,
+			ReferenceDigest: authorization.Grant.Commit.FirstDeliveryReferenceDigest, ExpiresAt: authorization.Grant.DeliveryDeadline,
+		},
+	})
+	if err != nil {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
+		return fmt.Errorf("commit warm attach: %w", err)
+	}
+	status := protocol.AckAccepted
+	if commit.Duplicate {
+		status = protocol.AckDuplicate
+	}
+	return writeCommandAck(ctx, conn, cmd.CommandID, status, "")
+}
+
+func validAttachCommitMaterial(material auth.AttachCommitMaterial, grant auth.AttachGrant) bool {
+	if material.Fingerprint.Domain == "" || material.Fingerprint.Version <= 0 || material.Fingerprint.KeyVersion <= 0 ||
+		material.TargetCredentialLineageRef == "" || len(material.TargetCredentialLineageRef) > 256 ||
+		material.FirstDeliveryReferenceID != grant.AttachID || zeroDigest(material.JTIHash) ||
+		zeroDigest(material.Fingerprint.Digest) || zeroDigest(material.FirstDeliveryReferenceDigest) {
+		return false
+	}
+	return true
+}
+
+func zeroDigest(digest [32]byte) bool {
+	return digest == [32]byte{}
 }
 
 func commandAdmissionAction(commandType protocol.CommandType) auth.SessionAdmissionAction {
@@ -963,7 +1044,8 @@ func validateClientCommand(cmd *protocol.Command) error {
 		return errors.New("command cmd_id, type, and session_id are required")
 	}
 	switch cmd.Type {
-	case protocol.CommandSessionSend, protocol.CommandPermissionRespond, protocol.CommandSessionInterrupt, protocol.CommandSessionStop:
+	case protocol.CommandSessionSend, protocol.CommandPermissionRespond, protocol.CommandSessionInterrupt, protocol.CommandSessionStop,
+		protocol.CommandSessionAttach:
 		return nil
 	default:
 		return fmt.Errorf("unsupported command type %q", cmd.Type)

@@ -198,6 +198,27 @@ func TestCommandSessionAttachRoundTrips(t *testing.T) {
 	}
 }
 
+func TestDecodeAttachGrantPayloadIsStrictAndBounded(t *testing.T) {
+	grant, err := DecodeAttachGrantPayload(json.RawMessage(`{"grant":"opaque"}`))
+	if err != nil || grant != "opaque" {
+		t.Fatalf("DecodeAttachGrantPayload() = %q, %v", grant, err)
+	}
+	for _, raw := range []json.RawMessage{
+		nil,
+		json.RawMessage(`null`),
+		json.RawMessage(`{}`),
+		json.RawMessage(`{"grant":""}`),
+		json.RawMessage(`{"grant":null}`),
+		json.RawMessage(`{"grant":"opaque","extra":true}`),
+		json.RawMessage(`{"grant":"one","grant":"two"}`),
+		json.RawMessage(`{"grant":"` + strings.Repeat("x", MaxAttachGrantBytes+1) + `"}`),
+	} {
+		if _, err := DecodeAttachGrantPayload(raw); err == nil {
+			t.Fatalf("DecodeAttachGrantPayload(%s) succeeded", raw)
+		}
+	}
+}
+
 func TestNegotiateVersion(t *testing.T) {
 	got, err := NegotiateVersion([]int{3, 2, 1}, []int{1})
 	if err != nil {

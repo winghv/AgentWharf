@@ -237,6 +237,43 @@ func TestEvaluateAttachAuthorizationFailsClosedAtTrustBoundaries(t *testing.T) {
 	}
 }
 
+func TestHMACAttachCommitDeriverProducesBoundedNonSecretMaterial(t *testing.T) {
+	deriver, err := auth.NewHMACAttachCommitDeriver([]byte("test-only-attach-hmac-key"), 7)
+	if err != nil {
+		t.Fatalf("NewHMACAttachCommitDeriver() error = %v", err)
+	}
+	grant := auth.AttachGrant{
+		Audience: "deploy-attach", JTI: "jti_1", AttachID: "attach_1",
+		BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code",
+		IssuedAt: time.Now().Add(-time.Second), ExpiresAt: time.Now().Add(time.Minute),
+		DeliveryDeadline: time.Now().Add(time.Minute), GrantFence: 2,
+	}
+	first, err := deriver.DeriveAttachCommit(context.Background(), grant)
+	if err != nil {
+		t.Fatalf("DeriveAttachCommit() error = %v", err)
+	}
+	second, err := deriver.DeriveAttachCommit(context.Background(), grant)
+	if err != nil {
+		t.Fatalf("DeriveAttachCommit() retry error = %v", err)
+	}
+	if first != second || first.Fingerprint.Domain == "" || first.Fingerprint.Version != 1 ||
+		first.Fingerprint.KeyVersion != 7 || first.TargetCredentialLineageRef == "" ||
+		first.FirstDeliveryReferenceID != grant.AttachID {
+		t.Fatalf("derived material = %+v", first)
+	}
+	changed := grant
+	changed.JTI = "jti_2"
+	other, err := deriver.DeriveAttachCommit(context.Background(), changed)
+	if err != nil {
+		t.Fatalf("DeriveAttachCommit(changed) error = %v", err)
+	}
+	if other.JTIHash == first.JTIHash || other.Fingerprint.Digest == first.Fingerprint.Digest ||
+		strings.Contains(first.TargetCredentialLineageRef, grant.JTI) ||
+		strings.Contains(first.TargetCredentialLineageRef, grant.TargetSessionID) {
+		t.Fatalf("derived material is not opaque or does not bind the verified grant: %+v", first)
+	}
+}
+
 func assertAuthorized(t *testing.T, principal auth.Principal, scope auth.Scope) {
 	t.Helper()
 

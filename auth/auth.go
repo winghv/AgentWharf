@@ -2,8 +2,13 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"strings"
 	"time"
 
@@ -103,6 +108,7 @@ type AttachGrant struct {
 	ExpiresAt          time.Time
 	DeliveryDeadline   time.Time
 	GrantFence         int64
+	Commit             AttachCommitMaterial
 }
 
 // BootstrapAuthority is the Store-derived current normal-hello snapshot.
@@ -135,6 +141,84 @@ type AttachAuthorization struct {
 // raw grant. The Hub does not depend on a platform token format or signer.
 type AttachGrantVerifier interface {
 	VerifyAttachGrant(ctx context.Context, rawGrant, expectedAudience string) (AttachGrant, error)
+}
+
+// AttachCommitMaterial is the bounded, non-secret output that Auth returns
+// with a verified grant. Raw grants, bearer material, and HMAC keys never
+// leave the Auth boundary.
+type AttachCommitMaterial struct {
+	JTIHash                      [32]byte
+	Fingerprint                  AttachCommitFingerprint
+	TargetCredentialLineageRef   string
+	FirstDeliveryReferenceID     string
+	FirstDeliveryReferenceDigest [32]byte
+}
+
+// AttachCommitFingerprint identifies the key and protocol domain used for a
+// stable, versioned HMAC of a verified attach grant.
+type AttachCommitFingerprint struct {
+	Domain     string
+	Version    int64
+	Digest     [32]byte
+	KeyVersion int64
+}
+
+const attachCommitFingerprintDomain = "agentwharf.attach"
+
+// HMACAttachCommitDeriver lets an Auth verifier derive Store-safe material
+// from verified claims while keeping its HMAC key private.
+type HMACAttachCommitDeriver struct {
+	key        []byte
+	keyVersion int64
+}
+
+func NewHMACAttachCommitDeriver(key []byte, keyVersion int64) (*HMACAttachCommitDeriver, error) {
+	if len(key) == 0 || keyVersion <= 0 {
+		return nil, ErrUnauthorized
+	}
+	return &HMACAttachCommitDeriver{key: append([]byte(nil), key...), keyVersion: keyVersion}, nil
+}
+
+func (d *HMACAttachCommitDeriver) DeriveAttachCommit(_ context.Context, grant AttachGrant) (AttachCommitMaterial, error) {
+	if d == nil || len(d.key) == 0 || d.keyVersion <= 0 || grant.JTI == "" || grant.AttachID == "" ||
+		grant.BootstrapSessionID == "" || grant.TargetSessionID == "" || grant.Provider == "" ||
+		!boundedAttachGrantStrings(grant.JTI, grant.AttachID, grant.BootstrapSessionID, grant.TargetSessionID, grant.Provider) {
+		return AttachCommitMaterial{}, ErrUnauthorized
+	}
+	grantFields := []string{
+		grant.Audience, grant.JTI, grant.AttachID, grant.BootstrapSessionID, grant.TargetSessionID, grant.Provider,
+		fmt.Sprintf("%d", grant.IssuedAt.UnixNano()), fmt.Sprintf("%d", grant.ExpiresAt.UnixNano()),
+		fmt.Sprintf("%d", grant.DeliveryDeadline.UnixNano()), fmt.Sprintf("%d", grant.GrantFence),
+	}
+	lineage := d.digest("target-lineage/v1", grant.BootstrapSessionID, grant.TargetSessionID, grant.AttachID, grant.JTI)
+	return AttachCommitMaterial{
+		JTIHash: d.digest("jti/v1", grant.JTI),
+		Fingerprint: AttachCommitFingerprint{
+			Domain: attachCommitFingerprintDomain, Version: 1, KeyVersion: d.keyVersion,
+			Digest: d.digest("fingerprint/v1", grantFields...),
+		},
+		TargetCredentialLineageRef:   "hmac-v1:" + hex.EncodeToString(lineage[:]),
+		FirstDeliveryReferenceID:     grant.AttachID,
+		FirstDeliveryReferenceDigest: d.digest("first-delivery/v1", grantFields...),
+	}, nil
+}
+
+func (d *HMACAttachCommitDeriver) digest(domain string, fields ...string) [32]byte {
+	mac := hmac.New(sha256.New, d.key)
+	writeAttachCommitField(mac, domain)
+	for _, field := range fields {
+		writeAttachCommitField(mac, field)
+	}
+	var digest [32]byte
+	copy(digest[:], mac.Sum(nil))
+	return digest
+}
+
+func writeAttachCommitField(mac hash.Hash, field string) {
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(field)))
+	_, _ = mac.Write(length[:])
+	_, _ = mac.Write([]byte(field))
 }
 
 // EvaluateAttachAuthorization validates the non-durable half of session.attach.

@@ -36,6 +36,7 @@ const (
 const (
 	HistoryPageMaxLimit  = 100
 	MaxEventPayloadBytes = 64 * 1024
+	MaxAttachGrantBytes  = 64 * 1024
 )
 
 type Role string
@@ -375,6 +376,24 @@ func strictObject(data []byte) (map[string]json.RawMessage, error) {
 		return nil, errors.New("trailing JSON value")
 	}
 	return fields, nil
+}
+
+// DecodeAttachGrantPayload accepts the deliberately narrow session.attach
+// payload. The raw grant remains at Client-to-Hub ingress and must not be
+// retained in a command/event or passed to downstream stores.
+func DecodeAttachGrantPayload(payload json.RawMessage) (string, error) {
+	if len(payload) == 0 || len(payload) > MaxAttachGrantBytes+32 {
+		return "", errors.New("attach grant payload is invalid")
+	}
+	fields, err := strictObject(payload)
+	if err != nil || len(fields) != 1 || fields["grant"] == nil {
+		return "", errors.New("attach grant payload is invalid")
+	}
+	var grant string
+	if err := json.Unmarshal(fields["grant"], &grant); err != nil || grant == "" || len(grant) > MaxAttachGrantBytes {
+		return "", errors.New("attach grant payload is invalid")
+	}
+	return grant, nil
 }
 
 func Encode(frame Frame) ([]byte, error) {
