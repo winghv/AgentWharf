@@ -520,6 +520,32 @@ func TestWarmAttachRejectsFencedAdmissionAndTerminalTarget(t *testing.T) {
 	}
 }
 
+func TestWarmAttachReplayIsReferenceOnly(t *testing.T) {
+	_, warm := newWarmAttachStore(t)
+	request := warmAttachRequestForPostgres()
+	commit, err := warm.CommitWarmAttach(context.Background(), request)
+	if err != nil {
+		t.Fatalf("commit warm attach: %v", err)
+	}
+	var replayed int
+	err = warm.Replay(context.Background(), request.Attachment.Identity.TargetSessionID, 1, func(event store.Event) error {
+		replayed++
+		if event.Seq != commit.Outbox.EventSeq || event.Type != "session.message" ||
+			!strings.Contains(string(event.Payload), `"reference_id":"ref_auth"`) {
+			return fmt.Errorf("unexpected warm attach replay event: %+v", event)
+		}
+		for _, forbidden := range []string{"content", "grant", "bearer", "credential"} {
+			if strings.Contains(strings.ToLower(string(event.Payload)), forbidden) {
+				return fmt.Errorf("warm attach replay leaked %s", forbidden)
+			}
+		}
+		return nil
+	})
+	if err != nil || replayed != 1 {
+		t.Fatalf("replay warm attach = events:%d err:%v", replayed, err)
+	}
+}
+
 func newWarmAttachStore(t *testing.T) (*pgxpool.Pool, *postgres.Store) {
 	t.Helper()
 	dsn := testDSN(t)
