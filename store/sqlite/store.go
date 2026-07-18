@@ -245,7 +245,15 @@ SELECT session_id FROM session_events UNION SELECT target_session_id FROM sessio
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM session_events WHERE session_id = ?`, sessionID).Scan(&latest); err != nil {
 			return AttentionBackfillResult{}, err
 		}
-		summary := store.SessionAttentionSummary{SessionID: sessionID, LatestSeq: latest, State: "starting", StateOfProjection: store.AttentionProjectionIncomplete}
+		summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, sessionID))
+		if errors.Is(err, sql.ErrNoRows) {
+			summary = store.SessionAttentionSummary{SessionID: sessionID, LatestSeq: latest, State: "starting", StateOfProjection: store.AttentionProjectionIncomplete}
+		} else if err != nil {
+			return AttentionBackfillResult{}, fmt.Errorf("load sqlite attention backfill summary: %w", err)
+		} else {
+			summary.LatestSeq = max(summary.LatestSeq, latest)
+			summary.StateOfProjection = store.AttentionProjectionIncomplete
+		}
 		if err := upsertSQLiteAttentionSummary(ctx, tx, summary, nowMS); err != nil {
 			return AttentionBackfillResult{}, err
 		}

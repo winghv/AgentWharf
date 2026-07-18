@@ -246,6 +246,46 @@ func TestAttentionMigrationMarkerUsesActiveAdapterTransaction(t *testing.T) {
 	}
 }
 
+func TestAttentionBackfillPreservesLivePendingSummary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attention := openStore(t, path)
+	if err := attention.Close(); err != nil {
+		t.Fatalf("close live pending seed store: %v", err)
+	}
+	db := openRawSQLite(t, path)
+	if _, err := db.Exec(`DELETE FROM session_attention_migration; DELETE FROM session_attention_summaries; INSERT INTO session_events (session_id, seq, type, payload, event_time_ms, created_at_ms) VALUES ('ses_live_pending', 1, 'session.state', '{"state":"ready"}', 1, 1)`); err != nil {
+		t.Fatalf("seed live pending legacy event: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close live pending legacy fixture: %v", err)
+	}
+	attention = openStore(t, path)
+	ctx := context.Background()
+	if _, err := attention.Append(ctx, "ses_live_pending", []store.PendingEvent{{Type: "session.state", Time: testTime(2), Payload: []byte(`{"state":"ended"}`)}}); err != nil {
+		t.Fatalf("append live pending terminal: %v", err)
+	}
+	if _, err := attention.CreateAttachment(ctx, store.AttachmentCreate{Identity: store.AttachmentIdentity{
+		AttachID: "att_live_pending", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_live_pending", TargetCredentialLineageRef: "lineage_live_pending",
+	}, ExpiresAt: time.Now().Add(10 * time.Second)}); err != nil {
+		t.Fatalf("create live pending attachment: %v", err)
+	}
+	result, err := attention.BackfillAttentionBatch(ctx, 1)
+	if err != nil || result.Processed != 1 || !result.Done {
+		t.Fatalf("backfill live pending summary = %+v, %v", result, err)
+	}
+	if err := attention.Close(); err != nil {
+		t.Fatalf("close backfilled live pending store: %v", err)
+	}
+	attention = openStore(t, path)
+	t.Cleanup(func() { _ = attention.Close() })
+	snapshot, err := attention.AttentionSnapshot(ctx, []string{"ses_live_pending"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].LatestSeq != 2 || snapshot[0].TerminalOutcome == nil || *snapshot[0].TerminalOutcome != "ended" ||
+		snapshot[0].Blocker == nil || snapshot[0].Blocker.Kind != store.AttentionBlockerQueued || snapshot[0].LastDurableEventAt == nil ||
+		snapshot[0].StateOfProjection != store.AttentionProjectionIncomplete {
+		t.Fatalf("backfilled live pending snapshot = %+v, %v", snapshot, err)
+	}
+}
+
 func TestAttentionSnapshotProjectsProposedTerminal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	attention := openStore(t, path)
