@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/winghv/agentwharf/adapter/acp"
 	"github.com/winghv/agentwharf/adapter/core"
 	"github.com/winghv/agentwharf/adapter/fallback/jsonstream"
@@ -32,6 +33,7 @@ import (
 	"github.com/winghv/agentwharf/hub"
 	"github.com/winghv/agentwharf/protocol"
 	"github.com/winghv/agentwharf/store"
+	"github.com/winghv/agentwharf/store/postgres"
 	"github.com/winghv/agentwharf/store/sqlite"
 	"nhooyr.io/websocket"
 )
@@ -67,7 +69,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: wharf serve|wrap|claude|codex|gemini|logout|machine [options]")
+		return errors.New("usage: wharf serve|wrap|claude|codex|gemini|logout|machine|attention-backfill [options]")
 	}
 
 	switch args[0] {
@@ -115,9 +117,39 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 			return runMachineLogout(stdout)
 		}
 		return errors.New("usage: wharf machine unlink")
+	case "attention-backfill":
+		return runAttentionBackfill(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runAttentionBackfill(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("attention-backfill", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	checkpoint := flags.String("checkpoint", "", "absolute checkpoint path")
+	batch := flags.Int("batch-size", 256, "sessions per bounded transaction")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *checkpoint == "" {
+		return errors.New("usage: wharf attention-backfill --checkpoint ABSOLUTE_PATH [--batch-size 1..256]")
+	}
+	dsn := os.Getenv("AGENTWHARF_POSTGRES_DSN")
+	if dsn == "" {
+		return errors.New("AGENTWHARF_POSTGRES_DSN is required")
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return errors.New("open attention backfill postgres pool")
+	}
+	defer pool.Close()
+	result, err := postgres.New(pool).RunAttentionBackfill(ctx, postgres.FileAttentionBackfillCheckpointStore{Path: *checkpoint}, *batch)
+	if err != nil {
+		return fmt.Errorf("run attention backfill: %w", err)
+	}
+	_, _ = fmt.Fprintf(stdout, "attention-backfill processed=%d incomplete=%d done=%t\n", result.Processed, result.Incomplete, result.Done)
+	return nil
 }
 
 func runMachineLogout(stdout io.Writer) error {

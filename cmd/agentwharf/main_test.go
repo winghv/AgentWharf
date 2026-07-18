@@ -99,11 +99,28 @@ func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	t.Parallel()
 
 	err := run(context.Background(), nil, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini|logout|machine [options]") {
+	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini|logout|machine|attention-backfill [options]") {
 		t.Fatalf("run() error = %v, want wharf usage", err)
 	}
 	if strings.Contains(err.Error(), "usage: agentwharf") {
 		t.Fatalf("run() error = %v, must not mention legacy agentwharf entrypoint", err)
+	}
+}
+
+func TestAttentionBackfillRequiresOperatorArguments(t *testing.T) {
+	if err := runWithInput(context.Background(), []string{"attention-backfill"}, nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: wharf attention-backfill") {
+		t.Fatalf("missing checkpoint error = %v", err)
+	}
+	t.Setenv("AGENTWHARF_POSTGRES_DSN", "")
+	if err := runWithInput(context.Background(), []string{"attention-backfill", "--checkpoint", "/tmp/checkpoint"}, nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "AGENTWHARF_POSTGRES_DSN is required") {
+		t.Fatalf("missing DSN error = %v", err)
+	}
+	t.Setenv("AGENTWHARF_POSTGRES_DSN", "not-a-dsn-secret-marker")
+	if err := runWithInput(context.Background(), []string{"attention-backfill", "--checkpoint", "/tmp/checkpoint"}, nil, io.Discard, io.Discard); err == nil || err.Error() != "open attention backfill postgres pool" {
+		t.Fatalf("invalid DSN error = %v", err)
+	}
+	if err := runWithInput(context.Background(), []string{"attention-backfill", "--postgres-dsn", "postgres://secret@example"}, nil, io.Discard, io.Discard); err == nil || strings.Contains(err.Error(), "postgres://secret@example") {
+		t.Fatalf("legacy DSN argument error = %v", err)
 	}
 }
 
