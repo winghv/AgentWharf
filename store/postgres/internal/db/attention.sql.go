@@ -119,6 +119,7 @@ SET latest_seq = EXCLUDED.latest_seq,
     last_durable_event_at = EXCLUDED.last_durable_event_at,
     projection_state = CASE
         WHEN session_attention_summaries.projection_state = 'incomplete' THEN 'incomplete'
+        WHEN EXCLUDED.latest_seq <> session_attention_summaries.latest_seq + 1 THEN 'incomplete'
         WHEN $11::BOOLEAN THEN 'incomplete'
         WHEN $8::BOOLEAN AND $3 IS NULL THEN 'incomplete'
         ELSE session_attention_summaries.projection_state
@@ -175,7 +176,7 @@ SET blocker_kind = $2,
     blocking_session_id = $5,
     blocker_operation = $6,
     summary_version = session_attention_summaries.summary_version + 1,
-    last_client_command_at = $7,
+    last_client_command_at = COALESCE($7, session_attention_summaries.last_client_command_at),
     updated_at = statement_timestamp()
 `
 
