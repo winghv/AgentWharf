@@ -113,6 +113,107 @@ func TestAttentionSnapshotProjectsUnknownCommandOutcome(t *testing.T) {
 	}
 }
 
+func TestAttentionBackfillCheckpointFailsClosedAndBatchesLegacySessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	attention := openStore(t, path)
+	ctx := context.Background()
+	if _, err := attention.CreateAttachment(ctx, store.AttachmentCreate{Identity: store.AttachmentIdentity{
+		AttachID: "att_legacy", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_legacy_attachment", TargetCredentialLineageRef: "lineage_legacy",
+	}, ExpiresAt: time.Now().Add(10 * time.Second)}); err != nil {
+		t.Fatalf("seed legacy attachment: %v", err)
+	}
+	connection, err := attention.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: "ses_legacy_connection", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("seed legacy connection: %v", err)
+	}
+	connection, err = attention.AcceptAdapterHello(ctx, connection.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("accept legacy connection hello: %v", err)
+	}
+	grantFence, err := attention.AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatalf("allocate legacy connection grant fence: %v", err)
+	}
+	if err := attention.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+	db := openRawSQLite(t, path)
+	if _, err := db.Exec(`DELETE FROM session_attention_migration`); err != nil {
+		t.Fatalf("clear migration marker: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM session_attention_summaries`); err != nil {
+		t.Fatalf("clear forward summaries: %v", err)
+	}
+	for index := 0; index < 257; index++ {
+		sessionID := fmt.Sprintf("ses_legacy_%03d", index)
+		if _, err := db.Exec(`INSERT INTO session_events (session_id, seq, type, payload, event_time_ms, created_at_ms) VALUES (?, 1, 'session.state', '{"state":"ready"}', 1, 1)`, sessionID); err != nil {
+			t.Fatalf("seed legacy session %d: %v", index, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy fixture: %v", err)
+	}
+	attention = openStore(t, path)
+	snapshot, err := attention.AttentionSnapshot(ctx, []string{"ses_legacy_000", "ses_legacy_attachment", "ses_legacy_connection"})
+	if err != nil || len(snapshot) != 3 || snapshot[0].StateOfProjection != store.AttentionProjectionIncomplete ||
+		snapshot[1].StateOfProjection != store.AttentionProjectionIncomplete || snapshot[2].StateOfProjection != store.AttentionProjectionIncomplete {
+		t.Fatalf("pending attention snapshot = %+v, %v", snapshot, err)
+	}
+	if _, err := attention.ValidateAdapterAdmission(ctx, connection.SessionID, store.AdapterConnectionAdmission{
+		CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grantFence,
+	}); err == nil {
+		t.Fatal("pending attention migration admitted legacy adapter")
+	}
+	first, err := attention.BackfillAttentionBatch(ctx, 256)
+	if err != nil || first.Processed != 256 || first.Done || first.Checkpoint != "ses_legacy_255" {
+		t.Fatalf("first attention backfill = %+v, %v", first, err)
+	}
+	if err := attention.Close(); err != nil {
+		t.Fatalf("close checkpointed store: %v", err)
+	}
+	attention = openStore(t, path)
+	t.Cleanup(func() { _ = attention.Close() })
+	second, err := attention.BackfillAttentionBatch(ctx, 256)
+	if err != nil || second.Processed != 3 || !second.Done || second.Checkpoint != "ses_legacy_connection" {
+		t.Fatalf("second attention backfill = %+v, %v", second, err)
+	}
+	snapshot, err = attention.AttentionSnapshot(ctx, []string{"ses_legacy_000", "ses_legacy_attachment", "ses_legacy_connection"})
+	if err != nil || len(snapshot) != 3 || snapshot[0].StateOfProjection != store.AttentionProjectionIncomplete ||
+		snapshot[1].StateOfProjection != store.AttentionProjectionIncomplete || snapshot[2].StateOfProjection != store.AttentionProjectionIncomplete {
+		t.Fatalf("backfilled attention snapshot = %+v, %v", snapshot, err)
+	}
+	fenced, err := attention.AdapterConnection(ctx, connection.SessionID)
+	if err != nil || fenced.RevokedAt == nil || fenced.TerminalAt == nil {
+		t.Fatalf("backfilled legacy connection fence = %+v, %v", fenced, err)
+	}
+}
+
+func TestAttentionMigrationRecoversSchemaCreatedBeforeMarker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	db := openRawSQLite(t, path)
+	if _, err := db.Exec(`CREATE TABLE session_events (
+    id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL,
+    payload BLOB NOT NULL, event_time_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL
+)`); err != nil {
+		t.Fatalf("seed crash-after-schema fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close crash-after-schema fixture: %v", err)
+	}
+	attention := openStore(t, path)
+	ctx := context.Background()
+	snapshot, err := attention.AttentionSnapshot(ctx, []string{"ses_crash_marker"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].StateOfProjection != store.AttentionProjectionIncomplete {
+		t.Fatalf("crash-after-schema snapshot = %+v, %v", snapshot, err)
+	}
+	result, err := attention.BackfillAttentionBatch(ctx, 1)
+	if err != nil || result.Processed != 0 || !result.Done || result.Checkpoint != "" {
+		t.Fatalf("crash-after-schema backfill = %+v, %v", result, err)
+	}
+}
+
 func TestAttentionSnapshotProjectsProposedTerminal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	attention := openStore(t, path)

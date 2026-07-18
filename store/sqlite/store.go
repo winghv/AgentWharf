@@ -152,6 +152,17 @@ func (s *Store) AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]s
 		seen[sessionID] = struct{}{}
 		args[index] = sessionID
 	}
+	pending, err := s.attentionMigrationPending(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if pending {
+		summaries := make([]store.SessionAttentionSummary, len(sessionIDs))
+		for index, sessionID := range sessionIDs {
+			summaries[index] = store.SessionAttentionSummary{SessionID: sessionID, State: "starting", StateOfProjection: store.AttentionProjectionIncomplete}
+		}
+		return summaries, nil
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id IN (`+sqlitePlaceholders(len(args))+`) ORDER BY session_id ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("select attention snapshot: %w", err)
@@ -169,6 +180,92 @@ func (s *Store) AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]s
 		return nil, fmt.Errorf("iterate attention snapshot: %w", err)
 	}
 	return summaries, nil
+}
+
+func (s *Store) attentionMigrationPending(ctx context.Context) (bool, error) {
+	var state string
+	if err := s.db.QueryRowContext(ctx, `SELECT state FROM session_attention_migration WHERE singleton = 1`).Scan(&state); err != nil {
+		return false, fmt.Errorf("read sqlite attention migration marker: %w", err)
+	}
+	if state != "pending" && state != "complete" {
+		return false, errors.New("sqlite attention migration marker is invalid")
+	}
+	return state == "pending", nil
+}
+
+const maxSQLiteAttentionBackfillBatch = 256
+
+type AttentionBackfillResult struct {
+	Checkpoint string
+	Processed  int
+	Done       bool
+}
+
+func (s *Store) BackfillAttentionBatch(ctx context.Context, limit int) (AttentionBackfillResult, error) {
+	if limit < 1 || limit > maxSQLiteAttentionBackfillBatch {
+		return AttentionBackfillResult{}, errors.New("sqlite attention backfill batch size is out of range")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AttentionBackfillResult{}, fmt.Errorf("begin sqlite attention backfill: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var checkpoint, state string
+	if err := tx.QueryRowContext(ctx, `SELECT checkpoint_session_id, state FROM session_attention_migration WHERE singleton = 1`).Scan(&checkpoint, &state); err != nil || state != "pending" {
+		return AttentionBackfillResult{}, errors.New("sqlite attention migration is not pending")
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT session_id FROM (
+SELECT session_id FROM session_events UNION SELECT target_session_id FROM session_attachments UNION SELECT session_id FROM session_adapter_connections
+) WHERE session_id > ? ORDER BY session_id LIMIT ?`, checkpoint, limit+1)
+	if err != nil {
+		return AttentionBackfillResult{}, fmt.Errorf("select sqlite attention backfill sessions: %w", err)
+	}
+	defer rows.Close()
+	sessions := make([]string, 0, limit+1)
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil || !validConnectionID(sessionID) {
+			return AttentionBackfillResult{}, errors.New("sqlite attention backfill session is invalid")
+		}
+		sessions = append(sessions, sessionID)
+	}
+	if err := rows.Err(); err != nil {
+		return AttentionBackfillResult{}, fmt.Errorf("iterate sqlite attention backfill sessions: %w", err)
+	}
+	result := AttentionBackfillResult{Checkpoint: checkpoint, Done: len(sessions) <= limit}
+	if len(sessions) > limit {
+		sessions = sessions[:limit]
+	}
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return AttentionBackfillResult{}, err
+	}
+	for _, sessionID := range sessions {
+		var latest int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM session_events WHERE session_id = ?`, sessionID).Scan(&latest); err != nil {
+			return AttentionBackfillResult{}, err
+		}
+		summary := store.SessionAttentionSummary{SessionID: sessionID, LatestSeq: latest, State: "starting", StateOfProjection: store.AttentionProjectionIncomplete}
+		if err := upsertSQLiteAttentionSummary(ctx, tx, summary, nowMS); err != nil {
+			return AttentionBackfillResult{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE session_adapter_connections SET revoked_at_ms = COALESCE(revoked_at_ms, ?), terminal_at_ms = COALESCE(terminal_at_ms, ?), updated_at_ms = ? WHERE session_id = ?`, nowMS, nowMS, nowMS, sessionID); err != nil {
+			return AttentionBackfillResult{}, err
+		}
+		result.Checkpoint = sessionID
+		result.Processed++
+	}
+	if result.Done {
+		if _, err := tx.ExecContext(ctx, `UPDATE session_attention_migration SET state = 'complete', checkpoint_session_id = ? WHERE singleton = 1`, result.Checkpoint); err != nil {
+			return AttentionBackfillResult{}, err
+		}
+	} else if _, err := tx.ExecContext(ctx, `UPDATE session_attention_migration SET checkpoint_session_id = ? WHERE singleton = 1`, result.Checkpoint); err != nil {
+		return AttentionBackfillResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AttentionBackfillResult{}, fmt.Errorf("commit sqlite attention backfill: %w", err)
+	}
+	return result, nil
 }
 
 type sqliteAttentionProjection struct {
@@ -1258,6 +1355,13 @@ func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, 
 		admission.AcceptedFence < 1 || admission.GrantFence <= admission.AcceptedFence {
 		return store.AdapterConnection{}, errors.New("invalid adapter admission")
 	}
+	pending, err := s.attentionMigrationPending(ctx)
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	if pending {
+		return store.AdapterConnection{}, errors.New("sqlite attention migration is incomplete")
+	}
 	if s.connectionTx != nil {
 		if _, err := s.connectionTx.ExecContext(ctx, `UPDATE session_adapter_connections SET updated_at_ms=updated_at_ms WHERE session_id=?`, sessionID); err != nil {
 			return store.AdapterConnection{}, fmt.Errorf("lock adapter admission: %w", err)
@@ -2059,6 +2163,10 @@ func (s *Store) init(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('session_adapter_fence_allocator', 'session_adapter_fence_identity')) + (SELECT count(*) FROM fence_store.sqlite_master WHERE type = 'table' AND name IN ('adapter_fence_allocator', 'adapter_fence_identity'))`).Scan(&fenceTables); err != nil || (fenceTables != 0 && fenceTables != 4) {
 		return errors.New("sqlite fence store schema is incomplete")
 	}
+	var legacyStore bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_events')`).Scan(&legacyStore); err != nil {
+		return fmt.Errorf("inspect sqlite event schema: %w", err)
+	}
 	if _, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS session_events (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2085,6 +2193,11 @@ CREATE TABLE IF NOT EXISTS session_attention_summaries (session_id TEXT PRIMARY 
         OR (blocker_kind IN ('reauthorization_required', 'new_run_required') AND blocker_reason IS NULL AND blocker_expires_at_ns IS NULL AND blocking_session_id IS NULL AND blocker_operation IS NULL))
 );
 CREATE INDEX IF NOT EXISTS session_attention_summaries_projection_state_session_idx ON session_attention_summaries (projection_state, session_id);
+
+CREATE TABLE IF NOT EXISTS session_attention_migration (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), state TEXT NOT NULL CHECK (state IN ('pending', 'complete')),
+    checkpoint_session_id TEXT NOT NULL DEFAULT '' CHECK (length(checkpoint_session_id) <= 255)
+);
 
 CREATE TABLE IF NOT EXISTS session_adapter_connections (
     session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 255),
@@ -2212,8 +2325,11 @@ CREATE TABLE IF NOT EXISTS session_workspace_leases (
 );
 CREATE INDEX IF NOT EXISTS session_workspace_leases_owner_idx
 ON session_workspace_leases (session_id, connection_epoch, credential_generation, status);
-`); err != nil {
+	`); err != nil {
 		return fmt.Errorf("initialize sqlite event store schema: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO session_attention_migration (singleton, state) VALUES (1, CASE WHEN ? THEN 'pending' ELSE 'complete' END) ON CONFLICT (singleton) DO NOTHING`, legacyStore); err != nil {
+		return fmt.Errorf("initialize sqlite attention migration marker: %w", err)
 	}
 	if fenceTables == 0 {
 		_, err := s.db.ExecContext(ctx, `
