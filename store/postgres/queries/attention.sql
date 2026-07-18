@@ -46,6 +46,7 @@ SET latest_seq = EXCLUDED.latest_seq,
     last_durable_event_at = EXCLUDED.last_durable_event_at,
     projection_state = CASE
         WHEN session_attention_summaries.projection_state = 'incomplete' THEN 'incomplete'
+        WHEN EXCLUDED.latest_seq <> session_attention_summaries.latest_seq + 1 THEN 'incomplete'
         WHEN sqlc.arg(projection_incomplete)::BOOLEAN THEN 'incomplete'
         WHEN sqlc.arg(state_observed)::BOOLEAN AND sqlc.narg(event_state) IS NULL THEN 'incomplete'
         ELSE session_attention_summaries.projection_state
@@ -67,7 +68,7 @@ INSERT INTO session_attention_summaries (
 ) VALUES (
     sqlc.arg(session_id), 'starting', sqlc.narg(blocker_kind), sqlc.narg(blocker_reason),
     sqlc.narg(blocker_expires_at), sqlc.narg(blocking_session_id), sqlc.narg(blocker_operation),
-    1, sqlc.arg(client_command_at), 'incomplete'
+    1, sqlc.narg(client_command_at), 'incomplete'
 )
 ON CONFLICT (session_id) DO UPDATE
 SET blocker_kind = sqlc.narg(blocker_kind),
@@ -76,5 +77,5 @@ SET blocker_kind = sqlc.narg(blocker_kind),
     blocking_session_id = sqlc.narg(blocking_session_id),
     blocker_operation = sqlc.narg(blocker_operation),
     summary_version = session_attention_summaries.summary_version + 1,
-    last_client_command_at = sqlc.arg(client_command_at),
+    last_client_command_at = COALESCE(sqlc.narg(client_command_at), session_attention_summaries.last_client_command_at),
     updated_at = statement_timestamp();

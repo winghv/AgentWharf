@@ -75,6 +75,17 @@ func TestAttentionSnapshotProjectsClientCommandLedger(t *testing.T) {
 	if summary.LatestSeq != 1 || summary.SummaryVersion != 1 || summary.LastClientCommandAt == nil || summary.Blocker != nil {
 		t.Fatalf("command attention summary = %+v, want independent ledger version and Store-clock activity", summary)
 	}
+	originalActivity := *summary.LastClientCommandAt
+	if _, err := harness.ClaimPendingCommand(context.Background(), "ses_command_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, request.CommandID); err != nil {
+		t.Fatalf("claim pending command: %v", err)
+	}
+	if _, err := harness.ResolvePendingCommand(context.Background(), "ses_command_1", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}, request.CommandID, store.PendingCommandCompleted); err != nil {
+		t.Fatalf("resolve pending command: %v", err)
+	}
+	snapshot, err = harness.AttentionSnapshot(context.Background(), []string{"ses_command_1"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].SummaryVersion != summary.SummaryVersion || snapshot[0].LastClientCommandAt == nil || !snapshot[0].LastClientCommandAt.Equal(originalActivity) {
+		t.Fatalf("receipt changed original command activity = %+v, %v", snapshot, err)
+	}
 }
 
 func TestAttentionProjectionRollsBackAndSurvivesReopen(t *testing.T) {
@@ -130,6 +141,21 @@ func TestAttentionSnapshotConcurrentAppend(t *testing.T) {
 	const sessionID = "ses_attention_concurrent"
 	const appends = 20
 	errs := make(chan error, appends)
+	done := make(chan struct{})
+	scanErr := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				if _, err := attention.AttentionSnapshot(ctx, []string{sessionID}); err != nil {
+					scanErr <- err
+					return
+				}
+			}
+		}
+	}()
 	for index := 0; index < appends; index++ {
 		go func() {
 			_, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.message", Time: time.Now(), Payload: []byte(`{"role":"agent"}`)}})
@@ -140,6 +166,12 @@ func TestAttentionSnapshotConcurrentAppend(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Fatalf("concurrent append: %v", err)
 		}
+	}
+	close(done)
+	select {
+	case err := <-scanErr:
+		t.Fatalf("concurrent attention snapshot: %v", err)
+	default:
 	}
 	snapshot, err := attention.AttentionSnapshot(ctx, []string{sessionID})
 	if err != nil || len(snapshot) != 1 || snapshot[0].LatestSeq != appends || snapshot[0].LastDurableEventAt == nil || snapshot[0].StateOfProjection != store.AttentionProjectionIncomplete {
@@ -517,6 +549,31 @@ INSERT INTO session_events (session_id, seq, type, payload, created_at) VALUES
 	summaries, err := attention.AttentionSnapshot(ctx, []string{"ses_attention_historical"})
 	if err != nil || len(summaries) != 1 || summaries[0].LatestSeq != 3 || summaries[0].State != "ready" || summaries[0].StateOfProjection != store.AttentionProjectionIncomplete {
 		t.Fatalf("historical attention summary = %+v, %v", summaries, err)
+	}
+}
+
+func TestAttentionProjectionMarksExistingSummaryIncompleteAcrossGap(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_gap_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	attention := postgres.New(pool)
+	ctx := context.Background()
+	if _, err := attention.Append(ctx, "ses_attention_gap", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"starting"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO session_events (session_id, seq, type, payload, created_at) VALUES ('ses_attention_gap', 2, 'permission.request', '{}', clock_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+	if seq, err := attention.Append(ctx, "ses_attention_gap", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil || seq != 3 {
+		t.Fatalf("append across attention gap = %d, %v", seq, err)
+	}
+	summaries, err := attention.AttentionSnapshot(ctx, []string{"ses_attention_gap"})
+	if err != nil || len(summaries) != 1 || summaries[0].LatestSeq != 3 || summaries[0].StateOfProjection != store.AttentionProjectionIncomplete {
+		t.Fatalf("attention summary across gap = %+v, %v", summaries, err)
 	}
 }
 

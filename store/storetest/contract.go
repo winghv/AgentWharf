@@ -563,11 +563,11 @@ func ConnectionContract(t *testing.T, harness ConnectionHarness) {
 		t.Fatalf("stale activation mutated pending lineage = %+v, %v", record, err)
 	}
 	connections = harness.Open(t)
-	expiringInit := store.AdapterConnectionInitialize{SessionID: "ses_connection_expired", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Millisecond)}
+	expiringInit := store.AdapterConnectionInitialize{SessionID: "ses_connection_expired", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(50 * time.Millisecond)}
 	if _, err := connections.InitializeAdapterConnection(context.Background(), expiringInit); err != nil {
 		t.Fatalf("initialize expiring connection: %v", err)
 	}
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(75 * time.Millisecond)
 	if _, err := connections.AcceptAdapterHello(context.Background(), expiringInit.SessionID, store.AdapterHello{CredentialGeneration: 1}); err == nil {
 		t.Fatal("expired hello unexpectedly succeeded")
 	}

@@ -414,7 +414,7 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 	if err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("insert pending command: %w", err)
 	}
-	if err := upsertAttentionLedger(ctx, queries, sessionID, nil, storeNow.Time); err != nil {
+	if err := upsertAttentionLedger(ctx, queries, sessionID, nil, &storeNow.Time); err != nil {
 		return store.PendingCommandCommit{}, err
 	}
 	if terminal {
@@ -428,8 +428,11 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 	return store.PendingCommandCommit{Command: pendingCommand(row)}, nil
 }
 
-func upsertAttentionLedger(ctx context.Context, queries *db.Queries, sessionID string, blocker *store.AttentionBlocker, at time.Time) error {
-	params := db.UpsertAttentionLedgerParams{SessionID: sessionID, ClientCommandAt: pgtype.Timestamptz{Time: at, Valid: true}}
+func upsertAttentionLedger(ctx context.Context, queries *db.Queries, sessionID string, blocker *store.AttentionBlocker, at *time.Time) error {
+	params := db.UpsertAttentionLedgerParams{SessionID: sessionID}
+	if at != nil {
+		params.ClientCommandAt = pgtype.Timestamptz{Time: *at, Valid: true}
+	}
 	if blocker != nil {
 		params.BlockerKind = pgtype.Text{String: blocker.Kind, Valid: true}
 		params.BlockerReason = textValue(blocker.Reason)
@@ -477,9 +480,6 @@ func (s *Store) ClaimPendingCommand(ctx context.Context, sessionID string, autho
 		}
 		command = pendingCommand(updated)
 		claimed = true
-		if err := upsertAttentionLedger(ctx, queries, sessionID, nil, storeNow.Time); err != nil {
-			return store.PendingCommandClaim{}, err
-		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.PendingCommandClaim{}, fmt.Errorf("commit pending command claim: %w", err)
@@ -515,17 +515,15 @@ func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, aut
 	if err != nil {
 		return store.PendingCommand{}, fmt.Errorf("resolve pending command: %w", err)
 	}
-	storeNow, err := queries.CommandStoreNow(ctx)
-	if err != nil {
-		return store.PendingCommand{}, fmt.Errorf("read resolution Store clock: %w", err)
-	}
 	var blocker *store.AttentionBlocker
 	if status == store.PendingCommandOutcomeUnknown {
 		operation := "command"
 		blocker = &store.AttentionBlocker{Kind: store.AttentionBlockerOutcomeUnknown, Operation: &operation}
 	}
-	if err := upsertAttentionLedger(ctx, queries, sessionID, blocker, storeNow.Time); err != nil {
-		return store.PendingCommand{}, err
+	if blocker != nil {
+		if err := upsertAttentionLedger(ctx, queries, sessionID, blocker, nil); err != nil {
+			return store.PendingCommand{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.PendingCommand{}, fmt.Errorf("commit pending command resolution: %w", err)
@@ -1186,7 +1184,7 @@ func (s *Store) CreateAttachment(ctx context.Context, request store.AttachmentCr
 		return store.AttachmentCommit{}, fmt.Errorf("insert attachment: %w", err)
 	}
 	created := attachment(row)
-	if err := upsertAttentionLedger(ctx, queries, created.Identity.TargetSessionID, attentionBlockerForAttachment(created, nil), storeNow.Time); err != nil {
+	if err := upsertAttentionLedger(ctx, queries, created.Identity.TargetSessionID, attentionBlockerForAttachment(created, nil), nil); err != nil {
 		return store.AttachmentCommit{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1252,7 +1250,7 @@ func (s *Store) UpdateAttachment(ctx context.Context, attachID string, expectedV
 		return store.AttachmentMutation{}, fmt.Errorf("update attachment: %w", err)
 	}
 	updated := attachment(row)
-	if err := upsertAttentionLedger(ctx, queries, updated.Identity.TargetSessionID, attentionBlockerForAttachment(updated, update.Blocker), storeNow.Time); err != nil {
+	if err := upsertAttentionLedger(ctx, queries, updated.Identity.TargetSessionID, attentionBlockerForAttachment(updated, update.Blocker), nil); err != nil {
 		return store.AttachmentMutation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
