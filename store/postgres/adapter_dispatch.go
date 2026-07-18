@@ -19,6 +19,9 @@ func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admis
 	if s == nil || s.pool == nil || len(events) == 0 {
 		return 0, errors.New("invalid postgres adapter event commit")
 	}
+	for _, event := range events[:len(events)-1] {
+		if attentionEventProjection(event).terminal { return 0, errors.New("terminal adapter event must be final") }
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin adapter event commit: %w", err)
