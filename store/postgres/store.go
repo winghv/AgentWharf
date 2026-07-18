@@ -947,6 +947,255 @@ func sameAttachAttempt(current store.AttachAttempt, request store.AttachAttemptR
 		(current.IssuedCredentialGeneration != nil && request.IssuedCredentialGeneration != nil && *current.IssuedCredentialGeneration == *request.IssuedCredentialGeneration))
 }
 
+func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRequest) (store.WarmAttachCommit, error) {
+	if s.pool == nil {
+		return store.WarmAttachCommit{}, errors.New("postgres event store pool is nil")
+	}
+	if err := validateWarmAttachRequest(request); err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("begin warm attach transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	storeNow, err := queries.WarmAttachStoreNow(ctx)
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("read warm attach Store clock: %w", err)
+	}
+	if !validWarmAttachExpiry(request, storeNow.Time) {
+		return store.WarmAttachCommit{}, errors.New("warm attach expiry is outside the Store-clock window")
+	}
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(request.Attachment.Identity.TargetSessionID)); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("lock warm attach target stream: %w", err)
+	}
+	if existing, lookupErr := queries.AttachAttemptByJTIHash(ctx, request.Attempt.Identity.JTIHash[:]); lookupErr == nil {
+		commit, duplicateErr := warmAttachDuplicate(ctx, queries, attachAttempt(existing), request)
+		if duplicateErr != nil {
+			return store.WarmAttachCommit{}, duplicateErr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return store.WarmAttachCommit{}, fmt.Errorf("commit warm attach duplicate: %w", err)
+		}
+		return commit, nil
+	} else if !errors.Is(lookupErr, pgx.ErrNoRows) {
+		return store.WarmAttachCommit{}, fmt.Errorf("load existing warm attach: %w", lookupErr)
+	}
+	if _, err := queries.LockWarmAttachBootstrap(ctx, db.LockWarmAttachBootstrapParams{
+		SessionID: request.Attempt.Identity.BootstrapSessionID, CredentialGeneration: request.BootstrapAdmission.CredentialGeneration,
+		ConnectionEpoch: request.BootstrapAdmission.ConnectionEpoch, AcceptedFence: request.BootstrapAdmission.AcceptedFence,
+		GrantFence: request.BootstrapAdmission.GrantFence,
+	}); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("lock warm attach bootstrap admission: %w", err)
+	}
+	if _, err := queries.LockWarmAttachTarget(ctx, request.Attachment.Identity.TargetSessionID); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("lock warm attach target: %w", err)
+	}
+	if _, err := queries.AttachmentByTarget(ctx, request.Attachment.Identity.TargetSessionID); err == nil {
+		return store.WarmAttachCommit{}, errors.New("warm attach target already has an attachment")
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return store.WarmAttachCommit{}, fmt.Errorf("load warm attach target attachment: %w", err)
+	}
+	storeNow, err = queries.WarmAttachStoreNow(ctx)
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("revalidate warm attach Store clock: %w", err)
+	}
+	if !validWarmAttachExpiry(request, storeNow.Time) {
+		return store.WarmAttachCommit{}, errors.New("warm attach expiry is outside the Store-clock window")
+	}
+	attemptRow, err := queries.InsertAttachAttempt(ctx, attachAttemptParams(request.Attempt))
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("insert warm attach attempt: %w", err)
+	}
+	attachmentRow, err := queries.InsertAttachment(ctx, db.InsertAttachmentParams{
+		AttachID: request.Attachment.Identity.AttachID, BootstrapSessionID: request.Attachment.Identity.BootstrapSessionID,
+		TargetSessionID: request.Attachment.Identity.TargetSessionID, ExpiresAt: pgtype.Timestamptz{Time: request.Attachment.ExpiresAt, Valid: true},
+		TargetCredentialLineageRef: request.Attachment.Identity.TargetCredentialLineageRef,
+	})
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("insert warm attach attachment: %w", err)
+	}
+	seq, terminal, err := appendEventsLocked(ctx, queries, request.Attachment.Identity.TargetSessionID, []store.PendingEvent{{
+		Type: "session.message", Time: storeNow.Time, Payload: warmAttachEventPayload(request.FirstDelivery),
+	}})
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("append warm attach reference event: %w", err)
+	}
+	if terminal {
+		return store.WarmAttachCommit{}, errors.New("warm attach reference event must not be terminal")
+	}
+	commandRow, err := queries.InsertWarmAttachPendingCommand(ctx, db.InsertWarmAttachPendingCommandParams{
+		SessionID: request.Attachment.Identity.TargetSessionID, CmdID: request.FirstDelivery.CommandID, EventSeq: seq,
+		ExpiresAt: pgtype.Timestamptz{Time: request.FirstDelivery.ExpiresAt, Valid: true},
+	})
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("insert warm attach pending command: %w", err)
+	}
+	created := attachment(attachmentRow)
+	if err := upsertAttentionLedger(ctx, queries, created.Identity.TargetSessionID, attentionBlockerForAttachment(created, nil), &storeNow.Time); err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	summary, err := warmAttachSummary(ctx, queries, created.Identity.TargetSessionID)
+	if err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("commit warm attach: %w", err)
+	}
+	return store.WarmAttachCommit{Attempt: attachAttempt(attemptRow), Attachment: created, Outbox: store.WarmAttachOutbox{
+		TargetSessionID: commandRow.SessionID, CommandID: commandRow.CmdID, EventSeq: commandRow.EventSeq,
+		ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: commandRow.ExpiresAt.Time,
+	}, Summary: summary}, nil
+}
+
+func (s *Store) ExpireWarmAttach(ctx context.Context, attachID string, expectedDeliveryVersion int64) (store.WarmAttachExpiry, error) {
+	if s.pool == nil {
+		return store.WarmAttachExpiry{}, errors.New("postgres event store pool is nil")
+	}
+	if !validConnectionID(attachID) || expectedDeliveryVersion < 0 {
+		return store.WarmAttachExpiry{}, errors.New("invalid warm attach expiry")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.WarmAttachExpiry{}, fmt.Errorf("begin warm attach expiry: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	currentRow, err := queries.LockAttachment(ctx, attachID)
+	if err != nil {
+		return store.WarmAttachExpiry{}, fmt.Errorf("lock warm attach expiry: %w", err)
+	}
+	current := attachment(currentRow)
+	storeNow, err := queries.WarmAttachStoreNow(ctx)
+	if err != nil {
+		return store.WarmAttachExpiry{}, fmt.Errorf("read warm attach expiry clock: %w", err)
+	}
+	if current.DeliveryVersion != expectedDeliveryVersion || current.Status != store.AttachmentJoinPending ||
+		current.DeliveryState != store.AttachmentDeliveryPending || current.ExpiresAt == nil || !current.ExpiresAt.Before(storeNow.Time) {
+		return store.WarmAttachExpiry{}, errors.New("warm attach is not expirable")
+	}
+	updatedRow, err := queries.UpdateAttachment(ctx, db.UpdateAttachmentParams{
+		Status: string(store.AttachmentReauthorizationRequired), DeliveryState: string(store.AttachmentDeliveryPending),
+		AttachID: attachID, ExpectedVersion: expectedDeliveryVersion,
+	})
+	if err != nil {
+		return store.WarmAttachExpiry{}, fmt.Errorf("expire warm attach attachment: %w", err)
+	}
+	updated := attachment(updatedRow)
+	blocker := &store.AttentionBlocker{Kind: store.AttentionBlockerReauthorizationRequired}
+	if err := upsertAttentionLedger(ctx, queries, updated.Identity.TargetSessionID, blocker, nil); err != nil {
+		return store.WarmAttachExpiry{}, err
+	}
+	summary, err := warmAttachSummary(ctx, queries, updated.Identity.TargetSessionID)
+	if err != nil {
+		return store.WarmAttachExpiry{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.WarmAttachExpiry{}, fmt.Errorf("commit warm attach expiry: %w", err)
+	}
+	return store.WarmAttachExpiry{Attachment: updated, Summary: summary}, nil
+}
+
+func validateWarmAttachRequest(request store.WarmAttachRequest) error {
+	if err := validateAttachAttempt(request.Attempt); err != nil {
+		return err
+	}
+	if request.Attempt.Outcome != store.AttachAttemptAccepted || request.Attempt.IssuedCredentialGeneration == nil ||
+		*request.Attempt.IssuedCredentialGeneration != request.BootstrapAdmission.CredentialGeneration ||
+		request.Attachment.Identity.AttachID != request.Attempt.Identity.AttachID ||
+		request.Attachment.Identity.BootstrapSessionID != request.Attempt.Identity.BootstrapSessionID ||
+		request.Attachment.Identity.TargetSessionID != request.Attempt.Identity.TargetSessionID ||
+		validateAttachmentIdentity(request.Attachment.Identity) != nil ||
+		request.BootstrapAdmission.CredentialGeneration < 1 || request.BootstrapAdmission.ConnectionEpoch < 1 ||
+		request.BootstrapAdmission.AcceptedFence < 1 || request.BootstrapAdmission.GrantFence <= request.BootstrapAdmission.AcceptedFence ||
+		!validAttachmentText(request.FirstDelivery.CommandID, 256) || !validAttachmentText(request.FirstDelivery.ReferenceID, 255) ||
+		request.FirstDelivery.ReferenceDigest == ([32]byte{}) || request.Attachment.ExpiresAt.IsZero() ||
+		!request.FirstDelivery.ExpiresAt.Equal(request.Attachment.ExpiresAt) {
+		return errors.New("invalid warm attach request")
+	}
+	return nil
+}
+
+func validWarmAttachExpiry(request store.WarmAttachRequest, storeNow time.Time) bool {
+	return request.Attempt.ExpiresAt.After(storeNow) && request.Attempt.ExpiresAt.Before(storeNow.Add(maxAttachAttemptTTL).Add(time.Nanosecond)) &&
+		validAttachmentExpiry(request.Attachment.ExpiresAt, storeNow) && !request.Attachment.ExpiresAt.After(request.Attempt.ExpiresAt)
+}
+
+func attachAttemptParams(request store.AttachAttemptRequest) db.InsertAttachAttemptParams {
+	return db.InsertAttachAttemptParams{
+		AttemptJtiHash: request.Identity.JTIHash[:], AttachID: request.Identity.AttachID, BootstrapSessionID: request.Identity.BootstrapSessionID,
+		TargetSessionID: request.Identity.TargetSessionID, Provider: request.Identity.Provider, FingerprintDomain: request.Fingerprint.Domain,
+		FingerprintVersion: int32(request.Fingerprint.Version), FingerprintDigest: request.Fingerprint.Digest[:], FingerprintKeyVersion: int32(request.Fingerprint.KeyVersion),
+		ExpiresAt: pgtype.Timestamptz{Time: request.ExpiresAt, Valid: true}, AdmissionOutcome: string(request.Outcome),
+		IssuedCredentialGeneration: nullableInt64(request.IssuedCredentialGeneration),
+	}
+}
+
+func warmAttachEventPayload(delivery store.WarmAttachFirstDelivery) []byte {
+	payload, _ := json.Marshal(struct {
+		Role            string `json:"role"`
+		ReferenceID     string `json:"reference_id"`
+		ReferenceDigest string `json:"reference_digest"`
+	}{Role: "user", ReferenceID: delivery.ReferenceID, ReferenceDigest: hex.EncodeToString(delivery.ReferenceDigest[:])})
+	return payload
+}
+
+func warmAttachDuplicate(ctx context.Context, queries *db.Queries, attempt store.AttachAttempt, request store.WarmAttachRequest) (store.WarmAttachCommit, error) {
+	if !sameAttachAttempt(attempt, request.Attempt) {
+		return store.WarmAttachCommit{}, errors.New("warm attach is immutable")
+	}
+	attachmentRow, err := queries.AttachmentByID(ctx, request.Attachment.Identity.AttachID)
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("load existing warm attach attachment: %w", err)
+	}
+	attachment := attachment(attachmentRow)
+	if attachment.Identity != request.Attachment.Identity {
+		return store.WarmAttachCommit{}, errors.New("warm attach attachment is immutable")
+	}
+	commandRow, err := queries.PendingCommandByID(ctx, db.PendingCommandByIDParams{SessionID: attachment.Identity.TargetSessionID, CmdID: request.FirstDelivery.CommandID})
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("load existing warm attach outbox: %w", err)
+	}
+	event, err := queries.WarmAttachEventByTargetSeq(ctx, db.WarmAttachEventByTargetSeqParams{SessionID: attachment.Identity.TargetSessionID, EventSeq: commandRow.EventSeq})
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("load existing warm attach event: %w", err)
+	}
+	if commandRow.Type != "session.send" || !commandRow.ExpiresAt.Time.Equal(request.FirstDelivery.ExpiresAt) ||
+		!sameWarmAttachEvent(event.Type, event.Payload, request.FirstDelivery) {
+		return store.WarmAttachCommit{}, errors.New("warm attach first delivery is immutable")
+	}
+	summary, err := warmAttachSummary(ctx, queries, attachment.Identity.TargetSessionID)
+	if err != nil {
+		return store.WarmAttachCommit{}, err
+	}
+	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, Outbox: store.WarmAttachOutbox{
+		TargetSessionID: commandRow.SessionID, CommandID: commandRow.CmdID, EventSeq: commandRow.EventSeq,
+		ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: commandRow.ExpiresAt.Time,
+	}, Summary: summary, Duplicate: true}, nil
+}
+
+func sameWarmAttachEvent(eventType string, payload []byte, delivery store.WarmAttachFirstDelivery) bool {
+	var event struct {
+		Role            string `json:"role"`
+		ReferenceID     string `json:"reference_id"`
+		ReferenceDigest string `json:"reference_digest"`
+	}
+	return eventType == "session.message" && json.Unmarshal(payload, &event) == nil && event.Role == "user" &&
+		event.ReferenceID == delivery.ReferenceID && event.ReferenceDigest == hex.EncodeToString(delivery.ReferenceDigest[:])
+}
+
+func warmAttachSummary(ctx context.Context, queries *db.Queries, sessionID string) (store.SessionAttentionSummary, error) {
+	rows, err := queries.AttentionSnapshot(ctx, []string{sessionID})
+	if err != nil {
+		return store.SessionAttentionSummary{}, fmt.Errorf("load warm attach attention summary: %w", err)
+	}
+	if len(rows) != 1 {
+		return store.SessionAttentionSummary{}, errors.New("warm attach attention summary is missing")
+	}
+	return attentionSummary(rows[0])
+}
+
 func (s *Store) ReserveWorkspaceLease(ctx context.Context, reserve store.WorkspaceLeaseReserve) (store.WorkspaceLease, error) {
 	if s.pool == nil {
 		return store.WorkspaceLease{}, errors.New("postgres event store pool is nil")

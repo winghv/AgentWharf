@@ -407,6 +407,174 @@ func TestAttachAttemptStoreContract(t *testing.T) {
 	})
 }
 
+func TestWarmAttachStoreContract(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_warm_attach_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ('ses_bootstrap'), ('ses_target')`); err != nil {
+		t.Fatal(err)
+	}
+	warm := postgres.New(pool)
+	if _, err := warm.Append(ctx, "ses_target", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatalf("seed warm target state: %v", err)
+	}
+	if _, err := warm.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_bootstrap", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatalf("initialize warm bootstrap: %v", err)
+	}
+	if _, err := warm.AcceptAdapterHello(ctx, "ses_bootstrap", store.AdapterHello{CredentialGeneration: 1}); err != nil {
+		t.Fatalf("accept warm bootstrap hello: %v", err)
+	}
+	storetest.WarmAttachContract(t, storetest.WarmAttachHarness{
+		Open: func(*testing.T) store.WarmAttachStore { return postgres.New(pool) },
+		Fail: func(t *testing.T, _ store.WarmAttachStore, failure storetest.WarmAttachFailure) {
+			clearWarmAttachFailpoint(t, pool)
+			table := map[storetest.WarmAttachFailure]string{
+				storetest.WarmAttachFailureAttempt:    "session_attach_attempts",
+				storetest.WarmAttachFailureAttachment: "session_attachments",
+				storetest.WarmAttachFailureOutbox:     "session_pending_commands",
+				storetest.WarmAttachFailureSummary:    "session_attention_summaries",
+			}[failure]
+			if table == "" {
+				t.Fatalf("unknown warm attach failure %q", failure)
+			}
+			if _, err := pool.Exec(context.Background(), fmt.Sprintf(`CREATE FUNCTION warm_attach_failpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'warm attach %s failpoint'; END $$; CREATE TRIGGER warm_attach_failpoint BEFORE INSERT OR UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION warm_attach_failpoint()`, failure, table)); err != nil {
+				t.Fatalf("install warm attach %s failpoint: %v", failure, err)
+			}
+		},
+		Expire: func(t *testing.T, _ store.WarmAttachStore) {
+			if _, err := pool.Exec(context.Background(), `UPDATE session_attachments SET expires_at = clock_timestamp() - interval '1 second' WHERE attach_id = 'att_warm'`); err != nil {
+				t.Fatalf("expire warm attachment fixture: %v", err)
+			}
+		},
+		Absent: func(t *testing.T, _ store.WarmAttachStore, _ store.WarmAttachRequest) {
+			clearWarmAttachFailpoint(t, pool)
+			var attempts, attachments, commands, references int
+			if err := pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM session_attach_attempts WHERE attach_id = 'att_warm'), (SELECT count(*) FROM session_attachments WHERE attach_id = 'att_warm'), (SELECT count(*) FROM session_pending_commands WHERE cmd_id = 'cmd_warm'), (SELECT count(*) FROM session_events WHERE session_id = 'ses_target' AND payload->>'reference_id' = 'ref_warm'`).Scan(&attempts, &attachments, &commands, &references); err != nil {
+				t.Fatalf("inspect rolled-back warm attach: %v", err)
+			}
+			if attempts+attachments+commands+references != 0 {
+				t.Fatalf("warm attach rollback left durable rows attempts=%d attachments=%d commands=%d references=%d", attempts, attachments, commands, references)
+			}
+			var latest int64
+			var blocker *string
+			if err := pool.QueryRow(context.Background(), `SELECT latest_seq, blocker_kind FROM session_attention_summaries WHERE session_id = 'ses_target'`).Scan(&latest, &blocker); err != nil || latest != 1 || blocker != nil {
+				t.Fatalf("warm attach rollback changed target summary latest=%d blocker=%v err=%v", latest, blocker, err)
+			}
+		},
+	})
+}
+
+func clearWarmAttachFailpoint(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	for _, table := range []string{"session_attach_attempts", "session_attachments", "session_pending_commands", "session_attention_summaries"} {
+		if _, err := pool.Exec(context.Background(), "DROP TRIGGER IF EXISTS warm_attach_failpoint ON "+table); err != nil {
+			t.Fatalf("drop warm attach failpoint on %s: %v", table, err)
+		}
+	}
+	if _, err := pool.Exec(context.Background(), "DROP FUNCTION IF EXISTS warm_attach_failpoint()"); err != nil {
+		t.Fatalf("drop warm attach failpoint function: %v", err)
+	}
+}
+
+func TestWarmAttachRejectsFencedAdmissionAndTerminalTarget(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(t *testing.T, warm *postgres.Store, pool *pgxpool.Pool, request *store.WarmAttachRequest)
+	}{
+		{name: "wrong_credential_generation", mutate: func(_ *testing.T, _ *postgres.Store, _ *pgxpool.Pool, request *store.WarmAttachRequest) {
+			request.BootstrapAdmission.CredentialGeneration++
+		}},
+		{name: "grant_does_not_advance_fence", mutate: func(_ *testing.T, _ *postgres.Store, _ *pgxpool.Pool, request *store.WarmAttachRequest) {
+			request.BootstrapAdmission.GrantFence = request.BootstrapAdmission.AcceptedFence
+		}},
+		{name: "stale_hello_epoch", mutate: func(t *testing.T, warm *postgres.Store, _ *pgxpool.Pool, _ *store.WarmAttachRequest) {
+			if _, err := warm.AcceptAdapterHello(context.Background(), "ses_bootstrap", store.AdapterHello{CredentialGeneration: 1}); err != nil {
+				t.Fatalf("advance bootstrap hello: %v", err)
+			}
+		}},
+		{name: "revoked_bootstrap", mutate: func(t *testing.T, _ *postgres.Store, pool *pgxpool.Pool, _ *store.WarmAttachRequest) {
+			if _, err := pool.Exec(context.Background(), `UPDATE session_adapter_connections SET revoked_at = clock_timestamp() WHERE session_id = 'ses_bootstrap'`); err != nil {
+				t.Fatalf("revoke bootstrap: %v", err)
+			}
+		}},
+		{name: "terminal_target", mutate: func(t *testing.T, warm *postgres.Store, _ *pgxpool.Pool, _ *store.WarmAttachRequest) {
+			if _, err := warm.Append(context.Background(), "ses_target", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ended"}`)}}); err != nil {
+				t.Fatalf("end target: %v", err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool, warm := newWarmAttachStore(t)
+			request := warmAttachRequestForPostgres()
+			test.mutate(t, warm, pool, &request)
+			if _, err := warm.CommitWarmAttach(context.Background(), request); err == nil {
+				t.Fatal("fenced warm attach committed")
+			}
+			assertWarmAttachRowsAbsent(t, pool)
+		})
+	}
+}
+
+func newWarmAttachStore(t *testing.T) (*pgxpool.Pool, *postgres.Store) {
+	t.Helper()
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_warm_attach_reject_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	pool := openPool(t, dsn, schemaName, nil)
+	resetSchema(t, pool)
+	warm := postgres.New(pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ('ses_bootstrap'), ('ses_target')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := warm.Append(ctx, "ses_target", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatalf("seed warm target state: %v", err)
+	}
+	if _, err := warm.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_bootstrap", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatalf("initialize warm bootstrap: %v", err)
+	}
+	if _, err := warm.AcceptAdapterHello(ctx, "ses_bootstrap", store.AdapterHello{CredentialGeneration: 1}); err != nil {
+		t.Fatalf("accept warm bootstrap hello: %v", err)
+	}
+	t.Cleanup(func() {
+		pool.Close()
+		dropSchema(t, dsn, schemaName)
+	})
+	return pool, warm
+}
+
+func warmAttachRequestForPostgres() store.WarmAttachRequest {
+	grantExpiresAt := time.Now().Add(3 * time.Minute)
+	deliveryExpiresAt := time.Now().Add(20 * time.Second)
+	issuedGeneration := int64(1)
+	return store.WarmAttachRequest{
+		Attempt: store.AttachAttemptRequest{
+			Identity:    store.AttachAttemptIdentity{JTIHash: [32]byte{9}, AttachID: "att_auth", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", Provider: "claude-code"},
+			Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{8}, KeyVersion: 1},
+			ExpiresAt:   grantExpiresAt, Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: &issuedGeneration,
+		},
+		Attachment:         store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_auth", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", TargetCredentialLineageRef: "lineage_target"}, ExpiresAt: deliveryExpiresAt},
+		BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, GrantFence: 2},
+		FirstDelivery:      store.WarmAttachFirstDelivery{CommandID: "cmd_auth", ReferenceID: "ref_auth", ReferenceDigest: [32]byte{7}, ExpiresAt: deliveryExpiresAt},
+	}
+}
+
+func assertWarmAttachRowsAbsent(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	var attempts, attachments, commands, references int
+	if err := pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM session_attach_attempts WHERE attach_id = 'att_auth'), (SELECT count(*) FROM session_attachments WHERE attach_id = 'att_auth'), (SELECT count(*) FROM session_pending_commands WHERE cmd_id = 'cmd_auth'), (SELECT count(*) FROM session_events WHERE session_id = 'ses_target' AND payload->>'reference_id' = 'ref_auth')`).Scan(&attempts, &attachments, &commands, &references); err != nil {
+		t.Fatalf("inspect fenced warm attach: %v", err)
+	}
+	if attempts+attachments+commands+references != 0 {
+		t.Fatalf("fenced warm attach left durable rows attempts=%d attachments=%d commands=%d references=%d", attempts, attachments, commands, references)
+	}
+}
+
 func TestAttachAttemptFailureLeavesNoRow(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_attempt_rollback_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
