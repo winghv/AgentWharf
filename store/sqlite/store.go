@@ -1047,6 +1047,10 @@ func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRe
 		return store.WarmAttachCommit{}, err
 	}
 	if existing, lookupErr := querySQLiteAttachAttempt(ctx, tx, request.Attempt.Identity.JTIHash); lookupErr == nil {
+		nowMS, err = sqliteNowMillis(ctx, tx)
+		if err != nil {
+			return store.WarmAttachCommit{}, err
+		}
 		commit, duplicateErr := sqliteWarmAttachDuplicate(ctx, tx, existing, request, nowMS)
 		if duplicateErr != nil {
 			return store.WarmAttachCommit{}, duplicateErr
