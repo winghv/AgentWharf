@@ -172,12 +172,14 @@ func runMachineLogout(stdout io.Writer) error {
 }
 
 type serveConfig struct {
-	Addr         string
-	DBPath       string
-	SessionID    string
-	Provider     string
-	ControlToken string
-	AdapterToken string
+	Addr                              string
+	DBPath                            string
+	SessionID                         string
+	Provider                          string
+	ControlToken                      string
+	AdapterToken                      string
+	SessionCredentialSignerKeyFile    string
+	SessionCredentialSignerKeyVersion int64
 }
 
 type wrapConfig struct {
@@ -250,12 +252,14 @@ type machineSessionResponse struct {
 
 func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
 	cfg := serveConfig{
-		Addr:         defaultServeAddr,
-		DBPath:       defaultDBPath(),
-		SessionID:    defaultSessionID,
-		Provider:     defaultProvider,
-		ControlToken: defaultControlToken,
-		AdapterToken: defaultAdapterToken,
+		Addr:                              defaultServeAddr,
+		DBPath:                            defaultDBPath(),
+		SessionID:                         defaultSessionID,
+		Provider:                          defaultProvider,
+		ControlToken:                      defaultControlToken,
+		AdapterToken:                      defaultAdapterToken,
+		SessionCredentialSignerKeyFile:    envOrDefault("AGENTWHARF_SESSION_CREDENTIAL_SIGNER_KEY_FILE", ""),
+		SessionCredentialSignerKeyVersion: 1,
 	}
 
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -266,11 +270,16 @@ func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
 	flags.StringVar(&cfg.Provider, "provider", cfg.Provider, "provider name")
 	flags.StringVar(&cfg.ControlToken, "control-token", cfg.ControlToken, "client control token")
 	flags.StringVar(&cfg.AdapterToken, "adapter-token", cfg.AdapterToken, "adapter token")
+	flags.StringVar(&cfg.SessionCredentialSignerKeyFile, "session-credential-signer-key-file", cfg.SessionCredentialSignerKeyFile, "local session credential signer key file")
+	flags.Int64Var(&cfg.SessionCredentialSignerKeyVersion, "session-credential-signer-key-version", cfg.SessionCredentialSignerKeyVersion, "local session credential signer key version")
 	if err := flags.Parse(args); err != nil {
 		return serveConfig{}, err
 	}
 	if flags.NArg() != 0 {
 		return serveConfig{}, fmt.Errorf("unexpected serve arguments: %v", flags.Args())
+	}
+	if cfg.SessionCredentialSignerKeyVersion < 1 {
+		return serveConfig{}, errors.New("session credential signer key version must be positive")
 	}
 	return normalizeServeConfig(cfg)
 }
@@ -393,6 +402,12 @@ func normalizeServeConfig(cfg serveConfig) (serveConfig, error) {
 			return serveConfig{}, err
 		}
 		cfg.AdapterToken = token
+	}
+	if cfg.SessionCredentialSignerKeyFile == "" {
+		cfg.SessionCredentialSignerKeyFile = strings.TrimSpace(os.Getenv("AGENTWHARF_SESSION_CREDENTIAL_SIGNER_KEY_FILE"))
+	}
+	if cfg.SessionCredentialSignerKeyVersion == 0 {
+		cfg.SessionCredentialSignerKeyVersion = 1
 	}
 	if !isLoopbackAddr(cfg.Addr) && usesDefaultToken(cfg) {
 		return serveConfig{}, errUnsafeDefaultToken
@@ -1828,6 +1843,10 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 	if err != nil {
 		return nil, err
 	}
+	issuer, err := newLocalSessionCredentialIssuer(cfg)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create sqlite directory: %w", err)
 	}
@@ -1854,14 +1873,14 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 			Scopes:  []auth.Scope{auth.SessionAdapter(cfg.SessionID)},
 		},
 	})
-	authenticator := localSessionAuthenticator{Authenticator: baseAuthenticator, sessionID: cfg.SessionID, provider: cfg.Provider}
+	authenticator := localSessionAuthenticator{Authenticator: baseAuthenticator, staticAdapterCredential: baseAuthenticator.AdapterCredential, sessionCredentialIssuer: issuer, sessionID: cfg.SessionID, provider: cfg.Provider}
 	sessionStore := localSessionStore{Store: eventStore, sessionID: cfg.SessionID}
 	handshake := hub.NewHandshake(hub.HandshakeConfig{
 		Authenticator: authenticator,
 		EventStore:    sessionStore,
 	})
 	server := &http.Server{
-		Handler:           hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: sessionStore}),
+		Handler:           hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: sessionStore, SessionCredentialIssuer: issuer, SessionCredentialLifecycle: issuer}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -1891,6 +1910,37 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 	return running, nil
 }
 
+func newLocalSessionCredentialIssuer(cfg serveConfig) (*auth.LocalSessionCredentialIssuer, error) {
+	if cfg.SessionCredentialSignerKeyFile == "" {
+		return nil, errors.New("session credential signer key file is required")
+	}
+	info, err := os.Lstat(cfg.SessionCredentialSignerKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("read session credential signer key: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return nil, errors.New("session credential signer key file must be private and regular")
+	}
+	file, err := os.Open(cfg.SessionCredentialSignerKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("open session credential signer key: %w", err)
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Mode().Perm()&0o077 != 0 || !os.SameFile(info, openedInfo) {
+		return nil, errors.New("session credential signer key file changed or is unsafe")
+	}
+	key, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil || len(key) == 0 || len(key) > 4096 {
+		return nil, errors.New("session credential signer key is invalid")
+	}
+	issuer, err := auth.NewLocalSessionCredentialIssuer(key, cfg.SessionCredentialSignerKeyVersion)
+	if err != nil {
+		return nil, errors.New("session credential signer configuration is invalid")
+	}
+	return issuer, nil
+}
+
 func (r *runningServe) wait() error {
 	serveErr := <-r.done
 	closeErr := r.store.Close()
@@ -1905,8 +1955,25 @@ func (r *runningServe) wait() error {
 
 type localSessionAuthenticator struct {
 	auth.Authenticator
-	sessionID string
-	provider  string
+	staticAdapterCredential func(context.Context, string, auth.Principal, string) (int64, int64, bool, error)
+	sessionCredentialIssuer *auth.LocalSessionCredentialIssuer
+	sessionID               string
+	provider                string
+}
+
+func (a localSessionAuthenticator) Authenticate(ctx context.Context, token string) (auth.Principal, error) {
+	principal, err := a.Authenticator.Authenticate(ctx, token)
+	if err == nil {
+		return principal, nil
+	}
+	if a.sessionCredentialIssuer == nil {
+		return auth.Principal{}, err
+	}
+	principal, issuerErr := a.sessionCredentialIssuer.AuthenticateSessionCredential(ctx, token)
+	if issuerErr != nil || len(principal.Scopes) != 1 || principal.Scopes[0] != auth.SessionAdapter(a.sessionID) {
+		return auth.Principal{}, err
+	}
+	return principal, nil
 }
 
 func (a localSessionAuthenticator) SessionAdmissionClaim(_ context.Context, _ auth.Principal, sessionID string) (auth.SessionAdmissionClaim, error) {

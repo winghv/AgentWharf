@@ -411,6 +411,13 @@ type SessionCredentialIssuer interface {
 	PrepareSessionCredential(ctx context.Context, request SessionCredentialRequest) (PreparedSessionCredential, error)
 }
 
+// SessionCredentialLifecycle makes an already-prepared bearer usable only after
+// the caller has committed its durable authorization tuple.
+type SessionCredentialLifecycle interface {
+	ActivateSessionCredential(context.Context, PreparedSessionCredential) error
+	DiscardSessionCredential(context.Context, PreparedSessionCredential)
+}
+
 func ParseScope(raw string) (Scope, error) {
 	parts := strings.Split(raw, ":")
 	switch {

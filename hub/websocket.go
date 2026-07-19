@@ -33,6 +33,7 @@ type WebSocketConfig struct {
 	CommandActivityObserver     CommandActivityObserver
 	AdapterActivityObserver     AdapterActivityObserver
 	SessionCredentialIssuer     auth.SessionCredentialIssuer
+	SessionCredentialLifecycle  auth.SessionCredentialLifecycle
 	WarmAttachCredentialHandoff WarmAttachCredentialHandoff
 }
 
@@ -74,6 +75,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		commandActivityObserver:     cfg.CommandActivityObserver,
 		adapterActivityObserver:     cfg.AdapterActivityObserver,
 		sessionCredentialIssuer:     cfg.SessionCredentialIssuer,
+		sessionCredentialLifecycle:  cfg.SessionCredentialLifecycle,
 		warmAttachCredentialHandoff: cfg.WarmAttachCredentialHandoff,
 		adapterAuthority:            newAdapterDispatchAuthority(cfg.Handshake, cfg.EventStore),
 		adapterAdmissionLocks:       make(map[string]chan struct{}),
@@ -119,6 +121,7 @@ type webSocketHandler struct {
 	adapterAdmissionMu          sync.Mutex
 	adapterAdmissionLocks       map[string]chan struct{}
 	sessionCredentialIssuer     auth.SessionCredentialIssuer
+	sessionCredentialLifecycle  auth.SessionCredentialLifecycle
 	warmAttachCredentialHandoff WarmAttachCredentialHandoff
 
 	mu          sync.Mutex
@@ -801,13 +804,28 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 		},
 	})
 	if err != nil {
+		h.discardWarmAttachCredential(ctx, prepared)
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
 		return fmt.Errorf("commit warm attach: %w", err)
 	}
-	if err := h.handoffCommittedWarmAttachCredential(ctx, warmStore, authorization, store.AdapterConnectionAdmission{
+	postCommitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), warmAttachCredentialHandoffTimeout)
+	defer cancel()
+	if commit.Duplicate && commit.Attachment.DeliveryState == store.AttachmentDeliveryOutcomeUnknown {
+		h.discardWarmAttachCredential(postCommitCtx, prepared)
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
+		return errors.New("warm attach credential handoff outcome is unknown")
+	}
+	if err := h.activateCommittedWarmAttachCredential(postCommitCtx, prepared); err != nil {
+		h.discardWarmAttachCredential(postCommitCtx, prepared)
+		_ = h.failClosedWarmAttachCredentialHandoff(commit.Attachment, warmStore)
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
+		return err
+	}
+	if err := h.handoffCommittedWarmAttachCredential(postCommitCtx, warmStore, authorization, store.AdapterConnectionAdmission{
 		CredentialGeneration: authorization.Bootstrap.CredentialGeneration, ConnectionEpoch: authorization.Bootstrap.ConnectionEpoch,
 		AcceptedFence: authorization.Bootstrap.AcceptedFence, GrantFence: authorization.Grant.GrantFence,
 	}, commit, prepared); err != nil {
+		h.discardWarmAttachCredential(postCommitCtx, prepared)
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
 		return err
 	}

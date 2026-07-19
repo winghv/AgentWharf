@@ -158,6 +158,7 @@ func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) {
 		cfg.EventStore = events
 		cfg.SessionCredentialIssuer = issuer
+		cfg.SessionCredentialLifecycle = issuer
 		cfg.WarmAttachCredentialHandoff = handoff
 	})
 	bootstrap := dialWebSocket(t, server.URL)
@@ -197,6 +198,12 @@ func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 	if got := len(events.warmAttachRequests()); got != 0 || len(handoff.calls()) != 0 {
 		t.Fatalf("commit failure wrote Store/handoff records %d/%d", got, len(handoff.calls()))
 	}
+	if got := issuer.activationCount(); got != 0 {
+		t.Fatalf("commit failure activated %d credential(s)", got)
+	}
+	if got := issuer.discardCount(); got != 1 {
+		t.Fatalf("commit failure discarded %d credential(s), want 1", got)
+	}
 	events.setCommitFailure(nil)
 	command := &protocol.Command{
 		CommandID: "attach-command", Type: protocol.CommandSessionAttach, SessionID: "ses_target",
@@ -208,6 +215,9 @@ func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 	case <-handoffEntered:
 	case <-time.After(time.Second):
 		t.Fatal("warm attach handoff did not enter transaction")
+	}
+	if got := issuer.activationCount(); got != 1 {
+		t.Fatalf("committed warm attach activated %d credential(s), want 1", got)
 	}
 	terminalized := make(chan struct{})
 	go func() {
@@ -300,6 +310,7 @@ func TestWebSocketSessionAttachDoesNotHandoffAfterFinalTupleLoss(t *testing.T) {
 	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) {
 		cfg.EventStore = events
 		cfg.SessionCredentialIssuer = issuer
+		cfg.SessionCredentialLifecycle = issuer
 		cfg.WarmAttachCredentialHandoff = handoff
 	})
 	bootstrap := dialWebSocket(t, server.URL)
@@ -350,7 +361,7 @@ func TestWebSocketSessionAttachRejectsDuplicateAfterUncertainCredentialHandoff(t
 		"adapter-token": {Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_bootstrap")}},
 	}, credentials: map[string]adapterCredentialEvidence{"adapter": {Generation: 1, ExpiresAt: time.Now().Add(time.Hour)}}}, AttachGrantVerifier: verifier, AttachGrantAudience: "deploy-attach", EventStore: events})
 	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) {
-		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.WarmAttachCredentialHandoff = events, issuer, handoff
+		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle, cfg.WarmAttachCredentialHandoff = events, issuer, issuer, handoff
 	})
 	bootstrap := dialWebSocket(t, server.URL)
 	defer bootstrap.Close(websocket.StatusNormalClosure, "")
@@ -374,6 +385,9 @@ func TestWebSocketSessionAttachRejectsDuplicateAfterUncertainCredentialHandoff(t
 	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "attach_rejected" {
 		t.Fatalf("uncertain retry acknowledgement = %+v, want rejected", ack)
 	}
+	if got := issuer.activationCount(); got != 1 {
+		t.Fatalf("uncertain retry activated %d credentials, want no reactivation", got)
+	}
 }
 
 func TestWebSocketSessionAttachRetriesExplicitUnacceptedCredentialHandoff(t *testing.T) {
@@ -390,7 +404,7 @@ func TestWebSocketSessionAttachRetriesExplicitUnacceptedCredentialHandoff(t *tes
 		"adapter-token": {Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_bootstrap")}},
 	}, credentials: map[string]adapterCredentialEvidence{"adapter": {Generation: 1, ExpiresAt: time.Now().Add(time.Hour)}}}, AttachGrantVerifier: verifier, AttachGrantAudience: "deploy-attach", EventStore: events})
 	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) {
-		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.WarmAttachCredentialHandoff = events, issuer, handoff
+		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle, cfg.WarmAttachCredentialHandoff = events, issuer, issuer, handoff
 	})
 	bootstrap := dialWebSocket(t, server.URL)
 	defer bootstrap.Close(websocket.StatusNormalClosure, "")
@@ -2337,9 +2351,36 @@ func (s *recordingWarmAttachStore) UpdateAttachment(_ context.Context, attachID 
 }
 
 type recordingSessionCredentialIssuer struct {
-	mu      sync.Mutex
-	calls   []auth.SessionCredentialRequest
-	failure error
+	mu          sync.Mutex
+	calls       []auth.SessionCredentialRequest
+	failure     error
+	activations int
+	discards    int
+}
+
+func (issuer *recordingSessionCredentialIssuer) ActivateSessionCredential(_ context.Context, _ auth.PreparedSessionCredential) error {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	issuer.activations++
+	return nil
+}
+
+func (issuer *recordingSessionCredentialIssuer) DiscardSessionCredential(_ context.Context, _ auth.PreparedSessionCredential) {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	issuer.discards++
+}
+
+func (issuer *recordingSessionCredentialIssuer) activationCount() int {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	return issuer.activations
+}
+
+func (issuer *recordingSessionCredentialIssuer) discardCount() int {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	return issuer.discards
 }
 
 func (issuer *recordingSessionCredentialIssuer) PrepareSessionCredential(_ context.Context, request auth.SessionCredentialRequest) (auth.PreparedSessionCredential, error) {

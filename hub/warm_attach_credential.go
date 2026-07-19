@@ -39,7 +39,7 @@ type warmAttachCredentialStore interface {
 }
 
 func (h *webSocketHandler) prepareWarmAttachCredential(ctx context.Context, authorization auth.AttachAuthorization) (store.WarmAttachTargetActivation, auth.PreparedSessionCredential, error) {
-	if h.sessionCredentialIssuer == nil || h.warmAttachCredentialHandoff == nil {
+	if h.sessionCredentialIssuer == nil || h.sessionCredentialLifecycle == nil || h.warmAttachCredentialHandoff == nil {
 		return store.WarmAttachTargetActivation{}, auth.PreparedSessionCredential{}, errors.New("warm attach credential delivery is not configured")
 	}
 	expiresAt := authorization.Grant.DeliveryDeadline.UTC().Truncate(time.Millisecond)
@@ -116,6 +116,19 @@ func (h *webSocketHandler) handoffCommittedWarmAttachCredential(ctx context.Cont
 		return h.failClosedWarmAttachCredentialHandoff(commit.Attachment, credentialStore)
 	}
 	return nil
+}
+
+func (h *webSocketHandler) activateCommittedWarmAttachCredential(ctx context.Context, prepared auth.PreparedSessionCredential) error {
+	if h.sessionCredentialLifecycle == nil || h.sessionCredentialLifecycle.ActivateSessionCredential(ctx, prepared) != nil {
+		return errors.New("warm attach credential activation is not configured")
+	}
+	return nil
+}
+
+func (h *webSocketHandler) discardWarmAttachCredential(ctx context.Context, prepared auth.PreparedSessionCredential) {
+	if h.sessionCredentialLifecycle != nil {
+		h.sessionCredentialLifecycle.DiscardSessionCredential(ctx, prepared)
+	}
 }
 
 func (h *webSocketHandler) releaseWarmAttachCredentialHandoff(ctx context.Context, attachment store.Attachment, credentialStore store.AttachmentStore) error {

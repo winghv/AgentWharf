@@ -7,11 +7,14 @@ import (
 )
 
 func (a localSessionAuthenticator) AdapterCredential(ctx context.Context, token string, principal auth.Principal, sessionID string) (int64, int64, bool, error) {
-	authenticator, ok := a.Authenticator.(interface {
-		AdapterCredential(context.Context, string, auth.Principal, string) (int64, int64, bool, error)
-	})
-	if !ok {
+	if a.sessionCredentialIssuer != nil {
+		prepared, err := a.sessionCredentialIssuer.ActiveSessionCredential(ctx, token)
+		if err == nil && prepared.SessionID == sessionID && len(principal.Scopes) == 1 && principal.Scopes[0] == auth.SessionAdapter(sessionID) {
+			return prepared.Generation, prepared.ExpiresAt.UnixNano(), true, nil
+		}
+	}
+	if a.staticAdapterCredential == nil {
 		return 0, 0, false, auth.ErrUnauthorized
 	}
-	return authenticator.AdapterCredential(ctx, token, principal, sessionID)
+	return a.staticAdapterCredential(ctx, token, principal, sessionID)
 }

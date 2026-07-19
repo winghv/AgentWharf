@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/winghv/agentwharf/auth"
+	"github.com/winghv/agentwharf/auth/static"
 	"github.com/winghv/agentwharf/protocol"
 	"nhooyr.io/websocket"
 )
@@ -92,6 +94,92 @@ func TestRunServeRejectsNonLocalDefaultToken(t *testing.T) {
 	}, io.Discard, io.Discard)
 	if err == nil || !errors.Is(err, errUnsafeDefaultToken) {
 		t.Fatalf("run serve error = %v, want errUnsafeDefaultToken", err)
+	}
+}
+
+func TestStartServeFailsClosedWithoutSessionCredentialSigner(t *testing.T) {
+	t.Setenv("AGENTWHARF_SESSION_CREDENTIAL_SIGNER_KEY_FILE", "")
+	_, err := startServe(context.Background(), serveConfig{
+		Addr: "127.0.0.1:0", DBPath: filepath.Join(t.TempDir(), "events.db"),
+		SessionID: "ses_local", Provider: "claude-code", ControlToken: "control-token", AdapterToken: "adapter-token",
+	})
+	if err == nil || !strings.Contains(err.Error(), "session credential signer") {
+		t.Fatalf("startServe() error = %v, want missing signer failure", err)
+	}
+}
+
+func TestStartServeRejectsUnsafeSessionCredentialSignerFile(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "signer-key")
+	if err := os.WriteFile(keyFile, []byte("test-only-local-session-credential-signer"), 0o644); err != nil {
+		t.Fatalf("write signer key: %v", err)
+	}
+	if err := os.Chmod(keyFile, 0o644); err != nil {
+		t.Fatalf("chmod signer key: %v", err)
+	}
+	_, err := startServe(context.Background(), serveConfig{
+		Addr: "127.0.0.1:0", DBPath: filepath.Join(t.TempDir(), "events.db"),
+		SessionID: "ses_local", Provider: "claude-code", ControlToken: "control-token", AdapterToken: "adapter-token",
+		SessionCredentialSignerKeyFile: keyFile,
+	})
+	if err == nil || !strings.Contains(err.Error(), "private and regular") {
+		t.Fatalf("startServe() error = %v, want unsafe signer failure", err)
+	}
+}
+
+func TestStartServeRejectsSessionCredentialSignerSymlink(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "signer-key")
+	if err := os.WriteFile(keyFile, []byte("test-only-local-session-credential-signer"), 0o600); err != nil {
+		t.Fatalf("write signer key: %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "signer-link")
+	if err := os.Symlink(keyFile, link); err != nil {
+		t.Fatalf("symlink signer key: %v", err)
+	}
+	_, err := startServe(context.Background(), serveConfig{
+		Addr: "127.0.0.1:0", DBPath: filepath.Join(t.TempDir(), "events.db"),
+		SessionID: "ses_local", Provider: "claude-code", ControlToken: "control-token", AdapterToken: "adapter-token",
+		SessionCredentialSignerKeyFile: link,
+	})
+	if err == nil || !strings.Contains(err.Error(), "private and regular") {
+		t.Fatalf("startServe() error = %v, want symlink signer rejection", err)
+	}
+}
+
+func TestParseServeConfigRejectsNonPositiveSessionCredentialSignerKeyVersion(t *testing.T) {
+	for _, version := range []string{"0", "-1"} {
+		if _, err := parseServeConfig([]string{"--session-credential-signer-key-version", version}, io.Discard); err == nil || !strings.Contains(err.Error(), "must be positive") {
+			t.Fatalf("parseServeConfig(%s) error = %v, want non-positive signer rejection", version, err)
+		}
+	}
+}
+
+func TestLocalSessionAuthenticatorAcceptsOnlyCurrentLocalSessionBearer(t *testing.T) {
+	issuer, err := auth.NewLocalSessionCredentialIssuer([]byte("test-only-local-session-credential-signer"), 1)
+	if err != nil {
+		t.Fatalf("new issuer: %v", err)
+	}
+	prepared, err := issuer.PrepareSessionCredential(context.Background(), auth.SessionCredentialRequest{
+		SessionID: "ses_local", Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialTargetAttach, AttachID: "attach_1", JTI: "jti_1"},
+		Generation: 1, RotationID: "rotation_1", RevocationID: "revocation_1", ExpiresAt: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("prepare credential: %v", err)
+	}
+	if err := issuer.ActivateSessionCredential(context.Background(), prepared); err != nil {
+		t.Fatalf("activate credential: %v", err)
+	}
+	base := static.New([]static.Token{{Token: "adapter-token", Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_local")}}})
+	authenticator := localSessionAuthenticator{Authenticator: base, staticAdapterCredential: base.AdapterCredential, sessionCredentialIssuer: issuer, sessionID: "ses_local"}
+	principal, err := authenticator.Authenticate(context.Background(), prepared.Bearer)
+	if err != nil || len(principal.Scopes) != 1 || principal.Scopes[0] != auth.SessionAdapter("ses_local") {
+		t.Fatalf("Authenticate(prepared bearer) = %+v, %v", principal, err)
+	}
+	if _, err := authenticator.Authenticate(context.Background(), "unknown"); err == nil {
+		t.Fatal("unknown local bearer unexpectedly authenticated")
+	}
+	generation, expiresAt, initialize, err := authenticator.AdapterCredential(context.Background(), prepared.Bearer, principal, "ses_local")
+	if err != nil || generation != prepared.Generation || expiresAt != prepared.ExpiresAt.UnixNano() || !initialize {
+		t.Fatalf("AdapterCredential() = %d, %d, %t, %v", generation, expiresAt, initialize, err)
 	}
 }
 
@@ -1626,7 +1714,23 @@ func TestMain(m *testing.M) {
 		runWrapProviderHelper()
 		return
 	}
-	os.Exit(m.Run())
+	keyFile, err := os.CreateTemp("", "agentwharf-test-session-signer-*")
+	if err != nil {
+		os.Exit(1)
+	}
+	keyPath := keyFile.Name()
+	if _, err := keyFile.WriteString("test-only-local-session-credential-signer"); err != nil {
+		_ = keyFile.Close()
+		_ = os.Remove(keyPath)
+		os.Exit(1)
+	}
+	if err := keyFile.Close(); err != nil || os.Setenv("AGENTWHARF_SESSION_CREDENTIAL_SIGNER_KEY_FILE", keyPath) != nil {
+		_ = os.Remove(keyPath)
+		os.Exit(1)
+	}
+	code := m.Run()
+	_ = os.Remove(keyPath)
+	os.Exit(code)
 }
 
 func runWrapProviderHelper() {
