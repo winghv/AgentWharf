@@ -99,6 +99,48 @@ func (q *Queries) InsertPendingCommand(ctx context.Context, arg InsertPendingCom
 	return i, err
 }
 
+const listPendingCommandsForDelivery = `-- name: ListPendingCommandsForDelivery :many
+SELECT command.session_id, command.cmd_id, command.type, command.event_seq, command.status, command.expires_at, command.created_at, command.updated_at
+FROM session_pending_commands AS command
+JOIN session_events AS event
+  ON event.session_id = command.session_id AND event.seq = command.event_seq
+WHERE command.session_id = $1
+  AND command.status IN ('pending', 'received')
+  AND command.expires_at > clock_timestamp()
+  AND event.type = 'session.message'
+  AND length(event.payload) BETWEEN 1 AND 65536
+ORDER BY command.event_seq ASC
+`
+
+func (q *Queries) ListPendingCommandsForDelivery(ctx context.Context, sessionID string) ([]SessionPendingCommand, error) {
+	rows, err := q.db.Query(ctx, listPendingCommandsForDelivery, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SessionPendingCommand
+	for rows.Next() {
+		var i SessionPendingCommand
+		if err := rows.Scan(
+			&i.SessionID,
+			&i.CmdID,
+			&i.Type,
+			&i.EventSeq,
+			&i.Status,
+			&i.ExpiresAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockCommandAuthority = `-- name: LockCommandAuthority :one
 SELECT true AS current
 FROM session_adapter_connections AS authority
