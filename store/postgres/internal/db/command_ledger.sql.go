@@ -250,6 +250,34 @@ func (q *Queries) PendingCommandByID(ctx context.Context, arg PendingCommandByID
 	return i, err
 }
 
+const resolvePendingCommandUnknown = `-- name: ResolvePendingCommandUnknown :one
+UPDATE session_pending_commands
+SET status = 'outcome_unknown', updated_at = statement_timestamp()
+WHERE session_id = $1 AND cmd_id = $2 AND status = 'received'
+RETURNING session_id, cmd_id, type, event_seq, status, expires_at, created_at, updated_at
+`
+
+type ResolvePendingCommandUnknownParams struct {
+	SessionID string
+	CmdID     string
+}
+
+func (q *Queries) ResolvePendingCommandUnknown(ctx context.Context, arg ResolvePendingCommandUnknownParams) (SessionPendingCommand, error) {
+	row := q.db.QueryRow(ctx, resolvePendingCommandUnknown, arg.SessionID, arg.CmdID)
+	var i SessionPendingCommand
+	err := row.Scan(
+		&i.SessionID,
+		&i.CmdID,
+		&i.Type,
+		&i.EventSeq,
+		&i.Status,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const updatePendingCommandStatus = `-- name: UpdatePendingCommandStatus :one
 UPDATE session_pending_commands AS command
 SET status = $1, updated_at = statement_timestamp()
