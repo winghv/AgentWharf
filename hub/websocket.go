@@ -759,6 +759,8 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return auth.ErrUnauthorized
 	}
+	_, unlockTarget := h.lockAdapterAdmission(authorization.Grant.TargetSessionID)
+	defer unlockTarget()
 	warmStore, ok := h.events.(warmAttachCredentialStore)
 	if !ok {
 		err := errors.New("warm attach store is not configured")
