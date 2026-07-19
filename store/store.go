@@ -411,6 +411,14 @@ type WarmAttachFirstDelivery struct {
 	ExpiresAt       time.Time
 }
 
+// WarmAttachTargetActivation is the non-secret credential lineage truth that
+// becomes durable with an accepted warm attach. The bearer itself never enters
+// the Store, an event, or an outbox record.
+type WarmAttachTargetActivation struct {
+	Generation int64
+	ExpiresAt  time.Time
+}
+
 // WarmAttachRequest binds the live bootstrap admission tuple to the immutable
 // attempt, target attachment lineage, and first reference-only delivery.
 // Implementations recheck target lifecycle and conflict truth in the same
@@ -418,6 +426,7 @@ type WarmAttachFirstDelivery struct {
 type WarmAttachRequest struct {
 	Attempt            AttachAttemptRequest
 	Attachment         AttachmentCreate
+	TargetActivation   WarmAttachTargetActivation
 	BootstrapAdmission AdapterConnectionAdmission
 	FirstDelivery      WarmAttachFirstDelivery
 }
@@ -434,11 +443,12 @@ type WarmAttachOutbox struct {
 }
 
 type WarmAttachCommit struct {
-	Attempt    AttachAttempt
-	Attachment Attachment
-	Outbox     WarmAttachOutbox
-	Summary    SessionAttentionSummary
-	Duplicate  bool
+	Attempt          AttachAttempt
+	Attachment       Attachment
+	TargetActivation WarmAttachTargetActivation
+	Outbox           WarmAttachOutbox
+	Summary          SessionAttentionSummary
+	Duplicate        bool
 }
 
 type WarmAttachExpiry struct {
@@ -454,6 +464,13 @@ type WarmAttachStore interface {
 	AttentionSummaryStore
 	CommitWarmAttach(ctx context.Context, request WarmAttachRequest) (WarmAttachCommit, error)
 	ExpireWarmAttach(ctx context.Context, attachID string, expectedDeliveryVersion int64) (WarmAttachExpiry, error)
+}
+
+// WarmAttachTargetActivationStore rechecks the initial target lineage against
+// Store-owned time immediately before credential delivery. It is deliberately
+// separate from normal Adapter admission, which requires a successful hello.
+type WarmAttachTargetActivationStore interface {
+	ValidateWarmAttachTargetActivation(ctx context.Context, sessionID string, activation WarmAttachTargetActivation) error
 }
 
 // WorkspaceLeaseKey is derived by trusted Hub/Auth code from an immutable

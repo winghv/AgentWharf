@@ -27,7 +27,7 @@ func TestSchemaFixtureIsEventStoreOnly(t *testing.T) {
 		"CREATE TABLE session_pending_commands",
 		"session_id TEXT NOT NULL CHECK (char_length(session_id) BETWEEN 1 AND 255) REFERENCES agent_sessions(id)",
 		"CREATE TABLE session_attachments",
-		"status = 'join_pending' AND delivery_state = 'pending'",
+		"status = 'join_pending' AND delivery_state IN ('pending', 'received', 'completed')",
 		"proposal_id TEXT",
 		"CREATE TABLE session_adapter_connections",
 		"pending_credential_generation <> prior_recovery_credential_generation",

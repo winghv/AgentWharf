@@ -27,11 +27,13 @@ const adapterEventBatchMaxEvents = 64
 var errReplayBufferOverflow = errors.New("replay buffer overflow")
 
 type WebSocketConfig struct {
-	Handshake               *Handshake
-	EventStore              store.EventStore
-	HandshakeTimeout        time.Duration
-	CommandActivityObserver CommandActivityObserver
-	AdapterActivityObserver AdapterActivityObserver
+	Handshake                   *Handshake
+	EventStore                  store.EventStore
+	HandshakeTimeout            time.Duration
+	CommandActivityObserver     CommandActivityObserver
+	AdapterActivityObserver     AdapterActivityObserver
+	SessionCredentialIssuer     auth.SessionCredentialIssuer
+	WarmAttachCredentialHandoff WarmAttachCredentialHandoff
 }
 
 type EphemeralBroadcaster interface {
@@ -66,18 +68,20 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		timeout = defaultHandshakeTimeout
 	}
 	handler := &webSocketHandler{
-		handshake:               cfg.Handshake,
-		events:                  cfg.EventStore,
-		handshakeTimeout:        timeout,
-		commandActivityObserver: cfg.CommandActivityObserver,
-		adapterActivityObserver: cfg.AdapterActivityObserver,
-		adapterAuthority:        newAdapterDispatchAuthority(cfg.Handshake, cfg.EventStore),
-		adapterAdmissionLocks:   make(map[string]chan struct{}),
-		subscribers:             make(map[string]map[*clientConnection]struct{}),
-		adapters:                make(map[string]*adapterConnection),
-		pendingCommands:         make(map[string][]queuedCommand),
-		acceptedCommands:        make(map[string]struct{}),
-		decisions:               make(map[string]struct{}),
+		handshake:                   cfg.Handshake,
+		events:                      cfg.EventStore,
+		handshakeTimeout:            timeout,
+		commandActivityObserver:     cfg.CommandActivityObserver,
+		adapterActivityObserver:     cfg.AdapterActivityObserver,
+		sessionCredentialIssuer:     cfg.SessionCredentialIssuer,
+		warmAttachCredentialHandoff: cfg.WarmAttachCredentialHandoff,
+		adapterAuthority:            newAdapterDispatchAuthority(cfg.Handshake, cfg.EventStore),
+		adapterAdmissionLocks:       make(map[string]chan struct{}),
+		subscribers:                 make(map[string]map[*clientConnection]struct{}),
+		adapters:                    make(map[string]*adapterConnection),
+		pendingCommands:             make(map[string][]queuedCommand),
+		acceptedCommands:            make(map[string]struct{}),
+		decisions:                   make(map[string]struct{}),
 	}
 	if cfg.Handshake != nil {
 		cfg.Handshake.SetLiveBootstrapAuthorityResolver(handler)
@@ -106,14 +110,16 @@ func (h *webSocketHandler) EmitEphemeralEvent(ctx context.Context, ev protocol.E
 }
 
 type webSocketHandler struct {
-	handshake               *Handshake
-	events                  store.EventStore
-	handshakeTimeout        time.Duration
-	commandActivityObserver CommandActivityObserver
-	adapterActivityObserver AdapterActivityObserver
-	adapterAuthority        *adapterDispatchAuthority
-	adapterAdmissionMu      sync.Mutex
-	adapterAdmissionLocks   map[string]chan struct{}
+	handshake                   *Handshake
+	events                      store.EventStore
+	handshakeTimeout            time.Duration
+	commandActivityObserver     CommandActivityObserver
+	adapterActivityObserver     AdapterActivityObserver
+	adapterAuthority            *adapterDispatchAuthority
+	adapterAdmissionMu          sync.Mutex
+	adapterAdmissionLocks       map[string]chan struct{}
+	sessionCredentialIssuer     auth.SessionCredentialIssuer
+	warmAttachCredentialHandoff WarmAttachCredentialHandoff
 
 	mu          sync.Mutex
 	subscribers map[string]map[*clientConnection]struct{}
@@ -750,13 +756,17 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return auth.ErrUnauthorized
 	}
-	warmStore, ok := h.events.(store.WarmAttachStore)
+	warmStore, ok := h.events.(warmAttachCredentialStore)
 	if !ok {
 		err := errors.New("warm attach store is not configured")
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "internal_error")
 		return err
 	}
-	issuedGeneration := authorization.Bootstrap.CredentialGeneration
+	activation, prepared, err := h.prepareWarmAttachCredential(ctx, authorization)
+	if err != nil {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
+		return err
+	}
 	commit, err := warmStore.CommitWarmAttach(ctx, store.WarmAttachRequest{
 		Attempt: store.AttachAttemptRequest{
 			Identity: store.AttachAttemptIdentity{
@@ -769,7 +779,7 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 				Digest: authorization.Grant.Commit.Fingerprint.Digest, KeyVersion: authorization.Grant.Commit.Fingerprint.KeyVersion,
 			},
 			ExpiresAt: authorization.Grant.ExpiresAt, Outcome: store.AttachAttemptAccepted,
-			IssuedCredentialGeneration: &issuedGeneration,
+			IssuedCredentialGeneration: &activation.Generation,
 		},
 		Attachment: store.AttachmentCreate{
 			Identity: store.AttachmentIdentity{
@@ -777,8 +787,9 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 				TargetSessionID:            authorization.Grant.TargetSessionID,
 				TargetCredentialLineageRef: authorization.Grant.Commit.TargetCredentialLineageRef,
 			},
-			ExpiresAt: authorization.Grant.DeliveryDeadline,
+			ExpiresAt: activation.ExpiresAt,
 		},
+		TargetActivation: activation,
 		BootstrapAdmission: store.AdapterConnectionAdmission{
 			CredentialGeneration: authorization.Bootstrap.CredentialGeneration,
 			ConnectionEpoch:      authorization.Bootstrap.ConnectionEpoch, AcceptedFence: authorization.Bootstrap.AcceptedFence,
@@ -786,12 +797,19 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 		},
 		FirstDelivery: store.WarmAttachFirstDelivery{
 			CommandID: cmd.CommandID, ReferenceID: authorization.Grant.Commit.FirstDeliveryReferenceID,
-			ReferenceDigest: authorization.Grant.Commit.FirstDeliveryReferenceDigest, ExpiresAt: authorization.Grant.DeliveryDeadline,
+			ReferenceDigest: authorization.Grant.Commit.FirstDeliveryReferenceDigest, ExpiresAt: activation.ExpiresAt,
 		},
 	})
 	if err != nil {
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
 		return fmt.Errorf("commit warm attach: %w", err)
+	}
+	if err := h.handoffCommittedWarmAttachCredential(ctx, warmStore, authorization, store.AdapterConnectionAdmission{
+		CredentialGeneration: authorization.Bootstrap.CredentialGeneration, ConnectionEpoch: authorization.Bootstrap.ConnectionEpoch,
+		AcceptedFence: authorization.Bootstrap.AcceptedFence, GrantFence: authorization.Grant.GrantFence,
+	}, commit, prepared); err != nil {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
+		return err
 	}
 	status := protocol.AckAccepted
 	if commit.Duplicate {

@@ -1185,6 +1185,20 @@ func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRe
 	if summary.StateOfProjection != store.AttentionProjectionComplete || summary.TerminalOutcome != nil || summary.State == "ended" || summary.State == "error" {
 		return store.WarmAttachCommit{}, errors.New("warm attach target is not attachable")
 	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO session_adapter_connections
+(session_id, connection_epoch, accepted_fence, active_credential_generation, credential_generation_high_watermark, active_credential_expires_at_ms, created_at_ms, updated_at_ms)
+VALUES (?, 0, 0, ?, ?, ?, ?, ?)`, request.Attachment.Identity.TargetSessionID, request.TargetActivation.Generation,
+		request.TargetActivation.Generation, request.TargetActivation.ExpiresAt.UnixMilli(), nowMS, nowMS); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("initialize sqlite warm attach target credential: %w", err)
+	}
+	connection, err := queryAdapterConnection(ctx, tx, request.Attachment.Identity.TargetSessionID)
+	if err != nil || connection.ConnectionEpoch != 0 || connection.AcceptedFence != 0 ||
+		connection.ActiveCredentialGeneration != request.TargetActivation.Generation || connection.CredentialGenerationHighWatermark != request.TargetActivation.Generation ||
+		!connection.ActiveCredentialExpiresAt.Equal(time.UnixMilli(request.TargetActivation.ExpiresAt.UnixMilli())) ||
+		connection.PendingCredentialGeneration != nil || connection.PriorRecoveryGeneration != nil || connection.RotationID != nil ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil {
+		return store.WarmAttachCommit{}, errors.New("sqlite warm attach target credential conflicts with existing state")
+	}
 	nowMS, err = sqliteNowMillis(ctx, tx)
 	if err != nil || !validSQLiteWarmAttachExpiry(request, time.UnixMilli(nowMS)) || validateSQLiteAttachAttempt(request.Attempt, time.UnixMilli(nowMS)) != nil {
 		return store.WarmAttachCommit{}, errors.New("warm attach expiry is outside the Store-clock window")
@@ -1228,7 +1242,7 @@ func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRe
 	if err := tx.Commit(); err != nil {
 		return store.WarmAttachCommit{}, fmt.Errorf("commit sqlite warm attach: %w", err)
 	}
-	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, Outbox: store.WarmAttachOutbox{TargetSessionID: attachment.Identity.TargetSessionID, CommandID: request.FirstDelivery.CommandID, EventSeq: seq, ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: *attachment.ExpiresAt}, Summary: summary}, nil
+	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, TargetActivation: request.TargetActivation, Outbox: store.WarmAttachOutbox{TargetSessionID: attachment.Identity.TargetSessionID, CommandID: request.FirstDelivery.CommandID, EventSeq: seq, ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: *attachment.ExpiresAt}, Summary: summary}, nil
 }
 
 func (s *Store) ExpireWarmAttach(ctx context.Context, attachID string, expectedDeliveryVersion int64) (store.WarmAttachExpiry, error) {
@@ -1245,10 +1259,16 @@ func (s *Store) ExpireWarmAttach(ctx context.Context, attachID string, expectedD
 		return store.WarmAttachExpiry{}, err
 	}
 	nowMS, err := sqliteNowMillis(ctx, tx)
-	if err != nil || current.DeliveryVersion != expectedDeliveryVersion || current.Status != store.AttachmentJoinPending || current.DeliveryState != store.AttachmentDeliveryPending || current.ExpiresAt == nil || !current.ExpiresAt.Before(time.UnixMilli(nowMS)) {
+	if err != nil || current.DeliveryVersion != expectedDeliveryVersion || current.Status != store.AttachmentJoinPending || current.ExpiresAt == nil || !current.ExpiresAt.Before(time.UnixMilli(nowMS)) {
 		return store.WarmAttachExpiry{}, errors.New("sqlite warm attach is not expirable")
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE session_attachments SET status = 'reauthorization_required', delivery_version = delivery_version + 1, expires_at_ns = NULL, updated_at_ms = ? WHERE attach_id = ? AND delivery_version = ?`, nowMS, attachID, expectedDeliveryVersion)
+	deliveryState, blocker := store.AttachmentDeliveryPending, &store.AttentionBlocker{Kind: store.AttentionBlockerReauthorizationRequired}
+	if current.DeliveryState != store.AttachmentDeliveryPending {
+		deliveryState = store.AttachmentDeliveryOutcomeUnknown
+		operation := "credential_handoff"
+		blocker = &store.AttentionBlocker{Kind: store.AttentionBlockerOutcomeUnknown, Operation: &operation}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_attachments SET status = 'reauthorization_required', delivery_state = ?, delivery_version = delivery_version + 1, expires_at_ns = NULL, updated_at_ms = ? WHERE attach_id = ? AND delivery_version = ?`, deliveryState, nowMS, attachID, expectedDeliveryVersion)
 	if err != nil {
 		return store.WarmAttachExpiry{}, err
 	}
@@ -1259,7 +1279,7 @@ func (s *Store) ExpireWarmAttach(ctx context.Context, attachID string, expectedD
 	if err != nil {
 		return store.WarmAttachExpiry{}, err
 	}
-	if err := upsertSQLiteAttentionLedger(ctx, tx, updated.Identity.TargetSessionID, &store.AttentionBlocker{Kind: store.AttentionBlockerReauthorizationRequired}, nil); err != nil {
+	if err := upsertSQLiteAttentionLedger(ctx, tx, updated.Identity.TargetSessionID, blocker, nil); err != nil {
 		return store.WarmAttachExpiry{}, err
 	}
 	summary, err := querySQLiteAttentionSummary(ctx, tx.QueryRowContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id = ?`, updated.Identity.TargetSessionID))
@@ -1273,7 +1293,7 @@ func (s *Store) ExpireWarmAttach(ctx context.Context, attachID string, expectedD
 }
 
 func validateSQLiteWarmAttach(request store.WarmAttachRequest) error {
-	if request.Attempt.Identity.JTIHash == ([32]byte{}) || request.Attempt.Identity.Provider == "" || request.Attempt.Fingerprint.Domain != "agentwharf.attach-request.v1" || request.Attempt.Fingerprint.Version != 1 || request.Attempt.Fingerprint.Digest == ([32]byte{}) || request.Attempt.Fingerprint.KeyVersion < 1 || request.Attempt.Outcome != store.AttachAttemptAccepted || request.Attempt.IssuedCredentialGeneration == nil || *request.Attempt.IssuedCredentialGeneration != request.BootstrapAdmission.CredentialGeneration || request.Attachment.Identity.AttachID != request.Attempt.Identity.AttachID || request.Attachment.Identity.BootstrapSessionID != request.Attempt.Identity.BootstrapSessionID || request.Attachment.Identity.TargetSessionID != request.Attempt.Identity.TargetSessionID || validateAttachmentIdentity(request.Attachment.Identity) != nil || request.BootstrapAdmission.CredentialGeneration < 1 || request.BootstrapAdmission.ConnectionEpoch < 1 || request.BootstrapAdmission.AcceptedFence < 1 || request.BootstrapAdmission.GrantFence <= request.BootstrapAdmission.AcceptedFence || !validAttachmentText(request.FirstDelivery.CommandID, 256) || !validAttachmentText(request.FirstDelivery.ReferenceID, 255) || request.FirstDelivery.ReferenceDigest == ([32]byte{}) || !request.FirstDelivery.ExpiresAt.Equal(request.Attachment.ExpiresAt) {
+	if request.Attempt.Identity.JTIHash == ([32]byte{}) || request.Attempt.Identity.Provider == "" || request.Attempt.Fingerprint.Domain != "agentwharf.attach-request.v1" || request.Attempt.Fingerprint.Version != 1 || request.Attempt.Fingerprint.Digest == ([32]byte{}) || request.Attempt.Fingerprint.KeyVersion < 1 || request.Attempt.Outcome != store.AttachAttemptAccepted || request.Attempt.IssuedCredentialGeneration == nil || *request.Attempt.IssuedCredentialGeneration != request.TargetActivation.Generation || request.Attachment.Identity.AttachID != request.Attempt.Identity.AttachID || request.Attachment.Identity.BootstrapSessionID != request.Attempt.Identity.BootstrapSessionID || request.Attachment.Identity.TargetSessionID != request.Attempt.Identity.TargetSessionID || validateAttachmentIdentity(request.Attachment.Identity) != nil || request.TargetActivation.Generation < 1 || request.TargetActivation.ExpiresAt.IsZero() || !request.TargetActivation.ExpiresAt.Equal(request.Attachment.ExpiresAt) || request.BootstrapAdmission.CredentialGeneration < 1 || request.BootstrapAdmission.ConnectionEpoch < 1 || request.BootstrapAdmission.AcceptedFence < 1 || request.BootstrapAdmission.GrantFence <= request.BootstrapAdmission.AcceptedFence || !validAttachmentText(request.FirstDelivery.CommandID, 256) || !validAttachmentText(request.FirstDelivery.ReferenceID, 255) || request.FirstDelivery.ReferenceDigest == ([32]byte{}) || !request.FirstDelivery.ExpiresAt.Equal(request.Attachment.ExpiresAt) {
 		return errors.New("invalid sqlite warm attach request")
 	}
 	return nil
@@ -1300,6 +1320,14 @@ func sqliteWarmAttachDuplicate(ctx context.Context, tx *sql.Tx, attempt store.At
 	if err != nil || attachment.Identity != request.Attachment.Identity {
 		return store.WarmAttachCommit{}, errors.New("sqlite warm attach attachment is immutable")
 	}
+	connection, err := queryAdapterConnection(ctx, tx, attachment.Identity.TargetSessionID)
+	if err != nil || connection.ConnectionEpoch != 0 || connection.AcceptedFence != 0 ||
+		connection.ActiveCredentialGeneration != request.TargetActivation.Generation || connection.CredentialGenerationHighWatermark != request.TargetActivation.Generation ||
+		!connection.ActiveCredentialExpiresAt.Equal(time.UnixMilli(request.TargetActivation.ExpiresAt.UnixMilli())) ||
+		connection.PendingCredentialGeneration != nil || connection.PriorRecoveryGeneration != nil || connection.RotationID != nil ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil {
+		return store.WarmAttachCommit{}, errors.New("sqlite warm attach target credential is immutable")
+	}
 	command, err := queryPendingCommand(ctx, tx, attachment.Identity.TargetSessionID, request.FirstDelivery.CommandID, nowMS)
 	if err != nil || command.Type != "session.send" || !command.ExpiresAt.Equal(request.FirstDelivery.ExpiresAt) {
 		return store.WarmAttachCommit{}, errors.New("sqlite warm attach outbox is immutable")
@@ -1313,7 +1341,7 @@ func sqliteWarmAttachDuplicate(ctx context.Context, tx *sql.Tx, attempt store.At
 	if err != nil {
 		return store.WarmAttachCommit{}, err
 	}
-	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, Outbox: store.WarmAttachOutbox{TargetSessionID: attachment.Identity.TargetSessionID, CommandID: command.CommandID, EventSeq: command.EventSeq, ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: command.ExpiresAt}, Summary: summary, Duplicate: true}, nil
+	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, TargetActivation: request.TargetActivation, Outbox: store.WarmAttachOutbox{TargetSessionID: attachment.Identity.TargetSessionID, CommandID: command.CommandID, EventSeq: command.EventSeq, ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: command.ExpiresAt}, Summary: summary, Duplicate: true}, nil
 }
 
 func (s *Store) ReserveWorkspaceLease(ctx context.Context, reserve store.WorkspaceLeaseReserve) (store.WorkspaceLease, error) {
@@ -1614,6 +1642,17 @@ func (s *Store) InitializeAdapterConnection(ctx context.Context, request store.A
 		}
 		return connection, nil
 	})
+}
+
+func (s *Store) ValidateWarmAttachTargetActivation(ctx context.Context, sessionID string, activation store.WarmAttachTargetActivation) error {
+	if s == nil || s.db == nil || !validConnectionID(sessionID) || activation.Generation < 1 || activation.ExpiresAt.IsZero() {
+		return errors.New("invalid sqlite warm attach target activation")
+	}
+	_, err := queryAdapterConnectionWhere(ctx, s.connectionExecutor(), `connection.session_id = ? AND connection.active_credential_generation = ? AND connection.credential_generation_high_watermark = ? AND connection.active_credential_expires_at_ms = ? AND connection.connection_epoch = 0 AND connection.accepted_fence = 0 AND connection.pending_credential_generation IS NULL AND connection.prior_recovery_credential_generation IS NULL AND connection.rotation_id IS NULL AND connection.revoked_at_ms IS NULL AND connection.terminal_at_ms IS NULL AND connection.active_credential_expires_at_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`, sessionID, activation.Generation, activation.Generation, activation.ExpiresAt.UnixMilli())
+	if err != nil {
+		return errors.New("sqlite warm attach target activation is expired or fenced")
+	}
+	return nil
 }
 
 func (s *Store) RefreshAdapterCredentialBeforeHello(ctx context.Context, sessionID string, refresh store.AdapterCredentialPreHelloRefresh) (store.AdapterConnection, error) {
@@ -2177,6 +2216,8 @@ func validateAttachmentUpdate(current store.Attachment, update store.AttachmentU
 	}
 	valid := false
 	switch update.Status {
+	case store.AttachmentJoinPending:
+		valid = current.Status == store.AttachmentJoinPending && update.QueueReason == nil && update.ExpiresAt != nil && current.ExpiresAt != nil && update.ExpiresAt.Equal(*current.ExpiresAt) && update.BlockingSessionID == nil && update.Blocker == nil && (update.DeliveryState == store.AttachmentDeliveryPending || update.DeliveryState == store.AttachmentDeliveryReceived || update.DeliveryState == store.AttachmentDeliveryCompleted)
 	case store.AttachmentQueued:
 		valid = update.DeliveryState == store.AttachmentDeliveryPending && update.QueueReason != nil && validAttachmentText(*update.QueueReason, 128) &&
 			update.ExpiresAt != nil && update.BlockingSessionID != nil && validAttachmentText(*update.BlockingSessionID, 255) &&
@@ -2211,7 +2252,7 @@ func validAttachmentRowShape(attachment store.Attachment, createdAtMS, nowMS int
 	}
 	switch attachment.Status {
 	case store.AttachmentJoinPending:
-		return attachment.DeliveryState == store.AttachmentDeliveryPending && attachment.QueueReason == nil && attachment.ExpiresAt != nil && attachment.CanceledAt == nil && attachment.BlockingSessionID == nil
+		return (attachment.DeliveryState == store.AttachmentDeliveryPending || attachment.DeliveryState == store.AttachmentDeliveryReceived || attachment.DeliveryState == store.AttachmentDeliveryCompleted) && attachment.QueueReason == nil && attachment.ExpiresAt != nil && attachment.CanceledAt == nil && attachment.BlockingSessionID == nil
 	case store.AttachmentQueued:
 		return attachment.DeliveryState == store.AttachmentDeliveryPending && attachment.QueueReason != nil && attachment.ExpiresAt != nil && attachment.CanceledAt == nil && attachment.BlockingSessionID != nil
 	case store.AttachmentStartReceived:
@@ -2232,7 +2273,7 @@ func validAttachmentExpiry(expiresAt, storeNow time.Time) bool {
 func validAttachmentText(value string, limit int) bool { return len(value) > 0 && len(value) <= limit }
 
 func validAttachmentOperation(value *string) bool {
-	return value != nil && (*value == "start" || *value == "command")
+	return value != nil && (*value == "start" || *value == "command" || *value == "credential_handoff")
 }
 
 func sqliteAttachmentSummary(attachment store.Attachment, blocker *store.AttachmentBlocker) store.AttachmentSummary {

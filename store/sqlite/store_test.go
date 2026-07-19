@@ -63,7 +63,7 @@ func TestWarmAttachStoreContract(t *testing.T) {
 		},
 		Expire: func(t *testing.T, warm store.WarmAttachStore) {
 			db := openRawSQLite(t, warm.(*sqliteWarmAttachHarness).path)
-			if _, err := db.Exec(`UPDATE session_attachments SET expires_at_ns = created_at_ms * 1000000 + 1 WHERE attach_id = 'att_warm'`); err != nil {
+			if _, err := db.Exec(`UPDATE session_attachments SET expires_at_ns = (created_at_ms - 1000) * 1000000 + 1, created_at_ms = created_at_ms - 1000 WHERE attach_id = 'att_warm'`); err != nil {
 				t.Fatal(err)
 			}
 		},
@@ -78,6 +78,10 @@ func TestWarmAttachStoreContract(t *testing.T) {
 			}
 			if attempts+attachments+commands+references != 0 {
 				t.Fatalf("warm rollback left %d/%d/%d/%d", attempts, attachments, commands, references)
+			}
+			var connections int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM session_adapter_connections WHERE session_id = 'ses_target'`).Scan(&connections); err != nil || connections != 0 {
+				t.Fatalf("warm rollback left target credential connections=%d err=%v", connections, err)
 			}
 		},
 	})
@@ -110,12 +114,20 @@ func TestWarmAttachCommitDuplicateAndExpiry(t *testing.T) {
 	request := store.WarmAttachRequest{
 		Attempt:            store.AttachAttemptRequest{Identity: store.AttachAttemptIdentity{JTIHash: [32]byte{1}, AttachID: "att_warm", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: "ses_warm_target", Provider: "claude-code"}, Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{2}, KeyVersion: 1}, ExpiresAt: time.Now().Add(time.Minute), Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: int64Pointer(1)},
 		Attachment:         store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_warm", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: "ses_warm_target", TargetCredentialLineageRef: "lineage_warm"}, ExpiresAt: expiresAt},
+		TargetActivation:   store.WarmAttachTargetActivation{Generation: 1, ExpiresAt: expiresAt},
 		BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grantFence},
 		FirstDelivery:      store.WarmAttachFirstDelivery{CommandID: "cmd_warm", ReferenceID: "ref_warm", ReferenceDigest: [32]byte{3}, ExpiresAt: expiresAt},
 	}
 	commit, err := warm.CommitWarmAttach(ctx, request)
 	if err != nil || commit.Duplicate || commit.Attachment.Status != store.AttachmentJoinPending || commit.Summary.Blocker == nil || commit.Summary.Blocker.Kind != store.AttentionBlockerQueued {
 		t.Fatalf("commit warm attach = %+v, %v", commit, err)
+	}
+	target, err := warm.AdapterConnection(ctx, "ses_warm_target")
+	if err != nil || target.ConnectionEpoch != 0 || target.AcceptedFence != 0 || target.ActiveCredentialGeneration != request.TargetActivation.Generation || target.CredentialGenerationHighWatermark != request.TargetActivation.Generation || target.ActiveCredentialExpiresAt.UnixMilli() != request.TargetActivation.ExpiresAt.UnixMilli() || target.RevokedAt != nil || target.TerminalAt != nil {
+		t.Fatalf("commit target activation = %+v, %v", target, err)
+	}
+	if err := warm.ValidateWarmAttachTargetActivation(ctx, "ses_warm_target", request.TargetActivation); err != nil {
+		t.Fatalf("validate current warm target activation: %v", err)
 	}
 	retry, err := warm.CommitWarmAttach(ctx, request)
 	if err != nil || !retry.Duplicate || retry.Attempt.Identity != commit.Attempt.Identity || retry.Attachment.Identity != commit.Attachment.Identity || retry.Attachment.DeliveryVersion != commit.Attachment.DeliveryVersion || retry.Outbox.EventSeq != commit.Outbox.EventSeq || retry.Outbox.CommandID != commit.Outbox.CommandID || retry.Outbox.ReferenceID != commit.Outbox.ReferenceID || retry.Summary.SessionID != commit.Summary.SessionID || retry.Summary.SummaryVersion != commit.Summary.SummaryVersion {
@@ -127,7 +139,13 @@ func TestWarmAttachCommitDuplicateAndExpiry(t *testing.T) {
 		t.Fatal("changed warm attach retry succeeded")
 	}
 	db := openRawSQLite(t, path)
-	if _, err := db.Exec(`UPDATE session_attachments SET expires_at_ns = created_at_ms * 1000000 + 1 WHERE attach_id = 'att_warm'`); err != nil {
+	if _, err := db.Exec(`UPDATE session_adapter_connections SET active_credential_expires_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 1, created_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 2000, updated_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 1000 WHERE session_id = 'ses_warm_target'`); err != nil {
+		t.Fatalf("expire target activation: %v", err)
+	}
+	if err := warm.ValidateWarmAttachTargetActivation(ctx, "ses_warm_target", request.TargetActivation); err == nil {
+		t.Fatal("expired target activation passed Store-clock recheck")
+	}
+	if _, err := db.Exec(`UPDATE session_attachments SET expires_at_ns = (created_at_ms - 1000) * 1000000 + 1, created_at_ms = created_at_ms - 1000 WHERE attach_id = 'att_warm'`); err != nil {
 		t.Fatalf("expire warm attach: %v", err)
 	}
 	expired, err := warm.ExpireWarmAttach(ctx, "att_warm", 0)
@@ -160,7 +178,7 @@ func TestWarmAttachRejectsMissingOrIncompleteTargetWithoutWrites(t *testing.T) {
 				t.Fatal(err)
 			}
 			expires := time.Now().Add(10 * time.Second)
-			request := store.WarmAttachRequest{Attempt: store.AttachAttemptRequest{Identity: store.AttachAttemptIdentity{JTIHash: [32]byte{9}, AttachID: "att_reject", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: target, Provider: "claude-code"}, Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{8}, KeyVersion: 1}, ExpiresAt: time.Now().Add(time.Minute), Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: int64Pointer(1)}, Attachment: store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_reject", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: target, TargetCredentialLineageRef: "lineage_reject"}, ExpiresAt: expires}, BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grant}, FirstDelivery: store.WarmAttachFirstDelivery{CommandID: "cmd_reject", ReferenceID: "ref_reject", ReferenceDigest: [32]byte{7}, ExpiresAt: expires}}
+			request := store.WarmAttachRequest{Attempt: store.AttachAttemptRequest{Identity: store.AttachAttemptIdentity{JTIHash: [32]byte{9}, AttachID: "att_reject", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: target, Provider: "claude-code"}, Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{8}, KeyVersion: 1}, ExpiresAt: time.Now().Add(time.Minute), Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: int64Pointer(1)}, Attachment: store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_reject", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: target, TargetCredentialLineageRef: "lineage_reject"}, ExpiresAt: expires}, TargetActivation: store.WarmAttachTargetActivation{Generation: 1, ExpiresAt: expires}, BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grant}, FirstDelivery: store.WarmAttachFirstDelivery{CommandID: "cmd_reject", ReferenceID: "ref_reject", ReferenceDigest: [32]byte{7}, ExpiresAt: expires}}
 			if _, err := warm.CommitWarmAttach(ctx, request); err == nil {
 				t.Fatal("untrusted target committed warm attach")
 			}
@@ -276,7 +294,7 @@ func TestWarmAttachWALRetryReopenExpiryAndCorruption(t *testing.T) {
 	}
 	assertSQLiteWarmAttachDurableRows(t, path, request, committed)
 	db := openRawSQLite(t, path)
-	if _, err := db.Exec(`UPDATE session_attachments SET expires_at_ns = created_at_ms * 1000000 + 1 WHERE attach_id = ?`, request.Attachment.Identity.AttachID); err != nil {
+	if _, err := db.Exec(`UPDATE session_attachments SET expires_at_ns = (created_at_ms - 1000) * 1000000 + 1, created_at_ms = created_at_ms - 1000 WHERE attach_id = ?`, request.Attachment.Identity.AttachID); err != nil {
 		t.Fatalf("expire reopened warm attachment: %v", err)
 	}
 	expired, err := reopened.ExpireWarmAttach(context.Background(), request.Attachment.Identity.AttachID, committed.Attachment.DeliveryVersion)
@@ -305,6 +323,46 @@ func TestWarmAttachWALRetryReopenExpiryAndCorruption(t *testing.T) {
 	assertSQLiteWarmAttachDurableRows(t, path, request, committed)
 }
 
+func TestWarmAttachCredentialReceiptSurvivesReopenAndFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "warm-attach-credential-receipt.db")
+	warm, request := newSQLiteWarmAttach(t, path)
+	committed, err := warm.CommitWarmAttach(context.Background(), request)
+	if err != nil {
+		t.Fatalf("commit warm attach: %v", err)
+	}
+	claimed, err := warm.UpdateAttachment(context.Background(), committed.Attachment.Identity.AttachID, committed.Attachment.DeliveryVersion, store.AttachmentUpdate{
+		Status: store.AttachmentJoinPending, DeliveryState: store.AttachmentDeliveryReceived, ExpiresAt: committed.Attachment.ExpiresAt,
+	})
+	if err != nil || claimed.Attachment.DeliveryState != store.AttachmentDeliveryReceived {
+		t.Fatalf("claim credential receipt = %+v, %v", claimed, err)
+	}
+	if err := warm.Close(); err != nil {
+		t.Fatalf("close claimed receipt store: %v", err)
+	}
+	reopened := openStore(t, path)
+	duplicate, err := reopened.CommitWarmAttach(context.Background(), request)
+	if err != nil || !duplicate.Duplicate || duplicate.Attachment.DeliveryState != store.AttachmentDeliveryReceived {
+		t.Fatalf("reopened credential receipt = %+v, %v", duplicate, err)
+	}
+	db := openRawSQLite(t, path)
+	if _, err := db.Exec(`UPDATE session_attachments SET expires_at_ns = (created_at_ms - 1000) * 1000000 + 1, created_at_ms = created_at_ms - 1000 WHERE attach_id = ?`, duplicate.Attachment.Identity.AttachID); err != nil {
+		t.Fatalf("expire claimed credential receipt: %v", err)
+	}
+	expired, err := reopened.ExpireWarmAttach(context.Background(), duplicate.Attachment.Identity.AttachID, duplicate.Attachment.DeliveryVersion)
+	if err != nil || expired.Attachment.Status != store.AttachmentReauthorizationRequired || expired.Attachment.DeliveryState != store.AttachmentDeliveryOutcomeUnknown || expired.Summary.Blocker == nil || expired.Summary.Blocker.Kind != store.AttentionBlockerOutcomeUnknown || expired.Summary.Blocker.Operation == nil || *expired.Summary.Blocker.Operation != "credential_handoff" {
+		t.Fatalf("expire claimed credential receipt = %+v, %v", expired, err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close failed receipt store: %v", err)
+	}
+	final := openStore(t, path)
+	defer final.Close()
+	retry, err := final.CommitWarmAttach(context.Background(), request)
+	if err != nil || !retry.Duplicate || retry.Attachment.Status != store.AttachmentReauthorizationRequired || retry.Attachment.DeliveryState != store.AttachmentDeliveryOutcomeUnknown {
+		t.Fatalf("final credential receipt = %+v, %v", retry, err)
+	}
+}
+
 func newSQLiteWarmAttach(t *testing.T, path string) (*sqlite.Store, store.WarmAttachRequest) {
 	t.Helper()
 	warm := openStore(t, path)
@@ -327,6 +385,7 @@ func newSQLiteWarmAttach(t *testing.T, path string) (*sqlite.Store, store.WarmAt
 	return warm, store.WarmAttachRequest{
 		Attempt:            store.AttachAttemptRequest{Identity: store.AttachAttemptIdentity{JTIHash: [32]byte{4}, AttachID: "att_warm", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: "ses_warm_target", Provider: "claude-code"}, Fingerprint: store.AttachAttemptFingerprint{Domain: "agentwharf.attach-request.v1", Version: 1, Digest: [32]byte{5}, KeyVersion: 1}, ExpiresAt: time.Now().Add(time.Minute), Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: int64Pointer(1)},
 		Attachment:         store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_warm", BootstrapSessionID: "ses_warm_bootstrap", TargetSessionID: "ses_warm_target", TargetCredentialLineageRef: "lineage_warm"}, ExpiresAt: expiresAt},
+		TargetActivation:   store.WarmAttachTargetActivation{Generation: 1, ExpiresAt: expiresAt},
 		BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grantFence},
 		FirstDelivery:      store.WarmAttachFirstDelivery{CommandID: "cmd_warm", ReferenceID: "ref_warm", ReferenceDigest: [32]byte{6}, ExpiresAt: expiresAt},
 	}

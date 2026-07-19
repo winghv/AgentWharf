@@ -143,9 +143,10 @@ func (s *memoryWarmAttachStore) CommitWarmAttach(_ context.Context, request stor
 			Identity: request.Attempt.Identity, Fingerprint: request.Attempt.Fingerprint, ExpiresAt: request.Attempt.ExpiresAt,
 			Outcome: request.Attempt.Outcome, IssuedCredentialGeneration: &issuedGeneration,
 		},
-		Attachment: attachment,
-		Outbox:     outbox,
-		Summary:    summary,
+		Attachment:       attachment,
+		TargetActivation: request.TargetActivation,
+		Outbox:           outbox,
+		Summary:          summary,
 	}
 	s.records[request.Attempt.Identity.JTIHash] = memoryWarmAttachRecord{request: request, commit: cloneWarmAttachCommit(commit)}
 	s.summaries[attachment.Identity.TargetSessionID] = cloneWarmAttachSummary(summary)
@@ -183,7 +184,7 @@ func (s *memoryWarmAttachStore) validRequest(request store.WarmAttachRequest) bo
 	if request.Attempt.Identity.JTIHash == ([32]byte{}) || request.Attempt.Outcome != store.AttachAttemptAccepted || request.Attempt.IssuedCredentialGeneration == nil || *request.Attempt.IssuedCredentialGeneration < 1 || request.Attempt.Identity.AttachID == "" || request.Attempt.Identity.BootstrapSessionID == "" || request.Attempt.Identity.TargetSessionID == "" || request.Attempt.Identity.BootstrapSessionID == request.Attempt.Identity.TargetSessionID || request.Attempt.Fingerprint.Domain != "agentwharf.attach-request.v1" || request.Attempt.Fingerprint.Version != 1 || request.Attempt.Fingerprint.KeyVersion < 1 {
 		return false
 	}
-	if request.Attachment.Identity.AttachID != request.Attempt.Identity.AttachID || request.Attachment.Identity.BootstrapSessionID != request.Attempt.Identity.BootstrapSessionID || request.Attachment.Identity.TargetSessionID != request.Attempt.Identity.TargetSessionID || request.Attachment.Identity.TargetCredentialLineageRef == "" || request.BootstrapAdmission.CredentialGeneration < 1 || request.BootstrapAdmission.ConnectionEpoch < 1 || request.BootstrapAdmission.GrantFence <= request.BootstrapAdmission.AcceptedFence || request.FirstDelivery.CommandID == "" || request.FirstDelivery.ReferenceID == "" {
+	if request.Attachment.Identity.AttachID != request.Attempt.Identity.AttachID || request.Attachment.Identity.BootstrapSessionID != request.Attempt.Identity.BootstrapSessionID || request.Attachment.Identity.TargetSessionID != request.Attempt.Identity.TargetSessionID || request.Attachment.Identity.TargetCredentialLineageRef == "" || request.TargetActivation.Generation < 1 || !request.TargetActivation.ExpiresAt.Equal(request.Attachment.ExpiresAt) || request.BootstrapAdmission.CredentialGeneration < 1 || request.BootstrapAdmission.ConnectionEpoch < 1 || request.BootstrapAdmission.GrantFence <= request.BootstrapAdmission.AcceptedFence || request.FirstDelivery.CommandID == "" || request.FirstDelivery.ReferenceID == "" {
 		return false
 	}
 	now := s.clock()

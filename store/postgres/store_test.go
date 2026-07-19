@@ -481,6 +481,10 @@ func TestWarmAttachStoreContract(t *testing.T) {
 			if attempts+attachments+commands+references != 0 {
 				t.Fatalf("warm attach rollback left durable rows attempts=%d attachments=%d commands=%d references=%d", attempts, attachments, commands, references)
 			}
+			var connections int
+			if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM session_adapter_connections WHERE session_id = 'ses_target'`).Scan(&connections); err != nil || connections != 0 {
+				t.Fatalf("warm attach rollback left target credential connections=%d err=%v", connections, err)
+			}
 			var latest int64
 			var blocker *string
 			if err := pool.QueryRow(context.Background(), `SELECT latest_seq, blocker_kind FROM session_attention_summaries WHERE session_id = 'ses_target'`).Scan(&latest, &blocker); err != nil || latest != 1 || blocker != nil {
@@ -542,11 +546,24 @@ func TestWarmAttachRejectsFencedAdmissionAndTerminalTarget(t *testing.T) {
 }
 
 func TestWarmAttachReplayIsReferenceOnly(t *testing.T) {
-	_, warm := newWarmAttachStore(t)
+	pool, warm := newWarmAttachStore(t)
 	request := warmAttachRequestForPostgres()
 	commit, err := warm.CommitWarmAttach(context.Background(), request)
 	if err != nil {
 		t.Fatalf("commit warm attach: %v", err)
+	}
+	target, err := warm.AdapterConnection(context.Background(), request.Attachment.Identity.TargetSessionID)
+	if err != nil || target.ConnectionEpoch != 0 || target.AcceptedFence != 0 || target.ActiveCredentialGeneration != request.TargetActivation.Generation || target.CredentialGenerationHighWatermark != request.TargetActivation.Generation || !target.ActiveCredentialExpiresAt.Equal(request.TargetActivation.ExpiresAt) || target.RevokedAt != nil || target.TerminalAt != nil {
+		t.Fatalf("committed target activation = %+v, %v", target, err)
+	}
+	if err := warm.ValidateWarmAttachTargetActivation(context.Background(), request.Attachment.Identity.TargetSessionID, request.TargetActivation); err != nil {
+		t.Fatalf("validate current warm target activation: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE session_adapter_connections SET active_credential_expires_at = clock_timestamp() - interval '1 millisecond' WHERE session_id = $1`, request.Attachment.Identity.TargetSessionID); err != nil {
+		t.Fatalf("expire target activation: %v", err)
+	}
+	if err := warm.ValidateWarmAttachTargetActivation(context.Background(), request.Attachment.Identity.TargetSessionID, request.TargetActivation); err == nil {
+		t.Fatal("expired target activation passed Store-clock recheck")
 	}
 	var replayed int
 	err = warm.Replay(context.Background(), request.Attachment.Identity.TargetSessionID, 1, func(event store.Event) error {
@@ -564,6 +581,28 @@ func TestWarmAttachReplayIsReferenceOnly(t *testing.T) {
 	})
 	if err != nil || replayed != 1 {
 		t.Fatalf("replay warm attach = events:%d err:%v", replayed, err)
+	}
+}
+
+func TestWarmAttachReceivedReceiptExpiresFailClosed(t *testing.T) {
+	pool, warm := newWarmAttachStore(t)
+	request := warmAttachRequestForPostgres()
+	committed, err := warm.CommitWarmAttach(context.Background(), request)
+	if err != nil {
+		t.Fatalf("commit warm attach: %v", err)
+	}
+	claimed, err := warm.UpdateAttachment(context.Background(), committed.Attachment.Identity.AttachID, committed.Attachment.DeliveryVersion, store.AttachmentUpdate{
+		Status: store.AttachmentJoinPending, DeliveryState: store.AttachmentDeliveryReceived, ExpiresAt: committed.Attachment.ExpiresAt,
+	})
+	if err != nil || claimed.Attachment.DeliveryState != store.AttachmentDeliveryReceived {
+		t.Fatalf("claim credential receipt = %+v, %v", claimed, err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE session_attachments SET expires_at = clock_timestamp() - interval '1 second' WHERE attach_id = $1`, claimed.Attachment.Identity.AttachID); err != nil {
+		t.Fatalf("expire claimed credential receipt: %v", err)
+	}
+	expired, err := warm.ExpireWarmAttach(context.Background(), claimed.Attachment.Identity.AttachID, claimed.Attachment.DeliveryVersion)
+	if err != nil || expired.Attachment.Status != store.AttachmentReauthorizationRequired || expired.Attachment.DeliveryState != store.AttachmentDeliveryOutcomeUnknown || expired.Summary.Blocker == nil || expired.Summary.Blocker.Kind != store.AttentionBlockerOutcomeUnknown || expired.Summary.Blocker.Operation == nil || *expired.Summary.Blocker.Operation != "credential_handoff" {
+		t.Fatalf("expire claimed credential receipt = %+v, %v", expired, err)
 	}
 }
 
@@ -597,7 +636,7 @@ func newWarmAttachStore(t *testing.T) (*pgxpool.Pool, *postgres.Store) {
 
 func warmAttachRequestForPostgres() store.WarmAttachRequest {
 	grantExpiresAt := time.Now().Add(3 * time.Minute)
-	deliveryExpiresAt := time.Now().Add(20 * time.Second)
+	deliveryExpiresAt := time.Now().Add(20 * time.Second).UTC().Truncate(time.Microsecond)
 	issuedGeneration := int64(1)
 	return store.WarmAttachRequest{
 		Attempt: store.AttachAttemptRequest{
@@ -606,6 +645,7 @@ func warmAttachRequestForPostgres() store.WarmAttachRequest {
 			ExpiresAt:   grantExpiresAt, Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: &issuedGeneration,
 		},
 		Attachment:         store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_auth", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", TargetCredentialLineageRef: "lineage_target"}, ExpiresAt: deliveryExpiresAt},
+		TargetActivation:   store.WarmAttachTargetActivation{Generation: issuedGeneration, ExpiresAt: deliveryExpiresAt},
 		BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, GrantFence: 2},
 		FirstDelivery:      store.WarmAttachFirstDelivery{CommandID: "cmd_auth", ReferenceID: "ref_auth", ReferenceDigest: [32]byte{7}, ExpiresAt: deliveryExpiresAt},
 	}
@@ -619,6 +659,10 @@ func assertWarmAttachRowsAbsent(t *testing.T, pool *pgxpool.Pool) {
 	}
 	if attempts+attachments+commands+references != 0 {
 		t.Fatalf("fenced warm attach left durable rows attempts=%d attachments=%d commands=%d references=%d", attempts, attachments, commands, references)
+	}
+	var connections int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM session_adapter_connections WHERE session_id = 'ses_target'`).Scan(&connections); err != nil || connections != 0 {
+		t.Fatalf("fenced warm attach left target credential connections=%d err=%v", connections, err)
 	}
 }
 

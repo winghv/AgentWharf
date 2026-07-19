@@ -716,6 +716,26 @@ func (s *Store) InitializeAdapterConnection(ctx context.Context, request store.A
 	return adapterConnection(existing), nil
 }
 
+func (s *Store) ValidateWarmAttachTargetActivation(ctx context.Context, sessionID string, activation store.WarmAttachTargetActivation) error {
+	if s == nil || !validConnectionID(sessionID) || activation.Generation < 1 || activation.ExpiresAt.IsZero() {
+		return errors.New("invalid warm attach target activation")
+	}
+	statement := `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 AND active_credential_generation=$2 AND credential_generation_high_watermark=$2 AND active_credential_expires_at=$3 AND connection_epoch=0 AND accepted_fence=0 AND pending_credential_generation IS NULL AND prior_recovery_credential_generation IS NULL AND rotation_id IS NULL AND revoked_at IS NULL AND terminal_at IS NULL AND active_credential_expires_at>clock_timestamp()`
+	var err error
+	if s.connectionTx != nil {
+		statement += ` FOR UPDATE`
+		err = s.connectionTx.QueryRow(ctx, statement, sessionID, activation.Generation, activation.ExpiresAt).Scan(new(int))
+	} else if s.pool != nil {
+		err = s.pool.QueryRow(ctx, statement, sessionID, activation.Generation, activation.ExpiresAt).Scan(new(int))
+	} else {
+		err = errors.New("postgres event store pool is nil")
+	}
+	if err != nil {
+		return errors.New("warm attach target activation is expired or fenced")
+	}
+	return nil
+}
+
 func (s *Store) RefreshAdapterCredentialBeforeHello(ctx context.Context, sessionID string, refresh store.AdapterCredentialPreHelloRefresh) (store.AdapterConnection, error) {
 	if !validConnectionID(sessionID) || refresh.ExpectedActiveCredentialGeneration < 1 || refresh.ActiveCredentialExpiresAt.IsZero() {
 		return store.AdapterConnection{}, errors.New("invalid pre-hello adapter credential refresh")
@@ -1054,6 +1074,12 @@ func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRe
 	if _, err := queries.LockWarmAttachTarget(ctx, request.Attachment.Identity.TargetSessionID); err != nil {
 		return store.WarmAttachCommit{}, fmt.Errorf("lock warm attach target: %w", err)
 	}
+	if _, err := queries.InitializeAdapterConnection(ctx, db.InitializeAdapterConnectionParams{
+		SessionID: request.Attachment.Identity.TargetSessionID, ActiveGeneration: request.TargetActivation.Generation,
+		ActiveExpiresAt: pgtype.Timestamptz{Time: request.TargetActivation.ExpiresAt, Valid: true},
+	}); err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("initialize warm attach target credential: %w", err)
+	}
 	if _, err := queries.AttachmentByTarget(ctx, request.Attachment.Identity.TargetSessionID); err == nil {
 		return store.WarmAttachCommit{}, errors.New("warm attach target already has an attachment")
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -1105,7 +1131,7 @@ func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRe
 	if err := tx.Commit(ctx); err != nil {
 		return store.WarmAttachCommit{}, fmt.Errorf("commit warm attach: %w", err)
 	}
-	return store.WarmAttachCommit{Attempt: attachAttempt(attemptRow), Attachment: created, Outbox: store.WarmAttachOutbox{
+	return store.WarmAttachCommit{Attempt: attachAttempt(attemptRow), Attachment: created, TargetActivation: request.TargetActivation, Outbox: store.WarmAttachOutbox{
 		TargetSessionID: commandRow.SessionID, CommandID: commandRow.CmdID, EventSeq: commandRow.EventSeq,
 		ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: commandRow.ExpiresAt.Time,
 	}, Summary: summary}, nil
@@ -1133,19 +1159,23 @@ func (s *Store) ExpireWarmAttach(ctx context.Context, attachID string, expectedD
 	if err != nil {
 		return store.WarmAttachExpiry{}, fmt.Errorf("read warm attach expiry clock: %w", err)
 	}
-	if current.DeliveryVersion != expectedDeliveryVersion || current.Status != store.AttachmentJoinPending ||
-		current.DeliveryState != store.AttachmentDeliveryPending || current.ExpiresAt == nil || !current.ExpiresAt.Before(storeNow.Time) {
+	if current.DeliveryVersion != expectedDeliveryVersion || current.Status != store.AttachmentJoinPending || current.ExpiresAt == nil || !current.ExpiresAt.Before(storeNow.Time) {
 		return store.WarmAttachExpiry{}, errors.New("warm attach is not expirable")
 	}
+	deliveryState, blocker := store.AttachmentDeliveryPending, &store.AttentionBlocker{Kind: store.AttentionBlockerReauthorizationRequired}
+	if current.DeliveryState != store.AttachmentDeliveryPending {
+		deliveryState = store.AttachmentDeliveryOutcomeUnknown
+		operation := "credential_handoff"
+		blocker = &store.AttentionBlocker{Kind: store.AttentionBlockerOutcomeUnknown, Operation: &operation}
+	}
 	updatedRow, err := queries.UpdateAttachment(ctx, db.UpdateAttachmentParams{
-		Status: string(store.AttachmentReauthorizationRequired), DeliveryState: string(store.AttachmentDeliveryPending),
+		Status: string(store.AttachmentReauthorizationRequired), DeliveryState: string(deliveryState),
 		AttachID: attachID, ExpectedVersion: expectedDeliveryVersion,
 	})
 	if err != nil {
 		return store.WarmAttachExpiry{}, fmt.Errorf("expire warm attach attachment: %w", err)
 	}
 	updated := attachment(updatedRow)
-	blocker := &store.AttentionBlocker{Kind: store.AttentionBlockerReauthorizationRequired}
 	if err := upsertAttentionLedger(ctx, queries, updated.Identity.TargetSessionID, blocker, nil); err != nil {
 		return store.WarmAttachExpiry{}, err
 	}
@@ -1164,7 +1194,7 @@ func validateWarmAttachRequest(request store.WarmAttachRequest) error {
 		return err
 	}
 	if request.Attempt.Outcome != store.AttachAttemptAccepted || request.Attempt.IssuedCredentialGeneration == nil ||
-		*request.Attempt.IssuedCredentialGeneration != request.BootstrapAdmission.CredentialGeneration ||
+		*request.Attempt.IssuedCredentialGeneration != request.TargetActivation.Generation ||
 		request.Attachment.Identity.AttachID != request.Attempt.Identity.AttachID ||
 		request.Attachment.Identity.BootstrapSessionID != request.Attempt.Identity.BootstrapSessionID ||
 		request.Attachment.Identity.TargetSessionID != request.Attempt.Identity.TargetSessionID ||
@@ -1172,7 +1202,8 @@ func validateWarmAttachRequest(request store.WarmAttachRequest) error {
 		request.BootstrapAdmission.CredentialGeneration < 1 || request.BootstrapAdmission.ConnectionEpoch < 1 ||
 		request.BootstrapAdmission.AcceptedFence < 1 || request.BootstrapAdmission.GrantFence <= request.BootstrapAdmission.AcceptedFence ||
 		!validAttachmentText(request.FirstDelivery.CommandID, 256) || !validAttachmentText(request.FirstDelivery.ReferenceID, 255) ||
-		request.FirstDelivery.ReferenceDigest == ([32]byte{}) || request.Attachment.ExpiresAt.IsZero() ||
+		request.FirstDelivery.ReferenceDigest == ([32]byte{}) || request.TargetActivation.Generation < 1 || request.TargetActivation.ExpiresAt.IsZero() || request.Attachment.ExpiresAt.IsZero() ||
+		!request.TargetActivation.ExpiresAt.Equal(request.Attachment.ExpiresAt) ||
 		!request.FirstDelivery.ExpiresAt.Equal(request.Attachment.ExpiresAt) {
 		return errors.New("invalid warm attach request")
 	}
@@ -1215,6 +1246,17 @@ func warmAttachDuplicate(ctx context.Context, queries *db.Queries, attempt store
 	if attachment.Identity != request.Attachment.Identity {
 		return store.WarmAttachCommit{}, errors.New("warm attach attachment is immutable")
 	}
+	connectionRow, err := queries.AdapterConnectionByID(ctx, request.Attachment.Identity.TargetSessionID)
+	if err != nil {
+		return store.WarmAttachCommit{}, fmt.Errorf("load warm attach target credential: %w", err)
+	}
+	connection := adapterConnection(connectionRow)
+	if connection.SessionID != request.Attachment.Identity.TargetSessionID || connection.ConnectionEpoch != 0 || connection.AcceptedFence != 0 ||
+		connection.ActiveCredentialGeneration != request.TargetActivation.Generation || connection.CredentialGenerationHighWatermark != request.TargetActivation.Generation ||
+		!connection.ActiveCredentialExpiresAt.Equal(request.TargetActivation.ExpiresAt) || connection.PendingCredentialGeneration != nil ||
+		connection.PriorRecoveryGeneration != nil || connection.RotationID != nil || connection.RevokedAt != nil || connection.TerminalAt != nil {
+		return store.WarmAttachCommit{}, errors.New("warm attach target credential is immutable")
+	}
 	commandRow, err := queries.PendingCommandByID(ctx, db.PendingCommandByIDParams{SessionID: attachment.Identity.TargetSessionID, CmdID: request.FirstDelivery.CommandID})
 	if err != nil {
 		return store.WarmAttachCommit{}, fmt.Errorf("load existing warm attach outbox: %w", err)
@@ -1234,7 +1276,7 @@ func warmAttachDuplicate(ctx context.Context, queries *db.Queries, attempt store
 	return store.WarmAttachCommit{Attempt: attempt, Attachment: attachment, Outbox: store.WarmAttachOutbox{
 		TargetSessionID: commandRow.SessionID, CommandID: commandRow.CmdID, EventSeq: commandRow.EventSeq,
 		ReferenceID: request.FirstDelivery.ReferenceID, ReferenceDigest: request.FirstDelivery.ReferenceDigest, ExpiresAt: commandRow.ExpiresAt.Time,
-	}, Summary: summary, Duplicate: true}, nil
+	}, TargetActivation: request.TargetActivation, Summary: summary, Duplicate: true}, nil
 }
 
 func sameWarmAttachEvent(eventType string, payload []byte, delivery store.WarmAttachFirstDelivery) bool {
@@ -1634,6 +1676,8 @@ func validateAttachmentUpdate(current store.Attachment, update store.AttachmentU
 
 	valid := false
 	switch update.Status {
+	case store.AttachmentJoinPending:
+		valid = current.Status == store.AttachmentJoinPending && update.QueueReason == nil && update.ExpiresAt != nil && current.ExpiresAt != nil && update.ExpiresAt.Equal(*current.ExpiresAt) && update.BlockingSessionID == nil && update.Blocker == nil && (update.DeliveryState == store.AttachmentDeliveryPending || update.DeliveryState == store.AttachmentDeliveryReceived || update.DeliveryState == store.AttachmentDeliveryCompleted)
 	case store.AttachmentQueued:
 		valid = update.DeliveryState == store.AttachmentDeliveryPending &&
 			update.QueueReason != nil && validAttachmentText(*update.QueueReason, 128) &&
@@ -1680,7 +1724,7 @@ func validAttachmentText(value string, max int) bool {
 }
 
 func validAttachmentOperation(value *string) bool {
-	return value != nil && (*value == "start" || *value == "command")
+	return value != nil && (*value == "start" || *value == "command" || *value == "credential_handoff")
 }
 
 func attachment(row db.SessionAttachment) store.Attachment {

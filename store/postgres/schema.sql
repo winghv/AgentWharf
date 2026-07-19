@@ -153,7 +153,7 @@ CREATE TABLE session_attachments (
     CHECK (expires_at IS NULL OR expires_at > created_at),
     CHECK (canceled_at IS NULL OR canceled_at >= created_at),
     CHECK (
-        (status = 'join_pending' AND delivery_state = 'pending' AND queue_reason IS NULL AND expires_at IS NOT NULL AND canceled_at IS NULL AND blocking_session_id IS NULL)
+        (status = 'join_pending' AND delivery_state IN ('pending', 'received', 'completed') AND queue_reason IS NULL AND expires_at IS NOT NULL AND canceled_at IS NULL AND blocking_session_id IS NULL)
         OR (status = 'queued' AND delivery_state = 'pending' AND queue_reason IS NOT NULL AND expires_at IS NOT NULL AND canceled_at IS NULL AND blocking_session_id IS NOT NULL)
         OR (status = 'start_received' AND delivery_state IN ('received', 'completed', 'outcome_unknown') AND queue_reason IS NULL AND expires_at IS NULL AND canceled_at IS NULL AND blocking_session_id IS NULL)
         OR (status = 'reauthorization_required' AND delivery_state IN ('pending', 'outcome_unknown') AND queue_reason IS NULL AND expires_at IS NULL AND canceled_at IS NULL AND blocking_session_id IS NULL)

@@ -68,8 +68,8 @@ type WarmAttachHarness struct {
 }
 
 // WarmAttachContract proves that admission and the initial reference-only
-// delivery are indivisible Store truth. Backend-specific SQL/SQLite work and
-// post-commit credential delivery remain outside this contract.
+// delivery and target credential activation are indivisible Store truth.
+// Post-commit credential delivery remains outside this contract.
 func WarmAttachContract(t *testing.T, harness WarmAttachHarness) {
 	t.Helper()
 	if harness.Open == nil || harness.Fail == nil || harness.Expire == nil || harness.Absent == nil {
@@ -77,6 +77,7 @@ func WarmAttachContract(t *testing.T, harness WarmAttachHarness) {
 	}
 	for _, shape := range []reflect.Type{
 		reflect.TypeOf(store.WarmAttachFirstDelivery{}),
+		reflect.TypeOf(store.WarmAttachTargetActivation{}),
 		reflect.TypeOf(store.WarmAttachRequest{}),
 		reflect.TypeOf(store.WarmAttachOutbox{}),
 		reflect.TypeOf(store.WarmAttachCommit{}),
@@ -221,6 +222,7 @@ func warmAttachRequest() store.WarmAttachRequest {
 			ExpiresAt:   grantExpiresAt, Outcome: store.AttachAttemptAccepted, IssuedCredentialGeneration: attachAttemptInt64(1),
 		},
 		Attachment:         store.AttachmentCreate{Identity: store.AttachmentIdentity{AttachID: "att_warm", BootstrapSessionID: "ses_bootstrap", TargetSessionID: "ses_target", TargetCredentialLineageRef: "lineage_target"}, ExpiresAt: deliveryExpiresAt},
+		TargetActivation:   store.WarmAttachTargetActivation{Generation: 1, ExpiresAt: deliveryExpiresAt},
 		BootstrapAdmission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, GrantFence: 2},
 		FirstDelivery:      store.WarmAttachFirstDelivery{CommandID: "cmd_warm", ReferenceID: "ref_warm", ReferenceDigest: [32]byte{3}, ExpiresAt: deliveryExpiresAt},
 	}
@@ -228,7 +230,7 @@ func warmAttachRequest() store.WarmAttachRequest {
 
 func assertWarmAttachCommit(t *testing.T, got store.WarmAttachCommit, request store.WarmAttachRequest, summaryVersion int64) {
 	t.Helper()
-	if got.Attempt.Identity != request.Attempt.Identity || got.Attempt.Fingerprint != request.Attempt.Fingerprint || got.Attachment.Identity != request.Attachment.Identity || got.Attachment.Status != store.AttachmentJoinPending || got.Attachment.DeliveryState != store.AttachmentDeliveryPending || !sameWarmAttachTime(got.Attachment.ExpiresAt, &request.Attachment.ExpiresAt) || got.Outbox.TargetSessionID != request.Attachment.Identity.TargetSessionID || got.Outbox.CommandID != request.FirstDelivery.CommandID || got.Outbox.ReferenceID != request.FirstDelivery.ReferenceID || got.Outbox.ReferenceDigest != request.FirstDelivery.ReferenceDigest || !got.Outbox.ExpiresAt.Equal(request.FirstDelivery.ExpiresAt) || got.Outbox.EventSeq < 1 || got.Summary.SessionID != request.Attachment.Identity.TargetSessionID || got.Summary.Blocker == nil || got.Summary.Blocker.Kind != store.AttentionBlockerQueued || got.Summary.SummaryVersion != summaryVersion || got.Summary.LastDurableEventAt == nil || got.Summary.LastClientCommandAt == nil || got.Summary.StateOfProjection != store.AttentionProjectionComplete {
+	if got.Attempt.Identity != request.Attempt.Identity || got.Attempt.Fingerprint != request.Attempt.Fingerprint || got.Attachment.Identity != request.Attachment.Identity || got.Attachment.Status != store.AttachmentJoinPending || got.Attachment.DeliveryState != store.AttachmentDeliveryPending || !sameWarmAttachTime(got.Attachment.ExpiresAt, &request.Attachment.ExpiresAt) || got.TargetActivation != request.TargetActivation || got.Outbox.TargetSessionID != request.Attachment.Identity.TargetSessionID || got.Outbox.CommandID != request.FirstDelivery.CommandID || got.Outbox.ReferenceID != request.FirstDelivery.ReferenceID || got.Outbox.ReferenceDigest != request.FirstDelivery.ReferenceDigest || !got.Outbox.ExpiresAt.Equal(request.FirstDelivery.ExpiresAt) || got.Outbox.EventSeq < 1 || got.Summary.SessionID != request.Attachment.Identity.TargetSessionID || got.Summary.Blocker == nil || got.Summary.Blocker.Kind != store.AttentionBlockerQueued || got.Summary.SummaryVersion != summaryVersion || got.Summary.LastDurableEventAt == nil || got.Summary.LastClientCommandAt == nil || got.Summary.StateOfProjection != store.AttentionProjectionComplete {
 		t.Fatalf("warm-attach commit = %+v", got)
 	}
 	if got.Summary.Blocker.Reason == nil || *got.Summary.Blocker.Reason != "join_pending" || got.Summary.Blocker.ExpiresAt == nil || !got.Summary.Blocker.ExpiresAt.Equal(request.Attachment.ExpiresAt) || got.Summary.Blocker.BlockingSessionID != nil || got.Summary.Blocker.Operation != nil || got.Summary.LatestSeq != got.Outbox.EventSeq {
