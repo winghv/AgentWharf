@@ -74,6 +74,41 @@ func TestWebSocketServerAcceptsAdapterWithDispatchStore(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerDeliversCommittedPendingCommandAfterAdapterReconnect(t *testing.T) {
+	events := newFakeEventStore(map[string]int64{"ses_1": 1}, map[string][]store.Event{
+		"ses_1": {{SessionID: "ses_1", Seq: 1, Type: "session.message", Payload: json.RawMessage(`{"role":"user","content":"resume"}`)}},
+	})
+	events.seedPending(store.PendingCommand{SessionID: "ses_1", CommandID: "cmd_reconnect", Type: "session.send", EventSeq: 1, Status: store.PendingCommandPending, ExpiresAt: time.Now().Add(time.Minute)})
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	if _, ok := readFrame(t, adapter).(*protocol.HelloAck); !ok {
+		t.Fatal("adapter did not receive hello.ack")
+	}
+	frame, readErr := readFrameWithin(adapter, time.Second)
+	if readErr != nil {
+		events.mu.Lock()
+		status := events.pending["ses_1\x00cmd_reconnect"].Status
+		events.mu.Unlock()
+		t.Fatalf("durable reconnect read error: %v (status=%q)", readErr, status)
+	}
+	command, ok := frame.(*protocol.Command)
+	if !ok || command.CommandID != "cmd_reconnect" || command.Type != protocol.CommandSessionSend || command.SessionID != "ses_1" || string(command.Payload) != `{"role":"user","content":"resume"}` {
+		events.mu.Lock()
+		status := events.pending["ses_1\x00cmd_reconnect"].Status
+		events.mu.Unlock()
+		t.Logf("durable pending status before assertion: %q", status)
+		t.Fatalf("durable reconnect command = %#v, want reconstructed session.send", frame)
+	}
+	events.mu.Lock()
+	status := events.pending["ses_1\x00cmd_reconnect"].Status
+	events.mu.Unlock()
+	if status != store.PendingCommandCompleted {
+		t.Fatalf("durable reconnect status = %q, want completed", status)
+	}
+}
+
 func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 	events := newRecordingWarmAttachStore()
 	verifier := &t18BAttachGrantVerifier{
@@ -1954,6 +1989,7 @@ type fakeEventStore struct {
 	onReplayEvent func()
 	truth         map[string]store.SessionAdmissionTruth
 	replayCalls   int
+	pending       map[string]store.PendingCommand
 }
 
 type t18BAttachGrantVerifier struct {
@@ -2217,7 +2253,17 @@ func newFakeEventStore(latest map[string]int64, events map[string][]store.Event)
 		}
 		nextFence++
 	}
-	return &fakeEventStore{latest: latest, events: events, truth: truth, connections: connections, nextFence: nextFence}
+	return &fakeEventStore{latest: latest, events: events, truth: truth, connections: connections, nextFence: nextFence, pending: make(map[string]store.PendingCommand)}
+}
+
+func (f *fakeEventStore) seedPending(command store.PendingCommand) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pending[command.SessionID+"\x00"+command.CommandID] = command
+}
+
+func (f *fakeEventStore) CommitPendingCommand(context.Context, string, store.CommandAuthority, store.PendingEvent, store.PendingCommandRequest) (store.PendingCommandCommit, error) {
+	return store.PendingCommandCommit{}, errors.New("test fake does not commit pending commands")
 }
 
 func (f *fakeEventStore) AdapterConnection(_ context.Context, sessionID string) (store.AdapterConnection, error) {
@@ -2367,4 +2413,45 @@ func (f *fakeEventStore) Replay(_ context.Context, sessionID string, afterSeq in
 		}
 	}
 	return nil
+}
+
+func (f *fakeEventStore) ListPendingCommands(_ context.Context, sessionID string, _ store.CommandAuthority) ([]store.PendingCommand, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	commands := make([]store.PendingCommand, 0)
+	for _, command := range f.pending {
+		if command.SessionID == sessionID && (command.Status == store.PendingCommandPending || command.Status == store.PendingCommandReceived) && command.ExpiresAt.After(time.Now()) {
+			commands = append(commands, command)
+		}
+	}
+	return commands, nil
+}
+
+func (f *fakeEventStore) ClaimPendingCommand(_ context.Context, sessionID string, _ store.CommandAuthority, commandID string) (store.PendingCommandClaim, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := sessionID + "\x00" + commandID
+	command, ok := f.pending[key]
+	if !ok {
+		return store.PendingCommandClaim{}, errors.New("pending command not found")
+	}
+	if command.Status == store.PendingCommandPending {
+		command.Status = store.PendingCommandReceived
+		f.pending[key] = command
+		return store.PendingCommandClaim{Command: command, Claimed: true}, nil
+	}
+	return store.PendingCommandClaim{Command: command}, nil
+}
+
+func (f *fakeEventStore) ResolvePendingCommand(_ context.Context, sessionID string, _ store.CommandAuthority, commandID string, status store.PendingCommandStatus) (store.PendingCommand, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := sessionID + "\x00" + commandID
+	command, ok := f.pending[key]
+	if !ok || command.Status != store.PendingCommandReceived {
+		return store.PendingCommand{}, errors.New("pending command is not received")
+	}
+	command.Status = status
+	f.pending[key] = command
+	return command, nil
 }

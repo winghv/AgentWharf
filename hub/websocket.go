@@ -958,6 +958,41 @@ func (h *webSocketHandler) hasAdapter(sessionID string) bool {
 func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *adapterConnection) error {
 	h.commandMu.Lock()
 	defer h.commandMu.Unlock()
+	if ledger, ok := h.events.(store.CommandLedgerStore); ok {
+		authority := store.CommandAuthority{
+			ConnectionEpoch:      adapter.admission.ConnectionEpoch,
+			CredentialGeneration: adapter.admission.CredentialGeneration,
+		}
+		pending, err := ledger.ListPendingCommands(ctx, adapter.sessionID, authority)
+		if err != nil {
+			return fmt.Errorf("list durable pending commands: %w", err)
+		}
+		for _, command := range pending {
+			claim, err := ledger.ClaimPendingCommand(ctx, adapter.sessionID, authority, command.CommandID)
+			if err != nil {
+				return fmt.Errorf("claim durable pending command %s: %w", command.CommandID, err)
+			}
+			if claim.Command.Status != store.PendingCommandReceived {
+				continue
+			}
+			routed, err := h.commandFromPendingEvent(ctx, claim.Command)
+			if err != nil {
+				if _, resolveErr := ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, command.CommandID, store.PendingCommandOutcomeUnknown); resolveErr != nil {
+					return fmt.Errorf("resolve malformed durable command %s: %w", command.CommandID, resolveErr)
+				}
+				continue
+			}
+			if err := h.writeAdapterFrame(ctx, adapter, &routed); err != nil {
+				_, _ = ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, command.CommandID, store.PendingCommandOutcomeUnknown)
+				h.unregisterAdapter(adapter)
+				return fmt.Errorf("deliver durable pending command %s: %w", command.CommandID, err)
+			}
+			if _, err := ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, command.CommandID, store.PendingCommandCompleted); err != nil {
+				_, _ = ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, command.CommandID, store.PendingCommandOutcomeUnknown)
+				return fmt.Errorf("resolve delivered durable command %s: %w", command.CommandID, err)
+			}
+		}
+	}
 
 	now := time.Now().UTC()
 	pending := h.pendingCommands[adapter.sessionID]
@@ -981,6 +1016,38 @@ func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *
 	}
 	h.pendingCommands[adapter.sessionID] = remaining
 	return nil
+}
+
+var errPendingEventFound = errors.New("pending command event found")
+
+func (h *webSocketHandler) commandFromPendingEvent(ctx context.Context, pending store.PendingCommand) (protocol.Command, error) {
+	if h.events == nil {
+		return protocol.Command{}, errors.New("event store is not configured")
+	}
+	var event *store.Event
+	err := h.events.Replay(ctx, pending.SessionID, pending.EventSeq-1, func(candidate store.Event) error {
+		if candidate.Seq == pending.EventSeq {
+			copy := candidate
+			copy.Payload = clonePayload(candidate.Payload)
+			event = &copy
+			return errPendingEventFound
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errPendingEventFound) {
+		return protocol.Command{}, fmt.Errorf("replay durable command event: %w", err)
+	}
+	if event == nil {
+		return protocol.Command{}, errors.New("durable command event is missing")
+	}
+	var commandType protocol.CommandType
+	switch event.Type {
+	case "session.message":
+		commandType = protocol.CommandSessionSend
+	default:
+		return protocol.Command{}, fmt.Errorf("durable command event type %q is unsupported", event.Type)
+	}
+	return protocol.Command{CommandID: pending.CommandID, Type: commandType, SessionID: pending.SessionID, Payload: event.Payload}, nil
 }
 
 func (h *webSocketHandler) markCommandAcceptedLocked(commandID string) {

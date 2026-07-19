@@ -1092,6 +1092,10 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 		if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_claim", authority, userCommandEvent(1), request); err != nil {
 			t.Fatalf("CommitPendingCommand() error = %v", err)
 		}
+		pending, err := ledger.ListPendingCommands(context.Background(), "ses_command_claim", authority)
+		if err != nil || len(pending) != 1 || pending[0].CommandID != request.CommandID || pending[0].Status != store.PendingCommandPending {
+			t.Fatalf("ListPendingCommands() = %+v, %v; want one pending committed reference", pending, err)
+		}
 		var wg sync.WaitGroup
 		start := make(chan struct{})
 		claims := make(chan store.PendingCommandClaim, 8)
@@ -1124,6 +1128,10 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 		}
 		if claimed != 1 {
 			t.Fatalf("successful concurrent claims = %d, want 1", claimed)
+		}
+		claimedList, err := ledger.ListPendingCommands(context.Background(), "ses_command_claim", authority)
+		if err != nil || len(claimedList) != 1 || claimedList[0].Status != store.PendingCommandReceived {
+			t.Fatalf("ListPendingCommands() after claim = %+v, %v; want received lease", claimedList, err)
 		}
 		claim, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_claim", authority, request.CommandID)
 		if err != nil || claim.Claimed {

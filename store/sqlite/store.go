@@ -598,6 +598,68 @@ INSERT INTO session_pending_commands (
 	}}, nil
 }
 
+func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin pending command listing: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCommandAuthority(ctx, tx, sessionID, authority, nowMS); err != nil {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT command.session_id, command.cmd_id, command.type, command.event_seq, command.status,
+       command.expires_at_ns, command.created_at_ms, event.type, event.payload
+FROM session_pending_commands AS command
+JOIN session_events AS event
+  ON event.session_id = command.session_id AND event.seq = command.event_seq
+WHERE command.session_id = ?
+  AND command.status IN ('pending', 'received')
+  AND command.expires_at_ns > ?
+  AND event.type = 'session.message'
+  AND length(event.payload) BETWEEN 1 AND ?
+ORDER BY command.event_seq ASC
+`, sessionID, nowMS*int64(time.Millisecond), maxEventPayloadSize)
+	if err != nil {
+		return nil, fmt.Errorf("list pending commands: %w", err)
+	}
+	defer rows.Close()
+	commands := make([]store.PendingCommand, 0)
+	for rows.Next() {
+		var command store.PendingCommand
+		var status, eventType string
+		var expiresAtNS, createdAtMS int64
+		var eventPayload []byte
+		if err := rows.Scan(&command.SessionID, &command.CommandID, &command.Type, &command.EventSeq, &status, &expiresAtNS, &createdAtMS, &eventType, &eventPayload); err != nil {
+			return nil, fmt.Errorf("scan pending command: %w", err)
+		}
+		command.Status = store.PendingCommandStatus(status)
+		command.ExpiresAt = time.Unix(0, expiresAtNS)
+		var payload struct {
+			Role string `json:"role"`
+		}
+		if command.SessionID != sessionID || command.CommandID == "" || len(command.CommandID) > 256 || command.Type != "session.send" ||
+			command.EventSeq < 1 || (command.Status != store.PendingCommandPending && command.Status != store.PendingCommandReceived) ||
+			createdAtMS < 1 || createdAtMS > nowMS || expiresAtNS <= createdAtMS*int64(time.Millisecond) ||
+			expiresAtNS > (createdAtMS+30000)*int64(time.Millisecond) || expiresAtNS > (nowMS+30000)*int64(time.Millisecond) ||
+			eventType != "session.message" || json.Unmarshal(eventPayload, &payload) != nil || payload.Role != "user" {
+			return nil, errors.New("pending command row is invalid")
+		}
+		commands = append(commands, command)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending commands: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit pending command listing: %w", err)
+	}
+	return commands, nil
+}
+
 func (s *Store) ClaimPendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, commandID string) (store.PendingCommandClaim, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

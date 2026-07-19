@@ -36,6 +36,18 @@ WHERE session_id = $1 AND cmd_id = $2
   AND expires_at > statement_timestamp()
 FOR UPDATE;
 
+-- name: ListPendingCommandsForDelivery :many
+SELECT command.*
+FROM session_pending_commands AS command
+JOIN session_events AS event
+  ON event.session_id = command.session_id AND event.seq = command.event_seq
+WHERE command.session_id = $1
+  AND command.status IN ('pending', 'received')
+  AND command.expires_at > clock_timestamp()
+  AND event.type = 'session.message'
+  AND length(event.payload) BETWEEN 1 AND 65536
+ORDER BY command.event_seq ASC;
+
 -- name: LockPendingCommandForResolve :one
 SELECT *
 FROM session_pending_commands

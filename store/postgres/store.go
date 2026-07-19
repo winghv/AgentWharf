@@ -428,6 +428,36 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 	return store.PendingCommandCommit{Command: pendingCommand(row)}, nil
 }
 
+func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {
+	tx, queries, err := s.beginCommandMutation(ctx, sessionID, authority)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	rows, err := queries.ListPendingCommandsForDelivery(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list pending commands: %w", err)
+	}
+	storeNow, err := queries.CommandStoreNow(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read pending command Store clock: %w", err)
+	}
+	commands := make([]store.PendingCommand, 0, len(rows))
+	for _, row := range rows {
+		command := pendingCommand(row)
+		if command.SessionID != sessionID || command.Type != "session.send" || command.EventSeq < 1 ||
+			(command.Status != store.PendingCommandPending && command.Status != store.PendingCommandReceived) ||
+			!command.ExpiresAt.After(storeNow.Time) {
+			return nil, errors.New("pending command row is invalid")
+		}
+		commands = append(commands, command)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit pending command listing: %w", err)
+	}
+	return commands, nil
+}
+
 func upsertAttentionLedger(ctx context.Context, queries *db.Queries, sessionID string, blocker *store.AttentionBlocker, at *time.Time) error {
 	params := db.UpsertAttentionLedgerParams{SessionID: sessionID}
 	if at != nil {

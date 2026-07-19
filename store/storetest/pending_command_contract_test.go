@@ -124,6 +124,21 @@ func (s *memoryCommandLedger) ClaimPendingCommand(_ context.Context, sessionID s
 	return store.PendingCommandClaim{Command: command, Claimed: true}, nil
 }
 
+func (s *memoryCommandLedger) ListPendingCommands(_ context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.authorized(authority) {
+		return nil, errors.New("stale command authority")
+	}
+	commands := make([]store.PendingCommand, 0)
+	for _, command := range s.commands {
+		if command.SessionID == sessionID && (command.Status == store.PendingCommandPending || command.Status == store.PendingCommandReceived) && command.ExpiresAt.After(time.Now()) {
+			commands = append(commands, command)
+		}
+	}
+	return commands, nil
+}
+
 func (s *memoryCommandLedger) ResolvePendingCommand(_ context.Context, sessionID string, authority store.CommandAuthority, commandID string, status store.PendingCommandStatus) (store.PendingCommand, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
