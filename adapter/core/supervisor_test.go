@@ -194,6 +194,51 @@ func TestProcessSupervisorRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
+func TestSessionWorkerOwnsOneSessionAndProviderSupervisor(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeProcessRunner()
+	worker, err := newSessionWorker(SessionWorkerConfig{
+		SessionID: "ses_worker_1",
+		Provider: ProcessConfig{
+			Command:     ProcessCommand{Path: "provider"},
+			MaxRestarts: 1,
+			Backoff:     time.Millisecond,
+			GracePeriod: 20 * time.Millisecond,
+		},
+	}, runner)
+	if err != nil {
+		t.Fatalf("newSessionWorker() error = %v", err)
+	}
+	if got := worker.SessionID(); got != "ses_worker_1" {
+		t.Fatalf("SessionID() = %q, want ses_worker_1", got)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- worker.Run(context.Background()) }()
+	_ = waitEvent(t, worker.Events(), ProcessEventStarted)
+	if got := len(runner.started); got != 1 {
+		t.Fatalf("provider starts = %d, want one", got)
+	}
+	if err := worker.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("Run() error after Stop() = %v", err)
+	}
+}
+
+func TestSessionWorkerRejectsMissingSessionID(t *testing.T) {
+	t.Parallel()
+
+	_, err := newSessionWorker(SessionWorkerConfig{
+		Provider: ProcessConfig{Command: ProcessCommand{Path: "provider"}},
+	}, newFakeProcessRunner())
+	if !errors.Is(err, ErrInvalidSessionWorkerConfig) {
+		t.Fatalf("newSessionWorker() error = %v, want ErrInvalidSessionWorkerConfig", err)
+	}
+}
+
 func helperCommand(mode string) ProcessCommand {
 	return ProcessCommand{
 		Path: os.Args[0],
