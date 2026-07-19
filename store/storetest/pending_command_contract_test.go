@@ -158,6 +158,19 @@ func (s *memoryCommandLedger) ResolvePendingCommand(_ context.Context, sessionID
 	return command, nil
 }
 
+func (s *memoryCommandLedger) ResolvePendingCommandUnknown(_ context.Context, sessionID string, commandID string) (store.PendingCommand, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := sessionID + "\x00" + commandID
+	command, ok := s.commands[key]
+	if !ok || command.Status != store.PendingCommandReceived {
+		return store.PendingCommand{}, errors.New("pending command is not received")
+	}
+	command.Status = store.PendingCommandOutcomeUnknown
+	s.commands[key] = command
+	return command, nil
+}
+
 func (s *memoryCommandLedger) authorized(authority store.CommandAuthority) bool {
 	return s.failure == "" && authority == s.authority
 }

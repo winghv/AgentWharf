@@ -374,6 +374,27 @@ func TestPendingCommandStoreContract(t *testing.T) {
 	})
 }
 
+func TestPendingCommandListRejectsCorruptEventPayload(t *testing.T) {
+	harness := newPostgresCommandHarness(t, "agentwharf_command_corrupt", nil)
+	ctx := context.Background()
+	if _, err := harness.pool.Exec(ctx, `
+INSERT INTO agent_sessions (id) VALUES ('ses_command_corrupt');
+INSERT INTO session_adapter_connections (
+    session_id, connection_epoch, accepted_fence, active_credential_generation,
+    credential_generation_high_watermark, active_credential_expires_at
+) VALUES ('ses_command_corrupt', 1, 1, 1, 1, statement_timestamp() + interval '1 hour');
+INSERT INTO session_events (session_id, seq, type, payload)
+VALUES ('ses_command_corrupt', 1, 'session.message', '{"role":"agent","content":"must reject"}');
+INSERT INTO session_pending_commands (session_id, cmd_id, type, event_seq, status, expires_at)
+VALUES ('ses_command_corrupt', 'cmd_corrupt', 'session.send', 1, 'pending', statement_timestamp() + interval '10 seconds');
+`); err != nil {
+		t.Fatalf("seed corrupt pending command: %v", err)
+	}
+	if _, err := harness.Store.ListPendingCommands(ctx, "ses_command_corrupt", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}); err == nil {
+		t.Fatal("ListPendingCommands() accepted corrupt non-user event payload")
+	}
+}
+
 func TestAttachmentStoreContract(t *testing.T) {
 	storetest.AttachmentContract(t, storetest.AttachmentHarness{
 		Open: func(t *testing.T) store.AttachmentStore {
@@ -1599,6 +1620,7 @@ func (h *postgresCommandHarness) seedAuthority(t *testing.T) {
 	sessionIDs := []string{
 		"ses_command_1", "ses_command_claim", "ses_command_stale",
 		"ses_command_expired", "ses_command_reopen", "ses_command_invalid",
+		"ses_command_unknown",
 	}
 	if _, err := h.pool.Exec(context.Background(), `
 INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS session_id

@@ -554,4 +554,5 @@ type CommandLedgerStore interface {
 	ListPendingCommands(ctx context.Context, sessionID string, authority CommandAuthority) ([]PendingCommand, error)
 	ClaimPendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, commandID string) (PendingCommandClaim, error)
 	ResolvePendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, commandID string, status PendingCommandStatus) (PendingCommand, error)
+	ResolvePendingCommandUnknown(ctx context.Context, sessionID string, commandID string) (PendingCommand, error)
 }

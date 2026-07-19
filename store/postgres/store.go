@@ -450,6 +450,14 @@ func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, autho
 			!command.ExpiresAt.After(storeNow.Time) {
 			return nil, errors.New("pending command row is invalid")
 		}
+		event, err := queries.NextSessionEvent(ctx, db.NextSessionEventParams{SessionID: sessionID, Seq: command.EventSeq - 1})
+		if err != nil || event.Seq != command.EventSeq || validatePendingCommandInput(store.PendingEvent{
+			Type: event.Type, Time: event.CreatedAt.Time, Payload: event.Payload,
+		}, store.PendingCommandRequest{
+			CommandID: command.CommandID, Type: command.Type, ExpiresAt: command.ExpiresAt,
+		}, storeNow.Time) != nil {
+			return nil, errors.New("pending command event is invalid")
+		}
 		commands = append(commands, command)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -557,6 +565,30 @@ func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, aut
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.PendingCommand{}, fmt.Errorf("commit pending command resolution: %w", err)
+	}
+	return pendingCommand(updated), nil
+}
+
+func (s *Store) ResolvePendingCommandUnknown(ctx context.Context, sessionID string, commandID string) (store.PendingCommand, error) {
+	if s.pool == nil {
+		return store.PendingCommand{}, errors.New("postgres event store pool is nil")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.PendingCommand{}, fmt.Errorf("begin unknown pending command resolution: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	updated, err := queries.ResolvePendingCommandUnknown(ctx, db.ResolvePendingCommandUnknownParams{SessionID: sessionID, CmdID: commandID})
+	if err != nil {
+		return store.PendingCommand{}, fmt.Errorf("resolve pending command outcome unknown: %w", err)
+	}
+	operation := "command"
+	if err := upsertAttentionLedger(ctx, queries, sessionID, &store.AttentionBlocker{Kind: store.AttentionBlockerOutcomeUnknown, Operation: &operation}, nil); err != nil {
+		return store.PendingCommand{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.PendingCommand{}, fmt.Errorf("commit pending command outcome unknown: %w", err)
 	}
 	return pendingCommand(updated), nil
 }

@@ -109,6 +109,29 @@ func TestWebSocketServerDeliversCommittedPendingCommandAfterAdapterReconnect(t *
 	}
 }
 
+func TestWebSocketServerDoesNotReplayPreviouslyReceivedCommand(t *testing.T) {
+	events := newFakeEventStore(map[string]int64{"ses_1": 1}, map[string][]store.Event{
+		"ses_1": {{SessionID: "ses_1", Seq: 1, Type: "session.message", Payload: json.RawMessage(`{"role":"user","content":"already-sent"}`)}},
+	})
+	events.seedPending(store.PendingCommand{SessionID: "ses_1", CommandID: "cmd_received", Type: "session.send", EventSeq: 1, Status: store.PendingCommandReceived, ExpiresAt: time.Now().Add(time.Minute)})
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	if _, ok := readFrame(t, adapter).(*protocol.HelloAck); !ok {
+		t.Fatal("adapter did not receive hello.ack")
+	}
+	if _, err := readFrameWithin(adapter, 100*time.Millisecond); err == nil {
+		t.Fatal("previously received durable command was replayed")
+	}
+	events.mu.Lock()
+	status := events.pending["ses_1\x00cmd_received"].Status
+	events.mu.Unlock()
+	if status != store.PendingCommandOutcomeUnknown {
+		t.Fatalf("previously received durable status = %q, want outcome_unknown", status)
+	}
+}
+
 func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 	events := newRecordingWarmAttachStore()
 	verifier := &t18BAttachGrantVerifier{
@@ -2452,6 +2475,19 @@ func (f *fakeEventStore) ResolvePendingCommand(_ context.Context, sessionID stri
 		return store.PendingCommand{}, errors.New("pending command is not received")
 	}
 	command.Status = status
+	f.pending[key] = command
+	return command, nil
+}
+
+func (f *fakeEventStore) ResolvePendingCommandUnknown(_ context.Context, sessionID string, commandID string) (store.PendingCommand, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := sessionID + "\x00" + commandID
+	command, ok := f.pending[key]
+	if !ok || command.Status != store.PendingCommandReceived {
+		return store.PendingCommand{}, errors.New("pending command is not received")
+	}
+	command.Status = store.PendingCommandOutcomeUnknown
 	f.pending[key] = command
 	return command, nil
 }

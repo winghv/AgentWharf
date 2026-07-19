@@ -764,6 +764,48 @@ WHERE session_id = ? AND cmd_id = ? AND status = 'received'
 	return command, nil
 }
 
+func (s *Store) ResolvePendingCommandUnknown(ctx context.Context, sessionID string, commandID string) (store.PendingCommand, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.PendingCommand{}, fmt.Errorf("begin unknown pending command resolution: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.PendingCommand{}, err
+	}
+	var command store.PendingCommand
+	var status string
+	var expiresAtNS, createdAtMS int64
+	if err := tx.QueryRowContext(ctx, `
+SELECT session_id, cmd_id, type, event_seq, status, expires_at_ns, created_at_ms
+FROM session_pending_commands
+WHERE session_id = ? AND cmd_id = ? AND status = 'received'
+`, sessionID, commandID).Scan(&command.SessionID, &command.CommandID, &command.Type, &command.EventSeq, &status, &expiresAtNS, &createdAtMS); err != nil {
+		return store.PendingCommand{}, fmt.Errorf("select received pending command: %w", err)
+	}
+	if command.SessionID != sessionID || command.Type != "session.send" || command.EventSeq < 1 || status != string(store.PendingCommandReceived) || createdAtMS < 1 || createdAtMS > nowMS {
+		return store.PendingCommand{}, errors.New("received pending command row is invalid")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_pending_commands SET status = 'outcome_unknown', updated_at_ms = ? WHERE session_id = ? AND cmd_id = ? AND status = 'received'`, nowMS, sessionID, commandID)
+	if err != nil {
+		return store.PendingCommand{}, fmt.Errorf("resolve pending command outcome unknown: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return store.PendingCommand{}, errors.New("pending command outcome unknown lost race")
+	}
+	operation := "command"
+	if err := upsertSQLiteAttentionLedger(ctx, tx, sessionID, &store.AttentionBlocker{Kind: store.AttentionBlockerOutcomeUnknown, Operation: &operation}, nil); err != nil {
+		return store.PendingCommand{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.PendingCommand{}, fmt.Errorf("commit pending command outcome unknown: %w", err)
+	}
+	command.Status = store.PendingCommandOutcomeUnknown
+	command.ExpiresAt = time.Unix(0, expiresAtNS)
+	return command, nil
+}
+
 func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, authority store.CommandAuthority, proposal store.ProposedEventRequest) (store.ProposedEventReceipt, error) {
 	event := proposal.Event
 	event.Payload = append([]byte(nil), proposal.Event.Payload...)

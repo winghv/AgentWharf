@@ -975,20 +975,26 @@ func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *
 			if claim.Command.Status != store.PendingCommandReceived {
 				continue
 			}
+			if !claim.Claimed {
+				if _, err := ledger.ResolvePendingCommandUnknown(ctx, adapter.sessionID, command.CommandID); err != nil {
+					return fmt.Errorf("resolve previously received durable command %s: %w", command.CommandID, err)
+				}
+				continue
+			}
 			routed, err := h.commandFromPendingEvent(ctx, claim.Command)
 			if err != nil {
-				if _, resolveErr := ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, command.CommandID, store.PendingCommandOutcomeUnknown); resolveErr != nil {
+				if _, resolveErr := ledger.ResolvePendingCommandUnknown(ctx, adapter.sessionID, command.CommandID); resolveErr != nil {
 					return fmt.Errorf("resolve malformed durable command %s: %w", command.CommandID, resolveErr)
 				}
 				continue
 			}
-			if err := h.writeAdapterFrame(ctx, adapter, &routed); err != nil {
-				_, _ = ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, command.CommandID, store.PendingCommandOutcomeUnknown)
+			if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
+				_, _ = ledger.ResolvePendingCommandUnknown(ctx, adapter.sessionID, command.CommandID)
 				h.unregisterAdapter(adapter)
 				return fmt.Errorf("deliver durable pending command %s: %w", command.CommandID, err)
 			}
 			if _, err := ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, command.CommandID, store.PendingCommandCompleted); err != nil {
-				_, _ = ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, command.CommandID, store.PendingCommandOutcomeUnknown)
+				_, _ = ledger.ResolvePendingCommandUnknown(ctx, adapter.sessionID, command.CommandID)
 				return fmt.Errorf("resolve delivered durable command %s: %w", command.CommandID, err)
 			}
 		}
@@ -1016,6 +1022,17 @@ func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *
 	}
 	h.pendingCommands[adapter.sessionID] = remaining
 	return nil
+}
+
+func (h *webSocketHandler) writeDurableAdapterFrame(ctx context.Context, adapter *adapterConnection, frame protocol.Frame) error {
+	if h.adapterAuthority == nil {
+		return errAdapterAuthorityLost
+	}
+	adapter.effectMu.Lock()
+	defer adapter.effectMu.Unlock()
+	return h.adapterAuthority.withAdmission(ctx, adapter, func(effectCtx context.Context) error {
+		return adapter.writeFrame(effectCtx, frame)
+	})
 }
 
 var errPendingEventFound = errors.New("pending command event found")

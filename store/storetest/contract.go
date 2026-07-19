@@ -1211,6 +1211,24 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 		}
 	})
 
+	t.Run("uncertain delivery can resolve after authority loss without replay", func(t *testing.T) {
+		ledger := harness.Open(t)
+		authority := harness.Authority(t, ledger)
+		request := store.PendingCommandRequest{CommandID: "cmd_contract_unknown", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}
+		if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_unknown", authority, userCommandEvent(1), request); err != nil {
+			t.Fatalf("prepare unknown delivery: %v", err)
+		}
+		if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_unknown", authority, request.CommandID); err != nil {
+			t.Fatalf("claim unknown delivery: %v", err)
+		}
+		harness.Invalidate(t, ledger, CommandAuthorityRevoked)
+		resolved, err := ledger.ResolvePendingCommandUnknown(context.Background(), "ses_command_unknown", request.CommandID)
+		if err != nil {
+			t.Fatalf("ResolvePendingCommandUnknown() error = %v", err)
+		}
+		assertPendingCommand(t, resolved, "ses_command_unknown", request, 1, store.PendingCommandOutcomeUnknown)
+	})
+
 	t.Run("reopen preserves queued and terminal ledger truth", func(t *testing.T) {
 		ledger := harness.Open(t)
 		authority := harness.Authority(t, ledger)

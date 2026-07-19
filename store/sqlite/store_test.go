@@ -2829,6 +2829,7 @@ func seedCommandAuthorities(t *testing.T, path string) {
 	for _, sessionID := range []string{
 		"ses_command_1", "ses_command_claim", "ses_command_stale",
 		"ses_command_expired", "ses_command_reopen", "ses_command_invalid",
+		"ses_command_unknown",
 	} {
 		if _, err := db.ExecContext(context.Background(), `
 INSERT INTO session_adapter_connections (

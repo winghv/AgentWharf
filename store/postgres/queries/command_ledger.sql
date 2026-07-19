@@ -88,3 +88,9 @@ WHERE command.session_id = sqlc.arg(session_id)
         AND authority.terminal_at IS NULL
   )
 RETURNING command.*;
+
+-- name: ResolvePendingCommandUnknown :one
+UPDATE session_pending_commands
+SET status = 'outcome_unknown', updated_at = statement_timestamp()
+WHERE session_id = $1 AND cmd_id = $2 AND status = 'received'
+RETURNING *;
