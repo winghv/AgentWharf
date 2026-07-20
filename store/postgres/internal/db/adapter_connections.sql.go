@@ -227,7 +227,7 @@ WHERE session_id = $4
   AND active_credential_generation = $5
   AND connection_epoch = $6
   AND connection_epoch > 0 AND accepted_fence > 0
-  AND pending_credential_generation IS NULL
+  AND (pending_credential_generation IS NULL OR (pending_credential_expires_at IS NOT NULL AND pending_credential_expires_at <= clock_timestamp()))
   AND $1::BIGINT > credential_generation_high_watermark
   AND active_credential_expires_at > clock_timestamp()
   AND $2::TIMESTAMPTZ > clock_timestamp()
