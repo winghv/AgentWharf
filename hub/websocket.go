@@ -638,6 +638,11 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 			return err
 		}
+		if durable && ev.Time <= 0 {
+			err := errors.New("v2 durable adapter events require a positive time")
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+			return err
+		}
 		if !durable && ev.ProposalID != "" {
 			err := errors.New("ephemeral adapter events must not include proposal_id")
 			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})

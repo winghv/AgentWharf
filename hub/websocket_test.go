@@ -2056,7 +2056,8 @@ func TestWebSocketServerRejectsInvalidAdapterProposalIDsWithoutStoreWrite(t *tes
 			writeAdapterHelloVersionFor(t, adapter, "adapter-token", "ses_1", test.version)
 			_ = readFrame(t, adapter).(*protocol.HelloAck)
 			writeFrame(t, adapter, &protocol.Event{Type: test.typeName, SessionID: "ses_1", ProposalID: test.proposalID, Payload: json.RawMessage(`{"role":"agent"}`)})
-			if response := readFrame(t, adapter).(*protocol.Error); response.Code != "invalid_event" {
+			response, ok := readFrame(t, adapter).(*protocol.Error)
+			if !ok || response.Code != "invalid_event" {
 				t.Fatalf("response = %+v, want invalid_event", response)
 			}
 			if calls := events.appended(); len(calls) != 0 {
@@ -2095,6 +2096,36 @@ func TestWebSocketServerV2ProposalRetryReturnsOriginalReceiptOnly(t *testing.T) 
 	}
 	if calls := events.appended(); len(calls) != 1 {
 		t.Fatalf("changed retry reached Store: %+v", calls)
+	}
+}
+
+func TestWebSocketServerV2ProposalRejectsMissingOrNonpositiveTime(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "missing", payload: `{"frame":"event","type":"session.message","session_id":"ses_1","proposal_id":"proposal_time_missing","payload":{"role":"agent"}}`},
+		{name: "zero", payload: `{"frame":"event","type":"session.message","session_id":"ses_1","time":0,"proposal_id":"proposal_time_zero","payload":{"role":"agent"}}`},
+		{name: "negative", payload: `{"frame":"event","type":"session.message","session_id":"ses_1","time":-1,"proposal_id":"proposal_time_negative","payload":{"role":"agent"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+			adapter := dialWebSocket(t, server.URL)
+			defer adapter.Close(websocket.StatusNormalClosure, "")
+			writeAdapterHelloV2(t, adapter, "adapter-token")
+			_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+			if err := adapter.Write(context.Background(), websocket.MessageText, []byte(test.payload)); err != nil {
+				t.Fatalf("write proposal: %v", err)
+			}
+			if response := readFrame(t, adapter).(*protocol.Error); response.Code != "invalid_event" {
+				t.Fatalf("response = %+v, want invalid_event", response)
+			}
+			if calls := events.appended(); len(calls) != 0 {
+				t.Fatalf("invalid time reached Store: %+v", calls)
+			}
+		})
 	}
 }
 
