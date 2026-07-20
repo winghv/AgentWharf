@@ -61,15 +61,17 @@ func (q *Queries) InsertProposedEvent(ctx context.Context, arg InsertProposedEve
 const proposedEventByID = `-- name: ProposedEventByID :one
 SELECT session_id, seq, proposal_id,
        type = $1::TEXT
-       AND payload = $2::JSONB AS matches
+       AND payload = $2::JSONB
+       AND created_at = $3::TIMESTAMPTZ AS matches
 FROM session_events
-WHERE session_id = $3
-  AND proposal_id = $4
+WHERE session_id = $4
+  AND proposal_id = $5
 `
 
 type ProposedEventByIDParams struct {
 	EventType  string
 	Payload    []byte
+	CreatedAt  pgtype.Timestamptz
 	SessionID  string
 	ProposalID pgtype.Text
 }
@@ -85,6 +87,7 @@ func (q *Queries) ProposedEventByID(ctx context.Context, arg ProposedEventByIDPa
 	row := q.db.QueryRow(ctx, proposedEventByID,
 		arg.EventType,
 		arg.Payload,
+		arg.CreatedAt,
 		arg.SessionID,
 		arg.ProposalID,
 	)
