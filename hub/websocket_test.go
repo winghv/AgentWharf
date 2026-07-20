@@ -136,7 +136,6 @@ func TestWebSocketServerDoesNotReplayPreviouslyReceivedCommand(t *testing.T) {
 func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 	events := newRecordingWarmAttachStore()
 	issuer := &recordingSessionCredentialIssuer{}
-	handoff := &recordingWarmAttachCredentialHandoff{}
 	verifier := &t18BAttachGrantVerifier{
 		raw: "raw-grant-must-not-escape",
 		grant: auth.AttachGrant{
@@ -160,12 +159,11 @@ func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 		cfg.EventStore = events
 		cfg.SessionCredentialIssuer = issuer
 		cfg.SessionCredentialLifecycle = issuer
-		cfg.WarmAttachCredentialHandoff = handoff
 	})
-	bootstrap := dialWebSocket(t, server.URL)
-	defer bootstrap.Close(websocket.StatusNormalClosure, "")
-	writeAdapterHelloFor(t, bootstrap, "adapter-token", "ses_bootstrap")
-	_ = readFrame(t, bootstrap).(*protocol.HelloAck)
+	legacyBootstrap := dialWebSocket(t, server.URL)
+	defer legacyBootstrap.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloFor(t, legacyBootstrap, "adapter-token", "ses_bootstrap")
+	_ = readFrame(t, legacyBootstrap).(*protocol.HelloAck)
 
 	fence, err := events.AllocateAdapterGrantFence(context.Background())
 	if err != nil {
@@ -180,70 +178,72 @@ func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 		Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}},
 	})
 	_ = readFrame(t, client).(*protocol.HelloAck)
+	v1Command := &protocol.Command{CommandID: "attach-v1-bootstrap", Type: protocol.CommandSessionAttach, SessionID: "ses_target", Payload: json.RawMessage(`{"grant":"raw-grant-must-not-escape"}`)}
+	writeFrame(t, client, v1Command)
+	if ack := readCommandAckFor(t, client, v1Command.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "attach_rejected" {
+		t.Fatalf("v1 bootstrap acknowledgement = %+v", ack)
+	}
+	if got := len(events.warmAttachRequests()); got != 0 {
+		t.Fatalf("v1 bootstrap wrote %d Store records", got)
+	}
+	if frame, err := readFrameWithin(legacyBootstrap, 100*time.Millisecond); err == nil {
+		t.Fatalf("v1 bootstrap received v2 frame %+v", frame)
+	}
+	_ = legacyBootstrap.CloseNow()
+
+	bootstrap := dialWebSocket(t, server.URL)
+	defer bootstrap.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloVersionFor(t, bootstrap, "adapter-token", "ses_bootstrap", protocol.ProtocolVersionV2)
+	_ = readFrame(t, bootstrap).(*protocol.HelloAck)
+	fence, err = events.AllocateAdapterGrantFence(context.Background())
+	if err != nil {
+		t.Fatalf("AllocateAdapterGrantFence() after v2 bootstrap error = %v", err)
+	}
+	verifier.grant.GrantFence = fence
 	issuer.setFailure(errors.New("issuer unavailable"))
 	prepareFailed := &protocol.Command{CommandID: "attach-prepare-failed", Type: protocol.CommandSessionAttach, SessionID: "ses_target", Payload: json.RawMessage(`{"grant":"raw-grant-must-not-escape"}`)}
 	writeFrame(t, client, prepareFailed)
 	if ack := readCommandAckFor(t, client, prepareFailed.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "attach_rejected" {
 		t.Fatalf("prepare-failed acknowledgement = %+v", ack)
 	}
-	if got := len(events.warmAttachRequests()); got != 0 || len(handoff.calls()) != 0 {
-		t.Fatalf("prepare failure wrote Store/handoff records %d/%d", got, len(handoff.calls()))
+	if got := len(events.warmAttachRequests()); got != 0 {
+		t.Fatalf("prepare failure wrote %d Store records", got)
 	}
 	issuer.setFailure(nil)
+	discardsBeforeCommitFailure := issuer.discardCount()
 	events.setCommitFailure(errors.New("commit failed"))
 	commitFailed := &protocol.Command{CommandID: "attach-commit-failed", Type: protocol.CommandSessionAttach, SessionID: "ses_target", Payload: json.RawMessage(`{"grant":"raw-grant-must-not-escape"}`)}
 	writeFrame(t, client, commitFailed)
 	if ack := readCommandAckFor(t, client, commitFailed.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "attach_rejected" {
 		t.Fatalf("commit-failed acknowledgement = %+v", ack)
 	}
-	if got := len(events.warmAttachRequests()); got != 0 || len(handoff.calls()) != 0 {
-		t.Fatalf("commit failure wrote Store/handoff records %d/%d", got, len(handoff.calls()))
+	if got := len(events.warmAttachRequests()); got != 0 {
+		t.Fatalf("commit failure wrote %d Store records", got)
 	}
+	_ = readFrame(t, bootstrap).(*protocol.TargetJoinChallenge)
 	if got := issuer.activationCount(); got != 0 {
 		t.Fatalf("commit failure activated %d credential(s)", got)
 	}
-	if got := issuer.discardCount(); got != 1 {
-		t.Fatalf("commit failure discarded %d credential(s), want 1", got)
+	if got := issuer.discardCount(); got != discardsBeforeCommitFailure+1 {
+		t.Fatalf("commit failure discard count = %d, want %d", got, discardsBeforeCommitFailure+1)
 	}
 	events.setCommitFailure(nil)
 	command := &protocol.Command{
 		CommandID: "attach-command", Type: protocol.CommandSessionAttach, SessionID: "ses_target",
 		Payload: json.RawMessage(`{"grant":"raw-grant-must-not-escape"}`),
 	}
-	handoffEntered, releaseHandoff := handoff.blockDelivery()
 	writeFrame(t, client, command)
-	select {
-	case <-handoffEntered:
-	case <-time.After(time.Second):
-		t.Fatal("warm attach handoff did not enter transaction")
+	challenge := readFrame(t, bootstrap).(*protocol.TargetJoinChallenge)
+	target := dialWebSocket(t, server.URL)
+	defer target.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, target, &protocol.TargetJoin{ProtocolVersion: protocol.ProtocolVersionV2, JoinNonce: challenge.JoinNonce})
+	credential := readFrame(t, target).(*protocol.TargetJoinCredential)
+	if credential.Credential == "" || credential.TargetSessionID != "ses_target" || credential.TargetCredentialLineageRef == "" || credential.Generation != 1 ||
+		strings.Contains(fmt.Sprintf("%+v", credential), "raw-grant-must-not-escape") {
+		t.Fatalf("target credential = %+v", credential)
 	}
-	if got := issuer.activationCount(); got != 1 {
-		t.Fatalf("committed warm attach activated %d credential(s), want 1", got)
-	}
-	terminalized := make(chan struct{})
-	go func() {
-		events.fakeEventStore.mu.Lock()
-		now := time.Now()
-		connection := events.fakeEventStore.connections["ses_target"]
-		connection.RevokedAt = &now
-		connection.TerminalAt = &now
-		events.fakeEventStore.connections["ses_target"] = connection
-		events.fakeEventStore.mu.Unlock()
-		close(terminalized)
-	}()
-	select {
-	case <-terminalized:
-		t.Fatal("target terminalized during the linearized credential handoff")
-	case <-time.After(25 * time.Millisecond):
-	}
-	close(releaseHandoff)
 	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckAccepted || ack.Reason != "" {
 		t.Fatalf("attach acknowledgement = %+v", ack)
-	}
-	select {
-	case <-terminalized:
-	case <-time.After(time.Second):
-		t.Fatal("target terminalization remained blocked after handoff")
 	}
 	requests := events.warmAttachRequests()
 	if len(requests) != 1 || requests[0].Attempt.Identity.TargetSessionID != "ses_target" ||
@@ -255,10 +255,6 @@ func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 		requests[0].FirstDelivery.ReferenceID != "attach_1" ||
 		strings.Contains(fmt.Sprintf("%+v", requests[0]), "raw-grant-must-not-escape") {
 		t.Fatalf("warm attach request = %+v", requests)
-	}
-	if calls := handoff.calls(); len(calls) != 1 || calls[0].delivery.TargetSessionID != "ses_target" || calls[0].credential.Bearer == "" ||
-		strings.Contains(fmt.Sprintf("%+v", calls[0].delivery), calls[0].credential.Bearer) {
-		t.Fatalf("warm attach handoff = %+v", calls)
 	}
 	wrongTarget := *command
 	wrongTarget.CommandID = "attach-wrong-target"
@@ -278,24 +274,21 @@ func TestWebSocketSessionAttachCommitsWarmAttachWithoutRouting(t *testing.T) {
 		t.Fatalf("rejected attaches wrote %d Store requests, want 1", got)
 	}
 	writeFrame(t, client, command)
+	_ = readFrame(t, bootstrap).(*protocol.TargetJoinChallenge)
 	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckDuplicate || ack.Reason != "" {
 		t.Fatalf("attach retry acknowledgement = %+v", ack)
 	}
 	if got := len(events.warmAttachRequests()); got != 2 {
 		t.Fatalf("warm attach retries = %d, want 2 Store calls", got)
 	}
-	if got := len(handoff.calls()); got != 1 {
-		t.Fatalf("duplicate attach redelivered credential %d times", got)
-	}
-	if frame, err := readFrameWithin(bootstrap, 100*time.Millisecond); err == nil {
-		t.Fatalf("session.attach routed a pre-commit frame to bootstrap: %+v", frame)
+	if frame, err := readFrameWithin(target, 100*time.Millisecond); err == nil {
+		t.Fatalf("pending target socket survived credential delivery: %+v", frame)
 	}
 }
 
 func TestWebSocketSessionAttachDoesNotHandoffAfterFinalTupleLoss(t *testing.T) {
 	events := newRecordingWarmAttachStore()
 	issuer := &recordingSessionCredentialIssuer{}
-	handoff := &recordingWarmAttachCredentialHandoff{}
 	verifier := &t18BAttachGrantVerifier{raw: "raw-grant", grant: auth.AttachGrant{
 		Audience: "deploy-attach", JTI: "jti_final", AttachID: "attach_final", BootstrapSessionID: "ses_bootstrap",
 		TargetSessionID: "ses_target", Provider: "claude-code", IssuedAt: time.Now().Add(-time.Second),
@@ -312,11 +305,10 @@ func TestWebSocketSessionAttachDoesNotHandoffAfterFinalTupleLoss(t *testing.T) {
 		cfg.EventStore = events
 		cfg.SessionCredentialIssuer = issuer
 		cfg.SessionCredentialLifecycle = issuer
-		cfg.WarmAttachCredentialHandoff = handoff
 	})
 	bootstrap := dialWebSocket(t, server.URL)
 	defer bootstrap.Close(websocket.StatusNormalClosure, "")
-	writeAdapterHelloFor(t, bootstrap, "adapter-token", "ses_bootstrap")
+	writeAdapterHelloVersionFor(t, bootstrap, "adapter-token", "ses_bootstrap", protocol.ProtocolVersionV2)
 	_ = readFrame(t, bootstrap).(*protocol.HelloAck)
 	fence, err := events.AllocateAdapterGrantFence(context.Background())
 	if err != nil {
@@ -338,20 +330,26 @@ func TestWebSocketSessionAttachDoesNotHandoffAfterFinalTupleLoss(t *testing.T) {
 	_ = readFrame(t, client).(*protocol.HelloAck)
 	command := &protocol.Command{CommandID: "attach-final-tuple-loss", Type: protocol.CommandSessionAttach, SessionID: "ses_target", Payload: json.RawMessage(`{"grant":"raw-grant"}`)}
 	writeFrame(t, client, command)
+	challenge := readFrame(t, bootstrap).(*protocol.TargetJoinChallenge)
+	target := dialWebSocket(t, server.URL)
+	defer target.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, target, &protocol.TargetJoin{ProtocolVersion: protocol.ProtocolVersionV2, JoinNonce: challenge.JoinNonce})
 	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "attach_rejected" {
 		t.Fatalf("final tuple loss acknowledgement = %+v", ack)
 	}
-	if got := len(events.warmAttachRequests()); got != 1 || len(handoff.calls()) != 0 {
-		t.Fatalf("final tuple loss Store/handoff records = %d/%d", got, len(handoff.calls()))
+	if got := len(events.warmAttachRequests()); got != 1 {
+		t.Fatalf("final tuple loss Store records = %d", got)
+	}
+	if frame, err := readFrameWithin(target, 100*time.Millisecond); err == nil {
+		t.Fatalf("final tuple loss delivered credential: %+v", frame)
 	}
 }
 
 func TestWebSocketSessionAttachRejectsDuplicateAfterUncertainCredentialHandoff(t *testing.T) {
-	// A callback error is an uncertain delivery result.  A retry must not turn
-	// that uncertainty into a duplicate-success acknowledgement.
+	// Any unexpected pending-socket input makes delivery uncertain. A retry must
+	// not turn that uncertainty into a duplicate-success acknowledgement.
 	events := newRecordingWarmAttachStore()
 	issuer := &recordingSessionCredentialIssuer{}
-	handoff := &recordingWarmAttachCredentialHandoff{failure: errors.New("handoff lost")}
 	verifier := &t18BAttachGrantVerifier{raw: "raw-grant-uncertain", grant: auth.AttachGrant{
 		Audience: "deploy-attach", JTI: "jti_uncertain", AttachID: "attach_uncertain", BootstrapSessionID: "ses_bootstrap",
 		TargetSessionID: "ses_target", Provider: "claude-code", IssuedAt: time.Now().Add(-time.Second),
@@ -362,76 +360,51 @@ func TestWebSocketSessionAttachRejectsDuplicateAfterUncertainCredentialHandoff(t
 		"adapter-token": {Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_bootstrap")}},
 	}, credentials: map[string]adapterCredentialEvidence{"adapter": {Generation: 1, ExpiresAt: time.Now().Add(time.Hour)}}}, AttachGrantVerifier: verifier, AttachGrantAudience: "deploy-attach", EventStore: events})
 	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) {
-		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle, cfg.WarmAttachCredentialHandoff = events, issuer, issuer, handoff
+		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle = events, issuer, issuer
 	})
 	bootstrap := dialWebSocket(t, server.URL)
 	defer bootstrap.Close(websocket.StatusNormalClosure, "")
-	writeAdapterHelloFor(t, bootstrap, "adapter-token", "ses_bootstrap")
+	writeAdapterHelloVersionFor(t, bootstrap, "adapter-token", "ses_bootstrap", protocol.ProtocolVersionV2)
 	_ = readFrame(t, bootstrap).(*protocol.HelloAck)
 	fence, err := events.AllocateAdapterGrantFence(context.Background())
 	if err != nil {
 		t.Fatalf("allocate grant fence: %v", err)
 	}
 	verifier.grant.GrantFence = fence
+	commitEntered := make(chan struct{})
+	commitRelease := make(chan struct{})
+	events.setBeforeCommit(func() { close(commitEntered); <-commitRelease })
 	client := dialWebSocket(t, server.URL)
 	defer client.Close(websocket.StatusNormalClosure, "")
 	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}}})
 	_ = readFrame(t, client).(*protocol.HelloAck)
 	command := &protocol.Command{CommandID: "attach-uncertain", Type: protocol.CommandSessionAttach, SessionID: "ses_target", Payload: json.RawMessage(`{"grant":"raw-grant-uncertain"}`)}
 	writeFrame(t, client, command)
+	challenge := readFrame(t, bootstrap).(*protocol.TargetJoinChallenge)
+	select {
+	case <-commitEntered:
+	case <-time.After(time.Second):
+		t.Fatal("warm attach did not reach commit gate")
+	}
+	target := dialWebSocket(t, server.URL)
+	defer target.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, target, &protocol.TargetJoin{ProtocolVersion: protocol.ProtocolVersionV2, JoinNonce: challenge.JoinNonce})
+	targetResult := make(chan error, 1)
+	go func() {
+		_, err := readFrameWithin(target, time.Second)
+		targetResult <- err
+	}()
+	writeFrame(t, target, &protocol.Ping{Nonce: "injected"})
+	if err := <-targetResult; err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pending target socket did not close after injected input: %v", err)
+	}
+	close(commitRelease)
+	events.setBeforeCommit(nil)
 	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "attach_rejected" {
 		t.Fatalf("uncertain handoff acknowledgement = %+v", ack)
 	}
-	writeFrame(t, client, command)
-	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "attach_rejected" {
-		t.Fatalf("uncertain retry acknowledgement = %+v, want rejected", ack)
-	}
 	if got := issuer.activationCount(); got != 1 {
-		t.Fatalf("uncertain retry activated %d credentials, want no reactivation", got)
-	}
-}
-
-func TestWebSocketSessionAttachRetriesExplicitUnacceptedCredentialHandoff(t *testing.T) {
-	events := newRecordingWarmAttachStore()
-	issuer := &recordingSessionCredentialIssuer{}
-	handoff := &recordingWarmAttachCredentialHandoff{failure: hub.ErrWarmAttachCredentialNotAccepted}
-	verifier := &t18BAttachGrantVerifier{raw: "raw-grant-unaccepted", grant: auth.AttachGrant{
-		Audience: "deploy-attach", JTI: "jti_unaccepted", AttachID: "attach_unaccepted", BootstrapSessionID: "ses_bootstrap",
-		TargetSessionID: "ses_target", Provider: "claude-code", IssuedAt: time.Now().Add(-time.Second),
-		ExpiresAt: time.Now().Add(time.Minute), DeliveryDeadline: time.Now().Add(30 * time.Second),
-	}}
-	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: websocketTestAuth{principals: map[string]auth.Principal{
-		"client-token":  {Subject: "client", Scopes: []auth.Scope{auth.SessionControl("ses_target")}},
-		"adapter-token": {Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_bootstrap")}},
-	}, credentials: map[string]adapterCredentialEvidence{"adapter": {Generation: 1, ExpiresAt: time.Now().Add(time.Hour)}}}, AttachGrantVerifier: verifier, AttachGrantAudience: "deploy-attach", EventStore: events})
-	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) {
-		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle, cfg.WarmAttachCredentialHandoff = events, issuer, issuer, handoff
-	})
-	bootstrap := dialWebSocket(t, server.URL)
-	defer bootstrap.Close(websocket.StatusNormalClosure, "")
-	writeAdapterHelloFor(t, bootstrap, "adapter-token", "ses_bootstrap")
-	_ = readFrame(t, bootstrap).(*protocol.HelloAck)
-	fence, err := events.AllocateAdapterGrantFence(context.Background())
-	if err != nil {
-		t.Fatalf("allocate grant fence: %v", err)
-	}
-	verifier.grant.GrantFence = fence
-	client := dialWebSocket(t, server.URL)
-	defer client.Close(websocket.StatusNormalClosure, "")
-	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_target"}}})
-	_ = readFrame(t, client).(*protocol.HelloAck)
-	command := &protocol.Command{CommandID: "attach-unaccepted", Type: protocol.CommandSessionAttach, SessionID: "ses_target", Payload: json.RawMessage(`{"grant":"raw-grant-unaccepted"}`)}
-	writeFrame(t, client, command)
-	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "attach_rejected" {
-		t.Fatalf("unaccepted handoff acknowledgement = %+v", ack)
-	}
-	handoff.setFailure(nil)
-	writeFrame(t, client, command)
-	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckDuplicate || ack.Reason != "" {
-		t.Fatalf("unaccepted retry acknowledgement = %+v", ack)
-	}
-	if calls := handoff.calls(); len(calls) != 1 {
-		t.Fatalf("unaccepted retry delivery calls = %d, want 1", len(calls))
+		t.Fatalf("uncertain delivery activated %d credentials, want one", got)
 	}
 }
 
@@ -2394,6 +2367,7 @@ type recordingWarmAttachStore struct {
 	warmSeen      []store.WarmAttachRequest
 	attachment    store.Attachment
 	commitFailure error
+	beforeCommit  func()
 	afterCommit   func(*recordingWarmAttachStore)
 }
 
@@ -2406,6 +2380,9 @@ func (s *recordingWarmAttachStore) AttentionSnapshot(context.Context, []string) 
 }
 
 func (s *recordingWarmAttachStore) CommitWarmAttach(_ context.Context, request store.WarmAttachRequest) (store.WarmAttachCommit, error) {
+	if s.beforeCommit != nil {
+		s.beforeCommit()
+	}
 	s.warmMu.Lock()
 	defer s.warmMu.Unlock()
 	if s.commitFailure != nil {
@@ -2544,6 +2521,12 @@ func (s *recordingWarmAttachStore) setAfterCommit(after func(*recordingWarmAttac
 	s.afterCommit = after
 }
 
+func (s *recordingWarmAttachStore) setBeforeCommit(before func()) {
+	s.warmMu.Lock()
+	defer s.warmMu.Unlock()
+	s.beforeCommit = before
+}
+
 func (s *recordingWarmAttachStore) ValidateWarmAttachTargetActivation(_ context.Context, sessionID string, activation store.WarmAttachTargetActivation) error {
 	connection, err := s.AdapterConnection(context.Background(), sessionID)
 	if err != nil || connection.ConnectionEpoch != 0 || connection.AcceptedFence != 0 ||
@@ -2594,61 +2577,6 @@ func (issuer *recordingSessionCredentialIssuer) setFailure(err error) {
 	issuer.mu.Lock()
 	defer issuer.mu.Unlock()
 	issuer.failure = err
-}
-
-type recordedWarmAttachCredentialHandoff struct {
-	delivery   hub.WarmAttachCredentialDelivery
-	credential auth.PreparedSessionCredential
-}
-
-type recordingWarmAttachCredentialHandoff struct {
-	mu           sync.Mutex
-	recorded     []recordedWarmAttachCredentialHandoff
-	blockEntered chan struct{}
-	blockRelease <-chan struct{}
-	failure      error
-}
-
-func (handoff *recordingWarmAttachCredentialHandoff) DeliverCommittedTargetCredential(ctx context.Context, delivery hub.WarmAttachCredentialDelivery, credential auth.PreparedSessionCredential) error {
-	handoff.mu.Lock()
-	entered, release := handoff.blockEntered, handoff.blockRelease
-	handoff.mu.Unlock()
-	if entered != nil {
-		close(entered)
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	handoff.mu.Lock()
-	defer handoff.mu.Unlock()
-	if handoff.failure != nil {
-		return handoff.failure
-	}
-	handoff.recorded = append(handoff.recorded, recordedWarmAttachCredentialHandoff{delivery: delivery, credential: credential})
-	return nil
-}
-
-func (handoff *recordingWarmAttachCredentialHandoff) blockDelivery() (chan struct{}, chan struct{}) {
-	handoff.mu.Lock()
-	defer handoff.mu.Unlock()
-	handoff.blockEntered = make(chan struct{})
-	release := make(chan struct{})
-	handoff.blockRelease = release
-	return handoff.blockEntered, release
-}
-
-func (handoff *recordingWarmAttachCredentialHandoff) calls() []recordedWarmAttachCredentialHandoff {
-	handoff.mu.Lock()
-	defer handoff.mu.Unlock()
-	return append([]recordedWarmAttachCredentialHandoff(nil), handoff.recorded...)
-}
-
-func (handoff *recordingWarmAttachCredentialHandoff) setFailure(err error) {
-	handoff.mu.Lock()
-	defer handoff.mu.Unlock()
-	handoff.failure = err
 }
 
 func (s *recordingWarmAttachStore) ExpireWarmAttach(context.Context, string, int64) (store.WarmAttachExpiry, error) {

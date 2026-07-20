@@ -27,13 +27,15 @@ const adapterEventBatchMaxEvents = 64
 var errReplayBufferOverflow = errors.New("replay buffer overflow")
 
 type WebSocketConfig struct {
-	Handshake                   *Handshake
-	EventStore                  store.EventStore
-	HandshakeTimeout            time.Duration
-	CommandActivityObserver     CommandActivityObserver
-	AdapterActivityObserver     AdapterActivityObserver
-	SessionCredentialIssuer     auth.SessionCredentialIssuer
-	SessionCredentialLifecycle  auth.SessionCredentialLifecycle
+	Handshake                  *Handshake
+	EventStore                 store.EventStore
+	HandshakeTimeout           time.Duration
+	CommandActivityObserver    CommandActivityObserver
+	AdapterActivityObserver    AdapterActivityObserver
+	SessionCredentialIssuer    auth.SessionCredentialIssuer
+	SessionCredentialLifecycle auth.SessionCredentialLifecycle
+	// Deprecated: credential delivery is always the Hub-owned pending target
+	// socket. Retained only to avoid a source-incompatible config removal.
 	WarmAttachCredentialHandoff WarmAttachCredentialHandoff
 }
 
@@ -84,7 +86,12 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		pendingCommands:             make(map[string][]queuedCommand),
 		acceptedCommands:            make(map[string]struct{}),
 		decisions:                   make(map[string]struct{}),
+		pendingTargetJoins:          make(map[string]*pendingTargetJoin),
+		pendingTargetJoinByAttach:   make(map[string]*pendingTargetJoin),
 	}
+	// Pending target joins are Hub-owned. The historical configuration field is
+	// retained for source compatibility but cannot replace this socket boundary.
+	handler.warmAttachCredentialHandoff = handler
 	if cfg.Handshake != nil {
 		cfg.Handshake.SetLiveBootstrapAuthorityResolver(handler)
 	}
@@ -135,17 +142,22 @@ type webSocketHandler struct {
 	acceptedCommandOrder []string
 	decisions            map[string]struct{}
 	decisionOrder        []string
+
+	pendingTargetJoinMu       sync.Mutex
+	pendingTargetJoins        map[string]*pendingTargetJoin
+	pendingTargetJoinByAttach map[string]*pendingTargetJoin
 }
 
 type adapterConnection struct {
-	conn      *websocket.Conn
-	writeGate contextWriteGate
-	effectMu  sync.Mutex
-	sessionID string
-	provider  string
-	handler   *webSocketHandler
-	admission store.AdapterConnectionAdmission
-	events    *adapterEventBatcher
+	conn            *managedConn
+	writeGate       contextWriteGate
+	effectMu        sync.Mutex
+	sessionID       string
+	provider        string
+	protocolVersion int
+	handler         *webSocketHandler
+	admission       store.AdapterConnectionAdmission
+	events          *adapterEventBatcher
 }
 
 type queuedCommand struct {
@@ -154,17 +166,24 @@ type queuedCommand struct {
 }
 
 func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		CompressionMode: websocket.CompressionDisabled,
-	})
+	conn, err := acceptManagedConn(w, r)
 	if err != nil {
 		return
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	ctx := r.Context()
+	first, err := h.readHelloFrame(ctx, conn)
+	if err != nil {
+		_ = writeProtocolError(context.Background(), conn, "timeout", "waiting for hello", true)
+		return
+	}
+	if join, ok := first.(*protocol.TargetJoin); ok {
+		h.servePendingTargetJoin(ctx, conn, join)
+		return
+	}
 	var adapter *adapterConnection
-	accepted, historyToken, err := h.acceptPeer(ctx, conn, &adapter)
+	accepted, historyToken, err := h.acceptPeer(ctx, conn, first, &adapter)
 	if err != nil {
 		return
 	}
@@ -189,13 +208,7 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.readLoop(ctx, conn, accepted, historyToken, peer, adapter)
 }
 
-func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn, adapterOut **adapterConnection) (AcceptedPeer, string, error) {
-	frame, err := h.readHelloFrame(ctx, conn)
-	if err != nil {
-		_ = writeProtocolError(context.Background(), conn, "timeout", "waiting for hello", true)
-		_ = conn.Close(websocket.StatusPolicyViolation, "hello timeout")
-		return AcceptedPeer{}, "", err
-	}
+func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, frame protocol.Frame, adapterOut **adapterConnection) (AcceptedPeer, string, error) {
 	hello, ok := frame.(*protocol.Hello)
 	if !ok {
 		_ = writeProtocolError(ctx, conn, "invalid_hello", "first frame must be hello", true)
@@ -253,7 +266,7 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *websocket.Conn,
 	return accepted, historyToken, nil
 }
 
-func (h *webSocketHandler) readHelloFrame(ctx context.Context, conn *websocket.Conn) (protocol.Frame, error) {
+func (h *webSocketHandler) readHelloFrame(ctx context.Context, conn *managedConn) (protocol.Frame, error) {
 	type result struct {
 		frame protocol.Frame
 		err   error
@@ -277,7 +290,7 @@ func (h *webSocketHandler) readHelloFrame(ctx context.Context, conn *websocket.C
 	}
 }
 
-func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, historyToken string, peer *clientConnection, adapter *adapterConnection) {
+func (h *webSocketHandler) readLoop(ctx context.Context, conn *managedConn, accepted AcceptedPeer, historyToken string, peer *clientConnection, adapter *adapterConnection) {
 	for {
 		frame, err := readProtocolFrame(ctx, conn)
 		if err != nil {
@@ -329,7 +342,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *websocket.Conn, a
 	}
 }
 
-func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, historyToken string, peer *clientConnection, adapter *adapterConnection, request *protocol.HistoryPageRequest) error {
+func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *managedConn, accepted AcceptedPeer, historyToken string, peer *clientConnection, adapter *adapterConnection, request *protocol.HistoryPageRequest) error {
 	history, ready := h.events.(store.HistoryStore)
 	if accepted.Role != protocol.RoleClient || accepted.ProtocolVersion != protocol.ProtocolVersionV2 || !ready {
 		return h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
@@ -424,7 +437,7 @@ func hasExactHistoryAccess(principal auth.Principal, sessionID string) bool {
 	return false
 }
 
-func (h *webSocketHandler) writeConnectionFrame(ctx context.Context, conn *websocket.Conn, peer *clientConnection, adapter *adapterConnection, frame protocol.Frame) error {
+func (h *webSocketHandler) writeConnectionFrame(ctx context.Context, conn *managedConn, peer *clientConnection, adapter *adapterConnection, frame protocol.Frame) error {
 	if peer != nil {
 		return peer.writeFrame(ctx, frame)
 	}
@@ -434,7 +447,7 @@ func (h *webSocketHandler) writeConnectionFrame(ctx context.Context, conn *webso
 	return writeProtocolFrame(ctx, conn, frame)
 }
 
-func writePongFrame(ctx context.Context, conn *websocket.Conn, peer *clientConnection, adapter *adapterConnection, nonce string) error {
+func writePongFrame(ctx context.Context, conn *managedConn, peer *clientConnection, adapter *adapterConnection, nonce string) error {
 	pong := &protocol.Pong{Nonce: nonce}
 	if peer != nil {
 		return peer.writeFrame(ctx, pong)
@@ -471,7 +484,7 @@ func (h *webSocketHandler) replayAccepted(ctx context.Context, peer *clientConne
 	return nil
 }
 
-func (h *webSocketHandler) registerPeer(conn *websocket.Conn, accepted AcceptedPeer) *clientConnection {
+func (h *webSocketHandler) registerPeer(conn *managedConn, accepted AcceptedPeer) *clientConnection {
 	if accepted.Role != protocol.RoleClient {
 		return nil
 	}
@@ -488,7 +501,7 @@ func (h *webSocketHandler) registerPeer(conn *websocket.Conn, accepted AcceptedP
 	return peer
 }
 
-func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, token string) (*adapterConnection, error) {
+func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *managedConn, accepted AcceptedPeer, token string) (*adapterConnection, error) {
 	if accepted.Role != protocol.RoleAdapter {
 		return nil, nil
 	}
@@ -501,7 +514,7 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *websocket.
 	if err != nil {
 		return nil, err
 	}
-	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, handler: h, admission: admission}
+	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, protocolVersion: accepted.ProtocolVersion, handler: h, admission: admission}
 	if h.events != nil {
 		fencedStore := fencedAdapterEventStore{handler: h, adapter: adapter}
 		adapter.events = newAdapterEventBatcher(adapterEventBatcherConfig{
@@ -750,7 +763,7 @@ func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *a
 	return nil
 }
 
-func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, cmd *protocol.Command) error {
+func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *managedConn, accepted AcceptedPeer, cmd *protocol.Command) error {
 	if err := validateClientCommand(cmd); err != nil {
 		_ = writeCommandAck(ctx, conn, commandID(cmd), protocol.AckRejected, "invalid_command")
 		return err
@@ -837,7 +850,7 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websoc
 	return nil
 }
 
-func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, cmd *protocol.Command) error {
+func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *managedConn, accepted AcceptedPeer, cmd *protocol.Command) error {
 	rawGrant, err := protocol.DecodeAttachGrantPayload(cmd.Payload)
 	if err != nil {
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "invalid_command")
@@ -863,6 +876,11 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 	}
 	activation, prepared, err := h.prepareWarmAttachCredential(ctx, authorization)
 	if err != nil {
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
+		return err
+	}
+	if err := h.beginPendingTargetJoin(ctx, authorization, activation); err != nil {
+		h.discardWarmAttachCredential(ctx, prepared)
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
 		return err
 	}
@@ -900,6 +918,7 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 		},
 	})
 	if err != nil {
+		h.cancelPendingTargetJoin(authorization.Grant.AttachID)
 		h.discardWarmAttachCredential(ctx, prepared)
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
 		return fmt.Errorf("commit warm attach: %w", err)
@@ -907,11 +926,13 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 	postCommitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), warmAttachCredentialHandoffTimeout)
 	defer cancel()
 	if commit.Duplicate && commit.Attachment.DeliveryState == store.AttachmentDeliveryOutcomeUnknown {
+		h.cancelPendingTargetJoin(authorization.Grant.AttachID)
 		h.discardWarmAttachCredential(postCommitCtx, prepared)
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
 		return errors.New("warm attach credential handoff outcome is unknown")
 	}
 	if err := h.activateCommittedWarmAttachCredential(postCommitCtx, prepared); err != nil {
+		h.cancelPendingTargetJoin(authorization.Grant.AttachID)
 		h.discardWarmAttachCredential(postCommitCtx, prepared)
 		_ = h.failClosedWarmAttachCredentialHandoff(commit.Attachment, warmStore)
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
@@ -921,6 +942,7 @@ func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *websocket
 		CredentialGeneration: authorization.Bootstrap.CredentialGeneration, ConnectionEpoch: authorization.Bootstrap.ConnectionEpoch,
 		AcceptedFence: authorization.Bootstrap.AcceptedFence, GrantFence: authorization.Grant.GrantFence,
 	}, commit, prepared); err != nil {
+		h.cancelPendingTargetJoin(authorization.Grant.AttachID)
 		h.discardWarmAttachCredential(postCommitCtx, prepared)
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "attach_rejected")
 		return err
@@ -1379,7 +1401,7 @@ func isEphemeralEvent(eventType string) bool {
 }
 
 type clientConnection struct {
-	conn            *websocket.Conn
+	conn            *managedConn
 	protocolVersion int
 	writeGate       contextWriteGate
 
@@ -1393,7 +1415,7 @@ type subscriptionState struct {
 	buffered  []protocol.Event
 }
 
-func newClientConnection(conn *websocket.Conn, protocolVersion int, subscriptions []protocol.Subscription, replaying bool) *clientConnection {
+func newClientConnection(conn *managedConn, protocolVersion int, subscriptions []protocol.Subscription, replaying bool) *clientConnection {
 	peer := &clientConnection{
 		conn:            conn,
 		protocolVersion: protocolVersion,
@@ -1551,12 +1573,12 @@ func cloneProtocolEvent(ev protocol.Event) protocol.Event {
 	return cloned
 }
 
-func readProtocolFrame(ctx context.Context, conn *websocket.Conn) (protocol.Frame, error) {
+func readProtocolFrame(ctx context.Context, conn *managedConn) (protocol.Frame, error) {
 	messageType, data, err := conn.Read(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if messageType != websocket.MessageText {
+	if websocket.MessageType(messageType) != websocket.MessageText {
 		return nil, fmt.Errorf("expected text websocket message, got %v", messageType)
 	}
 	frame, err := protocol.Decode(data)
@@ -1566,7 +1588,7 @@ func readProtocolFrame(ctx context.Context, conn *websocket.Conn) (protocol.Fram
 	return frame, nil
 }
 
-func writeProtocolFrame(ctx context.Context, conn *websocket.Conn, frame protocol.Frame) error {
+func writeProtocolFrame(ctx context.Context, conn *managedConn, frame protocol.Frame) error {
 	data, err := protocol.Encode(frame)
 	if err != nil {
 		return err
@@ -1574,7 +1596,7 @@ func writeProtocolFrame(ctx context.Context, conn *websocket.Conn, frame protoco
 	return conn.Write(ctx, websocket.MessageText, data)
 }
 
-func writeProtocolError(ctx context.Context, conn *websocket.Conn, code string, message string, fatal bool) error {
+func writeProtocolError(ctx context.Context, conn *managedConn, code string, message string, fatal bool) error {
 	return writeProtocolFrame(ctx, conn, &protocol.Error{
 		Code:    code,
 		Message: message,
@@ -1582,7 +1604,7 @@ func writeProtocolError(ctx context.Context, conn *websocket.Conn, code string, 
 	})
 }
 
-func writeCommandAck(ctx context.Context, conn *websocket.Conn, commandID string, status protocol.AckStatus, reason string) error {
+func writeCommandAck(ctx context.Context, conn *managedConn, commandID string, status protocol.AckStatus, reason string) error {
 	return writeProtocolFrame(ctx, conn, &protocol.CommandAck{
 		CommandID: commandID,
 		Status:    status,

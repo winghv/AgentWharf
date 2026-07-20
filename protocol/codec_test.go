@@ -248,6 +248,59 @@ func TestDecodeAttachGrantPayloadIsStrictAndBounded(t *testing.T) {
 	}
 }
 
+func TestTargetJoinFramesAreStrictAndBounded(t *testing.T) {
+	join := `{"frame":"target.join","protocol_version":2,"join_nonce":"0123456789abcdef0123456789abcdef"}`
+	frame, err := Decode([]byte(join))
+	if err != nil {
+		t.Fatalf("Decode(target.join) error = %v", err)
+	}
+	if got, ok := frame.(*TargetJoin); !ok || got.ProtocolVersion != ProtocolVersionV2 || got.JoinNonce == "" {
+		t.Fatalf("Decode(target.join) = %#v", frame)
+	}
+	for _, raw := range []string{
+		`{"frame":"target.join","protocol_version":1,"join_nonce":"0123456789abcdef0123456789abcdef"}`,
+		`{"frame":"target.join","protocol_version":2,"join_nonce":"short"}`,
+		`{"frame":"target.join","protocol_version":2,"join_nonce":"0123456789abcdef0123456789abcdef","token":"bearer"}`,
+		`{"frame":"target.join","protocol_version":2,"join_nonce":"one","join_nonce":"two"}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) unexpectedly succeeded", raw)
+		}
+	}
+	for _, raw := range []string{
+		`{"frame":"target.join.challenge","target_session_id":"ses_target","join_nonce":"0123456789abcdef0123456789abcdef","expires_at":1764937800000}`,
+		`{"frame":"target.join.credential","credential":"test-only-bearer","target_session_id":"ses_target","target_credential_lineage_ref":"lin_ref","generation":1,"expires_at":1764937800000}`,
+	} {
+		if _, err := Decode([]byte(raw)); err != nil {
+			t.Fatalf("Decode(%s) error = %v", raw, err)
+		}
+	}
+	for _, raw := range []string{
+		`{"frame":"target.join.challenge","target_session_id":"ses_target","join_nonce":"short","expires_at":1764937800000}`,
+		`{"frame":"target.join.credential","credential":"","target_session_id":"ses_target","target_credential_lineage_ref":"lin_ref","generation":1,"expires_at":1764937800000}`,
+		`{"frame":"target.join.credential","credential":"test-only-bearer","target_session_id":"ses_target","target_credential_lineage_ref":"lin_ref","generation":0,"expires_at":1764937800000}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) unexpectedly succeeded", raw)
+		}
+	}
+
+	credential := &TargetJoinCredential{
+		Credential: "test-only-bearer", TargetSessionID: "ses_target", TargetCredentialLineageRef: "lin_ref", Generation: 1, ExpiresAt: 1764937800000,
+	}
+	encoded, err := Encode(credential)
+	if err != nil {
+		t.Fatalf("Encode(target.join.credential) error = %v", err)
+	}
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode(target.join.credential) error = %v", err)
+	}
+	if got, ok := decoded.(*TargetJoinCredential); !ok || got.Credential != credential.Credential || got.TargetCredentialLineageRef != credential.TargetCredentialLineageRef {
+		t.Fatalf("target credential round trip = %#v", decoded)
+	}
+}
+
 func TestNegotiateVersion(t *testing.T) {
 	got, err := NegotiateVersion([]int{3, 2, 1}, []int{1})
 	if err != nil {

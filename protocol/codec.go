@@ -22,22 +22,28 @@ var (
 type FrameName string
 
 const (
-	FrameHello        FrameName = "hello"
-	FrameHelloAck     FrameName = "hello.ack"
-	FrameEvent        FrameName = "event"
-	FrameEventReceipt FrameName = "event.receipt"
-	FrameCommand      FrameName = "command"
-	FrameCommandAck   FrameName = "command.ack"
-	FramePing         FrameName = "ping"
-	FramePong         FrameName = "pong"
-	FrameError        FrameName = "error"
-	FrameHistoryPage  FrameName = "history.page"
+	FrameHello                FrameName = "hello"
+	FrameHelloAck             FrameName = "hello.ack"
+	FrameEvent                FrameName = "event"
+	FrameEventReceipt         FrameName = "event.receipt"
+	FrameCommand              FrameName = "command"
+	FrameCommandAck           FrameName = "command.ack"
+	FramePing                 FrameName = "ping"
+	FramePong                 FrameName = "pong"
+	FrameError                FrameName = "error"
+	FrameHistoryPage          FrameName = "history.page"
+	FrameTargetJoinChallenge  FrameName = "target.join.challenge"
+	FrameTargetJoin           FrameName = "target.join"
+	FrameTargetJoinCredential FrameName = "target.join.credential"
 )
 
 const (
-	HistoryPageMaxLimit  = 100
-	MaxEventPayloadBytes = 64 * 1024
-	MaxAttachGrantBytes  = 64 * 1024
+	HistoryPageMaxLimit          = 100
+	MaxEventPayloadBytes         = 64 * 1024
+	MaxAttachGrantBytes          = 64 * 1024
+	MinTargetJoinNonceBytes      = 32
+	MaxTargetJoinNonceBytes      = 128
+	MaxTargetJoinCredentialBytes = 4096
 )
 
 type Role string
@@ -78,6 +84,36 @@ type Hello struct {
 	Provider        string         `json:"provider,omitempty"`
 	Resume          bool           `json:"resume,omitempty"`
 }
+
+// TargetJoin is the sole client frame permitted on a pending target socket.
+// It deliberately has no Session identity or bearer field.
+type TargetJoin struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	JoinNonce       string `json:"join_nonce"`
+}
+
+func (*TargetJoin) FrameName() FrameName { return FrameTargetJoin }
+
+// TargetJoinChallenge contains only the opaque target reference and a
+// one-time Hub nonce. It is delivered to the current bootstrap Adapter.
+type TargetJoinChallenge struct {
+	TargetSessionID string `json:"target_session_id"`
+	JoinNonce       string `json:"join_nonce"`
+	ExpiresAt       int64  `json:"expires_at"`
+}
+
+func (*TargetJoinChallenge) FrameName() FrameName { return FrameTargetJoinChallenge }
+
+// TargetJoinCredential is the sole server frame on a pending target socket.
+type TargetJoinCredential struct {
+	Credential                 string `json:"credential"`
+	TargetSessionID            string `json:"target_session_id"`
+	TargetCredentialLineageRef string `json:"target_credential_lineage_ref"`
+	Generation                 int64  `json:"generation"`
+	ExpiresAt                  int64  `json:"expires_at"`
+}
+
+func (*TargetJoinCredential) FrameName() FrameName { return FrameTargetJoinCredential }
 
 func (*Hello) FrameName() FrameName { return FrameHello }
 
@@ -235,10 +271,74 @@ func Decode(data []byte) (Frame, error) {
 		return decodeInto(data, &Error{})
 	case FrameHistoryPage:
 		return decodeHistoryPage(data)
+	case FrameTargetJoin:
+		return decodeTargetJoin(data)
+	case FrameTargetJoinChallenge:
+		return decodeTargetJoinChallenge(data)
+	case FrameTargetJoinCredential:
+		return decodeTargetJoinCredential(data)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownFrame, env.Frame)
 	}
 }
+
+func decodeTargetJoin(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameTargetJoin, "protocol_version", "join_nonce")
+	if err != nil {
+		return nil, err
+	}
+	var out TargetJoin
+	if json.Unmarshal(fields["protocol_version"], &out.ProtocolVersion) != nil || json.Unmarshal(fields["join_nonce"], &out.JoinNonce) != nil ||
+		out.ProtocolVersion != ProtocolVersionV2 || len(out.JoinNonce) < MinTargetJoinNonceBytes || len(out.JoinNonce) > MaxTargetJoinNonceBytes {
+		return nil, targetJoinError(FrameTargetJoin)
+	}
+	return &out, nil
+}
+
+func decodeTargetJoinChallenge(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameTargetJoinChallenge, "target_session_id", "join_nonce", "expires_at")
+	if err != nil {
+		return nil, err
+	}
+	var out TargetJoinChallenge
+	if json.Unmarshal(fields["target_session_id"], &out.TargetSessionID) != nil || json.Unmarshal(fields["join_nonce"], &out.JoinNonce) != nil || json.Unmarshal(fields["expires_at"], &out.ExpiresAt) != nil ||
+		out.TargetSessionID == "" || len(out.JoinNonce) < MinTargetJoinNonceBytes || len(out.JoinNonce) > MaxTargetJoinNonceBytes || out.ExpiresAt <= 0 {
+		return nil, targetJoinError(FrameTargetJoinChallenge)
+	}
+	return &out, nil
+}
+
+func decodeTargetJoinCredential(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameTargetJoinCredential, "credential", "target_session_id", "target_credential_lineage_ref", "generation", "expires_at")
+	if err != nil {
+		return nil, err
+	}
+	var out TargetJoinCredential
+	if json.Unmarshal(fields["credential"], &out.Credential) != nil || json.Unmarshal(fields["target_session_id"], &out.TargetSessionID) != nil || json.Unmarshal(fields["target_credential_lineage_ref"], &out.TargetCredentialLineageRef) != nil || json.Unmarshal(fields["generation"], &out.Generation) != nil || json.Unmarshal(fields["expires_at"], &out.ExpiresAt) != nil ||
+		len(out.Credential) == 0 || len(out.Credential) > MaxTargetJoinCredentialBytes || out.TargetSessionID == "" || out.TargetCredentialLineageRef == "" || out.Generation < 1 || out.ExpiresAt <= 0 {
+		return nil, targetJoinError(FrameTargetJoinCredential)
+	}
+	return &out, nil
+}
+
+func targetJoinFields(data []byte, frame FrameName, keys ...string) (map[string]json.RawMessage, error) {
+	fields, err := strictObject(data)
+	if err != nil || len(fields) != len(keys)+1 {
+		return nil, targetJoinError(frame)
+	}
+	var actual FrameName
+	if json.Unmarshal(fields["frame"], &actual) != nil || actual != frame {
+		return nil, targetJoinError(frame)
+	}
+	for _, key := range keys {
+		if fields[key] == nil {
+			return nil, targetJoinError(frame)
+		}
+	}
+	return fields, nil
+}
+
+func targetJoinError(frame FrameName) error { return fmt.Errorf("decode %s: invalid frame", frame) }
 
 func decodeEvent(data []byte) (Frame, error) {
 	fields, err := strictObject(data)
