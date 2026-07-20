@@ -22,19 +22,23 @@ var (
 type FrameName string
 
 const (
-	FrameHello                FrameName = "hello"
-	FrameHelloAck             FrameName = "hello.ack"
-	FrameEvent                FrameName = "event"
-	FrameEventReceipt         FrameName = "event.receipt"
-	FrameCommand              FrameName = "command"
-	FrameCommandAck           FrameName = "command.ack"
-	FramePing                 FrameName = "ping"
-	FramePong                 FrameName = "pong"
-	FrameError                FrameName = "error"
-	FrameHistoryPage          FrameName = "history.page"
-	FrameTargetJoinChallenge  FrameName = "target.join.challenge"
-	FrameTargetJoin           FrameName = "target.join"
-	FrameTargetJoinCredential FrameName = "target.join.credential"
+	FrameHello                        FrameName = "hello"
+	FrameHelloAck                     FrameName = "hello.ack"
+	FrameEvent                        FrameName = "event"
+	FrameEventReceipt                 FrameName = "event.receipt"
+	FrameCommand                      FrameName = "command"
+	FrameCommandAck                   FrameName = "command.ack"
+	FramePing                         FrameName = "ping"
+	FramePong                         FrameName = "pong"
+	FrameError                        FrameName = "error"
+	FrameHistoryPage                  FrameName = "history.page"
+	FrameTargetJoinChallenge          FrameName = "target.join.challenge"
+	FrameTargetJoin                   FrameName = "target.join"
+	FrameTargetJoinCredential         FrameName = "target.join.credential"
+	FrameCredentialRotationRequest    FrameName = "credential.rotation.request"
+	FrameCredentialRotationCredential FrameName = "credential.rotation.credential"
+	FrameCredentialRotationPossession FrameName = "credential.rotation.possession"
+	FrameCredentialRotationActivation FrameName = "credential.rotation.activation"
 )
 
 const (
@@ -44,6 +48,7 @@ const (
 	MinTargetJoinNonceBytes      = 32
 	MaxTargetJoinNonceBytes      = 128
 	MaxTargetJoinCredentialBytes = 4096
+	MaxCredentialRotationIDBytes = 256
 )
 
 type Role string
@@ -114,6 +119,40 @@ type TargetJoinCredential struct {
 }
 
 func (*TargetJoinCredential) FrameName() FrameName { return FrameTargetJoinCredential }
+
+type CredentialRotationRequest struct {
+	RotationID string `json:"rotation_id"`
+}
+
+func (*CredentialRotationRequest) FrameName() FrameName { return FrameCredentialRotationRequest }
+
+type CredentialRotationCredential struct {
+	SessionID  string `json:"session_id"`
+	RotationID string `json:"rotation_id"`
+	Generation int64  `json:"generation"`
+	Credential string `json:"credential"`
+	ExpiresAt  int64  `json:"expires_at"`
+}
+
+func (*CredentialRotationCredential) FrameName() FrameName { return FrameCredentialRotationCredential }
+
+type CredentialRotationPossession struct {
+	SessionID     string `json:"session_id"`
+	RotationID    string `json:"rotation_id"`
+	Generation    int64  `json:"generation"`
+	AcceptedEpoch int64  `json:"accepted_epoch"`
+}
+
+func (*CredentialRotationPossession) FrameName() FrameName { return FrameCredentialRotationPossession }
+
+type CredentialRotationActivation struct {
+	RotationID      string `json:"rotation_id"`
+	Generation      int64  `json:"generation"`
+	ConnectionEpoch int64  `json:"connection_epoch"`
+	AcceptedFence   int64  `json:"accepted_fence"`
+}
+
+func (*CredentialRotationActivation) FrameName() FrameName { return FrameCredentialRotationActivation }
 
 func (*Hello) FrameName() FrameName { return FrameHello }
 
@@ -277,6 +316,14 @@ func Decode(data []byte) (Frame, error) {
 		return decodeTargetJoinChallenge(data)
 	case FrameTargetJoinCredential:
 		return decodeTargetJoinCredential(data)
+	case FrameCredentialRotationRequest:
+		return decodeCredentialRotationRequest(data)
+	case FrameCredentialRotationCredential:
+		return decodeCredentialRotationCredential(data)
+	case FrameCredentialRotationPossession:
+		return decodeCredentialRotationPossession(data)
+	case FrameCredentialRotationActivation:
+		return decodeCredentialRotationActivation(data)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownFrame, env.Frame)
 	}
@@ -317,6 +364,54 @@ func decodeTargetJoinCredential(data []byte) (Frame, error) {
 	if json.Unmarshal(fields["credential"], &out.Credential) != nil || json.Unmarshal(fields["target_session_id"], &out.TargetSessionID) != nil || json.Unmarshal(fields["target_credential_lineage_ref"], &out.TargetCredentialLineageRef) != nil || json.Unmarshal(fields["generation"], &out.Generation) != nil || json.Unmarshal(fields["expires_at"], &out.ExpiresAt) != nil ||
 		len(out.Credential) == 0 || len(out.Credential) > MaxTargetJoinCredentialBytes || out.TargetSessionID == "" || out.TargetCredentialLineageRef == "" || out.Generation < 1 || out.ExpiresAt <= 0 {
 		return nil, targetJoinError(FrameTargetJoinCredential)
+	}
+	return &out, nil
+}
+
+func decodeCredentialRotationRequest(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameCredentialRotationRequest, "rotation_id")
+	if err != nil {
+		return nil, targetJoinError(FrameCredentialRotationRequest)
+	}
+	var out CredentialRotationRequest
+	if json.Unmarshal(fields["rotation_id"], &out.RotationID) != nil || out.RotationID == "" || len(out.RotationID) > MaxCredentialRotationIDBytes {
+		return nil, targetJoinError(FrameCredentialRotationRequest)
+	}
+	return &out, nil
+}
+
+func decodeCredentialRotationCredential(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameCredentialRotationCredential, "session_id", "rotation_id", "generation", "credential", "expires_at")
+	if err != nil {
+		return nil, targetJoinError(FrameCredentialRotationCredential)
+	}
+	var out CredentialRotationCredential
+	if json.Unmarshal(fields["session_id"], &out.SessionID) != nil || json.Unmarshal(fields["rotation_id"], &out.RotationID) != nil || json.Unmarshal(fields["generation"], &out.Generation) != nil || json.Unmarshal(fields["credential"], &out.Credential) != nil || json.Unmarshal(fields["expires_at"], &out.ExpiresAt) != nil || out.SessionID == "" || out.RotationID == "" || len(out.RotationID) > MaxCredentialRotationIDBytes || out.Generation < 1 || len(out.Credential) == 0 || len(out.Credential) > MaxTargetJoinCredentialBytes || out.ExpiresAt <= 0 {
+		return nil, targetJoinError(FrameCredentialRotationCredential)
+	}
+	return &out, nil
+}
+
+func decodeCredentialRotationPossession(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameCredentialRotationPossession, "session_id", "rotation_id", "generation", "accepted_epoch")
+	if err != nil {
+		return nil, targetJoinError(FrameCredentialRotationPossession)
+	}
+	var out CredentialRotationPossession
+	if json.Unmarshal(fields["session_id"], &out.SessionID) != nil || json.Unmarshal(fields["rotation_id"], &out.RotationID) != nil || json.Unmarshal(fields["generation"], &out.Generation) != nil || json.Unmarshal(fields["accepted_epoch"], &out.AcceptedEpoch) != nil || out.SessionID == "" || out.RotationID == "" || len(out.RotationID) > MaxCredentialRotationIDBytes || out.Generation < 1 || out.AcceptedEpoch < 1 {
+		return nil, targetJoinError(FrameCredentialRotationPossession)
+	}
+	return &out, nil
+}
+
+func decodeCredentialRotationActivation(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameCredentialRotationActivation, "rotation_id", "generation", "connection_epoch", "accepted_fence")
+	if err != nil {
+		return nil, targetJoinError(FrameCredentialRotationActivation)
+	}
+	var out CredentialRotationActivation
+	if json.Unmarshal(fields["rotation_id"], &out.RotationID) != nil || json.Unmarshal(fields["generation"], &out.Generation) != nil || json.Unmarshal(fields["connection_epoch"], &out.ConnectionEpoch) != nil || json.Unmarshal(fields["accepted_fence"], &out.AcceptedFence) != nil || out.RotationID == "" || len(out.RotationID) > MaxCredentialRotationIDBytes || out.Generation < 1 || out.ConnectionEpoch < 1 || out.AcceptedFence < 1 {
+		return nil, targetJoinError(FrameCredentialRotationActivation)
 	}
 	return &out, nil
 }
