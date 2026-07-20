@@ -8,6 +8,17 @@ FROM session_attention_summaries
 WHERE session_id = ANY(sqlc.arg(session_ids)::TEXT[])
 ORDER BY session_id ASC;
 
+-- name: AttentionSummaryPage :many
+SELECT session_id, latest_seq, state, permission_id, permission_status,
+       terminal_outcome, latest_change_seq, blocker_kind, blocker_reason,
+       blocker_expires_at, blocking_session_id, blocker_operation,
+       summary_version, last_durable_event_at, last_client_command_at,
+       projection_state, created_at, updated_at
+FROM session_attention_summaries
+WHERE session_id > sqlc.arg(after_session_id)::TEXT
+ORDER BY session_id ASC
+LIMIT sqlc.arg(page_limit)::INT;
+
 -- name: AttentionStoreNow :one
 SELECT clock_timestamp()::TIMESTAMPTZ;
 
