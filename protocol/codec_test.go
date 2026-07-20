@@ -363,28 +363,21 @@ func TestEventTypeAllowed(t *testing.T) {
 		eventType string
 		want      bool
 	}{
-		{version: ProtocolVersion, eventType: "session.idle_warning", want: true},
-		{version: ProtocolVersionV2, eventType: "session.idle_warning", want: false},
-		{version: ProtocolVersion, eventType: "x.vm.idle_warning", want: false},
-		{version: ProtocolVersionV2, eventType: "x.vm.idle_warning", want: false},
+		{version: ProtocolVersion, eventType: "publisher.notice", want: true},
+		{version: ProtocolVersionV2, eventType: "publisher.notice", want: true},
 		{version: ProtocolVersionV2, eventType: "session.message", want: true},
 	} {
 		if got := EventTypeAllowed(test.version, test.eventType, false); got != test.want {
 			t.Fatalf("EventTypeAllowed(%d, %q, false) = %v, want %v", test.version, test.eventType, got, test.want)
 		}
 	}
-	if EventTypeAllowed(ProtocolVersion, "session.idle_warning", true) {
-		t.Fatal("durable legacy idle warning is allowed")
-	}
 	for _, eventType := range []string{"presence", "agent.activity", "log.tail", "resource.sample"} {
 		if EventTypeAllowed(ProtocolVersionV2, eventType, true) {
 			t.Fatalf("durable ephemeral event type %q is allowed", eventType)
 		}
 	}
-	for _, eventType := range []string{"session.idle_warning", "x.vm.idle_warning"} {
-		if PeerEventTypeAllowed(eventType) {
-			t.Fatalf("peer event type %q is allowed", eventType)
-		}
+	if !PeerEventTypeAllowed("publisher.notice") {
+		t.Fatal("generic peer event type is unexpectedly rejected")
 	}
 }
 

@@ -573,7 +573,13 @@ func TestWebSocketServerRejectsUntrustedHistoryPages(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			events := &fakeHistoryStore{fakeEventStore: newFakeEventStore(map[string]int64{"ses_1": 2}, nil), page: test.page}
-			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+				cfg.EventStore = events
+				cfg.EphemeralEventVariants = map[string]map[int]string{
+					"session.idle_warning": {protocol.ProtocolVersion: "session.idle_warning"},
+					"x.vm.idle_warning":    {protocol.ProtocolVersionV2: "x.vm.idle_warning"},
+				}
+			})
 			client := dialWebSocket(t, server.URL)
 			defer client.Close(websocket.StatusNormalClosure, "")
 			writeFrame(t, client, &protocol.Hello{ProtocolVersion: 2, Role: protocol.RoleClient, Token: "view-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
@@ -747,6 +753,9 @@ func TestWebSocketServerDoesNotReplayV2IdleWarning(t *testing.T) {
 	})
 	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
 		cfg.EventStore = events
+		cfg.EphemeralEventVariants = map[string]map[int]string{
+			"x.vm.idle_warning": {protocol.ProtocolVersionV2: "x.vm.idle_warning"},
+		}
 	})
 	client := dialWebSocket(t, server.URL)
 	defer client.Close(websocket.StatusNormalClosure, "")
@@ -914,8 +923,9 @@ func TestWebSocketServerEmitsIdleWarningFromHostWithoutPersistence(t *testing.T)
 
 	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
 	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{
-		Handshake:  testHandshakeWithStore(events),
-		EventStore: events,
+		Handshake:              testHandshakeWithStore(events),
+		EventStore:             events,
+		EphemeralEventVariants: map[string]map[int]string{"session.idle_warning": {protocol.ProtocolVersion: "session.idle_warning"}},
 	})
 	broadcaster, ok := handler.(hub.EphemeralBroadcaster)
 	if !ok {
@@ -949,10 +959,17 @@ func TestWebSocketServerEmitsIdleWarningFromHostWithoutPersistence(t *testing.T)
 	}
 }
 
-func TestWebSocketServerDoesNotSendV1IdleWarningToV2Client(t *testing.T) {
+func TestWebSocketServerSelectsPublisherEphemeralVariantByNegotiatedVersion(t *testing.T) {
 	t.Parallel()
 
-	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: testHandshake()})
+	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{
+		Handshake: testHandshake(),
+		EphemeralEventVariants: map[string]map[int]string{
+			"publisher.notice": {
+				protocol.ProtocolVersionV2: "publisher.notice.current",
+			},
+		},
+	})
 	broadcaster := handler.(hub.EphemeralBroadcaster)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
@@ -972,39 +989,44 @@ func TestWebSocketServerDoesNotSendV1IdleWarningToV2Client(t *testing.T) {
 	_ = readFrame(t, v2Client).(*protocol.HelloAck)
 
 	if err := broadcaster.EmitEphemeralEvent(context.Background(), protocol.Event{
-		Type: "session.idle_warning", SessionID: "ses_1", Time: 2003,
-		Payload: json.RawMessage(`{"message":"legacy warning"}`),
+		Type: "publisher.notice", SessionID: "ses_1", Time: 2003,
+		Payload: json.RawMessage(`{"message":"opaque warning"}`),
 	}); err != nil {
-		t.Fatalf("emit v1 idle warning: %v", err)
+		t.Fatalf("emit publisher event: %v", err)
 	}
-	if frame := readFrame(t, v1Client).(*protocol.Event); frame.Type != "session.idle_warning" {
-		t.Fatalf("v1 client event type = %q, want session.idle_warning", frame.Type)
+	if frame := readFrame(t, v1Client).(*protocol.Event); frame.Type != "publisher.notice" || frame.Seq != nil {
+		t.Fatalf("v1 publisher event = %+v", frame)
 	}
-	if frame, err := readFrameWithin(v2Client, 100*time.Millisecond); err == nil {
-		t.Fatalf("v2 client received v1-only event: %+v", frame)
+	if frame := readFrame(t, v2Client).(*protocol.Event); frame.Type != "publisher.notice.current" || frame.Seq != nil {
+		t.Fatalf("v2 publisher event = %+v", frame)
 	}
 }
 
-func TestWebSocketServerRejectsVersionOwnedWarningFromAdapter(t *testing.T) {
+func TestWebSocketServerRejectsPublisherEphemeralTypesFromAdapter(t *testing.T) {
 	t.Parallel()
 
 	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
 	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
 		cfg.EventStore = events
+		cfg.EphemeralEventVariants = map[string]map[int]string{
+			"publisher.notice": {protocol.ProtocolVersionV2: "publisher.notice.current"},
+		}
 	})
 	adapter := dialWebSocket(t, server.URL)
 	defer adapter.Close(websocket.StatusNormalClosure, "")
 	writeAdapterHello(t, adapter, "adapter-token")
 	_ = readFrame(t, adapter).(*protocol.HelloAck)
 
-	writeFrame(t, adapter, &protocol.Event{
-		Type: "x.vm.idle_warning", SessionID: "ses_1", Time: 2003, Payload: json.RawMessage(`{}`),
-	})
-	if frame := readFrame(t, adapter).(*protocol.Error); frame.Code != "invalid_event" {
-		t.Fatalf("adapter error = %+v, want invalid_event", frame)
+	for _, eventType := range []string{"publisher.notice", "publisher.notice.current"} {
+		writeFrame(t, adapter, &protocol.Event{
+			Type: eventType, SessionID: "ses_1", Time: 2003, Payload: json.RawMessage(`{}`),
+		})
+		if frame := readFrame(t, adapter).(*protocol.Error); frame.Code != "invalid_event" {
+			t.Fatalf("adapter error for %q = %+v, want invalid_event", eventType, frame)
+		}
 	}
 	if calls := events.appended(); len(calls) != 0 {
-		t.Fatalf("version-owned warning was persisted: %+v", calls)
+		t.Fatalf("publisher ephemeral type was persisted: %+v", calls)
 	}
 }
 

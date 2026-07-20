@@ -40,6 +40,7 @@ type WebSocketConfig struct {
 	SessionCredentialIssuer           auth.SessionCredentialIssuer
 	SessionCredentialLifecycle        auth.SessionCredentialLifecycle
 	SessionCredentialEvidenceResolver auth.SessionCredentialEvidenceResolver
+	EphemeralEventVariants            map[string]map[int]string
 	// Deprecated: credential delivery is always the Hub-owned pending target
 	// socket. Retained only to avoid a source-incompatible config removal.
 	WarmAttachCredentialHandoff WarmAttachCredentialHandoff
@@ -94,6 +95,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		sessionCredentialEvidenceResolver: evidenceResolver,
 		warmAttachCredentialHandoff:       cfg.WarmAttachCredentialHandoff,
 		adapterAuthority:                  newAdapterDispatchAuthority(cfg.Handshake, cfg.EventStore),
+		ephemeralEventVariants:            copyEphemeralEventVariants(cfg.EphemeralEventVariants),
 		adapterAdmissionLocks:             make(map[string]chan struct{}),
 		subscribers:                       make(map[string]map[*clientConnection]struct{}),
 		adapters:                          make(map[string]*adapterConnection),
@@ -103,6 +105,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		pendingTargetJoins:                make(map[string]*pendingTargetJoin),
 		pendingTargetJoinByAttach:         make(map[string]*pendingTargetJoin),
 	}
+	handler.publisherEphemeralTypes = publisherEphemeralTypes(handler.ephemeralEventVariants)
 	// Pending target joins are Hub-owned. The historical configuration field is
 	// retained for source compatibility but cannot replace this socket boundary.
 	handler.warmAttachCredentialHandoff = handler
@@ -119,7 +122,7 @@ func (h *webSocketHandler) EmitEphemeralEvent(ctx context.Context, ev protocol.E
 	if ev.Seq != nil {
 		return errors.New("ephemeral event must not include seq")
 	}
-	if !isEphemeralEvent(ev.Type) {
+	if !isEphemeralEvent(ev.Type) && !h.isPublisherEphemeralSource(ev.Type) {
 		return fmt.Errorf("event type %q is not ephemeral", ev.Type)
 	}
 	eventTime := normalizedEventTime(ev.Time)
@@ -139,6 +142,8 @@ type webSocketHandler struct {
 	commandActivityObserver           CommandActivityObserver
 	adapterActivityObserver           AdapterActivityObserver
 	adapterAuthority                  *adapterDispatchAuthority
+	ephemeralEventVariants            map[string]map[int]string
+	publisherEphemeralTypes           map[string]struct{}
 	adapterAdmissionMu                sync.Mutex
 	adapterAdmissionLocks             map[string]chan struct{}
 	publication                       sessionPublicationGates
@@ -541,7 +546,7 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *managedC
 		})
 	}
 	page, err := history.History(ctx, request.SessionID, request.BeforeSeq, request.Limit)
-	if err != nil || !validHistoryPage(page, request) ||
+	if err != nil || !h.validHistoryPage(page, request) ||
 		!h.authorizeHistory(ctx, historyToken, accepted.Principal.Subject, request.SessionID) {
 		return h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
@@ -569,7 +574,7 @@ func (h *webSocketHandler) authorizeHistory(ctx context.Context, token, subject,
 		h.handshake.authenticator.Authorize(ctx, principal, auth.SessionView(sessionID)) == nil
 }
 
-func validHistoryPage(page store.HistoryPage, request *protocol.HistoryPageRequest) bool {
+func (h *webSocketHandler) validHistoryPage(page store.HistoryPage, request *protocol.HistoryPageRequest) bool {
 	if request == nil || request.Limit < 1 || request.Limit > protocol.HistoryPageMaxLimit ||
 		len(page.Events) > request.Limit || page.LatestSeq < 0 ||
 		(page.RetentionState != store.RetentionComplete && page.RetentionState != store.RetentionGap) {
@@ -578,7 +583,7 @@ func validHistoryPage(page store.HistoryPage, request *protocol.HistoryPageReque
 	for index, event := range page.Events {
 		if event.SessionID != request.SessionID || event.Seq < 1 || event.Seq > page.LatestSeq ||
 			event.Type == "" || !json.Valid(event.Payload) || len(event.Payload) > protocol.MaxEventPayloadBytes ||
-			!protocol.EventTypeAllowed(protocol.ProtocolVersionV2, event.Type, true) ||
+			!protocol.EventTypeAllowed(protocol.ProtocolVersionV2, event.Type, true) || h.isPublisherEphemeralType(event.Type) ||
 			request.BeforeSeq != nil && event.Seq >= *request.BeforeSeq ||
 			index > 0 && page.Events[index-1].Seq >= event.Seq {
 			return false
@@ -673,7 +678,7 @@ func (h *webSocketHandler) registerPeer(conn *managedConn, accepted AcceptedPeer
 		return nil
 	}
 	current := accepted.currentSubscriptions()
-	peer := newClientConnection(conn, accepted.ProtocolVersion, current, h.events != nil)
+	peer := newClientConnection(conn, accepted.ProtocolVersion, current, h.events != nil, h.publisherEphemeralTypes)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, sub := range current {
@@ -851,7 +856,7 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 		return err
 	}
-	if !protocol.PeerEventTypeAllowed(ev.Type) {
+	if h.isPublisherEphemeralType(ev.Type) {
 		err := fmt.Errorf("event type %q is reserved for the trusted publisher", ev.Type)
 		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 		return err
@@ -1478,8 +1483,12 @@ func (h *webSocketHandler) broadcastEvent(ctx context.Context, ev protocol.Event
 	h.mu.Unlock()
 
 	for _, client := range targets {
+		out := ev
+		if ev.Seq == nil {
+			out.Type = h.selectEphemeralVariant(client.protocolVersion, ev.Type)
+		}
 		writeCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
-		err := client.sendLiveEvent(writeCtx, ev)
+		err := client.sendLiveEvent(writeCtx, out)
 		cancel()
 		if err != nil {
 			h.unregisterClient(client)
@@ -1615,17 +1624,69 @@ func clonePayload(payload json.RawMessage) json.RawMessage {
 
 func isEphemeralEvent(eventType string) bool {
 	switch eventType {
-	case "presence", "agent.activity", "log.tail", "resource.sample", "session.idle_warning":
+	case "presence", "agent.activity", "log.tail", "resource.sample":
 		return true
 	default:
 		return false
 	}
 }
 
+func copyEphemeralEventVariants(input map[string]map[int]string) map[string]map[int]string {
+	variants := make(map[string]map[int]string, len(input))
+	for source, byVersion := range input {
+		if !validOpaqueEventType(source) || len(byVersion) == 0 {
+			continue
+		}
+		copied := make(map[int]string, len(byVersion))
+		for version, selected := range byVersion {
+			if version >= protocol.ProtocolVersion && validOpaqueEventType(selected) {
+				copied[version] = selected
+			}
+		}
+		if len(copied) > 0 {
+			variants[source] = copied
+		}
+	}
+	return variants
+}
+
+func publisherEphemeralTypes(variants map[string]map[int]string) map[string]struct{} {
+	types := make(map[string]struct{})
+	for source, byVersion := range variants {
+		types[source] = struct{}{}
+		for _, selected := range byVersion {
+			types[selected] = struct{}{}
+		}
+	}
+	return types
+}
+
+func validOpaqueEventType(eventType string) bool {
+	return len(eventType) > 0 && len(eventType) <= 255
+}
+
+func (h *webSocketHandler) isPublisherEphemeralType(eventType string) bool {
+	_, ok := h.publisherEphemeralTypes[eventType]
+	return ok
+}
+
+func (h *webSocketHandler) isPublisherEphemeralSource(eventType string) bool {
+	_, ok := h.ephemeralEventVariants[eventType]
+	return ok
+}
+
+func (h *webSocketHandler) selectEphemeralVariant(version int, eventType string) string {
+	if selected := h.ephemeralEventVariants[eventType][version]; selected != "" {
+		return selected
+	}
+	return eventType
+}
+
 type clientConnection struct {
-	conn            *managedConn
-	protocolVersion int
-	writeGate       contextWriteGate
+	conn                    *managedConn
+	protocolVersion         int
+	publisherEphemeralTypes map[string]struct{}
+	writeGate               contextWriteGate
 
 	mu            sync.Mutex
 	subscriptions map[string]*subscriptionState
@@ -1637,12 +1698,13 @@ type subscriptionState struct {
 	buffered  []protocol.Event
 }
 
-func newClientConnection(conn *managedConn, protocolVersion int, subscriptions []protocol.Subscription, replaying bool) *clientConnection {
+func newClientConnection(conn *managedConn, protocolVersion int, subscriptions []protocol.Subscription, replaying bool, publisherEphemeralTypes map[string]struct{}) *clientConnection {
 	peer := &clientConnection{
-		conn:            conn,
-		protocolVersion: protocolVersion,
-		writeGate:       newContextWriteGate(),
-		subscriptions:   make(map[string]*subscriptionState, len(subscriptions)),
+		conn:                    conn,
+		protocolVersion:         protocolVersion,
+		writeGate:               newContextWriteGate(),
+		publisherEphemeralTypes: publisherEphemeralTypes,
+		subscriptions:           make(map[string]*subscriptionState, len(subscriptions)),
 	}
 	for _, sub := range subscriptions {
 		peer.subscriptions[sub.SessionID] = &subscriptionState{
@@ -1680,7 +1742,7 @@ func (g contextWriteGate) lock(ctx context.Context) (func(), error) {
 }
 
 func (c *clientConnection) writeReplayEvent(ctx context.Context, ev protocol.Event) error {
-	if !protocol.EventTypeAllowed(c.protocolVersion, ev.Type, true) {
+	if !protocol.EventTypeAllowed(c.protocolVersion, ev.Type, true) || c.isPublisherEphemeralType(ev.Type) {
 		c.markSent(ev)
 		return nil
 	}
@@ -1692,7 +1754,7 @@ func (c *clientConnection) writeReplayEvent(ctx context.Context, ev protocol.Eve
 }
 
 func (c *clientConnection) sendLiveEvent(ctx context.Context, ev protocol.Event) error {
-	if !protocol.EventTypeAllowed(c.protocolVersion, ev.Type, ev.Seq != nil) {
+	if !protocol.EventTypeAllowed(c.protocolVersion, ev.Type, ev.Seq != nil) || (ev.Seq != nil && c.isPublisherEphemeralType(ev.Type)) {
 		c.markSent(ev)
 		return nil
 	}
@@ -1722,6 +1784,11 @@ func (c *clientConnection) sendLiveEvent(ctx context.Context, ev protocol.Event)
 	}
 	c.markSent(ev)
 	return nil
+}
+
+func (c *clientConnection) isPublisherEphemeralType(eventType string) bool {
+	_, ok := c.publisherEphemeralTypes[eventType]
+	return ok
 }
 
 func (c *clientConnection) finishReplay(ctx context.Context, sessionID string) error {
