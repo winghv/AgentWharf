@@ -176,6 +176,35 @@ func TestDecodeCommandAndAckExamples(t *testing.T) {
 	}
 }
 
+func TestEventReceiptRoundTripsStrictReferenceOnlyFields(t *testing.T) {
+	receipt := &EventReceipt{ProposalID: "proposal_01H8X", Seq: 42, Status: EventReceiptAccepted}
+	encoded, err := Encode(receipt)
+	if err != nil {
+		t.Fatalf("Encode(event receipt) error = %v", err)
+	}
+	if string(encoded) != `{"frame":"event.receipt","proposal_id":"proposal_01H8X","seq":42,"status":"accepted"}` {
+		t.Fatalf("encoded event receipt = %s", encoded)
+	}
+	frame, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode(event receipt) error = %v", err)
+	}
+	if got, ok := frame.(*EventReceipt); !ok || *got != *receipt {
+		t.Fatalf("decoded event receipt = %#v", frame)
+	}
+	for _, raw := range []string{
+		`{"frame":"event.receipt","proposal_id":"proposal_01H8X","seq":42,"status":"accepted","payload":{}}`,
+		`{"frame":"event.receipt","proposal_id":"proposal_01H8X","proposal_id":"duplicate","seq":42,"status":"accepted"}`,
+		`{"frame":"event.receipt","proposal_id":"","seq":42,"status":"accepted"}`,
+		`{"frame":"event.receipt","proposal_id":"proposal_01H8X","seq":0,"status":"accepted"}`,
+		`{"frame":"event.receipt","proposal_id":"proposal_01H8X","seq":42,"status":"duplicate"}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) unexpectedly succeeded", raw)
+		}
+	}
+}
+
 func TestDecodeRejectsUnknownFrame(t *testing.T) {
 	_, err := Decode([]byte(`{"frame":"future.frame"}`))
 	if !errors.Is(err, ErrUnknownFrame) {

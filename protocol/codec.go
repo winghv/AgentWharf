@@ -22,15 +22,16 @@ var (
 type FrameName string
 
 const (
-	FrameHello       FrameName = "hello"
-	FrameHelloAck    FrameName = "hello.ack"
-	FrameEvent       FrameName = "event"
-	FrameCommand     FrameName = "command"
-	FrameCommandAck  FrameName = "command.ack"
-	FramePing        FrameName = "ping"
-	FramePong        FrameName = "pong"
-	FrameError       FrameName = "error"
-	FrameHistoryPage FrameName = "history.page"
+	FrameHello        FrameName = "hello"
+	FrameHelloAck     FrameName = "hello.ack"
+	FrameEvent        FrameName = "event"
+	FrameEventReceipt FrameName = "event.receipt"
+	FrameCommand      FrameName = "command"
+	FrameCommandAck   FrameName = "command.ack"
+	FramePing         FrameName = "ping"
+	FramePong         FrameName = "pong"
+	FrameError        FrameName = "error"
+	FrameHistoryPage  FrameName = "history.page"
 )
 
 const (
@@ -110,11 +111,12 @@ type SessionSummary struct {
 }
 
 type Event struct {
-	Type      string          `json:"type"`
-	SessionID string          `json:"session_id"`
-	Seq       *int64          `json:"seq,omitempty"`
-	Time      int64           `json:"time"`
-	Payload   json.RawMessage `json:"payload"`
+	Type       string          `json:"type"`
+	SessionID  string          `json:"session_id"`
+	Seq        *int64          `json:"seq,omitempty"`
+	Time       int64           `json:"time"`
+	Payload    json.RawMessage `json:"payload"`
+	ProposalID string          `json:"proposal_id,omitempty"`
 }
 
 func (*Event) FrameName() FrameName { return FrameEvent }
@@ -122,6 +124,21 @@ func (*Event) FrameName() FrameName { return FrameEvent }
 func (e *Event) Durable() bool {
 	return e.Seq != nil
 }
+
+type EventReceiptStatus string
+
+const EventReceiptAccepted EventReceiptStatus = "accepted"
+
+// EventReceipt is the reference-only acknowledgement of one v2 Adapter
+// durable event proposal. It intentionally does not carry event contents or
+// any session, credential, provider, or grant material.
+type EventReceipt struct {
+	ProposalID string             `json:"proposal_id"`
+	Seq        int64              `json:"seq"`
+	Status     EventReceiptStatus `json:"status"`
+}
+
+func (*EventReceipt) FrameName() FrameName { return FrameEventReceipt }
 
 type Command struct {
 	CommandID string          `json:"cmd_id"`
@@ -203,7 +220,9 @@ func Decode(data []byte) (Frame, error) {
 	case FrameHelloAck:
 		return decodeInto(data, &HelloAck{})
 	case FrameEvent:
-		return decodeInto(data, &Event{})
+		return decodeEvent(data)
+	case FrameEventReceipt:
+		return decodeEventReceipt(data)
 	case FrameCommand:
 		return decodeInto(data, &Command{})
 	case FrameCommandAck:
@@ -219,6 +238,57 @@ func Decode(data []byte) (Frame, error) {
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownFrame, env.Frame)
 	}
+}
+
+func decodeEvent(data []byte) (Frame, error) {
+	fields, err := strictObject(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode event: %w", err)
+	}
+	if raw := fields["frame"]; raw == nil {
+		return nil, errors.New("decode event: missing frame")
+	} else {
+		var frame FrameName
+		if json.Unmarshal(raw, &frame) != nil || frame != FrameEvent {
+			return nil, errors.New("decode event: invalid frame")
+		}
+	}
+	delete(fields, "frame")
+	withoutFrame, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("decode event payload: %w", err)
+	}
+	var event Event
+	if err := json.Unmarshal(withoutFrame, &event); err != nil {
+		return nil, fmt.Errorf("decode event: %w", err)
+	}
+	return &event, nil
+}
+
+func decodeEventReceipt(data []byte) (Frame, error) {
+	fields, err := strictObject(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode event.receipt: %w", err)
+	}
+	if len(fields) != 4 {
+		return nil, errors.New("decode event.receipt: expected exactly four fields")
+	}
+	for _, key := range []string{"frame", "proposal_id", "seq", "status"} {
+		if fields[key] == nil {
+			return nil, fmt.Errorf("decode event.receipt: missing %s", key)
+		}
+	}
+	var frame FrameName
+	var receipt EventReceipt
+	if json.Unmarshal(fields["frame"], &frame) != nil || frame != FrameEventReceipt ||
+		json.Unmarshal(fields["proposal_id"], &receipt.ProposalID) != nil ||
+		json.Unmarshal(fields["seq"], &receipt.Seq) != nil ||
+		json.Unmarshal(fields["status"], &receipt.Status) != nil ||
+		len(receipt.ProposalID) == 0 || len(receipt.ProposalID) > 255 || receipt.Seq < 1 ||
+		receipt.Status != EventReceiptAccepted {
+		return nil, errors.New("decode event.receipt: invalid receipt")
+	}
+	return &receipt, nil
 }
 
 func decodeHistoryPage(data []byte) (Frame, error) {

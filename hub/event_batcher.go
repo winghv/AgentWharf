@@ -3,11 +3,53 @@ package hub
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/winghv/agentwharf/protocol"
 	"github.com/winghv/agentwharf/store"
 )
+
+// sessionPublicationGates preserves one durable publication order per Session.
+// A cancelled waiter relays the queue token after its predecessor completes so
+// that later writers cannot bypass it.
+type sessionPublicationGates struct {
+	mu   sync.Mutex
+	tail map[string]chan struct{}
+}
+
+func (g *sessionPublicationGates) acquire(ctx context.Context, sessionID string) (func(), error) {
+	g.mu.Lock()
+	if g.tail == nil {
+		g.tail = make(map[string]chan struct{})
+	}
+	previous := g.tail[sessionID]
+	current := make(chan struct{})
+	g.tail[sessionID] = current
+	g.mu.Unlock()
+
+	if previous != nil {
+		select {
+		case <-previous:
+		case <-ctx.Done():
+			go func() {
+				<-previous
+				g.release(sessionID, current)
+			}()
+			return nil, ctx.Err()
+		}
+	}
+	return func() { g.release(sessionID, current) }, nil
+}
+
+func (g *sessionPublicationGates) release(sessionID string, current chan struct{}) {
+	g.mu.Lock()
+	if g.tail[sessionID] == current {
+		delete(g.tail, sessionID)
+	}
+	close(current)
+	g.mu.Unlock()
+}
 
 type adapterEventBatcherConfig struct {
 	Store       store.EventStore

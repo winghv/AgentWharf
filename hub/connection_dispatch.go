@@ -154,10 +154,12 @@ type fencedAdapterEventStore struct {
 }
 
 func (s fencedAdapterEventStore) Append(ctx context.Context, _ string, events []store.PendingEvent) (firstSeq int64, err error) {
-	err = s.handler.withAdapterEffect(ctx, s.adapter, func() error {
-		var appendErr error
-		firstSeq, appendErr = s.handler.adapterAuthority.store.AppendAdapterEvents(ctx, s.adapter.sessionID, s.adapter.admission, events)
-		return appendErr
+	err = s.handler.withSessionPublication(ctx, s.adapter.sessionID, func() error {
+		return s.handler.withAdapterEffect(ctx, s.adapter, func() error {
+			var appendErr error
+			firstSeq, appendErr = s.handler.adapterAuthority.store.AppendAdapterEvents(ctx, s.adapter.sessionID, s.adapter.admission, events)
+			return appendErr
+		})
 	})
 	return
 }

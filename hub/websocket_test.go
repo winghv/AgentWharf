@@ -1,6 +1,7 @@
 package hub_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -1987,16 +1988,114 @@ func writeAdapterHello(t *testing.T, conn *websocket.Conn, token string) {
 }
 
 func writeAdapterHelloFor(t *testing.T, conn *websocket.Conn, token, sessionID string) {
+	writeAdapterHelloVersionFor(t, conn, token, sessionID, protocol.ProtocolVersion)
+}
+
+func writeAdapterHelloV2(t *testing.T, conn *websocket.Conn, token string) {
+	writeAdapterHelloVersionFor(t, conn, token, "ses_1", protocol.ProtocolVersionV2)
+}
+
+func writeAdapterHelloVersionFor(t *testing.T, conn *websocket.Conn, token, sessionID string, version int) {
 	t.Helper()
 
 	writeFrame(t, conn, &protocol.Hello{
-		ProtocolVersion: protocol.ProtocolVersion,
+		ProtocolVersion: version,
 		Role:            protocol.RoleAdapter,
 		Token:           token,
 		SessionID:       sessionID,
 		Provider:        "claude-code",
 		Resume:          true,
 	})
+}
+
+func TestWebSocketServerV2AdapterReceivesProposalReceiptBeforeFanout(t *testing.T) {
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	if ack := readFrame(t, adapter).(*protocol.HelloAck); ack.ProtocolVersion != protocol.ProtocolVersionV2 {
+		t.Fatalf("adapter v2 hello.ack version = %d", ack.ProtocolVersion)
+	}
+	writeFrame(t, adapter, &protocol.Event{
+		Type: "session.message", SessionID: "ses_1", Time: 2001,
+		ProposalID: "proposal_01H8X", Payload: json.RawMessage(`{"role":"agent"}`),
+	})
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.ProposalID != "proposal_01H8X" || receipt.Seq != 1 || receipt.Status != protocol.EventReceiptAccepted {
+		t.Fatalf("proposal receipt = %+v", receipt)
+	}
+	if event := readFrame(t, client).(*protocol.Event); event.Seq == nil || *event.Seq != 1 || event.ProposalID != "" {
+		t.Fatalf("fanout event = %+v", event)
+	}
+}
+
+func TestWebSocketServerRejectsInvalidAdapterProposalIDsWithoutStoreWrite(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		version    int
+		proposalID string
+		typeName   string
+	}{
+		{name: "v2 durable missing", version: protocol.ProtocolVersionV2, typeName: "session.message"},
+		{name: "v2 durable oversized", version: protocol.ProtocolVersionV2, proposalID: strings.Repeat("p", 256), typeName: "session.message"},
+		{name: "v2 ephemeral carries proposal", version: protocol.ProtocolVersionV2, proposalID: "proposal_1", typeName: "log.tail"},
+		{name: "v1 carries proposal", version: protocol.ProtocolVersion, proposalID: "proposal_1", typeName: "session.message"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+			adapter := dialWebSocket(t, server.URL)
+			defer adapter.Close(websocket.StatusNormalClosure, "")
+			writeAdapterHelloVersionFor(t, adapter, "adapter-token", "ses_1", test.version)
+			_ = readFrame(t, adapter).(*protocol.HelloAck)
+			writeFrame(t, adapter, &protocol.Event{Type: test.typeName, SessionID: "ses_1", ProposalID: test.proposalID, Payload: json.RawMessage(`{"role":"agent"}`)})
+			if response := readFrame(t, adapter).(*protocol.Error); response.Code != "invalid_event" {
+				t.Fatalf("response = %+v, want invalid_event", response)
+			}
+			if calls := events.appended(); len(calls) != 0 {
+				t.Fatalf("invalid proposal reached Store: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestWebSocketServerV2ProposalRetryReturnsOriginalReceiptOnly(t *testing.T) {
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+	proposal := &protocol.Event{Type: "session.message", SessionID: "ses_1", Time: 2001, ProposalID: "proposal_retry", Payload: json.RawMessage(`{"role":"agent"}`)}
+	writeFrame(t, adapter, proposal)
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.Seq != 1 {
+		t.Fatalf("initial receipt = %+v", receipt)
+	}
+	writeFrame(t, adapter, proposal)
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.Seq != 1 || receipt.ProposalID != proposal.ProposalID {
+		t.Fatalf("retry receipt = %+v", receipt)
+	}
+	if calls := events.appended(); len(calls) != 1 {
+		t.Fatalf("proposal retry Store calls = %+v", calls)
+	}
+
+	changed := *proposal
+	changed.Payload = json.RawMessage(`{"role":"other"}`)
+	writeFrame(t, adapter, &changed)
+	if response := readFrame(t, adapter).(*protocol.Error); response.Code != "persist_failed" {
+		t.Fatalf("changed retry response = %+v", response)
+	}
+	if calls := events.appended(); len(calls) != 1 {
+		t.Fatalf("changed retry reached Store: %+v", calls)
+	}
 }
 
 func readFrame(t *testing.T, conn *websocket.Conn) protocol.Frame {
@@ -2229,6 +2328,12 @@ type fakeEventStore struct {
 	truth         map[string]store.SessionAdmissionTruth
 	replayCalls   int
 	pending       map[string]store.PendingCommand
+	proposals     map[string]fakeProposal
+}
+
+type fakeProposal struct {
+	receipt store.ProposedEventReceipt
+	event   store.PendingEvent
 }
 
 type t18BAttachGrantVerifier struct {
@@ -2712,7 +2817,38 @@ func newFakeEventStore(latest map[string]int64, events map[string][]store.Event)
 		}
 		nextFence++
 	}
-	return &fakeEventStore{latest: latest, events: events, truth: truth, connections: connections, nextFence: nextFence, pending: make(map[string]store.PendingCommand)}
+	return &fakeEventStore{latest: latest, events: events, truth: truth, connections: connections, nextFence: nextFence, pending: make(map[string]store.PendingCommand), proposals: make(map[string]fakeProposal)}
+}
+
+func (f *fakeEventStore) CommitProposedEvent(_ context.Context, sessionID string, authority store.CommandAuthority, proposal store.ProposedEventRequest) (store.ProposedEventReceipt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	connection, ok := f.connections[sessionID]
+	if !ok || authority.ConnectionEpoch != connection.ConnectionEpoch || authority.CredentialGeneration != connection.ActiveCredentialGeneration ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil || !connection.ActiveCredentialExpiresAt.After(time.Now()) {
+		return store.ProposedEventReceipt{}, errors.New("proposal authority lost")
+	}
+	if proposal.ProposalID == "" || len(proposal.ProposalID) > 255 || proposal.Event.Type == "" || len(proposal.Event.Payload) == 0 || !json.Valid(proposal.Event.Payload) {
+		return store.ProposedEventReceipt{}, errors.New("invalid proposed event")
+	}
+	key := sessionID + "\x00" + proposal.ProposalID
+	if existing, ok := f.proposals[key]; ok {
+		if existing.event.Type != proposal.Event.Type || !existing.event.Time.Equal(proposal.Event.Time) || !bytes.Equal(existing.event.Payload, proposal.Event.Payload) {
+			return store.ProposedEventReceipt{}, errors.New("conflicting proposed event retry")
+		}
+		return existing.receipt, nil
+	}
+	if f.appendErr != nil {
+		return store.ProposedEventReceipt{}, f.appendErr
+	}
+	seq := f.latest[sessionID] + 1
+	pending := store.PendingEvent{Type: proposal.Event.Type, Time: proposal.Event.Time, Payload: append([]byte(nil), proposal.Event.Payload...)}
+	f.appendCalls = append(f.appendCalls, appendCall{sessionID: sessionID, events: []store.PendingEvent{pending}})
+	f.events[sessionID] = append(f.events[sessionID], store.Event{SessionID: sessionID, Seq: seq, Type: pending.Type, Time: pending.Time, Payload: append(json.RawMessage(nil), pending.Payload...)})
+	f.latest[sessionID] = seq
+	receipt := store.ProposedEventReceipt{SessionID: sessionID, ProposalID: proposal.ProposalID, Seq: seq, Status: store.ProposedEventAccepted}
+	f.proposals[key] = fakeProposal{receipt: receipt, event: pending}
+	return receipt, nil
 }
 
 func (f *fakeEventStore) seedPending(command store.PendingCommand) {

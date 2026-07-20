@@ -151,10 +151,11 @@ func negotiateHelloVersion(hello *protocol.Hello) (int, error) {
 		}
 		return selected, nil
 	case protocol.RoleAdapter:
-		if hello.ProtocolVersion != protocol.ProtocolVersion {
+		selected, err := protocol.NegotiateHighestVersion(hello.ProtocolVersion, protocol.HubProtocolVersion)
+		if err != nil {
 			return 0, fmt.Errorf("%w: peer=%d adapter=%d", ErrVersionUnsupported, hello.ProtocolVersion, protocol.ProtocolVersion)
 		}
-		return protocol.ProtocolVersion, nil
+		return selected, nil
 	default:
 		return 0, fmt.Errorf("%w: unknown role %q", ErrInvalidHello, hello.Role)
 	}

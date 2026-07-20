@@ -120,6 +120,7 @@ type webSocketHandler struct {
 	adapterAuthority            *adapterDispatchAuthority
 	adapterAdmissionMu          sync.Mutex
 	adapterAdmissionLocks       map[string]chan struct{}
+	publication                 sessionPublicationGates
 	sessionCredentialIssuer     auth.SessionCredentialIssuer
 	sessionCredentialLifecycle  auth.SessionCredentialLifecycle
 	warmAttachCredentialHandoff WarmAttachCredentialHandoff
@@ -626,6 +627,23 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
 		return err
 	}
+	durable := !isEphemeralEvent(ev.Type)
+	if accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
+		if durable && (len(ev.ProposalID) == 0 || len(ev.ProposalID) > 255) {
+			err := errors.New("v2 durable adapter events require a bounded proposal_id")
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+			return err
+		}
+		if !durable && ev.ProposalID != "" {
+			err := errors.New("ephemeral adapter events must not include proposal_id")
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+			return err
+		}
+	} else if ev.ProposalID != "" {
+		err := errors.New("v1 adapter events must not include proposal_id")
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+		return err
+	}
 
 	eventTime := normalizedEventTime(ev.Time)
 	out := protocol.Event{
@@ -634,7 +652,7 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		Time:      eventTime.UnixMilli(),
 		Payload:   clonePayload(ev.Payload),
 	}
-	if isEphemeralEvent(ev.Type) {
+	if !durable {
 		return h.withAdapterEffect(ctx, adapter, func() error {
 			return h.adapterAuthority.withAdmission(ctx, adapter, func(effectCtx context.Context) error {
 				h.broadcastEvent(effectCtx, out)
@@ -647,6 +665,13 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
 		return err
 	}
+	if accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
+		if err := h.commitAdapterProposal(ctx, adapter, out, ev.ProposalID); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+			return err
+		}
+		return nil
+	}
 	if adapter.events == nil {
 		err := errors.New("adapter event batcher is not configured")
 		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
@@ -657,6 +682,56 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		Time:    eventTime,
 		Payload: clonePayload(ev.Payload),
 	})
+}
+
+func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	proposals, ok := h.events.(store.ProposedEventStore)
+	if !ok {
+		return errors.New("proposed event store is not configured")
+	}
+
+	receiptWriteFailed := false
+	if err := h.withSessionPublication(ctx, event.SessionID, func() error {
+		adapter.effectMu.Lock()
+		defer adapter.effectMu.Unlock()
+		if err := h.validateAdapter(ctx, adapter); err != nil {
+			return err
+		}
+
+		commitCtx, cancelCommit := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+		receipt, err := proposals.CommitProposedEvent(commitCtx, event.SessionID, store.CommandAuthority{
+			ConnectionEpoch: adapter.admission.ConnectionEpoch, CredentialGeneration: adapter.admission.CredentialGeneration,
+		}, store.ProposedEventRequest{ProposalID: proposalID, Event: store.PendingEvent{
+			Type: event.Type, Time: time.UnixMilli(event.Time), Payload: clonePayload(event.Payload),
+		}})
+		cancelCommit()
+		if err != nil {
+			return fmt.Errorf("commit adapter proposal: %w", err)
+		}
+		if receipt.SessionID != event.SessionID || receipt.ProposalID != proposalID || receipt.Seq < 1 || receipt.Status != store.ProposedEventAccepted {
+			return errors.New("proposed event store returned an invalid receipt")
+		}
+
+		seq := receipt.Seq
+		event.Seq = &seq
+		receiptCtx, cancelReceipt := context.WithTimeout(context.Background(), adapterAuthorityPollInterval)
+		if err := adapter.writeFrame(receiptCtx, &protocol.EventReceipt{
+			ProposalID: proposalID, Seq: receipt.Seq, Status: protocol.EventReceiptAccepted,
+		}); err != nil {
+			receiptWriteFailed = true
+		}
+		cancelReceipt()
+		broadcastCtx, cancelBroadcast := context.WithTimeout(context.Background(), adapterAuthorityPollInterval)
+		h.broadcastEvent(broadcastCtx, event)
+		cancelBroadcast()
+		return nil
+	}); err != nil {
+		return err
+	}
+	if receiptWriteFailed {
+		h.rejectAdapter(adapter)
+	}
+	return nil
 }
 
 func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websocket.Conn, accepted AcceptedPeer, cmd *protocol.Command) error {
@@ -714,16 +789,19 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *websoc
 
 	var persisted *protocol.Event
 	if commandNeedsPersistence(cmd.Type) {
-		ev, err := h.persistCommandEvent(ctx, cmd)
+		err := h.withSessionPublication(ctx, cmd.SessionID, func() error {
+			ev, err := h.persistCommandEvent(ctx, cmd)
+			if err != nil {
+				return err
+			}
+			persisted = ev
+			h.broadcastEvent(ctx, *persisted)
+			return nil
+		})
 		if err != nil {
 			_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "persist_failed")
 			return err
 		}
-		persisted = ev
-	}
-
-	if persisted != nil {
-		h.broadcastEvent(ctx, *persisted)
 	}
 	if err := h.routeOrBufferCommand(ctx, cmd); err != nil {
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, err.Error())
@@ -1140,13 +1218,25 @@ func (h *webSocketHandler) broadcastEvent(ctx context.Context, ev protocol.Event
 	h.mu.Unlock()
 
 	for _, client := range targets {
-		if err := client.sendLiveEvent(ctx, ev); err != nil {
+		writeCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+		err := client.sendLiveEvent(writeCtx, ev)
+		cancel()
+		if err != nil {
 			h.unregisterClient(client)
 			if errors.Is(err, errReplayBufferOverflow) {
 				_ = client.close(websocket.StatusPolicyViolation, "replay buffer overflow")
 			}
 		}
 	}
+}
+
+func (h *webSocketHandler) withSessionPublication(ctx context.Context, sessionID string, publish func() error) error {
+	release, err := h.publication.acquire(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return publish()
 }
 
 func validateClientCommand(cmd *protocol.Command) error {

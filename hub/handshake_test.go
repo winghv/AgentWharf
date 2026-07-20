@@ -326,7 +326,7 @@ func TestHandshakeRejectsInvalidHello(t *testing.T) {
 		want error
 	}{
 		{
-			name: "adapter v2 disabled",
+			name: "adapter v2 still applies authorization",
 			in: &protocol.Hello{
 				ProtocolVersion: 2,
 				Role:            protocol.RoleAdapter,
@@ -334,7 +334,7 @@ func TestHandshakeRejectsInvalidHello(t *testing.T) {
 				SessionID:       "ses_1",
 				Provider:        "claude-code",
 			},
-			want: hub.ErrVersionUnsupported,
+			want: auth.ErrUnauthorized,
 		},
 		{
 			name: "version below one",
