@@ -1872,7 +1872,7 @@ func TestWebSocketServerRecoversExpiredPendingRotation(t *testing.T) {
 
 func TestWebSocketServerRejectsLifecycleActivationBeforeDurableCommit(t *testing.T) {
 	events := newDispatchFenceStore()
-	issuer := &recordingSessionCredentialIssuer{activationFailure: errors.New("activation unavailable")}
+	issuer := &recordingSessionCredentialIssuer{validateFailure: errors.New("activation unavailable")}
 	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
 		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle = events, issuer, issuer
 	})
@@ -1891,6 +1891,28 @@ func TestWebSocketServerRejectsLifecycleActivationBeforeDurableCommit(t *testing
 	connection, err := events.AdapterConnection(context.Background(), "ses_1")
 	if err != nil || connection.ActiveCredentialGeneration != 1 || connection.PendingCredentialGeneration == nil || *connection.PendingCredentialGeneration != 2 || connection.RotationID == nil || *connection.RotationID != "rot_rollback" || connection.ConnectionEpoch != 2 {
 		t.Fatalf("preflight failure mutated durable rotation = %+v, %v", connection, err)
+	}
+}
+
+func TestWebSocketServerFailsClosedWhenActivationViolatesPreflight(t *testing.T) {
+	events := newDispatchFenceStore()
+	issuer := &recordingSessionCredentialIssuer{activationFailure: errors.New("activation unavailable")}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle = events, issuer, issuer
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	writeFrame(t, adapter, &protocol.CredentialRotationRequest{RotationID: "rot_post_cas_failure"})
+	credential := readFrame(t, adapter).(*protocol.CredentialRotationCredential)
+	writeFrame(t, adapter, &protocol.CredentialRotationPossession{SessionID: credential.SessionID, RotationID: credential.RotationID, Generation: credential.Generation, AcceptedEpoch: 2})
+	if _, err := readFrameWithin(adapter, time.Second); err == nil {
+		t.Fatal("post-CAS lifecycle failure left the stale Adapter socket open")
+	}
+	connection, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil || connection.ActiveCredentialGeneration != credential.Generation || connection.ConnectionEpoch != 3 || connection.RevokedAt != nil || connection.TerminalAt != nil {
+		t.Fatalf("post-CAS failure must preserve only the new fenced tuple: %+v, %v", connection, err)
 	}
 }
 
@@ -2661,6 +2683,7 @@ type recordingSessionCredentialIssuer struct {
 	mu                sync.Mutex
 	calls             []auth.SessionCredentialRequest
 	failure           error
+	validateFailure   error
 	activationFailure error
 	activations       int
 	discards          int
@@ -2679,7 +2702,7 @@ func (issuer *recordingSessionCredentialIssuer) ActivateSessionCredential(_ cont
 func (issuer *recordingSessionCredentialIssuer) ValidateSessionCredentialActivation(_ context.Context, _ auth.PreparedSessionCredential) error {
 	issuer.mu.Lock()
 	defer issuer.mu.Unlock()
-	return issuer.activationFailure
+	return issuer.validateFailure
 }
 
 func (issuer *recordingSessionCredentialIssuer) DiscardSessionCredential(_ context.Context, _ auth.PreparedSessionCredential) {

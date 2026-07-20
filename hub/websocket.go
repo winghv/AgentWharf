@@ -26,7 +26,10 @@ const adapterEventBatchMaxEvents = 64
 const credentialRotationTTL = 15 * time.Minute
 
 var errReplayBufferOverflow = errors.New("replay buffer overflow")
-var errRotationActivated = errors.New("adapter credential rotation activated")
+var (
+	errRotationActivated  = errors.New("adapter credential rotation activated")
+	errRotationFailClosed = errors.New("adapter credential rotation fail closed")
+)
 
 type WebSocketConfig struct {
 	Handshake                         *Handshake
@@ -371,7 +374,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *managedConn, acce
 				continue
 			}
 			if err := h.handleCredentialRotationPossession(ctx, adapter, typed); err != nil {
-				if errors.Is(err, errRotationActivated) {
+				if errors.Is(err, errRotationActivated) || errors.Is(err, errRotationFailClosed) {
 					return
 				}
 				continue
@@ -468,7 +471,7 @@ func (h *webSocketHandler) handleCredentialRotationPossession(ctx context.Contex
 			return errors.New("activate credential rotation")
 		}
 		if h.sessionCredentialLifecycle.ActivateSessionCredential(context.WithoutCancel(ctx), prepared) != nil {
-			return errors.New("activate rotated credential")
+			return errRotationFailClosed
 		}
 		if err := adapter.writeFrame(ctx, &protocol.CredentialRotationActivation{RotationID: possession.RotationID, Generation: activated.ActiveCredentialGeneration, ConnectionEpoch: activated.ConnectionEpoch, AcceptedFence: activated.AcceptedFence}); err != nil {
 			return err
