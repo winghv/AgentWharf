@@ -619,7 +619,7 @@ func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, autho
 	}
 	existing, err := queries.ProposedEventByID(ctx, db.ProposedEventByIDParams{
 		SessionID: sessionID, ProposalID: pgtype.Text{String: proposal.ProposalID, Valid: true},
-		EventType: event.Type, Payload: event.Payload,
+		EventType: event.Type, Payload: event.Payload, CreatedAt: pgtype.Timestamptz{Time: event.Time, Valid: true},
 	})
 	if err == nil {
 		if !existing.Matches.Valid || !existing.Matches.Bool {

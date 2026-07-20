@@ -163,3 +163,25 @@ func (s fencedAdapterEventStore) Append(ctx context.Context, _ string, events []
 	})
 	return
 }
+
+func (s fencedAdapterEventStore) publish(ctx context.Context, batch []pendingAdapterEvent, broadcast func(context.Context, protocol.Event)) error {
+	return s.handler.withSessionPublication(ctx, s.adapter.sessionID, func() error {
+		return s.handler.withAdapterEffect(ctx, s.adapter, func() error {
+			pending := make([]store.PendingEvent, len(batch))
+			for i, item := range batch {
+				pending[i] = item.pending
+			}
+			firstSeq, err := s.handler.adapterAuthority.store.AppendAdapterEvents(ctx, s.adapter.sessionID, s.adapter.admission, pending)
+			if err != nil {
+				return err
+			}
+			for i, item := range batch {
+				seq := firstSeq + int64(i)
+				event := item.event
+				event.Seq = &seq
+				broadcast(ctx, event)
+			}
+			return nil
+		})
+	})
+}

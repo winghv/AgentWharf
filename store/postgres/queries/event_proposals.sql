@@ -1,7 +1,8 @@
 -- name: ProposedEventByID :one
 SELECT session_id, seq, proposal_id,
        type = sqlc.arg(event_type)::TEXT
-       AND payload = sqlc.arg(payload)::JSONB AS matches
+       AND payload = sqlc.arg(payload)::JSONB
+       AND created_at = sqlc.arg(created_at)::TIMESTAMPTZ AS matches
 FROM session_events
 WHERE session_id = sqlc.arg(session_id)
   AND proposal_id = sqlc.arg(proposal_id);

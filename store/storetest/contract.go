@@ -1326,6 +1326,7 @@ func ProposalContract(t *testing.T, harness ProposalHarness) {
 		for _, conflict := range []store.ProposedEventRequest{
 			{ProposalID: request.ProposalID, Event: pending("session.message", 1)},
 			{ProposalID: request.ProposalID, Event: pending("session.state", 2)},
+			{ProposalID: request.ProposalID, Event: store.PendingEvent{Type: request.Event.Type, Time: request.Event.Time.Add(time.Millisecond), Payload: append([]byte(nil), request.Event.Payload...)}},
 		} {
 			if _, err := proposals.CommitProposedEvent(context.Background(), "ses_proposal_conflict", authority, conflict); err == nil {
 				t.Fatal("conflicting proposal retry unexpectedly succeeded")

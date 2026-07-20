@@ -503,8 +503,9 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *websocket.
 	}
 	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, handler: h, admission: admission}
 	if h.events != nil {
+		fencedStore := fencedAdapterEventStore{handler: h, adapter: adapter}
 		adapter.events = newAdapterEventBatcher(adapterEventBatcherConfig{
-			Store:     fencedAdapterEventStore{handler: h, adapter: adapter},
+			Store:     fencedStore,
 			SessionID: accepted.SessionID,
 			Window:    adapterEventBatchWindow,
 			MaxEvents: adapterEventBatchMaxEvents,
@@ -514,6 +515,9 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *websocket.
 					Code:    "persist_failed",
 					Message: err.Error(),
 				})
+			},
+			Publish: func(ctx context.Context, batch []pendingAdapterEvent) error {
+				return fencedStore.publish(ctx, batch, h.broadcastEvent)
 			},
 		})
 	}
@@ -699,12 +703,19 @@ func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *a
 		}
 
 		commitCtx, cancelCommit := context.WithTimeout(ctx, adapterAuthorityPollInterval)
-		receipt, err := proposals.CommitProposedEvent(commitCtx, event.SessionID, store.CommandAuthority{
+		authority := store.CommandAuthority{
 			ConnectionEpoch: adapter.admission.ConnectionEpoch, CredentialGeneration: adapter.admission.CredentialGeneration,
-		}, store.ProposedEventRequest{ProposalID: proposalID, Event: store.PendingEvent{
+		}
+		request := store.ProposedEventRequest{ProposalID: proposalID, Event: store.PendingEvent{
 			Type: event.Type, Time: time.UnixMilli(event.Time), Payload: clonePayload(event.Payload),
-		}})
+		}}
+		receipt, err := proposals.CommitProposedEvent(commitCtx, event.SessionID, authority, request)
 		cancelCommit()
+		if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+			recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), adapterAuthorityPollInterval)
+			receipt, err = proposals.CommitProposedEvent(recoveryCtx, event.SessionID, authority, request)
+			cancelRecovery()
+		}
 		if err != nil {
 			return fmt.Errorf("commit adapter proposal: %w", err)
 		}

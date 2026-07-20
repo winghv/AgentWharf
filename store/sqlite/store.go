@@ -829,9 +829,9 @@ func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, autho
 		return store.ProposedEventReceipt{}, err
 	}
 
-	existing, existingType, existingPayload, err := queryProposedEvent(ctx, tx, sessionID, proposal.ProposalID, nowMS)
+	existing, existingType, existingTime, existingPayload, err := queryProposedEvent(ctx, tx, sessionID, proposal.ProposalID, nowMS)
 	if err == nil {
-		if existingType != event.Type || !bytes.Equal(existingPayload, event.Payload) {
+		if existingType != event.Type || existingTime != event.Time.UnixMilli() || !bytes.Equal(existingPayload, event.Payload) {
 			return store.ProposedEventReceipt{}, errors.New("conflicting proposed event retry")
 		}
 		if err := tx.Commit(); err != nil {
@@ -885,13 +885,14 @@ WHERE session_id = ? AND connection_epoch = ? AND active_credential_generation =
 	return proposedEventReceipt(sessionID, proposal.ProposalID, seq), nil
 }
 
-func queryProposedEvent(ctx context.Context, tx *sql.Tx, sessionID, proposalID string, nowMS int64) (store.ProposedEventReceipt, string, []byte, error) {
+func queryProposedEvent(ctx context.Context, tx *sql.Tx, sessionID, proposalID string, nowMS int64) (store.ProposedEventReceipt, string, int64, []byte, error) {
 	var seq, createdAtMS int64
+	var eventTimeMS sql.NullInt64
 	var eventSessionID, eventType sql.NullString
 	var eventSeq, payloadLength sql.NullInt64
 	var payload []byte
 	err := tx.QueryRowContext(ctx, `
-SELECT proposal.event_seq, proposal.created_at_ms, event.session_id, event.seq, event.type,
+SELECT proposal.event_seq, proposal.created_at_ms, event.session_id, event.seq, event.type, event.event_time_ms,
        CASE WHEN length(event.payload) BETWEEN 1 AND ? THEN event.payload END,
        length(event.payload)
 FROM session_event_proposals AS proposal
@@ -899,18 +900,18 @@ LEFT JOIN session_events AS event
   ON event.session_id = proposal.session_id AND event.seq = proposal.event_seq
 WHERE proposal.session_id = ? AND proposal.proposal_id = ?
 `, maxEventPayloadSize, sessionID, proposalID).Scan(
-		&seq, &createdAtMS, &eventSessionID, &eventSeq, &eventType, &payload, &payloadLength,
+		&seq, &createdAtMS, &eventSessionID, &eventSeq, &eventType, &eventTimeMS, &payload, &payloadLength,
 	)
 	if err != nil {
-		return store.ProposedEventReceipt{}, "", nil, err
+		return store.ProposedEventReceipt{}, "", 0, nil, err
 	}
 	if seq < 1 || createdAtMS < 1 || createdAtMS > nowMS || !eventSessionID.Valid || eventSessionID.String != sessionID ||
-		!eventSeq.Valid || eventSeq.Int64 != seq || !eventType.Valid || eventType.String == "" ||
+		!eventSeq.Valid || eventSeq.Int64 != seq || !eventType.Valid || eventType.String == "" || !eventTimeMS.Valid ||
 		!payloadLength.Valid || payloadLength.Int64 < 1 || payloadLength.Int64 > maxEventPayloadSize ||
 		len(payload) != int(payloadLength.Int64) || !json.Valid(payload) {
-		return store.ProposedEventReceipt{}, "", nil, errors.New("proposed event row is invalid")
+		return store.ProposedEventReceipt{}, "", 0, nil, errors.New("proposed event row is invalid")
 	}
-	return proposedEventReceipt(sessionID, proposalID, seq), eventType.String, append([]byte(nil), payload...), nil
+	return proposedEventReceipt(sessionID, proposalID, seq), eventType.String, eventTimeMS.Int64, append([]byte(nil), payload...), nil
 }
 
 func validateProposedEventInput(sessionID string, authority store.CommandAuthority, proposalID string, event store.PendingEvent) error {

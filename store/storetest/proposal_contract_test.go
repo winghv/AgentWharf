@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/winghv/agentwharf/store"
 )
@@ -29,6 +30,7 @@ func TestProposalContract(t *testing.T) {
 type memoryProposal struct {
 	receipt  store.ProposedEventReceipt
 	typeName string
+	time     time.Time
 	digest   [sha256.Size]byte
 }
 
@@ -82,14 +84,14 @@ func (s *memoryProposalStore) CommitProposedEvent(_ context.Context, sessionID s
 	key := sessionID + "\x00" + request.ProposalID
 	digest := sha256.Sum256(request.Event.Payload)
 	if existing, ok := s.proposals[key]; ok {
-		if existing.typeName != request.Event.Type || existing.digest != digest {
+		if existing.typeName != request.Event.Type || !existing.time.Equal(request.Event.Time) || existing.digest != digest {
 			return store.ProposedEventReceipt{}, errors.New("conflicting proposal")
 		}
 		return existing.receipt, nil
 	}
 	seq := int64(len(s.events[sessionID]) + 1)
 	receipt := store.ProposedEventReceipt{SessionID: sessionID, ProposalID: request.ProposalID, Seq: seq, Status: store.ProposedEventAccepted}
-	s.proposals[key] = memoryProposal{receipt: receipt, typeName: request.Event.Type, digest: digest}
+	s.proposals[key] = memoryProposal{receipt: receipt, typeName: request.Event.Type, time: request.Event.Time, digest: digest}
 	s.events[sessionID] = append(s.events[sessionID], store.Event{SessionID: sessionID, Seq: seq, Type: request.Event.Type, Time: request.Event.Time, Payload: append([]byte(nil), request.Event.Payload...)})
 	return receipt, nil
 }
