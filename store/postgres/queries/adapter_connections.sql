@@ -116,7 +116,7 @@ WHERE session_id = sqlc.arg(session_id)
   AND active_credential_generation = sqlc.arg(expected_active_generation)
   AND connection_epoch = sqlc.arg(expected_epoch)
   AND connection_epoch > 0 AND accepted_fence > 0
-  AND pending_credential_generation IS NULL
+  AND (pending_credential_generation IS NULL OR (pending_credential_expires_at IS NOT NULL AND pending_credential_expires_at <= clock_timestamp()))
   AND sqlc.arg(pending_generation)::BIGINT > credential_generation_high_watermark
   AND active_credential_expires_at > clock_timestamp()
   AND sqlc.arg(pending_expires_at)::TIMESTAMPTZ > clock_timestamp()

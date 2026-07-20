@@ -1528,6 +1528,32 @@ CREATE TRIGGER adapter_fence_allocator_advance BEFORE UPDATE OF next_fence ON ad
 	}
 }
 
+func TestPrepareAdapterCredentialRotationSupersedesExpiredPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	connections := &sqliteConnectionHarness{Store: openStore(t, path), path: path}
+	ctx := context.Background()
+	init := store.AdapterConnectionInitialize{SessionID: "ses_expired_pending_recovery", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	active := initializeConnectionForRotation(t, connections, init)
+	if _, err := connections.Store.PrepareAdapterCredentialRotation(ctx, init.SessionID, store.AdapterCredentialRotation{
+		ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: active.ConnectionEpoch, PendingGeneration: 2,
+		ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_lost_delivery",
+	}); err != nil {
+		t.Fatalf("prepare first rotation: %v", err)
+	}
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(ctx, `UPDATE session_adapter_connections SET pending_credential_expires_at_ms = created_at_ms + 1 WHERE session_id = ?`, init.SessionID); err != nil {
+		t.Fatalf("expire pending rotation: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	recovered, err := connections.Store.PrepareAdapterCredentialRotation(ctx, init.SessionID, store.AdapterCredentialRotation{
+		ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: active.ConnectionEpoch, PendingGeneration: 3,
+		ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_recovered",
+	})
+	if err != nil || recovered.PendingCredentialGeneration == nil || *recovered.PendingCredentialGeneration != 3 || recovered.RotationID == nil || *recovered.RotationID != "rot_recovered" || recovered.CredentialGenerationHighWatermark != 3 {
+		t.Fatalf("expired pending recovery = %+v, %v", recovered, err)
+	}
+}
+
 func TestConnectionFenceSidecarIdentityFailsClosed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	connections, err := sqlite.Open(context.Background(), path)

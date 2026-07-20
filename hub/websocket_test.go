@@ -1847,6 +1847,53 @@ func TestWebSocketServerRotationPossessionFailsClosedAfterRevocation(t *testing.
 	}
 }
 
+func TestWebSocketServerRecoversExpiredPendingRotation(t *testing.T) {
+	events := newDispatchFenceStore()
+	issuer := &recordingSessionCredentialIssuer{}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle = events, issuer, issuer
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	writeFrame(t, adapter, &protocol.CredentialRotationRequest{RotationID: "rot_lost_delivery"})
+	first := readFrame(t, adapter).(*protocol.CredentialRotationCredential)
+	events.mutateConnection(func(connection *store.AdapterConnection) {
+		expired := time.Now().Add(-time.Second)
+		connection.PendingCredentialExpiresAt = &expired
+	})
+	writeFrame(t, adapter, &protocol.CredentialRotationRequest{RotationID: "rot_recovered"})
+	recovered, ok := readFrame(t, adapter).(*protocol.CredentialRotationCredential)
+	if !ok || recovered.RotationID != "rot_recovered" || recovered.Generation != first.Generation+1 || recovered.Credential == "" {
+		t.Fatalf("expired pending recovery = %+v", recovered)
+	}
+}
+
+func TestWebSocketServerRollsBackDurableRotationWhenLifecycleActivationFails(t *testing.T) {
+	events := newDispatchFenceStore()
+	issuer := &recordingSessionCredentialIssuer{activationFailure: errors.New("activation unavailable")}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle = events, issuer, issuer
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	writeFrame(t, adapter, &protocol.CredentialRotationRequest{RotationID: "rot_rollback"})
+	credential := readFrame(t, adapter).(*protocol.CredentialRotationCredential)
+	writeFrame(t, adapter, &protocol.CredentialRotationPossession{SessionID: credential.SessionID, RotationID: credential.RotationID, Generation: credential.Generation, AcceptedEpoch: 2})
+	if frame, readErr := readFrameWithin(adapter, time.Second); readErr == nil {
+		if rejected, ok := frame.(*protocol.Error); !ok || rejected.Code != "credential_rotation_rejected" {
+			t.Fatalf("activation failure response = %+v", frame)
+		}
+	}
+	connection, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil || connection.ActiveCredentialGeneration != 1 || connection.PendingCredentialGeneration != nil || connection.RotationID != nil || connection.ConnectionEpoch <= 2 {
+		t.Fatalf("durable rotation rollback = %+v, %v", connection, err)
+	}
+}
+
 func TestWebSocketServerRejectsRotationFramesOutsideV2Adapter(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -2611,17 +2658,21 @@ func (s *recordingWarmAttachStore) UpdateAttachment(_ context.Context, attachID 
 }
 
 type recordingSessionCredentialIssuer struct {
-	mu          sync.Mutex
-	calls       []auth.SessionCredentialRequest
-	failure     error
-	activations int
-	discards    int
+	mu                sync.Mutex
+	calls             []auth.SessionCredentialRequest
+	failure           error
+	activationFailure error
+	activations       int
+	discards          int
 }
 
 func (issuer *recordingSessionCredentialIssuer) ActivateSessionCredential(_ context.Context, _ auth.PreparedSessionCredential) error {
 	issuer.mu.Lock()
 	defer issuer.mu.Unlock()
 	issuer.activations++
+	if issuer.activationFailure != nil {
+		return issuer.activationFailure
+	}
 	return nil
 }
 
@@ -2811,8 +2862,10 @@ func (s *dispatchFenceStore) PrepareAdapterCredentialRotation(_ context.Context,
 	connection := &s.connection
 	if sessionID != connection.SessionID || rotation.ExpectedActiveCredentialGeneration != connection.ActiveCredentialGeneration ||
 		rotation.ExpectedEpoch != connection.ConnectionEpoch || rotation.PendingGeneration <= connection.CredentialGenerationHighWatermark ||
-		rotation.RotationID == "" || !rotation.ExpiresAt.After(time.Now()) || connection.PendingCredentialGeneration != nil ||
-		connection.PendingCredentialExpiresAt != nil || connection.RotationID != nil || connection.RevokedAt != nil || connection.TerminalAt != nil ||
+		rotation.RotationID == "" || !rotation.ExpiresAt.After(time.Now()) ||
+		(connection.PendingCredentialGeneration != nil && connection.PendingCredentialExpiresAt != nil && connection.PendingCredentialExpiresAt.After(time.Now())) ||
+		(connection.PendingCredentialGeneration == nil) != (connection.PendingCredentialExpiresAt == nil) || (connection.PendingCredentialGeneration == nil) != (connection.RotationID == nil) ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil ||
 		!connection.ActiveCredentialExpiresAt.After(time.Now()) {
 		return store.AdapterConnection{}, errors.New("adapter credential rotation rejected")
 	}
@@ -2843,6 +2896,25 @@ func (s *dispatchFenceStore) ActivateAdapterCredential(_ context.Context, sessio
 	connection.PendingCredentialGeneration = nil
 	connection.PendingCredentialExpiresAt = nil
 	connection.RotationID = nil
+	connection.ConnectionEpoch++
+	connection.AcceptedFence = s.nextFence
+	s.nextFence++
+	return *connection, nil
+}
+
+func (s *dispatchFenceStore) RollbackAdapterCredentialActivation(_ context.Context, sessionID string, activation store.AdapterCredentialActivation, priorGeneration int64, priorExpiresAt time.Time) (store.AdapterConnection, error) {
+	s.authorityMu.Lock()
+	defer s.authorityMu.Unlock()
+	connection := &s.connection
+	if sessionID != connection.SessionID || activation.ExpectedActiveCredentialGeneration != connection.ActiveCredentialGeneration ||
+		activation.ExpectedEpoch != connection.ConnectionEpoch || connection.PriorRecoveryGeneration == nil ||
+		*connection.PriorRecoveryGeneration != priorGeneration || connection.PendingCredentialGeneration != nil ||
+		connection.RotationID != nil || !priorExpiresAt.After(time.Now()) {
+		return store.AdapterConnection{}, errors.New("adapter credential rollback rejected")
+	}
+	connection.ActiveCredentialGeneration = priorGeneration
+	connection.ActiveCredentialExpiresAt = priorExpiresAt
+	connection.PriorRecoveryGeneration = nil
 	connection.ConnectionEpoch++
 	connection.AcceptedFence = s.nextFence
 	s.nextFence++

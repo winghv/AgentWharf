@@ -161,6 +161,13 @@ type webSocketHandler struct {
 	pendingTargetJoinTimer    func(time.Duration, func()) *time.Timer
 }
 
+// adapterCredentialActivationRollback is an internal recovery boundary. A
+// lifecycle failure after the durable CAS must restore the exact prior active
+// tuple before the Hub reports rotation failure.
+type adapterCredentialActivationRollback interface {
+	RollbackAdapterCredentialActivation(context.Context, string, store.AdapterCredentialActivation, int64, time.Time) (store.AdapterConnection, error)
+}
+
 type adapterConnection struct {
 	conn               *managedConn
 	writeGate          contextWriteGate
@@ -385,14 +392,22 @@ func (h *webSocketHandler) handleCredentialRotationRequest(ctx context.Context, 
 			return errAdapterAuthorityLost
 		}
 		if connection.PendingCredentialGeneration != nil || connection.PendingCredentialExpiresAt != nil || connection.RotationID != nil {
-			if connection.PendingCredentialGeneration == nil || connection.PendingCredentialExpiresAt == nil || connection.RotationID == nil || *connection.RotationID != request.RotationID {
+			if connection.PendingCredentialGeneration == nil || connection.PendingCredentialExpiresAt == nil || connection.RotationID == nil {
 				return errors.New("credential rotation is already pending")
 			}
-			prepared, err := h.prepareRotationCredential(ctx, adapter, request.RotationID, *connection.PendingCredentialGeneration, *connection.PendingCredentialExpiresAt)
-			if err != nil {
-				return err
+			if connection.PendingCredentialExpiresAt.After(time.Now()) {
+				if *connection.RotationID != request.RotationID {
+					return errors.New("credential rotation is already pending")
+				}
+				prepared, err := h.prepareRotationCredential(ctx, adapter, request.RotationID, *connection.PendingCredentialGeneration, *connection.PendingCredentialExpiresAt)
+				if err != nil {
+					return err
+				}
+				return h.deliverRotationCredential(ctx, adapter, prepared)
 			}
-			return h.deliverRotationCredential(ctx, adapter, prepared)
+			if *connection.RotationID == request.RotationID {
+				return errors.New("expired credential rotation requires a fresh rotation ID")
+			}
 		}
 		if adapter.credentialEvidence.RotationID == request.RotationID && adapter.credentialEvidence.Generation == connection.ActiveCredentialGeneration && connection.PriorRecoveryGeneration != nil {
 			return adapter.writeFrame(ctx, &protocol.CredentialRotationActivation{
@@ -447,7 +462,20 @@ func (h *webSocketHandler) handleCredentialRotationPossession(ctx context.Contex
 		if err != nil || activated.ActiveCredentialGeneration != possession.Generation || activated.ConnectionEpoch <= connection.ConnectionEpoch || activated.AcceptedFence <= connection.AcceptedFence {
 			return errors.New("activate credential rotation")
 		}
-		if h.sessionCredentialLifecycle.ActivateSessionCredential(context.WithoutCancel(ctx), prepared) != nil {
+		if activationErr := h.sessionCredentialLifecycle.ActivateSessionCredential(context.WithoutCancel(ctx), prepared); activationErr != nil {
+			rollbacker, ok := h.adapterAuthority.store.(adapterCredentialActivationRollback)
+			if !ok {
+				return errors.New("activate rotated credential without rollback")
+			}
+			if _, rollbackErr := rollbacker.RollbackAdapterCredentialActivation(context.WithoutCancel(ctx), adapter.sessionID, store.AdapterCredentialActivation{
+				ExpectedActiveCredentialGeneration: activated.ActiveCredentialGeneration,
+				ExpectedEpoch:                      activated.ConnectionEpoch,
+				PendingGeneration:                  possession.Generation,
+				RotationID:                         possession.RotationID,
+			}, connection.ActiveCredentialGeneration, connection.ActiveCredentialExpiresAt); rollbackErr != nil {
+				return fmt.Errorf("activate rotated credential: %v; rollback: %w", activationErr, rollbackErr)
+			}
+			h.discardRotationCredential(ctx, prepared)
 			return errors.New("activate rotated credential")
 		}
 		if err := adapter.writeFrame(ctx, &protocol.CredentialRotationActivation{RotationID: possession.RotationID, Generation: activated.ActiveCredentialGeneration, ConnectionEpoch: activated.ConnectionEpoch, AcceptedFence: activated.AcceptedFence}); err != nil {

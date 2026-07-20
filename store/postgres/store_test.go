@@ -1472,6 +1472,35 @@ func mustConnection(t *testing.T, harness *postgresConnectionHarness, sessionID 
 	return connection
 }
 
+func TestPrepareAdapterCredentialRotationSupersedesExpiredPending(t *testing.T) {
+	harness := newPostgresConnectionHarness(t)
+	ctx := context.Background()
+	request := store.AdapterConnectionInitialize{SessionID: "ses_expired_pending_recovery", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}
+	if _, err := harness.InitializeAdapterConnection(ctx, request); err != nil {
+		t.Fatalf("initialize connection: %v", err)
+	}
+	active, err := harness.AcceptAdapterHello(ctx, request.SessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatalf("accept hello: %v", err)
+	}
+	if _, err := harness.PrepareAdapterCredentialRotation(ctx, request.SessionID, store.AdapterCredentialRotation{
+		ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: active.ConnectionEpoch, PendingGeneration: 2,
+		ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_lost_delivery",
+	}); err != nil {
+		t.Fatalf("prepare first rotation: %v", err)
+	}
+	if _, err := harness.pool.Exec(ctx, `UPDATE session_adapter_connections SET pending_credential_expires_at = clock_timestamp() - interval '1 second' WHERE session_id = $1`, request.SessionID); err != nil {
+		t.Fatalf("expire pending rotation: %v", err)
+	}
+	recovered, err := harness.PrepareAdapterCredentialRotation(ctx, request.SessionID, store.AdapterCredentialRotation{
+		ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: active.ConnectionEpoch, PendingGeneration: 3,
+		ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_recovered",
+	})
+	if err != nil || recovered.PendingCredentialGeneration == nil || *recovered.PendingCredentialGeneration != 3 || recovered.RotationID == nil || *recovered.RotationID != "rot_recovered" || recovered.CredentialGenerationHighWatermark != 3 {
+		t.Fatalf("expired pending recovery = %+v, %v", recovered, err)
+	}
+}
+
 type postgresConnectionHarness struct {
 	*postgres.Store
 	pool       *pgxpool.Pool
