@@ -5,13 +5,55 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
 	gws "github.com/gorilla/websocket"
+	"github.com/winghv/agentwharf/auth"
 	"github.com/winghv/agentwharf/protocol"
+	"github.com/winghv/agentwharf/store"
 	"nhooyr.io/websocket"
 )
+
+func TestBeginPendingTargetJoinDoesNotScheduleRejectedAdmission(t *testing.T) {
+	expiresAt := time.Now().Add(time.Minute)
+	entry := func(attachID string) *pendingTargetJoin {
+		return &pendingTargetJoin{attachID: attachID, expiresAt: expiresAt}
+	}
+	full := make(map[string]*pendingTargetJoin, maxPendingTargetJoins)
+	for index := 0; index < maxPendingTargetJoins; index++ {
+		id := strconv.Itoa(index)
+		full["nonce"+id] = entry("other" + id)
+	}
+	for _, test := range []struct {
+		name     string
+		joins    map[string]*pendingTargetJoin
+		byAttach map[string]*pendingTargetJoin
+		attachID string
+	}{
+		{name: "duplicate", joins: map[string]*pendingTargetJoin{"nonce": entry("duplicate")}, byAttach: map[string]*pendingTargetJoin{"duplicate": entry("duplicate")}, attachID: "duplicate"},
+		{name: "capacity", joins: full, byAttach: map[string]*pendingTargetJoin{}, attachID: "new"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheduled := 0
+			handler := &webSocketHandler{
+				pendingTargetJoins: test.joins, pendingTargetJoinByAttach: test.byAttach,
+				pendingTargetJoinTimer: func(time.Duration, func()) *time.Timer {
+					scheduled++
+					return nil
+				},
+			}
+			authorization := auth.AttachAuthorization{Grant: auth.AttachGrant{AttachID: test.attachID}}
+			if err := handler.beginPendingTargetJoin(context.Background(), authorization, store.WarmAttachTargetActivation{ExpiresAt: expiresAt}); err == nil {
+				t.Fatal("beginPendingTargetJoin() unexpectedly accepted unavailable admission")
+			}
+			if scheduled != 0 {
+				t.Fatalf("rejected admission scheduled %d expiry timer(s), want 0", scheduled)
+			}
+		})
+	}
+}
 
 func TestPendingTargetJoinPingFenceRejectsDecodedInputBeforeObserverLock(t *testing.T) {
 	observed := make(chan struct{})

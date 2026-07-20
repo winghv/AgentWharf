@@ -146,6 +146,7 @@ type webSocketHandler struct {
 	pendingTargetJoinMu       sync.Mutex
 	pendingTargetJoins        map[string]*pendingTargetJoin
 	pendingTargetJoinByAttach map[string]*pendingTargetJoin
+	pendingTargetJoinTimer    func(time.Duration, func()) *time.Timer
 }
 
 type adapterConnection struct {

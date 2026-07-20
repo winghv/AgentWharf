@@ -83,13 +83,13 @@ func (h *webSocketHandler) beginPendingTargetJoin(ctx context.Context, authoriza
 		readerReady: make(chan struct{}),
 		finished:    make(chan struct{}),
 	}
-	entry.timer = time.AfterFunc(time.Until(entry.expiresAt), func() { h.expirePendingTargetJoin(entry) })
 	h.pendingTargetJoinMu.Lock()
 	h.prunePendingTargetJoinsLocked(time.Now())
 	if len(h.pendingTargetJoins) >= maxPendingTargetJoins || h.pendingTargetJoinByAttach[entry.attachID] != nil {
 		h.pendingTargetJoinMu.Unlock()
 		return errors.New("pending target join is unavailable")
 	}
+	h.startPendingTargetJoinTimer(entry)
 	h.pendingTargetJoins[nonce] = entry
 	h.pendingTargetJoinByAttach[entry.attachID] = entry
 	h.pendingTargetJoinMu.Unlock()
@@ -106,6 +106,14 @@ func (h *webSocketHandler) beginPendingTargetJoin(ctx context.Context, authoriza
 		return errors.New("deliver pending target join challenge")
 	}
 	return nil
+}
+
+func (h *webSocketHandler) startPendingTargetJoinTimer(entry *pendingTargetJoin) {
+	afterFunc := h.pendingTargetJoinTimer
+	if afterFunc == nil {
+		afterFunc = time.AfterFunc
+	}
+	entry.timer = afterFunc(time.Until(entry.expiresAt), func() { h.expirePendingTargetJoin(entry) })
 }
 
 func (h *webSocketHandler) expirePendingTargetJoin(entry *pendingTargetJoin) {
