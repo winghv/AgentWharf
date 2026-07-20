@@ -27,6 +27,30 @@ func TestAttentionSummaryStoreContract(t *testing.T) {
 	var _ store.AttentionSummaryStore = (*postgres.Store)(nil)
 }
 
+func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_page_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	attention := postgres.New(pool)
+	ctx := context.Background()
+	for _, sessionID := range []string{"ses_page_a", "ses_page_b", "ses_page_c"} {
+		if _, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+			t.Fatalf("seed %s: %v", sessionID, err)
+		}
+	}
+	page, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 2})
+	if err != nil || len(page.Summaries) != 2 || page.Summaries[0].SessionID != "ses_page_a" || page.NextAfterSessionID == nil || *page.NextAfterSessionID != "ses_page_b" {
+		t.Fatalf("first page = %+v, %v", page, err)
+	}
+	next, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{AfterSessionID: *page.NextAfterSessionID, Limit: 2})
+	if err != nil || len(next.Summaries) != 1 || next.Summaries[0].SessionID != "ses_page_c" || next.NextAfterSessionID != nil {
+		t.Fatalf("second page = %+v, %v", next, err)
+	}
+}
+
 func TestAttentionSnapshotProjectsDurableEvents(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_attention_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))

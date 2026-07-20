@@ -182,6 +182,44 @@ func (s *Store) AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]s
 	return summaries, nil
 }
 
+func (s *Store) AttentionSummaryPage(ctx context.Context, request store.AttentionSummaryPageRequest) (store.AttentionSummaryPage, error) {
+	if request.Limit < 1 || request.Limit > store.MaxAttentionSummaryPageSize {
+		return store.AttentionSummaryPage{}, errors.New("attention summary page limit is out of range")
+	}
+	if request.AfterSessionID != "" && !validConnectionID(request.AfterSessionID) {
+		return store.AttentionSummaryPage{}, errors.New("attention summary page cursor is invalid")
+	}
+	pending, err := s.attentionMigrationPending(ctx, s.db)
+	if err != nil {
+		return store.AttentionSummaryPage{}, err
+	}
+	if pending {
+		return store.AttentionSummaryPage{}, errors.New("attention summary page is unavailable during migration")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id > ? ORDER BY session_id ASC LIMIT ?`, request.AfterSessionID, request.Limit+1)
+	if err != nil {
+		return store.AttentionSummaryPage{}, fmt.Errorf("select attention summary page: %w", err)
+	}
+	defer rows.Close()
+	page := store.AttentionSummaryPage{Summaries: make([]store.SessionAttentionSummary, 0, request.Limit)}
+	for rows.Next() {
+		summary, err := querySQLiteAttentionSummary(ctx, rows)
+		if err != nil {
+			return store.AttentionSummaryPage{}, err
+		}
+		if len(page.Summaries) == request.Limit {
+			cursor := page.Summaries[len(page.Summaries)-1].SessionID
+			page.NextAfterSessionID = &cursor
+			break
+		}
+		page.Summaries = append(page.Summaries, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return store.AttentionSummaryPage{}, fmt.Errorf("iterate attention summary page: %w", err)
+	}
+	return page, nil
+}
+
 func (s *Store) attentionMigrationPending(ctx context.Context, executor sqliteConnectionExecutor) (bool, error) {
 	var state string
 	if err := executor.QueryRowContext(ctx, `SELECT state FROM session_attention_migration WHERE singleton = 1`).Scan(&state); err != nil {

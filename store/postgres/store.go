@@ -68,6 +68,39 @@ func (s *Store) AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]s
 	return summaries, nil
 }
 
+func (s *Store) AttentionSummaryPage(ctx context.Context, request store.AttentionSummaryPageRequest) (store.AttentionSummaryPage, error) {
+	if s.pool == nil {
+		return store.AttentionSummaryPage{}, errors.New("postgres event store pool is nil")
+	}
+	if request.Limit < 1 || request.Limit > store.MaxAttentionSummaryPageSize {
+		return store.AttentionSummaryPage{}, errors.New("attention summary page limit is out of range")
+	}
+	if request.AfterSessionID != "" && !validConnectionID(request.AfterSessionID) {
+		return store.AttentionSummaryPage{}, errors.New("attention summary page cursor is invalid")
+	}
+	rows, err := db.New(s.pool).AttentionSummaryPage(ctx, db.AttentionSummaryPageParams{
+		AfterSessionID: request.AfterSessionID,
+		PageLimit:      int32(request.Limit + 1),
+	})
+	if err != nil {
+		return store.AttentionSummaryPage{}, fmt.Errorf("select attention summary page: %w", err)
+	}
+	page := store.AttentionSummaryPage{Summaries: make([]store.SessionAttentionSummary, 0, request.Limit)}
+	for _, row := range rows {
+		summary, err := attentionSummary(row)
+		if err != nil {
+			return store.AttentionSummaryPage{}, err
+		}
+		if len(page.Summaries) == request.Limit {
+			cursor := page.Summaries[len(page.Summaries)-1].SessionID
+			page.NextAfterSessionID = &cursor
+			break
+		}
+		page.Summaries = append(page.Summaries, summary)
+	}
+	return page, nil
+}
+
 func (s *Store) Append(ctx context.Context, sessionID string, evs []store.PendingEvent) (firstSeq int64, err error) {
 	if len(evs) == 0 {
 		return 0, nil

@@ -34,6 +34,8 @@ var (
 type WebSocketConfig struct {
 	Handshake                         *Handshake
 	EventStore                        store.EventStore
+	ActivitySummaryStore              store.AttentionSummaryPageStore
+	ActivitySink                      ActivitySink
 	HandshakeTimeout                  time.Duration
 	CommandActivityObserver           CommandActivityObserver
 	AdapterActivityObserver           AdapterActivityObserver
@@ -49,6 +51,7 @@ type WebSocketConfig struct {
 type EphemeralBroadcaster interface {
 	http.Handler
 	EmitEphemeralEvent(context.Context, protocol.Event) error
+	RunActivityDispatcher(context.Context) error
 }
 
 type CommandActivity struct {
@@ -105,6 +108,15 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		pendingTargetJoins:                make(map[string]*pendingTargetJoin),
 		pendingTargetJoinByAttach:         make(map[string]*pendingTargetJoin),
 	}
+	if cfg.ActivitySink != nil {
+		pages := cfg.ActivitySummaryStore
+		if pages == nil {
+			pages, _ = cfg.EventStore.(store.AttentionSummaryPageStore)
+		}
+		if pages != nil {
+			handler.activityDispatcher = NewActivityDispatcher(pages, cfg.ActivitySink, ActivityDispatcherConfig{})
+		}
+	}
 	handler.publisherEphemeralTypes = publisherEphemeralTypes(handler.ephemeralEventVariants)
 	// Pending target joins are Hub-owned. The historical configuration field is
 	// retained for source compatibility but cannot replace this socket boundary.
@@ -151,6 +163,7 @@ type webSocketHandler struct {
 	sessionCredentialLifecycle        auth.SessionCredentialLifecycle
 	sessionCredentialEvidenceResolver auth.SessionCredentialEvidenceResolver
 	warmAttachCredentialHandoff       WarmAttachCredentialHandoff
+	activityDispatcher                *ActivityDispatcher
 
 	mu          sync.Mutex
 	subscribers map[string]map[*clientConnection]struct{}
@@ -167,6 +180,13 @@ type webSocketHandler struct {
 	pendingTargetJoins        map[string]*pendingTargetJoin
 	pendingTargetJoinByAttach map[string]*pendingTargetJoin
 	pendingTargetJoinTimer    func(time.Duration, func()) *time.Timer
+}
+
+func (h *webSocketHandler) RunActivityDispatcher(ctx context.Context) error {
+	if h.activityDispatcher == nil {
+		return nil
+	}
+	return h.activityDispatcher.Run(ctx)
 }
 
 // adapterCredentialActivationRollback is an internal recovery boundary. A

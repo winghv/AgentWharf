@@ -99,6 +99,30 @@ type AttentionSummaryStore interface {
 	AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]SessionAttentionSummary, error)
 }
 
+const MaxAttentionSummaryPageSize = 100
+
+// AttentionSummaryPageRequest is a bounded, read-only keyset scan over the
+// Store-owned projection. AfterSessionID is the exclusive last key returned by
+// a prior page; it is never interpreted as a platform identifier.
+type AttentionSummaryPageRequest struct {
+	AfterSessionID string
+	Limit          int
+}
+
+// AttentionSummaryPage contains an ordered page and an exclusive continuation
+// key. A nil continuation means the scan is complete.
+type AttentionSummaryPage struct {
+	Summaries          []SessionAttentionSummary
+	NextAfterSessionID *string
+}
+
+// AttentionSummaryPageStore exposes bounded restart-safe scans without
+// granting callers any mutation or access to EventStore implementation state.
+type AttentionSummaryPageStore interface {
+	AttentionSummaryStore
+	AttentionSummaryPage(context.Context, AttentionSummaryPageRequest) (AttentionSummaryPage, error)
+}
+
 const (
 	RetentionComplete = "complete"
 	RetentionGap      = "retention_gap"

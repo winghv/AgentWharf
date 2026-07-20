@@ -30,6 +30,27 @@ func TestAttentionSummaryStoreContract(t *testing.T) {
 	var _ store.AttentionSummaryStore = (*sqlite.Store)(nil)
 }
 
+func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
+	attention := openStore(t, filepath.Join(t.TempDir(), "attention-page.db"))
+	ctx := context.Background()
+	for _, sessionID := range []string{"ses_page_a", "ses_page_b", "ses_page_c"} {
+		if _, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+			t.Fatalf("seed %s: %v", sessionID, err)
+		}
+	}
+	page, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 2})
+	if err != nil || len(page.Summaries) != 2 || page.Summaries[0].SessionID != "ses_page_a" || page.NextAfterSessionID == nil || *page.NextAfterSessionID != "ses_page_b" {
+		t.Fatalf("first page = %+v, %v", page, err)
+	}
+	next, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{AfterSessionID: *page.NextAfterSessionID, Limit: 2})
+	if err != nil || len(next.Summaries) != 1 || next.Summaries[0].SessionID != "ses_page_c" || next.NextAfterSessionID != nil {
+		t.Fatalf("second page = %+v, %v", next, err)
+	}
+	if _, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 0}); err == nil {
+		t.Fatal("zero page limit was accepted")
+	}
+}
+
 func TestWarmAttachStoreContract(t *testing.T) {
 	var _ store.WarmAttachStore = (*sqlite.Store)(nil)
 	storetest.WarmAttachContract(t, storetest.WarmAttachHarness{
