@@ -114,6 +114,27 @@ func (issuer *LocalSessionCredentialIssuer) ActivateSessionCredential(ctx contex
 	return nil
 }
 
+// ValidateSessionCredentialActivation proves that the exact prepared bearer
+// can be activated before a caller commits its durable Store tuple. A
+// successful preflight makes the subsequent activation infallible for this
+// issuer under the caller's non-cancellable context.
+func (issuer *LocalSessionCredentialIssuer) ValidateSessionCredentialActivation(ctx context.Context, prepared PreparedSessionCredential) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if issuer == nil || prepared.Bearer == "" || !prepared.ExpiresAt.After(time.Now()) {
+		return ErrUnauthorized
+	}
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	issuer.discardExpiredLocked(time.Now())
+	stored, ok := issuer.prepared[prepared.Bearer]
+	if !ok || stored != prepared {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
 // DiscardSessionCredential removes a pending or active bearer when durable commit
 // or delivery cannot prove that it remains safe to use.
 func (issuer *LocalSessionCredentialIssuer) DiscardSessionCredential(_ context.Context, prepared PreparedSessionCredential) {

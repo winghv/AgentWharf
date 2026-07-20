@@ -164,8 +164,8 @@ type webSocketHandler struct {
 // adapterCredentialActivationRollback is an internal recovery boundary. A
 // lifecycle failure after the durable CAS must restore the exact prior active
 // tuple before the Hub reports rotation failure.
-type adapterCredentialActivationRollback interface {
-	RollbackAdapterCredentialActivation(context.Context, string, store.AdapterCredentialActivation, int64, time.Time) (store.AdapterConnection, error)
+type sessionCredentialActivationPreflight interface {
+	ValidateSessionCredentialActivation(context.Context, auth.PreparedSessionCredential) error
 }
 
 type adapterConnection struct {
@@ -455,6 +455,11 @@ func (h *webSocketHandler) handleCredentialRotationPossession(ctx context.Contex
 		if err != nil {
 			return err
 		}
+		preflight, ok := h.sessionCredentialLifecycle.(sessionCredentialActivationPreflight)
+		if !ok || preflight.ValidateSessionCredentialActivation(context.WithoutCancel(ctx), prepared) != nil {
+			h.discardRotationCredential(ctx, prepared)
+			return errors.New("validate rotated credential activation")
+		}
 		activated, err := h.adapterAuthority.store.ActivateAdapterCredential(ctx, adapter.sessionID, store.AdapterCredentialActivation{
 			ExpectedActiveCredentialGeneration: connection.ActiveCredentialGeneration, ExpectedEpoch: connection.ConnectionEpoch,
 			PendingGeneration: possession.Generation, RotationID: possession.RotationID,
@@ -462,20 +467,7 @@ func (h *webSocketHandler) handleCredentialRotationPossession(ctx context.Contex
 		if err != nil || activated.ActiveCredentialGeneration != possession.Generation || activated.ConnectionEpoch <= connection.ConnectionEpoch || activated.AcceptedFence <= connection.AcceptedFence {
 			return errors.New("activate credential rotation")
 		}
-		if activationErr := h.sessionCredentialLifecycle.ActivateSessionCredential(context.WithoutCancel(ctx), prepared); activationErr != nil {
-			rollbacker, ok := h.adapterAuthority.store.(adapterCredentialActivationRollback)
-			if !ok {
-				return errors.New("activate rotated credential without rollback")
-			}
-			if _, rollbackErr := rollbacker.RollbackAdapterCredentialActivation(context.WithoutCancel(ctx), adapter.sessionID, store.AdapterCredentialActivation{
-				ExpectedActiveCredentialGeneration: activated.ActiveCredentialGeneration,
-				ExpectedEpoch:                      activated.ConnectionEpoch,
-				PendingGeneration:                  possession.Generation,
-				RotationID:                         possession.RotationID,
-			}, connection.ActiveCredentialGeneration, connection.ActiveCredentialExpiresAt); rollbackErr != nil {
-				return fmt.Errorf("activate rotated credential: %v; rollback: %w", activationErr, rollbackErr)
-			}
-			h.discardRotationCredential(ctx, prepared)
+		if h.sessionCredentialLifecycle.ActivateSessionCredential(context.WithoutCancel(ctx), prepared) != nil {
 			return errors.New("activate rotated credential")
 		}
 		if err := adapter.writeFrame(ctx, &protocol.CredentialRotationActivation{RotationID: possession.RotationID, Generation: activated.ActiveCredentialGeneration, ConnectionEpoch: activated.ConnectionEpoch, AcceptedFence: activated.AcceptedFence}); err != nil {

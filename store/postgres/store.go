@@ -850,42 +850,6 @@ func (s *Store) ActivateAdapterCredential(ctx context.Context, sessionID string,
 	return adapterConnection(row), nil
 }
 
-// RollbackAdapterCredentialActivation restores the prior active generation
-// after a post-commit local lifecycle failure. The high watermark is retained
-// and a new epoch/fence prevents the failed socket from continuing.
-func (s *Store) RollbackAdapterCredentialActivation(ctx context.Context, sessionID string, activation store.AdapterCredentialActivation, priorGeneration int64, priorExpiresAt time.Time) (store.AdapterConnection, error) {
-	if !validConnectionID(sessionID) || activation.ExpectedActiveCredentialGeneration < 1 || activation.ExpectedEpoch < 1 ||
-		activation.PendingGeneration < 1 || !validAttachmentText(activation.RotationID, 255) || priorGeneration < 1 || priorExpiresAt.IsZero() {
-		return store.AdapterConnection{}, errors.New("invalid adapter credential rollback")
-	}
-	statement := `UPDATE session_adapter_connections
-SET active_credential_generation = $1, active_credential_expires_at = $2,
-    prior_recovery_credential_generation = NULL, connection_epoch = connection_epoch + 1,
-    accepted_fence = nextval('session_adapter_connection_accepted_fence_seq'), updated_at = clock_timestamp()
-WHERE session_id = $3 AND active_credential_generation = $4 AND connection_epoch = $5
-  AND prior_recovery_credential_generation = $6 AND pending_credential_generation IS NULL AND rotation_id IS NULL
-  AND active_credential_expires_at > clock_timestamp() AND $2::TIMESTAMPTZ > clock_timestamp()
-  AND revoked_at IS NULL AND terminal_at IS NULL`
-	var affected int64
-	var err error
-	if s.connectionTx != nil {
-		tag, execErr := s.connectionTx.Exec(ctx, statement, priorGeneration, priorExpiresAt, sessionID, activation.ExpectedActiveCredentialGeneration, activation.ExpectedEpoch, priorGeneration)
-		err, affected = execErr, tag.RowsAffected()
-	} else if s.pool != nil {
-		tag, execErr := s.pool.Exec(ctx, statement, priorGeneration, priorExpiresAt, sessionID, activation.ExpectedActiveCredentialGeneration, activation.ExpectedEpoch, priorGeneration)
-		err, affected = execErr, tag.RowsAffected()
-	} else {
-		return store.AdapterConnection{}, errors.New("postgres event store pool is nil")
-	}
-	if err != nil {
-		return store.AdapterConnection{}, fmt.Errorf("rollback adapter credential activation: %w", err)
-	}
-	if affected != 1 {
-		return store.AdapterConnection{}, errors.New("adapter credential rollback state conflict")
-	}
-	return s.AdapterConnection(ctx, sessionID)
-}
-
 func (s *Store) AdapterConnection(ctx context.Context, sessionID string) (store.AdapterConnection, error) {
 	if !validConnectionID(sessionID) {
 		return store.AdapterConnection{}, errors.New("invalid adapter connection session")

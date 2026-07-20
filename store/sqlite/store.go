@@ -1754,22 +1754,6 @@ AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL`, true, func(nowMS, fence i
 	})
 }
 
-// RollbackAdapterCredentialActivation restores the prior active generation
-// after a post-commit local lifecycle failure. The high watermark is retained
-// and a new epoch/fence prevents the failed socket from continuing.
-func (s *Store) RollbackAdapterCredentialActivation(ctx context.Context, sessionID string, activation store.AdapterCredentialActivation, priorGeneration int64, priorExpiresAt time.Time) (store.AdapterConnection, error) {
-	if !validConnectionID(sessionID) || activation.ExpectedActiveCredentialGeneration < 1 || activation.ExpectedEpoch < 1 ||
-		activation.PendingGeneration < 1 || !validAttachmentText(activation.RotationID, 255) || priorGeneration < 1 || priorExpiresAt.IsZero() {
-		return store.AdapterConnection{}, errors.New("invalid adapter credential rollback")
-	}
-	return s.updateConnection(ctx, sessionID, `UPDATE session_adapter_connections SET active_credential_generation = ?, active_credential_expires_at_ms = ?, prior_recovery_credential_generation = NULL, connection_epoch = connection_epoch + 1, accepted_fence = ?, updated_at_ms = ?
-WHERE session_id = ? AND active_credential_generation = ? AND connection_epoch = ? AND prior_recovery_credential_generation = ?
-AND pending_credential_generation IS NULL AND rotation_id IS NULL AND active_credential_expires_at_ms > ? AND ? > ? AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL`, true, func(nowMS, fence int64) []any {
-		return []any{priorGeneration, priorExpiresAt.UnixMilli(), fence, nowMS, sessionID, activation.ExpectedActiveCredentialGeneration,
-			activation.ExpectedEpoch, priorGeneration, nowMS, priorExpiresAt.UnixMilli(), nowMS}
-	})
-}
-
 func (s *Store) AdapterConnection(ctx context.Context, sessionID string) (store.AdapterConnection, error) {
 	if !validConnectionID(sessionID) {
 		return store.AdapterConnection{}, errors.New("invalid adapter connection session")
