@@ -72,6 +72,62 @@ func (q *Queries) AttentionStoreNow(ctx context.Context) (pgtype.Timestamptz, er
 	return column_1, err
 }
 
+const attentionSummaryPage = `-- name: AttentionSummaryPage :many
+SELECT session_id, latest_seq, state, permission_id, permission_status,
+       terminal_outcome, latest_change_seq, blocker_kind, blocker_reason,
+       blocker_expires_at, blocking_session_id, blocker_operation,
+       summary_version, last_durable_event_at, last_client_command_at,
+       projection_state, created_at, updated_at
+FROM session_attention_summaries
+WHERE session_id > $1::TEXT
+ORDER BY session_id ASC
+LIMIT $2::INT
+`
+
+type AttentionSummaryPageParams struct {
+	AfterSessionID string
+	PageLimit      int32
+}
+
+func (q *Queries) AttentionSummaryPage(ctx context.Context, arg AttentionSummaryPageParams) ([]SessionAttentionSummary, error) {
+	rows, err := q.db.Query(ctx, attentionSummaryPage, arg.AfterSessionID, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SessionAttentionSummary
+	for rows.Next() {
+		var i SessionAttentionSummary
+		if err := rows.Scan(
+			&i.SessionID,
+			&i.LatestSeq,
+			&i.State,
+			&i.PermissionID,
+			&i.PermissionStatus,
+			&i.TerminalOutcome,
+			&i.LatestChangeSeq,
+			&i.BlockerKind,
+			&i.BlockerReason,
+			&i.BlockerExpiresAt,
+			&i.BlockingSessionID,
+			&i.BlockerOperation,
+			&i.SummaryVersion,
+			&i.LastDurableEventAt,
+			&i.LastClientCommandAt,
+			&i.ProjectionState,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const fenceAttentionTerminal = `-- name: FenceAttentionTerminal :exec
 UPDATE session_adapter_connections
 SET revoked_at = clock_timestamp(), terminal_at = clock_timestamp(), updated_at = clock_timestamp()
