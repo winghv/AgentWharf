@@ -377,6 +377,7 @@ type SessionCredentialLineageKind string
 const (
 	SessionCredentialBootstrapInitial SessionCredentialLineageKind = "bootstrap_initial"
 	SessionCredentialTargetAttach     SessionCredentialLineageKind = "target_attach"
+	SessionCredentialTargetRotation   SessionCredentialLineageKind = "target_rotation"
 )
 
 type SessionCredentialLineage struct {
@@ -403,6 +404,23 @@ type PreparedSessionCredential struct {
 	RevocationID string
 	ExpiresAt    time.Time
 	Scope        Scope
+}
+
+// SessionCredentialEvidence is verified adapter credential metadata for the
+// Hub boundary. It deliberately excludes the bearer and is never durable.
+type SessionCredentialEvidence struct {
+	SessionID    string
+	Lineage      SessionCredentialLineage
+	Generation   int64
+	RotationID   string
+	RevocationID string
+	ExpiresAt    time.Time
+}
+
+// SessionCredentialEvidenceResolver verifies a bearer at the Auth boundary
+// and returns only metadata needed to bind a live Adapter connection.
+type SessionCredentialEvidenceResolver interface {
+	SessionCredentialEvidence(context.Context, string) (SessionCredentialEvidence, error)
 }
 
 // SessionCredentialIssuer prepares one in-memory Adapter bearer. It makes no

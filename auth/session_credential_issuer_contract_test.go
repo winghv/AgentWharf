@@ -31,6 +31,7 @@ func SessionCredentialIssuerContract(t *testing.T, harness SessionCredentialIssu
 	for _, request := range []SessionCredentialRequest{
 		{SessionID: "ses_bootstrap", Lineage: SessionCredentialLineage{Kind: SessionCredentialBootstrapInitial}, Generation: 1, RotationID: "rot_bootstrap", RevocationID: "revoke_bootstrap", ExpiresAt: time.Now().Add(time.Minute)},
 		{SessionID: "ses_target", Lineage: SessionCredentialLineage{Kind: SessionCredentialTargetAttach, AttachID: "attach_1", JTI: "jti_1"}, Generation: 2, RotationID: "rot_target", RevocationID: "revoke_target", ExpiresAt: time.Now().Add(time.Minute)},
+		{SessionID: "ses_target_rotation", Lineage: SessionCredentialLineage{Kind: SessionCredentialTargetRotation, AttachID: "attach_rotation"}, Generation: 3, RotationID: "rot_target_rotation", RevocationID: "revoke_target_rotation", ExpiresAt: time.Now().Add(time.Minute)},
 	} {
 		prepared, err := issuer.PrepareSessionCredential(context.Background(), request)
 		if err != nil {
@@ -98,6 +99,10 @@ func (issuer *memorySessionCredentialIssuer) PrepareSessionCredential(_ context.
 	case SessionCredentialTargetAttach:
 		if request.Lineage.AttachID == "" || request.Lineage.JTI == "" {
 			return PreparedSessionCredential{}, errors.New("invalid target lineage")
+		}
+	case SessionCredentialTargetRotation:
+		if request.Lineage.AttachID == "" || request.Lineage.JTI != "" {
+			return PreparedSessionCredential{}, errors.New("invalid target rotation lineage")
 		}
 	default:
 		return PreparedSessionCredential{}, errors.New("invalid session credential lineage")

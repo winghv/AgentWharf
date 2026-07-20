@@ -117,3 +117,29 @@ func TestLocalSessionCredentialIssuerFailsClosedAndKeepsBearerOpaque(t *testing.
 		t.Fatal("canceled prepare unexpectedly succeeded")
 	}
 }
+
+func TestLocalSessionCredentialIssuerRecoversSealedCredentialAfterRestart(t *testing.T) {
+	key := []byte("test-only-session-credential-restart-key")
+	issuer, err := NewLocalSessionCredentialIssuer(key, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := issuer.PrepareSessionCredential(context.Background(), SessionCredentialRequest{
+		SessionID: "ses_target", Lineage: SessionCredentialLineage{Kind: SessionCredentialTargetRotation, AttachID: "att_target"},
+		Generation: 2, RotationID: "rot_2", RevocationID: "rev_2", ExpiresAt: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.ActivateSessionCredential(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewLocalSessionCredentialIssuer(key, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := restarted.ActiveSessionCredential(context.Background(), prepared.Bearer)
+	if err != nil || actual.Bearer != prepared.Bearer || actual.SessionID != prepared.SessionID || actual.Lineage != prepared.Lineage || actual.Generation != prepared.Generation || actual.RotationID != prepared.RotationID || actual.RevocationID != prepared.RevocationID || !actual.ExpiresAt.Equal(prepared.ExpiresAt) || actual.Scope != prepared.Scope {
+		t.Fatalf("restart credential = %+v, %v; want %+v", actual, err, prepared)
+	}
+}
