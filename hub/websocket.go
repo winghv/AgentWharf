@@ -23,17 +23,20 @@ const maxAcceptedCommandIDs = 4096
 const maxDecisionRequestIDs = 4096
 const adapterEventBatchWindow = 50 * time.Millisecond
 const adapterEventBatchMaxEvents = 64
+const credentialRotationTTL = 15 * time.Minute
 
 var errReplayBufferOverflow = errors.New("replay buffer overflow")
+var errRotationActivated = errors.New("adapter credential rotation activated")
 
 type WebSocketConfig struct {
-	Handshake                  *Handshake
-	EventStore                 store.EventStore
-	HandshakeTimeout           time.Duration
-	CommandActivityObserver    CommandActivityObserver
-	AdapterActivityObserver    AdapterActivityObserver
-	SessionCredentialIssuer    auth.SessionCredentialIssuer
-	SessionCredentialLifecycle auth.SessionCredentialLifecycle
+	Handshake                         *Handshake
+	EventStore                        store.EventStore
+	HandshakeTimeout                  time.Duration
+	CommandActivityObserver           CommandActivityObserver
+	AdapterActivityObserver           AdapterActivityObserver
+	SessionCredentialIssuer           auth.SessionCredentialIssuer
+	SessionCredentialLifecycle        auth.SessionCredentialLifecycle
+	SessionCredentialEvidenceResolver auth.SessionCredentialEvidenceResolver
 	// Deprecated: credential delivery is always the Hub-owned pending target
 	// socket. Retained only to avoid a source-incompatible config removal.
 	WarmAttachCredentialHandoff WarmAttachCredentialHandoff
@@ -70,24 +73,32 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 	if timeout <= 0 {
 		timeout = defaultHandshakeTimeout
 	}
+	evidenceResolver := cfg.SessionCredentialEvidenceResolver
+	if evidenceResolver == nil {
+		evidenceResolver, _ = cfg.SessionCredentialIssuer.(auth.SessionCredentialEvidenceResolver)
+	}
+	if evidenceResolver == nil && cfg.Handshake != nil {
+		evidenceResolver, _ = cfg.Handshake.authenticator.(auth.SessionCredentialEvidenceResolver)
+	}
 	handler := &webSocketHandler{
-		handshake:                   cfg.Handshake,
-		events:                      cfg.EventStore,
-		handshakeTimeout:            timeout,
-		commandActivityObserver:     cfg.CommandActivityObserver,
-		adapterActivityObserver:     cfg.AdapterActivityObserver,
-		sessionCredentialIssuer:     cfg.SessionCredentialIssuer,
-		sessionCredentialLifecycle:  cfg.SessionCredentialLifecycle,
-		warmAttachCredentialHandoff: cfg.WarmAttachCredentialHandoff,
-		adapterAuthority:            newAdapterDispatchAuthority(cfg.Handshake, cfg.EventStore),
-		adapterAdmissionLocks:       make(map[string]chan struct{}),
-		subscribers:                 make(map[string]map[*clientConnection]struct{}),
-		adapters:                    make(map[string]*adapterConnection),
-		pendingCommands:             make(map[string][]queuedCommand),
-		acceptedCommands:            make(map[string]struct{}),
-		decisions:                   make(map[string]struct{}),
-		pendingTargetJoins:          make(map[string]*pendingTargetJoin),
-		pendingTargetJoinByAttach:   make(map[string]*pendingTargetJoin),
+		handshake:                         cfg.Handshake,
+		events:                            cfg.EventStore,
+		handshakeTimeout:                  timeout,
+		commandActivityObserver:           cfg.CommandActivityObserver,
+		adapterActivityObserver:           cfg.AdapterActivityObserver,
+		sessionCredentialIssuer:           cfg.SessionCredentialIssuer,
+		sessionCredentialLifecycle:        cfg.SessionCredentialLifecycle,
+		sessionCredentialEvidenceResolver: evidenceResolver,
+		warmAttachCredentialHandoff:       cfg.WarmAttachCredentialHandoff,
+		adapterAuthority:                  newAdapterDispatchAuthority(cfg.Handshake, cfg.EventStore),
+		adapterAdmissionLocks:             make(map[string]chan struct{}),
+		subscribers:                       make(map[string]map[*clientConnection]struct{}),
+		adapters:                          make(map[string]*adapterConnection),
+		pendingCommands:                   make(map[string][]queuedCommand),
+		acceptedCommands:                  make(map[string]struct{}),
+		decisions:                         make(map[string]struct{}),
+		pendingTargetJoins:                make(map[string]*pendingTargetJoin),
+		pendingTargetJoinByAttach:         make(map[string]*pendingTargetJoin),
 	}
 	// Pending target joins are Hub-owned. The historical configuration field is
 	// retained for source compatibility but cannot replace this socket boundary.
@@ -119,18 +130,19 @@ func (h *webSocketHandler) EmitEphemeralEvent(ctx context.Context, ev protocol.E
 }
 
 type webSocketHandler struct {
-	handshake                   *Handshake
-	events                      store.EventStore
-	handshakeTimeout            time.Duration
-	commandActivityObserver     CommandActivityObserver
-	adapterActivityObserver     AdapterActivityObserver
-	adapterAuthority            *adapterDispatchAuthority
-	adapterAdmissionMu          sync.Mutex
-	adapterAdmissionLocks       map[string]chan struct{}
-	publication                 sessionPublicationGates
-	sessionCredentialIssuer     auth.SessionCredentialIssuer
-	sessionCredentialLifecycle  auth.SessionCredentialLifecycle
-	warmAttachCredentialHandoff WarmAttachCredentialHandoff
+	handshake                         *Handshake
+	events                            store.EventStore
+	handshakeTimeout                  time.Duration
+	commandActivityObserver           CommandActivityObserver
+	adapterActivityObserver           AdapterActivityObserver
+	adapterAuthority                  *adapterDispatchAuthority
+	adapterAdmissionMu                sync.Mutex
+	adapterAdmissionLocks             map[string]chan struct{}
+	publication                       sessionPublicationGates
+	sessionCredentialIssuer           auth.SessionCredentialIssuer
+	sessionCredentialLifecycle        auth.SessionCredentialLifecycle
+	sessionCredentialEvidenceResolver auth.SessionCredentialEvidenceResolver
+	warmAttachCredentialHandoff       WarmAttachCredentialHandoff
 
 	mu          sync.Mutex
 	subscribers map[string]map[*clientConnection]struct{}
@@ -150,15 +162,16 @@ type webSocketHandler struct {
 }
 
 type adapterConnection struct {
-	conn            *managedConn
-	writeGate       contextWriteGate
-	effectMu        sync.Mutex
-	sessionID       string
-	provider        string
-	protocolVersion int
-	handler         *webSocketHandler
-	admission       store.AdapterConnectionAdmission
-	events          *adapterEventBatcher
+	conn               *managedConn
+	writeGate          contextWriteGate
+	effectMu           sync.Mutex
+	sessionID          string
+	provider           string
+	protocolVersion    int
+	handler            *webSocketHandler
+	admission          store.AdapterConnectionAdmission
+	credentialEvidence auth.SessionCredentialEvidence
+	events             *adapterEventBatcher
 }
 
 type queuedCommand struct {
@@ -337,9 +350,156 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *managedConn, acce
 				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "client command ack frames are not accepted"})
 			}
 			continue
+		case *protocol.CredentialRotationRequest:
+			if accepted.Role != protocol.RoleAdapter || accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "credential rotation is v2 Adapter-only"})
+				continue
+			}
+			if err := h.handleCredentialRotationRequest(ctx, adapter, typed); err != nil {
+				continue
+			}
+		case *protocol.CredentialRotationPossession:
+			if accepted.Role != protocol.RoleAdapter || accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "credential rotation is v2 Adapter-only"})
+				continue
+			}
+			if err := h.handleCredentialRotationPossession(ctx, adapter, typed); err != nil {
+				if errors.Is(err, errRotationActivated) {
+					return
+				}
+				continue
+			}
 		default:
 			_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: fmt.Sprintf("unsupported frame %s", typed.FrameName())})
 		}
+	}
+}
+
+func (h *webSocketHandler) handleCredentialRotationRequest(ctx context.Context, adapter *adapterConnection, request *protocol.CredentialRotationRequest) error {
+	if adapter == nil || request == nil || request.RotationID == "" || h.adapterAuthority == nil || h.sessionCredentialLifecycle == nil {
+		return errors.New("invalid credential rotation request")
+	}
+	err := h.withAdapterEffect(ctx, adapter, func() error {
+		connection, err := h.adapterAuthority.store.AdapterConnection(ctx, adapter.sessionID)
+		if err != nil || connection.ActiveCredentialGeneration != adapter.admission.CredentialGeneration || connection.ConnectionEpoch != adapter.admission.ConnectionEpoch {
+			return errAdapterAuthorityLost
+		}
+		if connection.PendingCredentialGeneration != nil || connection.PendingCredentialExpiresAt != nil || connection.RotationID != nil {
+			if connection.PendingCredentialGeneration == nil || connection.PendingCredentialExpiresAt == nil || connection.RotationID == nil || *connection.RotationID != request.RotationID {
+				return errors.New("credential rotation is already pending")
+			}
+			prepared, err := h.prepareRotationCredential(ctx, adapter, request.RotationID, *connection.PendingCredentialGeneration, *connection.PendingCredentialExpiresAt)
+			if err != nil {
+				return err
+			}
+			return h.deliverRotationCredential(ctx, adapter, prepared)
+		}
+		if adapter.credentialEvidence.RotationID == request.RotationID && adapter.credentialEvidence.Generation == connection.ActiveCredentialGeneration && connection.PriorRecoveryGeneration != nil {
+			return adapter.writeFrame(ctx, &protocol.CredentialRotationActivation{
+				RotationID: request.RotationID, Generation: connection.ActiveCredentialGeneration,
+				ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence,
+			})
+		}
+		expiresAt := time.Now().UTC().Add(credentialRotationTTL).Truncate(time.Millisecond)
+		prepared, err := h.prepareRotationCredential(ctx, adapter, request.RotationID, connection.CredentialGenerationHighWatermark+1, expiresAt)
+		if err != nil {
+			return err
+		}
+		pending, err := h.adapterAuthority.store.PrepareAdapterCredentialRotation(ctx, adapter.sessionID, store.AdapterCredentialRotation{
+			ExpectedActiveCredentialGeneration: connection.ActiveCredentialGeneration, ExpectedEpoch: connection.ConnectionEpoch,
+			PendingGeneration: prepared.Generation, ExpiresAt: prepared.ExpiresAt, RotationID: request.RotationID,
+		})
+		if err != nil || pending.PendingCredentialGeneration == nil || *pending.PendingCredentialGeneration != prepared.Generation || pending.RotationID == nil || *pending.RotationID != request.RotationID {
+			h.discardRotationCredential(ctx, prepared)
+			return errors.New("prepare credential rotation")
+		}
+		return h.deliverRotationCredential(ctx, adapter, prepared)
+	})
+	if err != nil {
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "credential_rotation_rejected", Message: "credential rotation rejected"})
+	}
+	return err
+}
+
+func (h *webSocketHandler) handleCredentialRotationPossession(ctx context.Context, adapter *adapterConnection, possession *protocol.CredentialRotationPossession) error {
+	if adapter == nil || possession == nil || possession.SessionID != adapter.sessionID || possession.AcceptedEpoch != adapter.admission.ConnectionEpoch || h.adapterAuthority == nil {
+		err := errors.New("invalid credential rotation possession")
+		if adapter != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "credential_rotation_rejected", Message: "credential rotation rejected"})
+		}
+		return err
+	}
+	err := h.withAdapterEffect(ctx, adapter, func() error {
+		connection, err := h.adapterAuthority.store.AdapterConnection(ctx, adapter.sessionID)
+		if err != nil || connection.ActiveCredentialGeneration != adapter.admission.CredentialGeneration || connection.ConnectionEpoch != adapter.admission.ConnectionEpoch ||
+			connection.PendingCredentialGeneration == nil || connection.PendingCredentialExpiresAt == nil || connection.RotationID == nil ||
+			*connection.PendingCredentialGeneration != possession.Generation || *connection.RotationID != possession.RotationID {
+			return errAdapterAuthorityLost
+		}
+		prepared, err := h.prepareRotationCredential(ctx, adapter, possession.RotationID, possession.Generation, *connection.PendingCredentialExpiresAt)
+		if err != nil {
+			return err
+		}
+		activated, err := h.adapterAuthority.store.ActivateAdapterCredential(ctx, adapter.sessionID, store.AdapterCredentialActivation{
+			ExpectedActiveCredentialGeneration: connection.ActiveCredentialGeneration, ExpectedEpoch: connection.ConnectionEpoch,
+			PendingGeneration: possession.Generation, RotationID: possession.RotationID,
+		})
+		if err != nil || activated.ActiveCredentialGeneration != possession.Generation || activated.ConnectionEpoch <= connection.ConnectionEpoch || activated.AcceptedFence <= connection.AcceptedFence {
+			return errors.New("activate credential rotation")
+		}
+		if h.sessionCredentialLifecycle.ActivateSessionCredential(context.WithoutCancel(ctx), prepared) != nil {
+			return errors.New("activate rotated credential")
+		}
+		if err := adapter.writeFrame(ctx, &protocol.CredentialRotationActivation{RotationID: possession.RotationID, Generation: activated.ActiveCredentialGeneration, ConnectionEpoch: activated.ConnectionEpoch, AcceptedFence: activated.AcceptedFence}); err != nil {
+			return err
+		}
+		return errRotationActivated
+	})
+	if err != nil && !errors.Is(err, errRotationActivated) {
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "credential_rotation_rejected", Message: "credential rotation rejected"})
+	}
+	return err
+}
+
+func (h *webSocketHandler) prepareRotationCredential(ctx context.Context, adapter *adapterConnection, rotationID string, generation int64, expiresAt time.Time) (auth.PreparedSessionCredential, error) {
+	if h.sessionCredentialIssuer == nil || adapter == nil || generation < 1 || !expiresAt.After(time.Now()) || rotationID == "" {
+		return auth.PreparedSessionCredential{}, auth.ErrUnauthorized
+	}
+	lineage, ok := rotationLineage(adapter.credentialEvidence.Lineage)
+	if !ok {
+		return auth.PreparedSessionCredential{}, auth.ErrUnauthorized
+	}
+	prepared, err := h.sessionCredentialIssuer.PrepareSessionCredential(ctx, auth.SessionCredentialRequest{
+		SessionID: adapter.sessionID, Lineage: lineage, Generation: generation, RotationID: rotationID, RevocationID: rotationID, ExpiresAt: expiresAt,
+	})
+	if err != nil || prepared.Bearer == "" || prepared.SessionID != adapter.sessionID || prepared.Lineage != lineage || prepared.Generation != generation ||
+		prepared.RotationID != rotationID || prepared.RevocationID != rotationID || !prepared.ExpiresAt.Equal(expiresAt) || prepared.Scope != auth.SessionAdapter(adapter.sessionID) {
+		return auth.PreparedSessionCredential{}, auth.ErrUnauthorized
+	}
+	return prepared, nil
+}
+
+func rotationLineage(lineage auth.SessionCredentialLineage) (auth.SessionCredentialLineage, bool) {
+	switch lineage.Kind {
+	case auth.SessionCredentialBootstrapInitial:
+		return auth.SessionCredentialLineage{Kind: auth.SessionCredentialBootstrapInitial}, true
+	case auth.SessionCredentialTargetAttach, auth.SessionCredentialTargetRotation:
+		if lineage.AttachID != "" {
+			return auth.SessionCredentialLineage{Kind: auth.SessionCredentialTargetRotation, AttachID: lineage.AttachID}, true
+		}
+	}
+	return auth.SessionCredentialLineage{}, false
+}
+
+func (h *webSocketHandler) deliverRotationCredential(ctx context.Context, adapter *adapterConnection, prepared auth.PreparedSessionCredential) error {
+	return h.adapterAuthority.withAdmission(ctx, adapter, func(effectCtx context.Context) error {
+		return adapter.writeFrame(effectCtx, &protocol.CredentialRotationCredential{SessionID: prepared.SessionID, RotationID: prepared.RotationID, Generation: prepared.Generation, Credential: prepared.Bearer, ExpiresAt: prepared.ExpiresAt.UnixMilli()})
+	})
+}
+
+func (h *webSocketHandler) discardRotationCredential(ctx context.Context, prepared auth.PreparedSessionCredential) {
+	if h.sessionCredentialLifecycle != nil {
+		h.sessionCredentialLifecycle.DiscardSessionCredential(ctx, prepared)
 	}
 }
 
@@ -511,11 +671,19 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *managedCon
 	}
 	_, unlock := h.lockAdapterAdmission(accepted.SessionID)
 	defer unlock()
-	admission, err := h.adapterAuthority.admit(ctx, token, accepted.Principal, accepted.SessionID)
+	generation, credentialExpiresAt, allowInitialize, err := h.adapterAuthority.authenticate(ctx, token, accepted.Principal, accepted.SessionID)
 	if err != nil {
 		return nil, err
 	}
-	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, protocolVersion: accepted.ProtocolVersion, handler: h, admission: admission}
+	evidence, err := h.resolveAdapterCredentialEvidence(ctx, token, accepted.SessionID, generation, credentialExpiresAt)
+	if err != nil {
+		return nil, errAdapterAuthorityLost
+	}
+	admission, err := h.adapterAuthority.admit(ctx, accepted.SessionID, generation, credentialExpiresAt, allowInitialize)
+	if err != nil {
+		return nil, err
+	}
+	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, protocolVersion: accepted.ProtocolVersion, handler: h, admission: admission, credentialEvidence: evidence}
 	if h.events != nil {
 		fencedStore := fencedAdapterEventStore{handler: h, adapter: adapter}
 		adapter.events = newAdapterEventBatcher(adapterEventBatcherConfig{
@@ -536,6 +704,36 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *managedCon
 		})
 	}
 	return adapter, nil
+}
+
+func (h *webSocketHandler) resolveAdapterCredentialEvidence(ctx context.Context, bearer, sessionID string, generation int64, credentialExpiresAt time.Time) (auth.SessionCredentialEvidence, error) {
+	if h.sessionCredentialEvidenceResolver != nil {
+		evidence, err := h.sessionCredentialEvidenceResolver.SessionCredentialEvidence(ctx, bearer)
+		if err == nil {
+			if evidence.SessionID != sessionID || evidence.Generation != generation || !evidence.ExpiresAt.Equal(credentialExpiresAt) ||
+				!validAdapterCredentialLineage(evidence.Lineage) {
+				return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+			}
+			return evidence, nil
+		}
+	}
+	if generation != 1 {
+		return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+	}
+	return auth.SessionCredentialEvidence{SessionID: sessionID, Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialBootstrapInitial}, Generation: 1}, nil
+}
+
+func validAdapterCredentialLineage(lineage auth.SessionCredentialLineage) bool {
+	switch lineage.Kind {
+	case auth.SessionCredentialBootstrapInitial:
+		return lineage.AttachID == "" && lineage.JTI == ""
+	case auth.SessionCredentialTargetAttach:
+		return lineage.AttachID != "" && lineage.JTI != ""
+	case auth.SessionCredentialTargetRotation:
+		return lineage.AttachID != "" && lineage.JTI == ""
+	default:
+		return false
+	}
 }
 
 func (h *webSocketHandler) publishAdapter(ctx context.Context, adapter *adapterConnection) error {

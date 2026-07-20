@@ -1729,6 +1729,10 @@ func TestAdapterDispatchRejectsGenerationAboveOneBeforeRotation(t *testing.T) {
 		connection.ActiveCredentialGeneration = 2
 		connection.CredentialGenerationHighWatermark = 2
 	})
+	before, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	handshake := testHandshakeWithCredential(events, adapterCredentialEvidence{Generation: 2, ExpiresAt: time.Now().Add(time.Hour)})
 	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
 	adapter := dialWebSocket(t, server.URL)
@@ -1738,6 +1742,140 @@ func TestAdapterDispatchRejectsGenerationAboveOneBeforeRotation(t *testing.T) {
 		if _, accepted := frame.(*protocol.HelloAck); accepted {
 			t.Fatalf("generation-2 Adapter received hello.ack before T18H")
 		}
+	}
+	after, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil || after.ConnectionEpoch != before.ConnectionEpoch || after.AcceptedFence != before.AcceptedFence {
+		t.Fatalf("missing evidence mutated connection: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
+func TestAdapterDispatchAdmitsVerifiedRotatedCredential(t *testing.T) {
+	events := newDispatchFenceStore()
+	events.mutateConnection(func(connection *store.AdapterConnection) {
+		connection.ActiveCredentialGeneration = 2
+		connection.CredentialGenerationHighWatermark = 2
+	})
+	expiresAt := time.Now().Add(time.Hour).UTC()
+	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: websocketTestAuth{
+		principals:  map[string]auth.Principal{"adapter-token": {Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_1")}}},
+		credentials: map[string]adapterCredentialEvidence{"adapter": {Generation: 2, ExpiresAt: expiresAt}},
+		evidences: map[string]auth.SessionCredentialEvidence{"adapter-token": {
+			SessionID: "ses_1", Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialTargetRotation, AttachID: "att_1"},
+			Generation: 2, RotationID: "rot_2", RevocationID: "rev_2", ExpiresAt: expiresAt,
+		}},
+	}, EventStore: events})
+	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "adapter-token")
+	if _, ok := readFrame(t, adapter).(*protocol.HelloAck); !ok {
+		t.Fatal("verified generation-2 Adapter did not receive hello.ack")
+	}
+}
+
+func TestWebSocketServerRotatesAdapterCredentialAfterExactPossession(t *testing.T) {
+	events := newDispatchFenceStore()
+	issuer := &recordingSessionCredentialIssuer{}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle = events, issuer, issuer
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	writeFrame(t, adapter, &protocol.CredentialRotationRequest{RotationID: "rot_2"})
+	credential, ok := readFrame(t, adapter).(*protocol.CredentialRotationCredential)
+	if !ok {
+		t.Fatal("rotation request did not return a credential")
+	}
+	if credential.SessionID != "ses_1" || credential.RotationID != "rot_2" || credential.Generation != 2 || credential.Credential == "" || credential.ExpiresAt <= time.Now().UnixMilli() {
+		t.Fatalf("rotation credential = %+v", credential)
+	}
+	writeFrame(t, adapter, &protocol.CredentialRotationRequest{RotationID: "rot_2"})
+	duplicate, ok := readFrame(t, adapter).(*protocol.CredentialRotationCredential)
+	if !ok || *duplicate != *credential {
+		t.Fatalf("duplicate rotation credential = %+v, want %+v", duplicate, credential)
+	}
+	writeFrame(t, adapter, &protocol.CredentialRotationPossession{SessionID: credential.SessionID, RotationID: credential.RotationID, Generation: credential.Generation, AcceptedEpoch: 1})
+	if rejected, ok := readFrame(t, adapter).(*protocol.Error); !ok || rejected.Code != "credential_rotation_rejected" {
+		t.Fatalf("wrong possession response = %+v", rejected)
+	}
+	connection, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil || connection.ActiveCredentialGeneration != 1 || connection.PendingCredentialGeneration == nil || *connection.PendingCredentialGeneration != 2 {
+		t.Fatalf("wrong possession changed connection = %+v, %v", connection, err)
+	}
+	writeFrame(t, adapter, &protocol.CredentialRotationPossession{SessionID: credential.SessionID, RotationID: credential.RotationID, Generation: credential.Generation, AcceptedEpoch: 2})
+	activation, ok := readFrame(t, adapter).(*protocol.CredentialRotationActivation)
+	if !ok {
+		t.Fatal("rotation possession did not return activation")
+	}
+	if activation.RotationID != "rot_2" || activation.Generation != 2 || activation.ConnectionEpoch != 3 || activation.AcceptedFence < 4 {
+		t.Fatalf("rotation activation = %+v", activation)
+	}
+	connection, err = events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil || connection.ActiveCredentialGeneration != 2 || connection.PendingCredentialGeneration != nil || connection.RotationID != nil || connection.PriorRecoveryGeneration == nil || *connection.PriorRecoveryGeneration != 1 {
+		t.Fatalf("rotated connection = %+v, %v", connection, err)
+	}
+	if issuer.activationCount() != 1 {
+		t.Fatalf("credential activation count = %d, want 1", issuer.activationCount())
+	}
+}
+
+func TestWebSocketServerRotationPossessionFailsClosedAfterRevocation(t *testing.T) {
+	events := newDispatchFenceStore()
+	issuer := &recordingSessionCredentialIssuer{}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore, cfg.SessionCredentialIssuer, cfg.SessionCredentialLifecycle = events, issuer, issuer
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	writeFrame(t, adapter, &protocol.CredentialRotationRequest{RotationID: "rot_2"})
+	credential := readFrame(t, adapter).(*protocol.CredentialRotationCredential)
+	events.mutateConnection(func(connection *store.AdapterConnection) {
+		now := time.Now().UTC()
+		connection.RevokedAt = &now
+	})
+	writeFrame(t, adapter, &protocol.CredentialRotationPossession{SessionID: credential.SessionID, RotationID: credential.RotationID, Generation: credential.Generation, AcceptedEpoch: 2})
+	if frame, err := readFrameWithin(adapter, time.Second); err == nil {
+		t.Fatalf("revoked rotation received frame %+v", frame)
+	}
+	connection, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil || connection.ActiveCredentialGeneration != 1 || connection.PendingCredentialGeneration == nil || issuer.activationCount() != 0 {
+		t.Fatalf("revoked possession activated rotation: connection=%+v activation=%d err=%v", connection, issuer.activationCount(), err)
+	}
+}
+
+func TestWebSocketServerRejectsRotationFramesOutsideV2Adapter(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		hello func(*testing.T, *websocket.Conn)
+	}{
+		{name: "v1_adapter", hello: func(t *testing.T, conn *websocket.Conn) { writeAdapterHello(t, conn, "adapter-token") }},
+		{name: "v2_client", hello: func(t *testing.T, conn *websocket.Conn) { writeClientHello(t, conn, "client-token", 0) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := newDispatchFenceStore()
+			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+			conn := dialWebSocket(t, server.URL)
+			defer conn.Close(websocket.StatusNormalClosure, "")
+			test.hello(t, conn)
+			_ = readFrame(t, conn).(*protocol.HelloAck)
+			for _, frame := range []protocol.Frame{
+				&protocol.CredentialRotationRequest{RotationID: "rot_2"},
+				&protocol.CredentialRotationPossession{SessionID: "ses_1", RotationID: "rot_2", Generation: 2, AcceptedEpoch: 2},
+			} {
+				writeFrame(t, conn, frame)
+				if rejected, ok := readFrame(t, conn).(*protocol.Error); !ok || rejected.Code != "unsupported_frame" {
+					t.Fatalf("%T response = %+v", frame, rejected)
+				}
+			}
+			connection, err := events.AdapterConnection(context.Background(), "ses_1")
+			if err != nil || connection.ActiveCredentialGeneration != 1 || connection.PendingCredentialGeneration != nil || connection.RotationID != nil {
+				t.Fatalf("unsupported rotation changed connection = %+v, %v", connection, err)
+			}
+		})
 	}
 }
 
@@ -2186,6 +2324,7 @@ func testHandshakeWithCredential(events store.EventStore, credential adapterCred
 type websocketTestAuth struct {
 	principals  map[string]auth.Principal
 	credentials map[string]adapterCredentialEvidence
+	evidences   map[string]auth.SessionCredentialEvidence
 }
 
 type adapterCredentialEvidence struct {
@@ -2313,6 +2452,14 @@ func (a websocketTestAuth) AdapterCredential(_ context.Context, _ string, princi
 		return 0, 0, false, auth.ErrUnauthorized
 	}
 	return evidence.Generation, evidence.ExpiresAt.UnixNano(), evidence.AllowInitialize, nil
+}
+
+func (a websocketTestAuth) SessionCredentialEvidence(_ context.Context, token string) (auth.SessionCredentialEvidence, error) {
+	evidence, ok := a.evidences[token]
+	if !ok {
+		return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+	}
+	return evidence, nil
 }
 
 func (a websocketTestAuth) SessionAdmissionClaim(_ context.Context, _ auth.Principal, sessionID string) (auth.SessionAdmissionClaim, error) {
@@ -2656,6 +2803,50 @@ func (s *dispatchFenceStore) ValidateAdapterAdmission(_ context.Context, session
 
 func (s *dispatchFenceStore) ValidateAdapterEffectAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
 	return s.ValidateAdapterAdmission(ctx, sessionID, admission)
+}
+
+func (s *dispatchFenceStore) PrepareAdapterCredentialRotation(_ context.Context, sessionID string, rotation store.AdapterCredentialRotation) (store.AdapterConnection, error) {
+	s.authorityMu.Lock()
+	defer s.authorityMu.Unlock()
+	connection := &s.connection
+	if sessionID != connection.SessionID || rotation.ExpectedActiveCredentialGeneration != connection.ActiveCredentialGeneration ||
+		rotation.ExpectedEpoch != connection.ConnectionEpoch || rotation.PendingGeneration <= connection.CredentialGenerationHighWatermark ||
+		rotation.RotationID == "" || !rotation.ExpiresAt.After(time.Now()) || connection.PendingCredentialGeneration != nil ||
+		connection.PendingCredentialExpiresAt != nil || connection.RotationID != nil || connection.RevokedAt != nil || connection.TerminalAt != nil ||
+		!connection.ActiveCredentialExpiresAt.After(time.Now()) {
+		return store.AdapterConnection{}, errors.New("adapter credential rotation rejected")
+	}
+	pendingGeneration, rotationID := rotation.PendingGeneration, rotation.RotationID
+	pendingExpiry := rotation.ExpiresAt
+	connection.PendingCredentialGeneration = &pendingGeneration
+	connection.PendingCredentialExpiresAt = &pendingExpiry
+	connection.RotationID = &rotationID
+	connection.CredentialGenerationHighWatermark = rotation.PendingGeneration
+	return *connection, nil
+}
+
+func (s *dispatchFenceStore) ActivateAdapterCredential(_ context.Context, sessionID string, activation store.AdapterCredentialActivation) (store.AdapterConnection, error) {
+	s.authorityMu.Lock()
+	defer s.authorityMu.Unlock()
+	connection := &s.connection
+	if sessionID != connection.SessionID || activation.ExpectedActiveCredentialGeneration != connection.ActiveCredentialGeneration ||
+		activation.ExpectedEpoch != connection.ConnectionEpoch || connection.PendingCredentialGeneration == nil ||
+		connection.PendingCredentialExpiresAt == nil || connection.RotationID == nil || *connection.PendingCredentialGeneration != activation.PendingGeneration ||
+		*connection.RotationID != activation.RotationID || !connection.ActiveCredentialExpiresAt.After(time.Now()) ||
+		!connection.PendingCredentialExpiresAt.After(time.Now()) || connection.RevokedAt != nil || connection.TerminalAt != nil {
+		return store.AdapterConnection{}, errors.New("adapter credential activation rejected")
+	}
+	prior := connection.ActiveCredentialGeneration
+	connection.PriorRecoveryGeneration = &prior
+	connection.ActiveCredentialGeneration = *connection.PendingCredentialGeneration
+	connection.ActiveCredentialExpiresAt = *connection.PendingCredentialExpiresAt
+	connection.PendingCredentialGeneration = nil
+	connection.PendingCredentialExpiresAt = nil
+	connection.RotationID = nil
+	connection.ConnectionEpoch++
+	connection.AcceptedFence = s.nextFence
+	s.nextFence++
+	return *connection, nil
 }
 
 func (s *dispatchFenceStore) WithAdapterConnectionTransaction(ctx context.Context, fn func(store.AdapterConnectionStore) error) error {

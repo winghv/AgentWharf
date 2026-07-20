@@ -37,15 +37,23 @@ func newAdapterDispatchAuthority(handshake *Handshake, candidate any) *adapterDi
 	}
 	return &adapterDispatchAuthority{store: dispatchStore, adapterCredential: authenticator.AdapterCredential}
 }
-func (a *adapterDispatchAuthority) admit(ctx context.Context, token string, principal auth.Principal, sessionID string) (store.AdapterConnectionAdmission, error) {
+func (a *adapterDispatchAuthority) authenticate(ctx context.Context, token string, principal auth.Principal, sessionID string) (int64, time.Time, bool, error) {
 	generation, expiresAt, allowInitialize, err := a.adapterCredential(ctx, token, principal, sessionID)
-	if err != nil || generation != 1 || expiresAt <= time.Now().UnixNano() {
+	if err != nil || generation < 1 || expiresAt <= time.Now().UnixNano() {
+		return 0, time.Time{}, false, errAdapterAuthorityLost
+	}
+	return generation, time.Unix(0, expiresAt), allowInitialize, nil
+}
+
+func (a *adapterDispatchAuthority) admit(ctx context.Context, sessionID string, generation int64, expiresAt time.Time, allowInitialize bool) (store.AdapterConnectionAdmission, error) {
+	if generation < 1 || !expiresAt.After(time.Now()) {
 		return store.AdapterConnectionAdmission{}, errAdapterAuthorityLost
 	}
+	var err error
 	if allowInitialize {
 		if _, err = a.store.AdapterConnection(ctx, sessionID); err != nil {
 			_, err = a.store.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
-				SessionID: sessionID, ActiveCredentialGeneration: generation, ActiveCredentialExpiresAt: time.Unix(0, expiresAt),
+				SessionID: sessionID, ActiveCredentialGeneration: generation, ActiveCredentialExpiresAt: expiresAt,
 			})
 		}
 	}
