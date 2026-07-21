@@ -45,8 +45,9 @@ type Scope struct {
 }
 
 type Principal struct {
-	Subject string
-	Scopes  []Scope
+	Subject        string
+	Scopes         []Scope
+	AdmissionClaim *SessionAdmissionClaim
 }
 
 type Authenticator interface {
