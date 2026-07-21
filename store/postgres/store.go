@@ -23,6 +23,8 @@ type Store struct {
 	connectionTx pgx.Tx
 }
 
+var _ store.SessionAdmissionTruthStore = (*Store)(nil)
+
 const maxHistoryPageSize = 100
 const maxAttachAttemptTTL = 5 * time.Minute
 
@@ -34,6 +36,31 @@ func New(pool *pgxpool.Pool) *Store {
 // transaction. The caller alone commits or rolls it back.
 func NewAdapterConnectionTx(tx pgx.Tx) *Store {
 	return &Store{connectionTx: tx}
+}
+
+func (s *Store) SessionAdmissionTruth(ctx context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
+	truth := store.SessionAdmissionTruth{SessionID: sessionID}
+	if !validConnectionID(sessionID) {
+		return truth, errors.New("session admission session ID is invalid")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return truth, err
+	}
+	row, err := queries.SessionAdmissionTruth(ctx, sessionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return truth, nil
+	}
+	if err != nil {
+		return truth, fmt.Errorf("select session admission truth: %w", err)
+	}
+	terminal := row.EndedAt.Valid || row.Status == "ended" || row.Status == "error"
+	truth.Provider = row.Provider
+	truth.Exists = true
+	truth.Complete = row.Provider != "" && row.Status != ""
+	truth.Terminal = terminal
+	truth.Live = !terminal
+	return truth, nil
 }
 
 func (s *Store) AttentionSnapshot(ctx context.Context, sessionIDs []string) ([]store.SessionAttentionSummary, error) {

@@ -27,6 +27,41 @@ func TestAttentionSummaryStoreContract(t *testing.T) {
 	var _ store.AttentionSummaryStore = (*postgres.Store)(nil)
 }
 
+func TestSessionAdmissionTruthIsBoundedAndFailsClosed(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_admission_truth_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO agent_sessions (id, provider, status, started_at)
+VALUES ('ses_live', 'claude-code', 'ready', clock_timestamp()),
+       ('ses_terminal', 'claude-code', 'ended', clock_timestamp())`); err != nil {
+		t.Fatalf("seed admission sessions: %v", err)
+	}
+	events := postgres.New(pool)
+	for _, test := range []struct {
+		sessionID string
+		want      store.SessionAdmissionTruth
+	}{
+		{sessionID: "ses_live", want: store.SessionAdmissionTruth{SessionID: "ses_live", Provider: "claude-code", Exists: true, Complete: true, Live: true}},
+		{sessionID: "ses_terminal", want: store.SessionAdmissionTruth{SessionID: "ses_terminal", Provider: "claude-code", Exists: true, Complete: true, Terminal: true}},
+		{sessionID: "ses_missing", want: store.SessionAdmissionTruth{SessionID: "ses_missing"}},
+	} {
+		got, err := events.SessionAdmissionTruth(ctx, test.sessionID)
+		if err != nil || got != test.want {
+			t.Fatalf("SessionAdmissionTruth(%q) = %+v, %v; want %+v, nil", test.sessionID, got, err, test.want)
+		}
+	}
+	if _, err := events.SessionAdmissionTruth(ctx, ""); err == nil {
+		t.Fatal("empty session ID was accepted")
+	}
+}
+
 func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_attention_page_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))

@@ -2,7 +2,11 @@
 -- It is not evidence of, or a replacement for, the platform production schema.
 -- Production trigger/function behavior remains owned by platform migrations.
 CREATE TABLE agent_sessions (
-    id TEXT PRIMARY KEY
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL DEFAULT 'claude-code',
+    status TEXT NOT NULL DEFAULT 'ready',
+    started_at TIMESTAMPTZ,
+    ended_at TIMESTAMPTZ
 );
 
 CREATE TABLE session_events (
