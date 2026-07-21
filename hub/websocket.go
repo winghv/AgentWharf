@@ -52,6 +52,7 @@ type EphemeralBroadcaster interface {
 	http.Handler
 	EmitEphemeralEvent(context.Context, protocol.Event) error
 	RunActivityDispatcher(context.Context) error
+	RequestActivityRefresh(context.Context) error
 }
 
 type CommandActivity struct {
@@ -193,6 +194,16 @@ func (h *webSocketHandler) RunActivityDispatcher(ctx context.Context) error {
 		return nil
 	}
 	return h.activityDispatcher.Run(ctx)
+}
+
+func (h *webSocketHandler) RequestActivityRefresh(ctx context.Context) error {
+	if h.activityDispatcherErr != nil {
+		return h.activityDispatcherErr
+	}
+	if h.activityDispatcher == nil {
+		return errors.New("activity dispatcher is unavailable")
+	}
+	return h.activityDispatcher.RequestActivityRefresh(ctx)
 }
 
 // adapterCredentialActivationRollback is an internal recovery boundary. A

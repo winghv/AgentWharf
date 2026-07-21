@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,6 +76,45 @@ func TestActivityDispatcherRejectsUnprovablePageContinuation(t *testing.T) {
 	}
 }
 
+func TestActivityDispatcherRefreshCoalescesConcurrentRequests(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	pages := &blockingActivityPageStore{started: started, release: release}
+	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(context.Context, ActivitySummary) error {
+		return nil
+	}), ActivityDispatcherConfig{})
+
+	first := make(chan error, 1)
+	go func() { first <- dispatcher.RequestActivityRefresh(context.Background()) }()
+	<-started
+	second := make(chan error, 1)
+	go func() { second <- dispatcher.RequestActivityRefresh(context.Background()) }()
+	select {
+	case err := <-second:
+		t.Fatalf("coalesced request returned before scan completed: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	if calls := pages.calls.Load(); calls != 1 {
+		t.Fatalf("Store scans = %d, want 1", calls)
+	}
+}
+
+func TestActivityDispatcherRefreshReturnsStoreFailure(t *testing.T) {
+	dispatcher := NewActivityDispatcher(&failingActivityPageStore{}, ActivitySinkFunc(func(context.Context, ActivitySummary) error {
+		return nil
+	}), ActivityDispatcherConfig{})
+	if err := dispatcher.RequestActivityRefresh(context.Background()); err == nil {
+		t.Fatal("refresh error = nil, want Store failure")
+	}
+}
+
 type activityPageStore struct {
 	pages []store.AttentionSummaryPage
 	index int
@@ -92,3 +132,33 @@ func (s *activityPageStore) AttentionSummaryPage(_ context.Context, _ store.Atte
 }
 
 func timePointer(value time.Time) *time.Time { return &value }
+
+type blockingActivityPageStore struct {
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (s *blockingActivityPageStore) AttentionSnapshot(context.Context, []string) ([]store.SessionAttentionSummary, error) {
+	return nil, nil
+}
+
+func (s *blockingActivityPageStore) AttentionSummaryPage(context.Context, store.AttentionSummaryPageRequest) (store.AttentionSummaryPage, error) {
+	s.calls.Add(1)
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return store.AttentionSummaryPage{SnapshotAt: time.Now().UTC()}, nil
+}
+
+type failingActivityPageStore struct{}
+
+func (*failingActivityPageStore) AttentionSnapshot(context.Context, []string) ([]store.SessionAttentionSummary, error) {
+	return nil, nil
+}
+
+func (*failingActivityPageStore) AttentionSummaryPage(context.Context, store.AttentionSummaryPageRequest) (store.AttentionSummaryPage, error) {
+	return store.AttentionSummaryPage{}, errors.New("Store unavailable")
+}

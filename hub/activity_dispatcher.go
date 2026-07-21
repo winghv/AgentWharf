@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/winghv/agentwharf/store"
@@ -43,9 +44,17 @@ type ActivityDispatcherConfig struct {
 // ActivityDispatcher performs bounded keyset rescans. It has one ticker for
 // the whole Store and creates no Session-specific timers or goroutines.
 type ActivityDispatcher struct {
-	pages    store.AttentionSummaryPageStore
-	sink     ActivitySink
-	interval time.Duration
+	pages     store.AttentionSummaryPageStore
+	sink      ActivitySink
+	interval  time.Duration
+	scanMu    sync.Mutex
+	refreshMu sync.Mutex
+	refresh   *activityRefresh
+}
+
+type activityRefresh struct {
+	done chan struct{}
+	err  error
 }
 
 func NewActivityDispatcher(pages store.AttentionSummaryPageStore, sink ActivitySink, cfg ActivityDispatcherConfig) *ActivityDispatcher {
@@ -78,6 +87,12 @@ func (d *ActivityDispatcher) DispatchOnce(ctx context.Context) error {
 	if d == nil || d.pages == nil || d.sink == nil {
 		return errors.New("activity dispatcher is not configured")
 	}
+	d.scanMu.Lock()
+	defer d.scanMu.Unlock()
+	return d.dispatchOnce(ctx)
+}
+
+func (d *ActivityDispatcher) dispatchOnce(ctx context.Context) error {
 	after := ""
 	for {
 		page, err := d.pages.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{
@@ -112,4 +127,35 @@ func (d *ActivityDispatcher) DispatchOnce(ctx context.Context) error {
 			return errors.New("activity summary page continuation is invalid")
 		}
 	}
+}
+
+// RequestActivityRefresh requests one immediate Store-derived summary rescan.
+// Concurrent calls wait for the same scan, so the request cannot multiply
+// Store reads, callbacks, or background work.
+func (d *ActivityDispatcher) RequestActivityRefresh(ctx context.Context) error {
+	if d == nil || d.pages == nil || d.sink == nil {
+		return errors.New("activity dispatcher is not configured")
+	}
+
+	d.refreshMu.Lock()
+	if inFlight := d.refresh; inFlight != nil {
+		d.refreshMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-inFlight.done:
+			return inFlight.err
+		}
+	}
+	inFlight := &activityRefresh{done: make(chan struct{})}
+	d.refresh = inFlight
+	d.refreshMu.Unlock()
+
+	err := d.DispatchOnce(ctx)
+	d.refreshMu.Lock()
+	inFlight.err = err
+	d.refresh = nil
+	close(inFlight.done)
+	d.refreshMu.Unlock()
+	return err
 }
