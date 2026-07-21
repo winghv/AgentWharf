@@ -159,6 +159,38 @@ func TestActivityDispatcherRefreshRetriesAfterLeaderDeadline(t *testing.T) {
 	}
 }
 
+func TestActivityDispatcherRefreshDeadlineIncludesPeriodicScanOwnership(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	pages := &blockingActivityPageStore{started: started, release: release}
+	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(context.Context, ActivitySummary) error {
+		return nil
+	}), ActivityDispatcherConfig{})
+
+	periodicContext, stopPeriodic := context.WithCancel(context.Background())
+	periodic := make(chan error, 1)
+	go func() { periodic <- dispatcher.Run(periodicContext) }()
+	<-started
+
+	refreshContext, cancelRefresh := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelRefresh()
+	if err := dispatcher.RequestActivityRefresh(refreshContext); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("refresh waiting for periodic scan = %v, want deadline exceeded", err)
+	}
+
+	close(release)
+	if err := dispatcher.RequestActivityRefresh(context.Background()); err != nil {
+		t.Fatalf("retry after periodic scan: %v", err)
+	}
+	stopPeriodic()
+	if err := <-periodic; !errors.Is(err, context.Canceled) {
+		t.Fatalf("periodic dispatcher error = %v, want context cancellation", err)
+	}
+	if calls := pages.calls.Load(); calls != 2 {
+		t.Fatalf("Store scans = %d, want periodic scan plus retry", calls)
+	}
+}
+
 type activityPageStore struct {
 	pages []store.AttentionSummaryPage
 	index int

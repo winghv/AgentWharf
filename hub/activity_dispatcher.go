@@ -9,7 +9,10 @@ import (
 	"github.com/winghv/agentwharf/store"
 )
 
-const defaultActivityDispatchInterval = time.Minute
+const (
+	defaultActivityDispatchInterval = time.Minute
+	defaultActivityDispatchTimeout  = 5 * time.Second
+)
 
 // ActivitySink receives provider-neutral, Store-committed activity summaries.
 // It deliberately contains only durable summary facts, so dispatch cannot
@@ -47,7 +50,7 @@ type ActivityDispatcher struct {
 	pages     store.AttentionSummaryPageStore
 	sink      ActivitySink
 	interval  time.Duration
-	scanMu    sync.Mutex
+	scanToken chan struct{}
 	refreshMu sync.Mutex
 	refresh   *activityRefresh
 }
@@ -62,11 +65,13 @@ func NewActivityDispatcher(pages store.AttentionSummaryPageStore, sink ActivityS
 	if interval <= 0 {
 		interval = defaultActivityDispatchInterval
 	}
-	return &ActivityDispatcher{pages: pages, sink: sink, interval: interval}
+	return &ActivityDispatcher{
+		pages: pages, sink: sink, interval: interval, scanToken: make(chan struct{}, 1),
+	}
 }
 
 func (d *ActivityDispatcher) Run(ctx context.Context) error {
-	if err := d.DispatchOnce(ctx); err != nil {
+	if err := d.dispatchPeriodic(ctx); err != nil {
 		return err
 	}
 	ticker := time.NewTicker(d.interval)
@@ -76,19 +81,29 @@ func (d *ActivityDispatcher) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := d.DispatchOnce(ctx); err != nil {
+			if err := d.dispatchPeriodic(ctx); err != nil {
 				return err
 			}
 		}
 	}
 }
 
+func (d *ActivityDispatcher) dispatchPeriodic(ctx context.Context) error {
+	periodicCtx, cancel := context.WithTimeout(ctx, defaultActivityDispatchTimeout)
+	defer cancel()
+	return d.DispatchOnce(periodicCtx)
+}
+
 func (d *ActivityDispatcher) DispatchOnce(ctx context.Context) error {
 	if d == nil || d.pages == nil || d.sink == nil {
 		return errors.New("activity dispatcher is not configured")
 	}
-	d.scanMu.Lock()
-	defer d.scanMu.Unlock()
+	select {
+	case d.scanToken <- struct{}{}:
+		defer func() { <-d.scanToken }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	return d.dispatchOnce(ctx)
 }
 
