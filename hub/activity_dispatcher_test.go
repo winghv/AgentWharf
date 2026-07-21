@@ -9,32 +9,47 @@ import (
 	"github.com/winghv/agentwharf/store"
 )
 
-func TestActivityDispatcherPublishesOnlyCompleteNonExpiredStoreTruth(t *testing.T) {
+func TestActivityDispatcherPublishesMinimalStoreProjectionIncludingIncompleteTruth(t *testing.T) {
 	now := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
-	pages := &activityPageStore{pages: []store.AttentionSummaryPage{{Summaries: []store.SessionAttentionSummary{
+	pages := &activityPageStore{pages: []store.AttentionSummaryPage{{SnapshotAt: now, Summaries: []store.SessionAttentionSummary{
 		{SessionID: "ses_complete", StateOfProjection: store.AttentionProjectionComplete, LastDurableEventAt: &now},
 		{SessionID: "ses_expired", StateOfProjection: store.AttentionProjectionComplete, Blocker: &store.AttentionBlocker{ExpiresAt: timePointer(now.Add(-time.Second))}},
 		{SessionID: "ses_incomplete", StateOfProjection: store.AttentionProjectionIncomplete},
 	}}}}
-	var published []store.SessionAttentionSummary
-	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(_ context.Context, summary store.SessionAttentionSummary) error {
+	var published []ActivitySummary
+	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(_ context.Context, summary ActivitySummary) error {
 		published = append(published, summary)
 		return nil
-	}), ActivityDispatcherConfig{Now: func() time.Time { return now }})
+	}), ActivityDispatcherConfig{})
 	if err := dispatcher.DispatchOnce(context.Background()); err != nil {
 		t.Fatalf("DispatchOnce() error = %v", err)
 	}
-	if len(published) != 1 || published[0].SessionID != "ses_complete" || published[0].LastDurableEventAt == nil || !published[0].LastDurableEventAt.Equal(now) {
+	if len(published) != 3 || published[0].SessionID != "ses_complete" || published[0].LastDurableEventAt == nil || !published[0].LastDurableEventAt.Equal(now) || published[0].StoreSnapshotAt.IsZero() {
 		t.Fatalf("published = %+v", published)
+	}
+	if got := published[2]; got.SessionID != "ses_incomplete" || got.ProjectionState != store.AttentionProjectionIncomplete || !got.StoreSnapshotAt.Equal(now) {
+		t.Fatalf("incomplete projection = %+v", got)
+	}
+}
+
+func TestActivityDispatcherRunReturnsSinkFailureForSupervisor(t *testing.T) {
+	pages := &activityPageStore{pages: []store.AttentionSummaryPage{{SnapshotAt: time.Now().UTC(), Summaries: []store.SessionAttentionSummary{{
+		SessionID: "ses_retry", StateOfProjection: store.AttentionProjectionComplete,
+	}}}}}
+	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(context.Context, ActivitySummary) error {
+		return errors.New("sink unavailable")
+	}), ActivityDispatcherConfig{})
+	if err := dispatcher.Run(context.Background()); err == nil {
+		t.Fatal("Run() error = nil, want sink failure for supervisor")
 	}
 }
 
 func TestActivityDispatcherReplaysAfterCallbackFailure(t *testing.T) {
-	pages := &activityPageStore{pages: []store.AttentionSummaryPage{{Summaries: []store.SessionAttentionSummary{{
+	pages := &activityPageStore{pages: []store.AttentionSummaryPage{{SnapshotAt: time.Now(), Summaries: []store.SessionAttentionSummary{{
 		SessionID: "ses_retry", StateOfProjection: store.AttentionProjectionComplete,
 	}}}}}
 	attempts := 0
-	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(context.Context, store.SessionAttentionSummary) error {
+	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(context.Context, ActivitySummary) error {
 		attempts++
 		if attempts == 1 {
 			return errors.New("sink unavailable")
@@ -51,8 +66,8 @@ func TestActivityDispatcherReplaysAfterCallbackFailure(t *testing.T) {
 
 func TestActivityDispatcherRejectsUnprovablePageContinuation(t *testing.T) {
 	cursor := "ses_skipped"
-	pages := &activityPageStore{pages: []store.AttentionSummaryPage{{NextAfterSessionID: &cursor}}}
-	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(context.Context, store.SessionAttentionSummary) error {
+	pages := &activityPageStore{pages: []store.AttentionSummaryPage{{SnapshotAt: time.Now(), NextAfterSessionID: &cursor}}}
+	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(context.Context, ActivitySummary) error {
 		return nil
 	}), ActivityDispatcherConfig{})
 	if err := dispatcher.DispatchOnce(context.Background()); err == nil {

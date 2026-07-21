@@ -200,7 +200,6 @@ func (s *Store) AttentionSummaryPage(ctx context.Context, request store.Attentio
 	if err != nil {
 		return store.AttentionSummaryPage{}, fmt.Errorf("select attention summary page: %w", err)
 	}
-	defer rows.Close()
 	page := store.AttentionSummaryPage{Summaries: make([]store.SessionAttentionSummary, 0, request.Limit)}
 	for rows.Next() {
 		summary, err := querySQLiteAttentionSummary(ctx, rows)
@@ -217,6 +216,14 @@ func (s *Store) AttentionSummaryPage(ctx context.Context, request store.Attentio
 	if err := rows.Err(); err != nil {
 		return store.AttentionSummaryPage{}, fmt.Errorf("iterate attention summary page: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return store.AttentionSummaryPage{}, fmt.Errorf("close attention summary page: %w", err)
+	}
+	snapshotMS, err := sqliteNowMillis(ctx, s.db)
+	if err != nil {
+		return store.AttentionSummaryPage{}, err
+	}
+	page.SnapshotAt = time.UnixMilli(snapshotMS).UTC()
 	return page, nil
 }
 

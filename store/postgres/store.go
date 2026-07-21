@@ -85,7 +85,11 @@ func (s *Store) AttentionSummaryPage(ctx context.Context, request store.Attentio
 	if err != nil {
 		return store.AttentionSummaryPage{}, fmt.Errorf("select attention summary page: %w", err)
 	}
-	page := store.AttentionSummaryPage{Summaries: make([]store.SessionAttentionSummary, 0, request.Limit)}
+	snapshot, err := db.New(s.pool).AttentionStoreNow(ctx)
+	if err != nil || !snapshot.Valid {
+		return store.AttentionSummaryPage{}, errors.New("read attention summary Store clock")
+	}
+	page := store.AttentionSummaryPage{Summaries: make([]store.SessionAttentionSummary, 0, request.Limit), SnapshotAt: snapshot.Time.UTC()}
 	for _, row := range rows {
 		summary, err := attentionSummary(row)
 		if err != nil {

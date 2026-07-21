@@ -114,6 +114,7 @@ type AttentionSummaryPageRequest struct {
 type AttentionSummaryPage struct {
 	Summaries          []SessionAttentionSummary
 	NextAfterSessionID *string
+	SnapshotAt         time.Time
 }
 
 // AttentionSummaryPageStore exposes bounded restart-safe scans without

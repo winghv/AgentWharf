@@ -34,6 +34,7 @@ func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
 	pool := openPool(t, dsn, schemaName, nil)
 	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
 	attention := postgres.New(pool)
 	ctx := context.Background()
 	for _, sessionID := range []string{"ses_page_a", "ses_page_b", "ses_page_c"} {
@@ -42,7 +43,7 @@ func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 		}
 	}
 	page, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 2})
-	if err != nil || len(page.Summaries) != 2 || page.Summaries[0].SessionID != "ses_page_a" || page.NextAfterSessionID == nil || *page.NextAfterSessionID != "ses_page_b" {
+	if err != nil || page.SnapshotAt.IsZero() || len(page.Summaries) != 2 || page.Summaries[0].SessionID != "ses_page_a" || page.NextAfterSessionID == nil || *page.NextAfterSessionID != "ses_page_b" {
 		t.Fatalf("first page = %+v, %v", page, err)
 	}
 	next, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{AfterSessionID: *page.NextAfterSessionID, Limit: 2})

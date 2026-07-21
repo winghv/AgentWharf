@@ -11,21 +11,33 @@ import (
 const defaultActivityDispatchInterval = time.Minute
 
 // ActivitySink receives provider-neutral, Store-committed activity summaries.
-// It deliberately has no Session command, credential, provider, Task, or VM
-// input so dispatch cannot become another source of activity truth.
-type ActivitySink interface {
-	PublishActivitySummary(context.Context, store.SessionAttentionSummary) error
+// It deliberately contains only durable summary facts, so dispatch cannot
+// become another source of activity truth.
+type ActivitySummary struct {
+	SessionID           string
+	State               string
+	LastDurableSeq      int64
+	LedgerVersion       int64
+	LastDurableEventAt  *time.Time
+	LastClientCommandAt *time.Time
+	StoreSnapshotAt     time.Time
+	ProjectionState     string
+	BlockerKind         string
+	BlockerExpiresAt    *time.Time
 }
 
-type ActivitySinkFunc func(context.Context, store.SessionAttentionSummary) error
+type ActivitySink interface {
+	PublishActivitySummary(context.Context, ActivitySummary) error
+}
 
-func (fn ActivitySinkFunc) PublishActivitySummary(ctx context.Context, summary store.SessionAttentionSummary) error {
+type ActivitySinkFunc func(context.Context, ActivitySummary) error
+
+func (fn ActivitySinkFunc) PublishActivitySummary(ctx context.Context, summary ActivitySummary) error {
 	return fn(ctx, summary)
 }
 
 type ActivityDispatcherConfig struct {
 	Interval time.Duration
-	Now      func() time.Time
 }
 
 // ActivityDispatcher performs bounded keyset rescans. It has one ticker for
@@ -34,7 +46,6 @@ type ActivityDispatcher struct {
 	pages    store.AttentionSummaryPageStore
 	sink     ActivitySink
 	interval time.Duration
-	now      func() time.Time
 }
 
 func NewActivityDispatcher(pages store.AttentionSummaryPageStore, sink ActivitySink, cfg ActivityDispatcherConfig) *ActivityDispatcher {
@@ -42,15 +53,11 @@ func NewActivityDispatcher(pages store.AttentionSummaryPageStore, sink ActivityS
 	if interval <= 0 {
 		interval = defaultActivityDispatchInterval
 	}
-	now := cfg.Now
-	if now == nil {
-		now = time.Now
-	}
-	return &ActivityDispatcher{pages: pages, sink: sink, interval: interval, now: now}
+	return &ActivityDispatcher{pages: pages, sink: sink, interval: interval}
 }
 
 func (d *ActivityDispatcher) Run(ctx context.Context) error {
-	if err := d.DispatchOnce(ctx); errors.Is(err, context.Canceled) {
+	if err := d.DispatchOnce(ctx); err != nil {
 		return err
 	}
 	ticker := time.NewTicker(d.interval)
@@ -60,7 +67,7 @@ func (d *ActivityDispatcher) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := d.DispatchOnce(ctx); errors.Is(err, context.Canceled) {
+			if err := d.DispatchOnce(ctx); err != nil {
 				return err
 			}
 		}
@@ -80,15 +87,21 @@ func (d *ActivityDispatcher) DispatchOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if page.SnapshotAt.IsZero() {
+			return errors.New("activity summary page snapshot is missing")
+		}
 		for _, summary := range page.Summaries {
 			if summary.SessionID <= after {
 				return errors.New("activity summary page is not strictly ordered")
 			}
 			after = summary.SessionID
-			if summary.StateOfProjection != store.AttentionProjectionComplete || attentionBlockerExpired(summary.Blocker, d.now()) {
-				continue
+			activity := ActivitySummary{SessionID: summary.SessionID, State: summary.State, LastDurableSeq: summary.LatestSeq,
+				LedgerVersion: summary.SummaryVersion, LastDurableEventAt: summary.LastDurableEventAt, LastClientCommandAt: summary.LastClientCommandAt,
+				StoreSnapshotAt: page.SnapshotAt.UTC(), ProjectionState: summary.StateOfProjection}
+			if summary.Blocker != nil {
+				activity.BlockerKind, activity.BlockerExpiresAt = summary.Blocker.Kind, summary.Blocker.ExpiresAt
 			}
-			if err := d.sink.PublishActivitySummary(ctx, summary); err != nil {
+			if err := d.sink.PublishActivitySummary(ctx, activity); err != nil {
 				return err
 			}
 		}
@@ -99,8 +112,4 @@ func (d *ActivityDispatcher) DispatchOnce(ctx context.Context) error {
 			return errors.New("activity summary page continuation is invalid")
 		}
 	}
-}
-
-func attentionBlockerExpired(blocker *store.AttentionBlocker, now time.Time) bool {
-	return blocker != nil && blocker.ExpiresAt != nil && !blocker.ExpiresAt.After(now)
 }
