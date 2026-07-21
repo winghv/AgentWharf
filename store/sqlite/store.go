@@ -24,10 +24,11 @@ const (
 )
 
 type Store struct {
-	db           *sql.DB
-	fenceDB      *sql.DB
-	connectionTx *sql.Tx
-	closed       atomic.Bool
+	db               *sql.DB
+	fenceDB          *sql.DB
+	connectionTx     *sql.Tx
+	attentionPageNow func(context.Context, *sql.DB) (int64, error)
+	closed           atomic.Bool
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -196,11 +197,15 @@ func (s *Store) AttentionSummaryPage(ctx context.Context, request store.Attentio
 	if pending {
 		return store.AttentionSummaryPage{}, errors.New("attention summary page is unavailable during migration")
 	}
-	snapshotMS, err := sqliteNowMillis(ctx, s.db)
+	pageNow := s.attentionPageNow
+	if pageNow == nil {
+		pageNow = func(ctx context.Context, db *sql.DB) (int64, error) { return sqliteNowMillis(ctx, db) }
+	}
+	snapshotMS, err := pageNow(ctx, s.db)
 	if err != nil {
 		return store.AttentionSummaryPage{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id > ? AND EXISTS (SELECT 1 FROM session_adapter_connections AS authority WHERE authority.session_id = session_attention_summaries.session_id AND authority.active_credential_expires_at_ms > ? AND authority.revoked_at_ms IS NULL AND authority.terminal_at_ms IS NULL) ORDER BY session_id ASC LIMIT ?`, request.AfterSessionID, snapshotMS, request.Limit+1)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id > ? AND EXISTS (SELECT 1 FROM session_adapter_connections AS authority WHERE authority.session_id = session_attention_summaries.session_id AND authority.active_credential_expires_at_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) AND authority.revoked_at_ms IS NULL AND authority.terminal_at_ms IS NULL) ORDER BY session_id ASC LIMIT ?`, request.AfterSessionID, request.Limit+1)
 	if err != nil {
 		return store.AttentionSummaryPage{}, fmt.Errorf("select attention summary page: %w", err)
 	}
