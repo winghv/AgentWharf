@@ -9,3 +9,7 @@ The compatibility window ends at `2027-01-08T00:00:00Z`. One negotiated
 connection receives one name only. The generic Hub does not interpret platform
 payloads. T1B, T15K, and T52B remain time-gated until T69 and the separately
 approved removal contract.
+
+`activity-refresh.md` defines the internal, payload-free refresh request used
+when a Control Plane projection is missing, incomplete, or stale. It is not a
+wire protocol extension.
