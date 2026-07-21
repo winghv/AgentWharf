@@ -40,7 +40,8 @@ func TestSessionAdmissionTruthIsBoundedAndFailsClosed(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 INSERT INTO agent_sessions (id, provider, status, started_at)
 VALUES ('ses_live', 'claude-code', 'ready', clock_timestamp()),
-       ('ses_terminal', 'claude-code', 'ended', clock_timestamp())`); err != nil {
+	       ('ses_preallocated_target', 'claude-code', 'starting', clock_timestamp()),
+	       ('ses_terminal', 'claude-code', 'ended', clock_timestamp())`); err != nil {
 		t.Fatalf("seed admission sessions: %v", err)
 	}
 	events := postgres.New(pool)
@@ -49,6 +50,9 @@ VALUES ('ses_live', 'claude-code', 'ready', clock_timestamp()),
 		want      store.SessionAdmissionTruth
 	}{
 		{sessionID: "ses_live", want: store.SessionAdmissionTruth{SessionID: "ses_live", Provider: "claude-code", Exists: true, Complete: true, Live: true}},
+		// A Control Plane preallocation establishes the durable Task/Run relation,
+		// but is not Hub Store truth until attachment commits it.
+		{sessionID: "ses_preallocated_target", want: store.SessionAdmissionTruth{SessionID: "ses_preallocated_target"}},
 		{sessionID: "ses_terminal", want: store.SessionAdmissionTruth{SessionID: "ses_terminal", Provider: "claude-code", Exists: true, Complete: true, Terminal: true}},
 		{sessionID: "ses_missing", want: store.SessionAdmissionTruth{SessionID: "ses_missing"}},
 	} {

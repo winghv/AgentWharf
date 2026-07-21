@@ -54,6 +54,11 @@ func (s *Store) SessionAdmissionTruth(ctx context.Context, sessionID string) (st
 	if err != nil {
 		return truth, fmt.Errorf("select session admission truth: %w", err)
 	}
+	// Control Plane preallocates a warm target as starting so its Task/Run
+	// relation is durable. It becomes Store truth only when Hub attaches it.
+	if row.Status == "starting" {
+		return truth, nil
+	}
 	terminal := row.EndedAt.Valid || row.Status == "ended" || row.Status == "error"
 	truth.Provider = row.Provider
 	truth.Exists = true
