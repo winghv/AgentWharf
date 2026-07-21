@@ -115,6 +115,28 @@ func TestActivityDispatcherRefreshReturnsStoreFailure(t *testing.T) {
 	}
 }
 
+func TestActivityDispatcherRefreshHonorsWaitingContext(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	pages := &blockingActivityPageStore{started: started, release: release}
+	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(context.Context, ActivitySummary) error {
+		return nil
+	}), ActivityDispatcherConfig{})
+
+	first := make(chan error, 1)
+	go func() { first <- dispatcher.RequestActivityRefresh(context.Background()) }()
+	<-started
+	waiter, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := dispatcher.RequestActivityRefresh(waiter); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiting refresh error = %v, want context cancellation", err)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+}
+
 type activityPageStore struct {
 	pages []store.AttentionSummaryPage
 	index int
