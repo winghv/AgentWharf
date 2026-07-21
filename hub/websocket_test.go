@@ -62,6 +62,15 @@ func TestWebSocketServerRejectsAdapterWithoutDispatchStore(t *testing.T) {
 	}
 }
 
+func TestWebSocketHandlerFailsClosedForActivitySinkWithoutSummaryPageStore(t *testing.T) {
+	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{
+		ActivitySink: hub.ActivitySinkFunc(func(context.Context, hub.ActivitySummary) error { return nil }),
+	})
+	if err := handler.RunActivityDispatcher(context.Background()); err == nil {
+		t.Fatal("activity sink without summary page store was accepted")
+	}
+}
+
 func TestWebSocketServerAcceptsAdapterWithDispatchStore(t *testing.T) {
 	t.Parallel()
 

@@ -78,16 +78,17 @@ func (s *Store) AttentionSummaryPage(ctx context.Context, request store.Attentio
 	if request.AfterSessionID != "" && !validConnectionID(request.AfterSessionID) {
 		return store.AttentionSummaryPage{}, errors.New("attention summary page cursor is invalid")
 	}
-	rows, err := db.New(s.pool).AttentionSummaryPage(ctx, db.AttentionSummaryPageParams{
+	queries := db.New(s.pool)
+	snapshot, err := queries.AttentionStoreNow(ctx)
+	if err != nil || !snapshot.Valid {
+		return store.AttentionSummaryPage{}, errors.New("read attention summary Store clock")
+	}
+	rows, err := queries.AttentionSummaryPage(ctx, db.AttentionSummaryPageParams{
 		AfterSessionID: request.AfterSessionID,
 		PageLimit:      int32(request.Limit + 1),
 	})
 	if err != nil {
 		return store.AttentionSummaryPage{}, fmt.Errorf("select attention summary page: %w", err)
-	}
-	snapshot, err := db.New(s.pool).AttentionStoreNow(ctx)
-	if err != nil || !snapshot.Valid {
-		return store.AttentionSummaryPage{}, errors.New("read attention summary Store clock")
 	}
 	page := store.AttentionSummaryPage{Summaries: make([]store.SessionAttentionSummary, 0, request.Limit), SnapshotAt: snapshot.Time.UTC()}
 	for _, row := range rows {

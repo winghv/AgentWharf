@@ -41,6 +41,9 @@ func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 		if _, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
 			t.Fatalf("seed %s: %v", sessionID, err)
 		}
+		if _, err := attention.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+			t.Fatalf("initialize %s: %v", sessionID, err)
+		}
 	}
 	page, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 2})
 	if err != nil || page.SnapshotAt.IsZero() || len(page.Summaries) != 2 || page.Summaries[0].SessionID != "ses_page_a" || page.NextAfterSessionID == nil || *page.NextAfterSessionID != "ses_page_b" {
@@ -49,6 +52,35 @@ func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 	next, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{AfterSessionID: *page.NextAfterSessionID, Limit: 2})
 	if err != nil || len(next.Summaries) != 1 || next.Summaries[0].SessionID != "ses_page_c" || next.NextAfterSessionID != nil {
 		t.Fatalf("second page = %+v, %v", next, err)
+	}
+}
+
+func TestAttentionSummaryPageRequiresCurrentAdapterAuthority(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_authority_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	attention := postgres.New(pool)
+	ctx := context.Background()
+	for _, sessionID := range []string{"ses_active", "ses_expired", "ses_revoked", "ses_terminal", "ses_missing"} {
+		if _, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+			t.Fatalf("seed %s: %v", sessionID, err)
+		}
+		if sessionID != "ses_missing" {
+			if _, err := attention.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+				t.Fatalf("initialize %s: %v", sessionID, err)
+			}
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE session_adapter_connections SET active_credential_expires_at = clock_timestamp() - interval '1 second' WHERE session_id = 'ses_expired'; UPDATE session_adapter_connections SET revoked_at = clock_timestamp() WHERE session_id = 'ses_revoked'; UPDATE session_adapter_connections SET terminal_at = clock_timestamp() WHERE session_id = 'ses_terminal'`); err != nil {
+		t.Fatal(err)
+	}
+	page, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 10})
+	if err != nil || len(page.Summaries) != 1 || page.Summaries[0].SessionID != "ses_active" {
+		t.Fatalf("authority-fenced page = %+v, %v", page, err)
 	}
 }
 

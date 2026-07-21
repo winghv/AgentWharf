@@ -196,11 +196,16 @@ func (s *Store) AttentionSummaryPage(ctx context.Context, request store.Attentio
 	if pending {
 		return store.AttentionSummaryPage{}, errors.New("attention summary page is unavailable during migration")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id > ? ORDER BY session_id ASC LIMIT ?`, request.AfterSessionID, request.Limit+1)
+	snapshotMS, err := sqliteNowMillis(ctx, s.db)
+	if err != nil {
+		return store.AttentionSummaryPage{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sqliteAttentionSummaryColumns+` FROM session_attention_summaries WHERE session_id > ? AND EXISTS (SELECT 1 FROM session_adapter_connections AS authority WHERE authority.session_id = session_attention_summaries.session_id AND authority.active_credential_expires_at_ms > ? AND authority.revoked_at_ms IS NULL AND authority.terminal_at_ms IS NULL) ORDER BY session_id ASC LIMIT ?`, request.AfterSessionID, snapshotMS, request.Limit+1)
 	if err != nil {
 		return store.AttentionSummaryPage{}, fmt.Errorf("select attention summary page: %w", err)
 	}
-	page := store.AttentionSummaryPage{Summaries: make([]store.SessionAttentionSummary, 0, request.Limit)}
+	defer rows.Close()
+	page := store.AttentionSummaryPage{Summaries: make([]store.SessionAttentionSummary, 0, request.Limit), SnapshotAt: time.UnixMilli(snapshotMS).UTC()}
 	for rows.Next() {
 		summary, err := querySQLiteAttentionSummary(ctx, rows)
 		if err != nil {
@@ -219,11 +224,6 @@ func (s *Store) AttentionSummaryPage(ctx context.Context, request store.Attentio
 	if err := rows.Close(); err != nil {
 		return store.AttentionSummaryPage{}, fmt.Errorf("close attention summary page: %w", err)
 	}
-	snapshotMS, err := sqliteNowMillis(ctx, s.db)
-	if err != nil {
-		return store.AttentionSummaryPage{}, err
-	}
-	page.SnapshotAt = time.UnixMilli(snapshotMS).UTC()
 	return page, nil
 }
 

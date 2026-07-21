@@ -31,11 +31,15 @@ func TestAttentionSummaryStoreContract(t *testing.T) {
 }
 
 func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
-	attention := openStore(t, filepath.Join(t.TempDir(), "attention-page.db"))
+	path := filepath.Join(t.TempDir(), "attention-page.db")
+	attention := openStore(t, path)
 	ctx := context.Background()
 	for _, sessionID := range []string{"ses_page_a", "ses_page_b", "ses_page_c"} {
 		if _, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
 			t.Fatalf("seed %s: %v", sessionID, err)
+		}
+		if _, err := attention.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+			t.Fatalf("initialize %s: %v", sessionID, err)
 		}
 	}
 	page, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 2})
@@ -48,6 +52,30 @@ func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 	}
 	if _, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 0}); err == nil {
 		t.Fatal("zero page limit was accepted")
+	}
+}
+
+func TestAttentionSummaryPageRequiresCurrentAdapterAuthority(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "attention-page-authority.db")
+	attention := openStore(t, path)
+	ctx := context.Background()
+	for _, sessionID := range []string{"ses_active", "ses_expired", "ses_revoked", "ses_terminal", "ses_missing"} {
+		if _, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+			t.Fatalf("seed %s: %v", sessionID, err)
+		}
+		if sessionID != "ses_missing" {
+			if _, err := attention.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+				t.Fatalf("initialize %s: %v", sessionID, err)
+			}
+		}
+	}
+	raw := openRawSQLite(t, path)
+	if _, err := raw.Exec(`UPDATE session_adapter_connections SET active_credential_expires_at_ms = created_at_ms - 1000, created_at_ms = created_at_ms - 2000 WHERE session_id = 'ses_expired'; UPDATE session_adapter_connections SET revoked_at_ms = created_at_ms + 1 WHERE session_id = 'ses_revoked'; UPDATE session_adapter_connections SET terminal_at_ms = created_at_ms + 1 WHERE session_id = 'ses_terminal'`); err != nil {
+		t.Fatal(err)
+	}
+	page, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 10})
+	if err != nil || len(page.Summaries) != 1 || page.Summaries[0].SessionID != "ses_active" {
+		t.Fatalf("authority-fenced page = %+v, %v", page, err)
 	}
 }
 

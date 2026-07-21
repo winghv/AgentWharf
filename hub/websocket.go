@@ -115,6 +115,8 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		}
 		if pages != nil {
 			handler.activityDispatcher = NewActivityDispatcher(pages, cfg.ActivitySink, ActivityDispatcherConfig{})
+		} else {
+			handler.activityDispatcherErr = errors.New("activity sink requires an attention summary page store")
 		}
 	}
 	handler.publisherEphemeralTypes = publisherEphemeralTypes(handler.ephemeralEventVariants)
@@ -164,6 +166,7 @@ type webSocketHandler struct {
 	sessionCredentialEvidenceResolver auth.SessionCredentialEvidenceResolver
 	warmAttachCredentialHandoff       WarmAttachCredentialHandoff
 	activityDispatcher                *ActivityDispatcher
+	activityDispatcherErr             error
 
 	mu          sync.Mutex
 	subscribers map[string]map[*clientConnection]struct{}
@@ -183,6 +186,9 @@ type webSocketHandler struct {
 }
 
 func (h *webSocketHandler) RunActivityDispatcher(ctx context.Context) error {
+	if h.activityDispatcherErr != nil {
+		return h.activityDispatcherErr
+	}
 	if h.activityDispatcher == nil {
 		return nil
 	}
