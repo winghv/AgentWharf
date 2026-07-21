@@ -80,6 +80,14 @@ SELECT session_id, latest_seq, state, permission_id, permission_status,
        projection_state, created_at, updated_at
 FROM session_attention_summaries
 WHERE session_id > $1::TEXT
+  AND EXISTS (
+      SELECT 1
+      FROM session_adapter_connections AS authority
+      WHERE authority.session_id = session_attention_summaries.session_id
+        AND authority.active_credential_expires_at > clock_timestamp()
+        AND authority.revoked_at IS NULL
+        AND authority.terminal_at IS NULL
+  )
 ORDER BY session_id ASC
 LIMIT $2::INT
 `
