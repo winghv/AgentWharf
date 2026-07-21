@@ -9,7 +9,11 @@ import (
 )
 
 type AgentSession struct {
-	ID string
+	ID        string
+	Provider  string
+	Status    string
+	StartedAt pgtype.Timestamptz
+	EndedAt   pgtype.Timestamptz
 }
 
 type SessionAdapterConnection struct {
