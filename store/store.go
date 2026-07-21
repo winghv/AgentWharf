@@ -30,6 +30,7 @@ type EventStore interface {
 // fresh target from existing complete Session truth without platform lookup.
 type SessionAdmissionTruth struct {
 	SessionID   string
+	Provider    string
 	Exists      bool
 	Complete    bool
 	Terminal    bool
