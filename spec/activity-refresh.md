@@ -23,6 +23,10 @@ mapping.
 - The operation is idempotent. While a refresh scan is pending or running,
   concurrent calls coalesce into that scan and create no per-request goroutine,
   timer, queue, durable record, or Store write.
+- The Control Plane owns a fixed five-second deadline for every request. Hub
+  uses that context for the complete leader scan; deadline expiry returns an
+  error to all coalesced callers, leaves the projection fail closed, and lets a
+  later request start one new bounded retry.
 - A request is satisfied only after a complete bounded rescan has delivered
   Store-derived summaries to the existing ActivitySink. A cancellation or page
   or sink failure satisfies nothing and is returned to the caller.
