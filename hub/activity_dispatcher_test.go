@@ -137,6 +137,28 @@ func TestActivityDispatcherRefreshHonorsWaitingContext(t *testing.T) {
 	}
 }
 
+func TestActivityDispatcherRefreshRetriesAfterLeaderDeadline(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	pages := &blockingActivityPageStore{started: started, release: release}
+	dispatcher := NewActivityDispatcher(pages, ActivitySinkFunc(func(context.Context, ActivitySummary) error {
+		return nil
+	}), ActivityDispatcherConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := dispatcher.RequestActivityRefresh(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("leader refresh error = %v, want deadline", err)
+	}
+	close(release)
+	if err := dispatcher.RequestActivityRefresh(context.Background()); err != nil {
+		t.Fatalf("retry refresh: %v", err)
+	}
+	if calls := pages.calls.Load(); calls != 2 {
+		t.Fatalf("Store scans = %d, want timed-out leader plus retry", calls)
+	}
+}
+
 type activityPageStore struct {
 	pages []store.AttentionSummaryPage
 	index int
@@ -165,13 +187,17 @@ func (s *blockingActivityPageStore) AttentionSnapshot(context.Context, []string)
 	return nil, nil
 }
 
-func (s *blockingActivityPageStore) AttentionSummaryPage(context.Context, store.AttentionSummaryPageRequest) (store.AttentionSummaryPage, error) {
+func (s *blockingActivityPageStore) AttentionSummaryPage(ctx context.Context, _ store.AttentionSummaryPageRequest) (store.AttentionSummaryPage, error) {
 	s.calls.Add(1)
 	select {
 	case s.started <- struct{}{}:
 	default:
 	}
-	<-s.release
+	select {
+	case <-ctx.Done():
+		return store.AttentionSummaryPage{}, ctx.Err()
+	case <-s.release:
+	}
 	return store.AttentionSummaryPage{SnapshotAt: time.Now().UTC()}, nil
 }
 
