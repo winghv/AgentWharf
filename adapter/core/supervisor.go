@@ -23,14 +23,18 @@ const (
 )
 
 type ProcessCommand struct {
-	Path   string
-	Args   []string
-	Env    []string
-	Dir    string
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+	Path       string
+	Args       []string
+	Env        []string
+	Dir        string
+	Stdin      io.Reader
+	Stdout     io.Writer
+	Stderr     io.Writer
+	Credential *ProcessCredential
 }
+
+// ProcessCredential is the fixed-entry-only identity for a Provider child.
+type ProcessCredential struct{ UID, GID uint32 }
 
 type ProcessConfig struct {
 	Command     ProcessCommand
@@ -311,6 +315,9 @@ func (execProcessRunner) Start(command ProcessCommand) (processHandle, error) {
 	cmd.Stdin = command.Stdin
 	cmd.Stdout = command.Stdout
 	cmd.Stderr = command.Stderr
+	if err := applyProcessCredential(cmd, command.Credential); err != nil {
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}

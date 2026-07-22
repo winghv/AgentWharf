@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -183,18 +184,20 @@ type serveConfig struct {
 }
 
 type wrapConfig struct {
-	HubURL          string
-	SessionID       string
-	Agent           string
-	Provider        string
-	AdapterToken    string
-	Format          string
-	SecretDir       string
-	Managed         bool
-	Pair            bool
-	CloudAPIURL     string
-	Heartbeat       heartbeatConfig
-	ProviderCommand []string
+	HubURL             string
+	SessionID          string
+	Agent              string
+	Provider           string
+	AdapterToken       string
+	Format             string
+	SecretDir          string
+	Managed            bool
+	Pair               bool
+	CloudAPIURL        string
+	Heartbeat          heartbeatConfig
+	ProviderCommand    []string
+	HealthMarker       string
+	ProviderCredential *core.ProcessCredential
 }
 
 type heartbeatConfig struct {
@@ -462,6 +465,15 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	cfg.SecretDir = filepath.Clean(cfg.SecretDir)
 	if cfg.SecretDir == "." {
 		cfg.SecretDir = ""
+	}
+	if marker := strings.TrimSpace(os.Getenv("SUPERWHV_FIXED_ENTRY_HEALTH_PATH")); marker != "" {
+		uid, uidErr := strconv.ParseUint(os.Getenv("AGENTWHARF_PROVIDER_UID"), 10, 32)
+		gid, gidErr := strconv.ParseUint(os.Getenv("AGENTWHARF_PROVIDER_GID"), 10, 32)
+		if uidErr != nil || gidErr != nil || uid == 0 || gid == 0 {
+			return wrapConfig{}, errors.New("fixed entry requires non-root provider uid and gid")
+		}
+		cfg.HealthMarker = marker
+		cfg.ProviderCredential = &core.ProcessCredential{UID: uint32(uid), GID: uint32(gid)}
 	}
 	return cfg, nil
 }
@@ -1030,6 +1042,11 @@ func sameCloudAPIURL(left string, right string) bool {
 }
 
 func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker) error {
+	stopHealth, err := core.StartFixedEntryHealth(ctx, cfg.HealthMarker)
+	if err != nil {
+		return err
+	}
+	defer stopHealth()
 	if cfg.Format == "acp" {
 		return runWrapACPProvider(ctx, cfg, conn, masker)
 	}
@@ -1043,11 +1060,12 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 	stdoutReader, stdoutWriter := io.Pipe()
 	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
 		Command: core.ProcessCommand{
-			Path:   cfg.ProviderCommand[0],
-			Args:   cfg.ProviderCommand[1:],
-			Stdin:  stdinReader,
-			Stdout: stdoutWriter,
-			Stderr: os.Stderr,
+			Path:       cfg.ProviderCommand[0],
+			Args:       cfg.ProviderCommand[1:],
+			Stdin:      stdinReader,
+			Stdout:     stdoutWriter,
+			Stderr:     os.Stderr,
+			Credential: cfg.ProviderCredential,
 		},
 	})
 	if err != nil {
@@ -1141,11 +1159,12 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	stdoutReader, stdoutWriter := io.Pipe()
 	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
 		Command: core.ProcessCommand{
-			Path:   cfg.ProviderCommand[0],
-			Args:   cfg.ProviderCommand[1:],
-			Stdin:  stdinReader,
-			Stdout: stdoutWriter,
-			Stderr: os.Stderr,
+			Path:       cfg.ProviderCommand[0],
+			Args:       cfg.ProviderCommand[1:],
+			Stdin:      stdinReader,
+			Stdout:     stdoutWriter,
+			Stderr:     os.Stderr,
+			Credential: cfg.ProviderCredential,
 		},
 	})
 	if err != nil {

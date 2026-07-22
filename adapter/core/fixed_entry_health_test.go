@@ -1,0 +1,31 @@
+package core
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestStartFixedEntryHealthRequiresRegularMarker(t *testing.T) {
+	t.Parallel()
+	if _, err := StartFixedEntryHealth(context.Background(), filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("StartFixedEntryHealth() error = nil, want missing marker rejection")
+	}
+}
+
+func TestStartFixedEntryHealthTouchesExistingMarker(t *testing.T) {
+	t.Parallel()
+	marker := filepath.Join(t.TempDir(), "health")
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	stop, err := StartFixedEntryHealth(context.Background(), marker)
+	if err != nil {
+		t.Fatalf("StartFixedEntryHealth() error = %v", err)
+	}
+	defer stop()
+	if info, err := os.Stat(marker); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("marker = %v, %v", info, err)
+	}
+}
