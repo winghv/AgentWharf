@@ -874,6 +874,42 @@ func TestPendingCommandStoreContract(t *testing.T) {
 	})
 }
 
+func TestSettingsCommandStoreContract(t *testing.T) {
+	storetest.SettingsCommandContract(t, storetest.SettingsCommandHarness{
+		Open: func(t *testing.T) store.SettingsCommandStore {
+			t.Helper()
+			path := filepath.Join(t.TempDir(), "events.db")
+			harness := &sqliteCommandHarness{Store: openStore(t, path), path: path}
+			seedCommandAuthorities(t, path)
+			return harness
+		},
+		Reopen: func(t *testing.T, current store.SettingsCommandStore) store.SettingsCommandStore {
+			t.Helper()
+			harness := current.(*sqliteCommandHarness)
+			if err := harness.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			harness.Store = openStore(t, harness.path)
+			return harness
+		},
+		ExpireOperationDeadline: func(t *testing.T, current store.SettingsCommandStore, sessionID, commandID string) {
+			t.Helper()
+			harness := current.(*sqliteCommandHarness)
+			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), `UPDATE session_settings_commands SET operation_deadline_ms=created_at_ms+1 WHERE session_id=? AND cmd_id=?`, sessionID, commandID); err != nil {
+				t.Fatalf("expire settings operation deadline: %v", err)
+			}
+		},
+		RevokeWriter: func(t *testing.T, current store.SettingsCommandStore, sessionID string) {
+			t.Helper()
+			harness := current.(*sqliteCommandHarness)
+			now := time.Now().UnixMilli()
+			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), `UPDATE session_adapter_connections SET revoked_at_ms=?, updated_at_ms=? WHERE session_id=?`, now, now, sessionID); err != nil {
+				t.Fatalf("revoke settings writer: %v", err)
+			}
+		},
+	})
+}
+
 func TestProposalStoreContract(t *testing.T) {
 	storetest.ProposalContract(t, storetest.ProposalHarness{
 		Open: func(t *testing.T) store.ProposedEventStore {
@@ -2963,7 +2999,7 @@ func seedCommandAuthorities(t *testing.T, path string) {
 	for _, sessionID := range []string{
 		"ses_command_1", "ses_command_claim", "ses_command_stale",
 		"ses_command_expired", "ses_command_reopen", "ses_command_invalid",
-		"ses_command_unknown",
+		"ses_command_unknown", "ses_settings_1", "ses_settings_2", "ses_settings_revoked_ack", "ses_settings_revoked_finalize",
 	} {
 		if _, err := db.ExecContext(context.Background(), `
 INSERT INTO session_adapter_connections (

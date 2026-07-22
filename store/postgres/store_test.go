@@ -470,6 +470,36 @@ func TestPendingCommandStoreContract(t *testing.T) {
 	})
 }
 
+func TestSettingsCommandStoreContract(t *testing.T) {
+	storetest.SettingsCommandContract(t, storetest.SettingsCommandHarness{
+		Open: func(t *testing.T) store.SettingsCommandStore {
+			t.Helper()
+			return newPostgresCommandHarness(t, "agentwharf_settings", nil)
+		},
+		Reopen: func(t *testing.T, current store.SettingsCommandStore) store.SettingsCommandStore {
+			t.Helper()
+			harness := current.(*postgresCommandHarness)
+			harness.pool.Close()
+			harness.reopen(t)
+			return harness
+		},
+		ExpireOperationDeadline: func(t *testing.T, current store.SettingsCommandStore, sessionID, commandID string) {
+			t.Helper()
+			harness := current.(*postgresCommandHarness)
+			if _, err := harness.pool.Exec(context.Background(), `UPDATE session_settings_commands SET operation_deadline=created_at + interval '1 millisecond' WHERE session_id=$1 AND cmd_id=$2`, sessionID, commandID); err != nil {
+				t.Fatalf("expire settings operation deadline: %v", err)
+			}
+		},
+		RevokeWriter: func(t *testing.T, current store.SettingsCommandStore, sessionID string) {
+			t.Helper()
+			harness := current.(*postgresCommandHarness)
+			if _, err := harness.pool.Exec(context.Background(), `UPDATE session_adapter_connections SET revoked_at=statement_timestamp() WHERE session_id=$1`, sessionID); err != nil {
+				t.Fatalf("revoke settings writer: %v", err)
+			}
+		},
+	})
+}
+
 func TestPendingCommandListRejectsCorruptEventPayload(t *testing.T) {
 	harness := newPostgresCommandHarness(t, "agentwharf_command_corrupt", nil)
 	ctx := context.Background()
@@ -1611,7 +1641,7 @@ func newPostgresConnectionHarness(t *testing.T) *postgresConnectionHarness {
 	setupSchema(t, dsn, schemaName)
 	pool := openPool(t, dsn, schemaName, nil)
 	resetSchema(t, pool)
-	if _, err := pool.Exec(context.Background(), `CREATE SEQUENCE session_adapter_connection_accepted_fence_seq AS BIGINT MINVALUE 1 START WITH 1`); err != nil {
+	if _, err := pool.Exec(context.Background(), `CREATE SEQUENCE IF NOT EXISTS session_adapter_connection_accepted_fence_seq AS BIGINT MINVALUE 1 START WITH 1`); err != nil {
 		t.Fatalf("create connection fence sequence: %v", err)
 	}
 	if _, err := pool.Exec(context.Background(), `
@@ -1789,7 +1819,7 @@ func (h *postgresCommandHarness) seedAuthority(t *testing.T) {
 	sessionIDs := []string{
 		"ses_command_1", "ses_command_claim", "ses_command_stale",
 		"ses_command_expired", "ses_command_reopen", "ses_command_invalid",
-		"ses_command_unknown",
+		"ses_command_unknown", "ses_settings_1", "ses_settings_2", "ses_settings_revoked_ack", "ses_settings_revoked_finalize",
 	}
 	if _, err := h.pool.Exec(context.Background(), `
 INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS session_id

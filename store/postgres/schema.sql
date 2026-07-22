@@ -138,6 +138,56 @@ CREATE TABLE session_pending_commands (
 CREATE INDEX session_pending_commands_status_expiry_idx
     ON session_pending_commands (status, expires_at);
 
+CREATE TABLE session_settings_capabilities (
+    session_id TEXT PRIMARY KEY REFERENCES agent_sessions(id),
+    capability_event_seq BIGINT NOT NULL,
+    fingerprint TEXT NOT NULL CHECK (fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+    effective_model_id TEXT NOT NULL CHECK (char_length(effective_model_id) BETWEEN 1 AND 128),
+    effective_permission_mode_id TEXT NOT NULL CHECK (char_length(effective_permission_mode_id) BETWEEN 1 AND 128),
+    capability_version BIGINT NOT NULL CHECK (capability_version > 0),
+    writer_connection_epoch BIGINT NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation BIGINT NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (char_length(writer_lease_id) BETWEEN 1 AND 255),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
+    ,FOREIGN KEY (session_id, capability_event_seq) REFERENCES session_events(session_id, seq)
+);
+CREATE TABLE session_settings_commands (
+    session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+    cmd_id TEXT NOT NULL CHECK (char_length(cmd_id) BETWEEN 1 AND 256),
+    request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+    requested_model_id TEXT CHECK (requested_model_id IS NULL OR char_length(requested_model_id) BETWEEN 1 AND 128),
+    requested_permission_mode_id TEXT CHECK (requested_permission_mode_id IS NULL OR char_length(requested_permission_mode_id) BETWEEN 1 AND 128),
+    reservation_version BIGINT NOT NULL CHECK (reservation_version > 0),
+    delivery_deadline TIMESTAMPTZ NOT NULL,
+    operation_deadline TIMESTAMPTZ,
+    writer_connection_epoch BIGINT NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation BIGINT NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (char_length(writer_lease_id) BETWEEN 1 AND 255),
+    reserved_capability_event_seq BIGINT NOT NULL,
+    reserved_fingerprint TEXT NOT NULL CHECK (reserved_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+    reserved_effective_model_id TEXT NOT NULL CHECK (char_length(reserved_effective_model_id) BETWEEN 1 AND 128),
+    reserved_effective_permission_mode_id TEXT NOT NULL CHECK (char_length(reserved_effective_permission_mode_id) BETWEEN 1 AND 128),
+    status TEXT NOT NULL CHECK (status IN ('delivery_pending', 'pending', 'recovery_pending', 'applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective')),
+    terminal_event_seq BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    PRIMARY KEY (session_id, cmd_id),
+    FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
+    FOREIGN KEY (session_id, reserved_capability_event_seq) REFERENCES session_events(session_id, seq),
+    CHECK (requested_model_id IS NOT NULL OR requested_permission_mode_id IS NOT NULL),
+    CHECK ((status = 'delivery_pending' AND operation_deadline IS NULL AND terminal_event_seq IS NULL)
+        OR (status IN ('pending', 'recovery_pending') AND operation_deadline IS NOT NULL AND terminal_event_seq IS NULL)
+        OR (status IN ('applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective') AND terminal_event_seq IS NOT NULL)),
+    CHECK (delivery_deadline > created_at),
+    CHECK (delivery_deadline <= created_at + interval '5 seconds'),
+    CHECK (operation_deadline IS NULL OR operation_deadline > created_at),
+    CHECK (operation_deadline IS NULL OR operation_deadline <= created_at + interval '35 seconds')
+);
+CREATE UNIQUE INDEX session_settings_commands_one_nonterminal_idx
+    ON session_settings_commands (session_id)
+    WHERE status IN ('delivery_pending', 'pending', 'recovery_pending');
+CREATE SEQUENCE session_adapter_connection_accepted_fence_seq AS BIGINT MINVALUE 1 START WITH 1;
 CREATE TABLE session_attachments (
     attach_id TEXT PRIMARY KEY CHECK (char_length(attach_id) BETWEEN 1 AND 255),
     bootstrap_session_id TEXT NOT NULL REFERENCES agent_sessions(id),
@@ -198,7 +248,12 @@ CREATE TABLE session_adapter_connections (
 
 CREATE INDEX session_adapter_connections_active_expiry_idx
     ON session_adapter_connections (active_credential_expires_at);
-
+CREATE TABLE session_settings_live_writers (
+    session_id TEXT PRIMARY KEY REFERENCES agent_sessions(id),
+    connection_epoch BIGINT NOT NULL CHECK (connection_epoch > 0),
+    credential_generation BIGINT NOT NULL CHECK (credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (char_length(writer_lease_id) BETWEEN 1 AND 255)
+);
 CREATE TABLE session_attach_attempts (
     attempt_jti_hash BYTEA PRIMARY KEY CHECK (octet_length(attempt_jti_hash) = 32),
     attach_id TEXT NOT NULL CHECK (char_length(attach_id) BETWEEN 1 AND 255),

@@ -315,6 +315,7 @@ type AdapterConnectionPreHelloTermination struct {
 
 type AdapterHello struct {
 	CredentialGeneration int64
+	WriterLeaseID        string
 }
 
 // AdapterConnectionAdmission binds an opaque grant fence to the exact live
@@ -598,4 +599,97 @@ type CommandLedgerStore interface {
 	ClaimPendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, commandID string) (PendingCommandClaim, error)
 	ResolvePendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, commandID string, status PendingCommandStatus) (PendingCommand, error)
 	ResolvePendingCommandUnknown(ctx context.Context, sessionID string, commandID string) (PendingCommand, error)
+}
+
+type SettingsWriter struct {
+	ConnectionEpoch      int64
+	CredentialGeneration int64
+	LeaseID              string
+}
+type SettingsCapability struct {
+	SessionID                 string
+	EventSeq                  int64
+	Fingerprint               string
+	EffectiveModelID          string
+	EffectivePermissionModeID string
+	Version                   int64
+	Writer                    SettingsWriter
+}
+type SettingsCapabilityUpdate struct {
+	EventSeq                  int64
+	Fingerprint               string
+	EffectiveModelID          string
+	EffectivePermissionModeID string
+	Writer                    SettingsWriter
+}
+type SettingsCommandStatus string
+
+const (
+	SettingsCommandDeliveryPending SettingsCommandStatus = "delivery_pending"
+	SettingsCommandPending         SettingsCommandStatus = "pending"
+	SettingsCommandRecoveryPending SettingsCommandStatus = "recovery_pending"
+	SettingsCommandApplied         SettingsCommandStatus = "applied"
+	SettingsCommandRejected        SettingsCommandStatus = "rejected"
+	SettingsCommandTimeout         SettingsCommandStatus = "timeout"
+	SettingsCommandUnsupported     SettingsCommandStatus = "unsupported"
+	SettingsCommandStaleCapability SettingsCommandStatus = "stale_capability"
+	SettingsCommandOutcomeUnknown  SettingsCommandStatus = "outcome_unknown"
+	SettingsCommandMismatched      SettingsCommandStatus = "mismatched_effective"
+)
+
+type SettingsCommandRequest struct {
+	CommandID                 string
+	RequestFingerprint        string
+	RequestedModelID          *string
+	RequestedPermissionModeID *string
+	Writer                    SettingsWriter
+}
+type SettingsCommand struct {
+	SessionID                 string
+	CommandID                 string
+	RequestFingerprint        string
+	RequestedModelID          *string
+	RequestedPermissionModeID *string
+	ReservationVersion        int64
+	DeliveryDeadline          time.Time
+	OperationDeadline         *time.Time
+	Writer                    SettingsWriter
+	ReservedCapability        SettingsCapability
+	Status                    SettingsCommandStatus
+	TerminalEventSeq          *int64
+}
+type SettingsCommandReserve struct {
+	Command   SettingsCommand
+	Duplicate bool
+}
+type SettingsCommandFinalize struct {
+	ReservationVersion  int64
+	ExpectedStatus      SettingsCommandStatus
+	Writer              *SettingsWriter
+	Outcome             SettingsCommandStatus
+	ReasonCode          *string
+	EffectiveCapability SettingsCapability
+}
+
+func SettingsTerminalEventPayload(command SettingsCommand, capability SettingsCapability, outcome SettingsCommandStatus, reason *string) ([]byte, error) {
+	return json.Marshal(struct {
+		CommandID                 string                `json:"cmd_id"`
+		RequestFingerprint        string                `json:"request_fingerprint"`
+		EffectiveFingerprint      string                `json:"effective_fingerprint"`
+		Outcome                   SettingsCommandStatus `json:"outcome"`
+		EffectiveModelID          string                `json:"effective_model_id"`
+		EffectivePermissionModeID string                `json:"effective_permission_mode_id"`
+		ReasonCode                *string               `json:"reason_code"`
+	}{command.CommandID, command.RequestFingerprint, capability.Fingerprint, outcome, capability.EffectiveModelID, capability.EffectivePermissionModeID, reason})
+}
+
+type SettingsCommandStore interface {
+	EventStore
+	PublishSettingsCapability(ctx context.Context, sessionID string, update SettingsCapabilityUpdate) (SettingsCapability, error)
+	SettingsCommandReserve(ctx context.Context, sessionID string, request SettingsCommandRequest) (SettingsCommandReserve, error)
+	AcknowledgeSettingsCommandDelivery(ctx context.Context, sessionID string, commandID string, reservationVersion int64, writer SettingsWriter) (SettingsCommand, error)
+	FinalizeSettingsCommand(ctx context.Context, sessionID string, commandID string, finalize SettingsCommandFinalize) (SettingsCommand, error)
+	RecoverSettingsCommand(ctx context.Context, sessionID string, commandID string, priorWriter SettingsWriter) (SettingsCommand, error)
+	SettingsCommand(ctx context.Context, sessionID string, commandID string) (SettingsCommand, error)
+	PendingSettingsCommands(ctx context.Context, sessionID string) ([]SettingsCommand, error)
 }

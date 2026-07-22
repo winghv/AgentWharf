@@ -29,6 +29,339 @@ type PendingCommandHarness struct {
 	Invalidate func(t *testing.T, ledger store.CommandLedgerStore, kind CommandAuthorityFailure)
 }
 
+type SettingsCommandHarness struct {
+	Open                    func(t *testing.T) store.SettingsCommandStore
+	Reopen                  func(t *testing.T, current store.SettingsCommandStore) store.SettingsCommandStore
+	ExpireOperationDeadline func(t *testing.T, ledger store.SettingsCommandStore, sessionID, commandID string)
+	RevokeWriter            func(t *testing.T, ledger store.SettingsCommandStore, sessionID string)
+}
+
+// SettingsCommandContract fixes the durable reservation state machine shared by
+// SQLite and PostgreSQL. Callers use only opaque IDs, fingerprints and writer
+// routing metadata; the contract deliberately has no Provider, credential or
+// content fixtures.
+func SettingsCommandContract(t *testing.T, harness SettingsCommandHarness) {
+	t.Helper()
+	if harness.Open == nil || harness.Reopen == nil || harness.ExpireOperationDeadline == nil || harness.RevokeWriter == nil {
+		t.Fatal("settings-command harness is incomplete")
+	}
+	ctx := context.Background()
+	capability := store.SettingsCapabilityUpdate{
+		Fingerprint:      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		EffectiveModelID: "reasoning", EffectivePermissionModeID: "ask",
+	}
+	request := store.SettingsCommandRequest{
+		CommandID: "cmd_settings_1", RequestFingerprint: capability.Fingerprint,
+		RequestedModelID: settingsString("reasoning"),
+	}
+	ledger := harness.Open(t)
+	writer := bindSettingsWriter(t, ledger, "ses_settings_1", "lease_current")
+	capability.Writer = writer
+	request.Writer = writer
+	capability.EventSeq = appendSettingsCapabilityEvent(t, ledger, "ses_settings_1")
+	published, err := ledger.PublishSettingsCapability(ctx, "ses_settings_1", capability)
+	if err != nil || published.Version != 1 || published.Writer != writer {
+		t.Fatalf("PublishSettingsCapability() = %+v, %v", published, err)
+	}
+	reserved, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", request)
+	if err != nil || reserved.Duplicate || reserved.Command.Status != store.SettingsCommandDeliveryPending || reserved.Command.ReservationVersion != 1 || !reserved.Command.DeliveryDeadline.After(time.Now()) {
+		t.Fatalf("SettingsCommandReserve() = %+v, %v", reserved, err)
+	}
+	retry, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", request)
+	if err != nil || !retry.Duplicate || !reflect.DeepEqual(retry.Command, reserved.Command) {
+		t.Fatalf("exact SettingsCommandReserve retry = %+v, %v; want %+v", retry, err, reserved.Command)
+	}
+	changed := request
+	changed.RequestedModelID = settingsString("balanced")
+	if _, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", changed); err == nil {
+		t.Fatal("changed cmd_id retry unexpectedly succeeded")
+	}
+	second := request
+	second.CommandID = "cmd_settings_2"
+	if _, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", second); err == nil {
+		t.Fatal("second nonterminal Session reservation unexpectedly succeeded")
+	}
+	secondCapability := capability
+	secondWriter := bindSettingsWriter(t, ledger, "ses_settings_2", "lease_second")
+	secondCapability.Writer = secondWriter
+	secondCapability.EventSeq = appendSettingsCapabilityEvent(t, ledger, "ses_settings_2")
+	if _, err := ledger.PublishSettingsCapability(ctx, "ses_settings_2", secondCapability); err != nil {
+		t.Fatalf("publish second Session capability: %v", err)
+	}
+	secondRequest := request
+	secondRequest.Writer = secondWriter
+	if _, err := ledger.SettingsCommandReserve(ctx, "ses_settings_2", secondRequest); err != nil {
+		t.Fatalf("cross-Session reservation unexpectedly blocked: %v", err)
+	}
+	stale := writer
+	stale.LeaseID = "lease_stale"
+	if _, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, "ses_settings_1", request.CommandID, reserved.Command.ReservationVersion, stale); err == nil {
+		t.Fatal("stale writer delivery acknowledgement unexpectedly succeeded")
+	}
+	acknowledged, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, "ses_settings_1", request.CommandID, reserved.Command.ReservationVersion, writer)
+	if err != nil || acknowledged.Status != store.SettingsCommandPending || acknowledged.OperationDeadline == nil {
+		t.Fatalf("AcknowledgeSettingsCommandDelivery() = %+v, %v", acknowledged, err)
+	}
+	ledger = harness.Reopen(t, ledger)
+	pending, err := ledger.PendingSettingsCommands(ctx, "ses_settings_1")
+	if err != nil || len(pending) != 1 || !reflect.DeepEqual(pending[0], acknowledged) {
+		t.Fatalf("restart pending settings recovery = %+v, %v; want %+v", pending, err, acknowledged)
+	}
+	changedCapability := capability
+	changedCapability.EventSeq = appendSettingsCapabilityEvent(t, ledger, "ses_settings_1")
+	changedCapability.EffectivePermissionModeID = "workspace"
+	changedPublished, err := ledger.PublishSettingsCapability(ctx, "ses_settings_1", changedCapability)
+	if err != nil {
+		t.Fatalf("publish unrequested control mutation: %v", err)
+	}
+	if _, err := ledger.FinalizeSettingsCommand(ctx, "ses_settings_1", request.CommandID, store.SettingsCommandFinalize{
+		ReservationVersion: acknowledged.ReservationVersion, ExpectedStatus: store.SettingsCommandPending,
+		Writer: &writer, Outcome: store.SettingsCommandApplied, EffectiveCapability: changedPublished,
+	}); err == nil {
+		t.Fatal("applied finalization accepted an unrequested control mutation")
+	}
+	capability.EventSeq = appendSettingsCapabilityEvent(t, ledger, "ses_settings_1")
+	published, err = ledger.PublishSettingsCapability(ctx, "ses_settings_1", capability)
+	if err != nil || published.Writer != writer {
+		t.Fatalf("restore reserved capability: %+v, %v", published, err)
+	}
+	finalized, err := ledger.FinalizeSettingsCommand(ctx, "ses_settings_1", request.CommandID, store.SettingsCommandFinalize{
+		ReservationVersion: acknowledged.ReservationVersion, ExpectedStatus: store.SettingsCommandPending,
+		Writer: &writer, Outcome: store.SettingsCommandApplied, EffectiveCapability: published,
+	})
+	if err != nil || finalized.Status != store.SettingsCommandApplied || finalized.TerminalEventSeq == nil || *finalized.TerminalEventSeq < 1 {
+		t.Fatalf("FinalizeSettingsCommand() = %+v, %v", finalized, err)
+	}
+	if _, err := ledger.FinalizeSettingsCommand(ctx, "ses_settings_1", request.CommandID, store.SettingsCommandFinalize{
+		ReservationVersion: acknowledged.ReservationVersion, ExpectedStatus: store.SettingsCommandPending,
+		Writer: &writer, Outcome: store.SettingsCommandApplied, EffectiveCapability: published,
+	}); err == nil {
+		t.Fatal("second terminal settings finalize unexpectedly succeeded")
+	}
+	if commands, err := ledger.PendingSettingsCommands(ctx, "ses_settings_1"); err != nil || len(commands) != 0 {
+		t.Fatalf("terminal reservation remained pending: %+v, %v", commands, err)
+	}
+	timeoutRequest := request
+	timeoutRequest.CommandID = "cmd_settings_operation_deadline"
+	timeout, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", timeoutRequest)
+	if err != nil || timeout.Duplicate {
+		t.Fatalf("operation-deadline reservation = %+v, %v", timeout, err)
+	}
+	timeoutPending, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, "ses_settings_1", timeoutRequest.CommandID, timeout.Command.ReservationVersion, writer)
+	if err != nil || timeoutPending.OperationDeadline == nil {
+		t.Fatalf("operation-deadline acknowledgement = %+v, %v", timeoutPending, err)
+	}
+	timeoutReason := "operation_timeout"
+	timeoutFinalize := store.SettingsCommandFinalize{ReservationVersion: timeoutPending.ReservationVersion, ExpectedStatus: store.SettingsCommandPending, Outcome: store.SettingsCommandTimeout, ReasonCode: &timeoutReason, EffectiveCapability: published}
+	if _, err := ledger.FinalizeSettingsCommand(ctx, "ses_settings_1", timeoutRequest.CommandID, timeoutFinalize); err == nil {
+		t.Fatal("pre-deadline timeout unexpectedly finalized")
+	}
+	if current, err := ledger.SettingsCommand(ctx, "ses_settings_1", timeoutRequest.CommandID); err != nil || current.Status != store.SettingsCommandPending || current.TerminalEventSeq != nil {
+		t.Fatalf("pre-deadline timeout mutated command = %+v, %v", current, err)
+	}
+	harness.ExpireOperationDeadline(t, ledger, "ses_settings_1", timeoutRequest.CommandID)
+	timedOut, err := ledger.FinalizeSettingsCommand(ctx, "ses_settings_1", timeoutRequest.CommandID, timeoutFinalize)
+	if err != nil || timedOut.Status != store.SettingsCommandTimeout || timedOut.TerminalEventSeq == nil {
+		t.Fatalf("elapsed operation timeout = %+v, %v", timedOut, err)
+	}
+	recoveryRequest := request
+	recoveryRequest.CommandID = "cmd_settings_recovery"
+	recovery, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", recoveryRequest)
+	if err != nil || recovery.Duplicate {
+		t.Fatalf("recovery SettingsCommandReserve() = %+v, %v", recovery, err)
+	}
+	if _, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, "ses_settings_1", recoveryRequest.CommandID, recovery.Command.ReservationVersion, writer); err != nil {
+		t.Fatalf("acknowledge recovery command: %v", err)
+	}
+	newWriter := replaceSettingsWriter(t, ledger, "ses_settings_1", "lease_recovered")
+	refreshedUpdate := capability
+	refreshedUpdate.Fingerprint = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	refreshedUpdate.Writer = newWriter
+	refreshedUpdate.EventSeq = appendSettingsCapabilityEvent(t, ledger, "ses_settings_1")
+	refreshed, err := ledger.PublishSettingsCapability(ctx, "ses_settings_1", refreshedUpdate)
+	if err != nil || refreshed.Version != 4 || refreshed.Writer != newWriter {
+		t.Fatalf("refresh settings capability = %+v, %v", refreshed, err)
+	}
+	assertRevokedSettingsWriter(t, ledger, harness, refreshed)
+	stalePublish := refreshedUpdate
+	stalePublish.EventSeq = appendSettingsCapabilityEvent(t, ledger, "ses_settings_1")
+	stalePublish.Writer = writer
+	if _, err := ledger.PublishSettingsCapability(ctx, "ses_settings_1", stalePublish); err == nil {
+		t.Fatal("replaced writer republished a Settings capability")
+	}
+	staleReserve := request
+	staleReserve.CommandID = "cmd_settings_stale_writer"
+	if _, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", staleReserve); err == nil {
+		t.Fatal("replaced writer reserved a Settings command")
+	}
+	if _, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, "ses_settings_1", recoveryRequest.CommandID, recovery.Command.ReservationVersion, writer); err == nil {
+		t.Fatal("replaced writer acknowledged a Settings command")
+	}
+	fenced, err := ledger.RecoverSettingsCommand(ctx, "ses_settings_1", recoveryRequest.CommandID, writer)
+	if err != nil || fenced.Status != store.SettingsCommandRecoveryPending {
+		t.Fatalf("RecoverSettingsCommand() = %+v, %v", fenced, err)
+	}
+	if _, err := ledger.FinalizeSettingsCommand(ctx, "ses_settings_1", recoveryRequest.CommandID, store.SettingsCommandFinalize{
+		ReservationVersion: fenced.ReservationVersion, ExpectedStatus: store.SettingsCommandRecoveryPending,
+		Writer: &writer, Outcome: store.SettingsCommandApplied, EffectiveCapability: published,
+	}); err == nil {
+		t.Fatal("recovered command accepted fenced old writer")
+	}
+	retryAfterWriterRefresh := request
+	retryAfterWriterRefresh.Writer = newWriter
+	if retry, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", retryAfterWriterRefresh); err != nil || !retry.Duplicate {
+		t.Fatalf("retry after writer refresh = %+v, %v; want duplicate", retry, err)
+	}
+	recoveryReason := "recovery_unconfirmed"
+	unknown, err := ledger.FinalizeSettingsCommand(ctx, "ses_settings_1", recoveryRequest.CommandID, store.SettingsCommandFinalize{
+		ReservationVersion: fenced.ReservationVersion, ExpectedStatus: store.SettingsCommandRecoveryPending,
+		Outcome: store.SettingsCommandOutcomeUnknown, ReasonCode: &recoveryReason, EffectiveCapability: refreshed,
+	})
+	if err != nil || unknown.Status != store.SettingsCommandOutcomeUnknown || unknown.TerminalEventSeq == nil {
+		t.Fatalf("recovery finalization = %+v, %v", unknown, err)
+	}
+	raceRequest := request
+	raceRequest.CommandID = "cmd_settings_race"
+	raceRequest.RequestFingerprint = refreshed.Fingerprint
+	raceRequest.Writer = newWriter
+	race, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", raceRequest)
+	if err != nil || race.Duplicate {
+		t.Fatalf("race SettingsCommandReserve() = %+v, %v", race, err)
+	}
+	racePending, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, "ses_settings_1", raceRequest.CommandID, race.Command.ReservationVersion, newWriter)
+	if err != nil {
+		t.Fatalf("acknowledge race command: %v", err)
+	}
+	finalizeResult := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, finalizeErr := ledger.FinalizeSettingsCommand(ctx, "ses_settings_1", raceRequest.CommandID, store.SettingsCommandFinalize{
+				ReservationVersion: racePending.ReservationVersion, ExpectedStatus: store.SettingsCommandPending,
+				Writer: &newWriter, Outcome: store.SettingsCommandApplied, EffectiveCapability: refreshed,
+			})
+			finalizeResult <- finalizeErr
+		}()
+	}
+	successes := 0
+	for range 2 {
+		if err := <-finalizeResult; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent settings finalization successes = %d, want 1", successes)
+	}
+	deliveryDeadline := raceRequest
+	deliveryDeadline.CommandID = "cmd_settings_delivery_deadline"
+	delivery, err := ledger.SettingsCommandReserve(ctx, "ses_settings_1", deliveryDeadline)
+	if err != nil || delivery.Duplicate {
+		t.Fatalf("delivery-deadline reservation = %+v, %v", delivery, err)
+	}
+	time.Sleep(5100 * time.Millisecond)
+	expired, err := ledger.RecoverSettingsCommand(ctx, "ses_settings_1", deliveryDeadline.CommandID, newWriter)
+	if err != nil || expired.Status != store.SettingsCommandRejected || expired.TerminalEventSeq == nil {
+		t.Fatalf("delivery deadline recovery = %+v, %v", expired, err)
+	}
+	terminalEvents := 0
+	if err := ledger.Replay(ctx, "ses_settings_1", 0, func(event store.Event) error {
+		if event.Type == "session.settings.effective" {
+			terminalEvents++
+		}
+		return nil
+	}); err != nil || terminalEvents != 5 {
+		t.Fatalf("settings terminal events = %d, %v; want exactly five", terminalEvents, err)
+	}
+}
+
+func settingsString(value string) *string { return &value }
+
+func bindSettingsWriter(t *testing.T, ledger store.SettingsCommandStore, sessionID, leaseID string) store.SettingsWriter {
+	t.Helper()
+	connections, ok := ledger.(store.AdapterConnectionStore)
+	if !ok {
+		t.Fatal("settings Store does not expose Adapter connection authority")
+	}
+	if _, err := connections.AdapterConnection(context.Background(), sessionID); err != nil {
+		if _, err := connections.InitializeAdapterConnection(context.Background(), store.AdapterConnectionInitialize{SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+			t.Fatalf("initialize Settings writer = %v", err)
+		}
+	}
+	return replaceSettingsWriter(t, ledger, sessionID, leaseID)
+}
+
+func replaceSettingsWriter(t *testing.T, ledger store.SettingsCommandStore, sessionID, leaseID string) store.SettingsWriter {
+	t.Helper()
+	connections, ok := ledger.(store.AdapterConnectionStore)
+	if !ok {
+		t.Fatal("settings Store does not expose Adapter connection authority")
+	}
+	current, err := connections.AdapterConnection(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("read Settings writer connection = %v", err)
+	}
+	connection, err := connections.AcceptAdapterHello(context.Background(), sessionID, store.AdapterHello{CredentialGeneration: current.ActiveCredentialGeneration, WriterLeaseID: leaseID})
+	if err != nil {
+		t.Fatalf("accept Settings writer hello = %v", err)
+	}
+	return store.SettingsWriter{ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: leaseID}
+}
+
+func appendSettingsCapabilityEvent(t *testing.T, ledger store.EventStore, sessionID string) int64 {
+	t.Helper()
+	seq, err := ledger.Append(context.Background(), sessionID, []store.PendingEvent{{
+		Type: "session.settings.capabilities", Time: time.Now(), Payload: json.RawMessage(`{}`),
+	}})
+	if err != nil {
+		t.Fatalf("append settings capability event: %v", err)
+	}
+	return seq
+}
+
+func assertRevokedSettingsWriter(t *testing.T, ledger store.SettingsCommandStore, harness SettingsCommandHarness, capability store.SettingsCapability) {
+	t.Helper()
+	ctx := context.Background()
+	for _, sessionID := range []string{"ses_settings_revoked_ack", "ses_settings_revoked_finalize"} {
+		current := bindSettingsWriter(t, ledger, sessionID, "lease_"+sessionID)
+		update := store.SettingsCapabilityUpdate{Fingerprint: capability.Fingerprint, EffectiveModelID: capability.EffectiveModelID, EffectivePermissionModeID: capability.EffectivePermissionModeID}
+		update.Writer, update.EventSeq = current, appendSettingsCapabilityEvent(t, ledger, sessionID)
+		published, err := ledger.PublishSettingsCapability(ctx, sessionID, update)
+		if err != nil {
+			t.Fatalf("publish revoked-writer fixture %s: %v", sessionID, err)
+		}
+		request := store.SettingsCommandRequest{CommandID: "cmd_" + sessionID, RequestFingerprint: published.Fingerprint, RequestedModelID: settingsString("reasoning"), Writer: current}
+		reserved, err := ledger.SettingsCommandReserve(ctx, sessionID, request)
+		if err != nil || reserved.Duplicate {
+			t.Fatalf("reserve revoked-writer fixture %s: %+v, %v", sessionID, reserved, err)
+		}
+		if sessionID == "ses_settings_revoked_finalize" {
+			if _, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, sessionID, request.CommandID, reserved.Command.ReservationVersion, current); err != nil {
+				t.Fatalf("acknowledge revoked-finalize fixture: %v", err)
+			}
+		}
+		harness.RevokeWriter(t, ledger, sessionID)
+		if connection, err := ledger.(store.AdapterConnectionStore).AdapterConnection(ctx, sessionID); err != nil || connection.ConnectionEpoch != current.ConnectionEpoch || connection.ActiveCredentialGeneration != current.CredentialGeneration || connection.RevokedAt == nil {
+			t.Fatalf("revoked writer changed trusted tuple for %s: %+v, %v", sessionID, connection, err)
+		}
+		update.EventSeq = appendSettingsCapabilityEvent(t, ledger, sessionID)
+		if _, err := ledger.PublishSettingsCapability(ctx, sessionID, update); err == nil {
+			t.Fatalf("revoked unchanged-tuple writer published for %s", sessionID)
+		}
+		if _, err := ledger.SettingsCommandReserve(ctx, sessionID, store.SettingsCommandRequest{CommandID: "cmd_second_" + sessionID, RequestFingerprint: published.Fingerprint, RequestedModelID: settingsString("reasoning"), Writer: current}); err == nil {
+			t.Fatalf("revoked unchanged-tuple writer reserved for %s", sessionID)
+		}
+		if sessionID == "ses_settings_revoked_ack" {
+			if _, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, sessionID, request.CommandID, reserved.Command.ReservationVersion, current); err == nil {
+				t.Fatal("revoked unchanged-tuple writer acknowledged delivery")
+			}
+			continue
+		}
+		reason := "recovery_unconfirmed"
+		if _, err := ledger.FinalizeSettingsCommand(ctx, sessionID, request.CommandID, store.SettingsCommandFinalize{ReservationVersion: reserved.Command.ReservationVersion, ExpectedStatus: store.SettingsCommandPending, Writer: &current, Outcome: store.SettingsCommandOutcomeUnknown, ReasonCode: &reason, EffectiveCapability: published}); err == nil {
+			t.Fatal("revoked unchanged-tuple writer finalized")
+		}
+	}
+}
+
 type AttachmentHarness struct {
 	Open   func(t *testing.T) store.AttachmentStore
 	Reopen func(t *testing.T, current store.AttachmentStore) store.AttachmentStore

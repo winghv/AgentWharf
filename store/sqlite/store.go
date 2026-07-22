@@ -648,6 +648,329 @@ INSERT INTO session_pending_commands (
 	}}, nil
 }
 
+func (s *Store) PublishSettingsCapability(ctx context.Context, sessionID string, update store.SettingsCapabilityUpdate) (store.SettingsCapability, error) {
+	if !validSettingsCapabilityUpdate(sessionID, update) {
+		return store.SettingsCapability{}, errors.New("invalid settings capability")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.SettingsCapability{}, fmt.Errorf("begin settings capability transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.SettingsCapability{}, err
+	}
+	if err := lockCommandAuthority(ctx, tx, sessionID, store.CommandAuthority{ConnectionEpoch: update.Writer.ConnectionEpoch, CredentialGeneration: update.Writer.CredentialGeneration}); err != nil {
+		return store.SettingsCapability{}, err
+	}
+	if err := validateLiveSettingsWriter(ctx, tx, sessionID, update.Writer); err != nil {
+		return store.SettingsCapability{}, err
+	}
+	if err := verifySettingsCapabilityEvent(ctx, tx, sessionID, update.EventSeq); err != nil {
+		return store.SettingsCapability{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO session_settings_capabilities
+(session_id, capability_event_seq, fingerprint, effective_model_id, effective_permission_mode_id, capability_version, writer_connection_epoch, writer_credential_generation, writer_lease_id, created_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=excluded.capability_event_seq, fingerprint=excluded.fingerprint, effective_model_id=excluded.effective_model_id,
+ effective_permission_mode_id=excluded.effective_permission_mode_id, capability_version=session_settings_capabilities.capability_version+1,
+ writer_connection_epoch=excluded.writer_connection_epoch, writer_credential_generation=excluded.writer_credential_generation,
+ writer_lease_id=excluded.writer_lease_id, updated_at_ms=excluded.updated_at_ms
+`, sessionID, update.EventSeq, update.Fingerprint, update.EffectiveModelID, update.EffectivePermissionModeID, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID, nowMS, nowMS); err != nil {
+		return store.SettingsCapability{}, fmt.Errorf("upsert settings capability: %w", err)
+	}
+	capability, err := querySettingsCapability(ctx, tx, sessionID)
+	if err != nil {
+		return store.SettingsCapability{}, err
+	}
+	return capability, tx.Commit()
+}
+
+func (s *Store) SettingsCommandReserve(ctx context.Context, sessionID string, request store.SettingsCommandRequest) (store.SettingsCommandReserve, error) {
+	if !validSettingsCommandRequest(sessionID, request) {
+		return store.SettingsCommandReserve{}, errors.New("invalid settings command reservation")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.SettingsCommandReserve{}, fmt.Errorf("begin settings reservation transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.SettingsCommandReserve{}, err
+	}
+	authority := store.CommandAuthority{ConnectionEpoch: request.Writer.ConnectionEpoch, CredentialGeneration: request.Writer.CredentialGeneration}
+	if err := lockCommandAuthority(ctx, tx, sessionID, authority); err != nil {
+		return store.SettingsCommandReserve{}, err
+	}
+	if err := validateCurrentSettingsWriter(ctx, tx, sessionID, request.Writer); err != nil {
+		return store.SettingsCommandReserve{}, err
+	}
+	capability, err := querySettingsCapability(ctx, tx, sessionID)
+	if err != nil {
+		return store.SettingsCommandReserve{}, fmt.Errorf("select settings capability: %w", err)
+	}
+	existing, err := querySettingsCommand(ctx, tx, sessionID, request.CommandID)
+	if err == nil {
+		if existing.RequestFingerprint != request.RequestFingerprint || !sameSettingsOptionalID(existing.RequestedModelID, request.RequestedModelID) || !sameSettingsOptionalID(existing.RequestedPermissionModeID, request.RequestedPermissionModeID) {
+			return store.SettingsCommandReserve{}, errors.New("settings command ID is reused")
+		}
+		if err := tx.Commit(); err != nil {
+			return store.SettingsCommandReserve{}, fmt.Errorf("commit duplicate settings reservation: %w", err)
+		}
+		return store.SettingsCommandReserve{Command: existing, Duplicate: true}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return store.SettingsCommandReserve{}, err
+	}
+	if capability.Fingerprint != request.RequestFingerprint || capability.Writer != request.Writer {
+		return store.SettingsCommandReserve{}, errors.New("settings capability is stale or writer is fenced")
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO session_settings_commands
+(session_id, cmd_id, request_fingerprint, requested_model_id, requested_permission_mode_id, reservation_version, delivery_deadline_ms, writer_connection_epoch, writer_credential_generation, writer_lease_id, reserved_capability_event_seq, reserved_fingerprint, reserved_effective_model_id, reserved_effective_permission_mode_id, status, created_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'delivery_pending', ?, ?)
+`, sessionID, request.CommandID, request.RequestFingerprint, request.RequestedModelID, request.RequestedPermissionModeID, nowMS+5000, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, capability.EventSeq, capability.Fingerprint, capability.EffectiveModelID, capability.EffectivePermissionModeID, nowMS, nowMS); err != nil {
+		return store.SettingsCommandReserve{}, fmt.Errorf("insert settings reservation: %w", err)
+	}
+	command, err := querySettingsCommand(ctx, tx, sessionID, request.CommandID)
+	if err != nil {
+		return store.SettingsCommandReserve{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.SettingsCommandReserve{}, fmt.Errorf("commit settings reservation: %w", err)
+	}
+	return store.SettingsCommandReserve{Command: command}, nil
+}
+
+func (s *Store) AcknowledgeSettingsCommandDelivery(ctx context.Context, sessionID, commandID string, reservationVersion int64, writer store.SettingsWriter) (store.SettingsCommand, error) {
+	if !validConnectionID(sessionID) || commandID == "" || reservationVersion < 1 || !validSettingsWriter(writer) {
+		return store.SettingsCommand{}, errors.New("invalid settings delivery acknowledgement")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.SettingsCommand{}, fmt.Errorf("begin settings delivery transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	if err := lockCommandAuthority(ctx, tx, sessionID, store.CommandAuthority{ConnectionEpoch: writer.ConnectionEpoch, CredentialGeneration: writer.CredentialGeneration}); err != nil {
+		return store.SettingsCommand{}, err
+	}
+	if err := validateCurrentSettingsWriter(ctx, tx, sessionID, writer); err != nil {
+		return store.SettingsCommand{}, err
+	}
+	command, err := querySettingsCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	if command.ReservationVersion != reservationVersion || command.Writer != writer || command.Status != store.SettingsCommandDeliveryPending || command.DeliveryDeadline.UnixMilli() <= nowMS {
+		return store.SettingsCommand{}, errors.New("settings delivery acknowledgement is fenced")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_settings_commands SET status='pending', operation_deadline_ms=?, updated_at_ms=? WHERE session_id=? AND cmd_id=? AND reservation_version=? AND status='delivery_pending' AND delivery_deadline_ms>? AND writer_connection_epoch=? AND writer_credential_generation=? AND writer_lease_id=?`, nowMS+30000, nowMS, sessionID, commandID, reservationVersion, nowMS, writer.ConnectionEpoch, writer.CredentialGeneration, writer.LeaseID)
+	if err != nil {
+		return store.SettingsCommand{}, fmt.Errorf("acknowledge settings delivery: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return store.SettingsCommand{}, errors.New("settings delivery acknowledgement lost race")
+	}
+	command, err = querySettingsCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.SettingsCommand{}, fmt.Errorf("commit settings delivery acknowledgement: %w", err)
+	}
+	return command, nil
+}
+
+func (s *Store) RecoverSettingsCommand(ctx context.Context, sessionID, commandID string, priorWriter store.SettingsWriter) (store.SettingsCommand, error) {
+	if !validConnectionID(sessionID) || commandID == "" || !validSettingsWriter(priorWriter) {
+		return store.SettingsCommand{}, errors.New("invalid settings recovery")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.SettingsCommand{}, fmt.Errorf("begin settings recovery transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	command, err := querySettingsCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	if command.Writer != priorWriter {
+		return store.SettingsCommand{}, errors.New("settings recovery lost writer fence")
+	}
+	if command.Status == store.SettingsCommandDeliveryPending {
+		if command.DeliveryDeadline.UnixMilli() > nowMS {
+			return store.SettingsCommand{}, errors.New("settings delivery deadline has not elapsed")
+		}
+		reason := "adapter_delivery_failed"
+		payload, err := store.SettingsTerminalEventPayload(command, command.ReservedCapability, store.SettingsCommandRejected, &reason)
+		if err != nil {
+			return store.SettingsCommand{}, err
+		}
+		var latest int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM session_events WHERE session_id=?`, sessionID).Scan(&latest); err != nil {
+			return store.SettingsCommand{}, err
+		}
+		seq := latest + 1
+		if _, err := tx.ExecContext(ctx, `INSERT INTO session_events (session_id, seq, type, payload, event_time_ms, created_at_ms) VALUES (?, ?, 'session.settings.effective', ?, ?, ?)`, sessionID, seq, payload, nowMS, nowMS); err != nil {
+			return store.SettingsCommand{}, err
+		}
+		if result, err := tx.ExecContext(ctx, `UPDATE session_settings_commands SET status='rejected', terminal_event_seq=?, updated_at_ms=? WHERE session_id=? AND cmd_id=? AND status='delivery_pending' AND delivery_deadline_ms<=? AND terminal_event_seq IS NULL`, seq, nowMS, sessionID, commandID, nowMS); err != nil || result == nil {
+			return store.SettingsCommand{}, errors.New("settings delivery deadline finalization lost race")
+		} else if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return store.SettingsCommand{}, errors.New("settings delivery deadline finalization lost race")
+		}
+	} else {
+		if command.Status != store.SettingsCommandPending {
+			return store.SettingsCommand{}, errors.New("settings recovery requires a pending command")
+		}
+		capability, err := querySettingsCapability(ctx, tx, sessionID)
+		if err != nil || capability.Writer == priorWriter || capability.EventSeq <= command.ReservedCapability.EventSeq {
+			return store.SettingsCommand{}, errors.New("settings recovery requires a fresh replacement writer")
+		}
+		if err := validateLiveSettingsWriter(ctx, tx, sessionID, capability.Writer); err != nil {
+			return store.SettingsCommand{}, errors.New("settings recovery replacement writer is not live")
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE session_settings_commands SET status='recovery_pending', updated_at_ms=? WHERE session_id=? AND cmd_id=? AND status='pending' AND writer_connection_epoch=? AND writer_credential_generation=? AND writer_lease_id=?`, nowMS, sessionID, commandID, priorWriter.ConnectionEpoch, priorWriter.CredentialGeneration, priorWriter.LeaseID)
+		if err != nil {
+			return store.SettingsCommand{}, fmt.Errorf("fence settings writer for recovery: %w", err)
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return store.SettingsCommand{}, errors.New("settings recovery lost writer fence")
+		}
+	}
+	command, err = querySettingsCommand(ctx, tx, sessionID, commandID)
+	if err := tx.Commit(); err != nil {
+		return store.SettingsCommand{}, fmt.Errorf("commit settings recovery: %w", err)
+	}
+	return command, nil
+}
+
+func (s *Store) FinalizeSettingsCommand(ctx context.Context, sessionID, commandID string, finalize store.SettingsCommandFinalize) (store.SettingsCommand, error) {
+	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || !validSettingsNonterminalStatus(finalize.ExpectedStatus) || !validSettingsTerminalStatus(finalize.Outcome) || !validSettingsCapabilityUpdate(sessionID, store.SettingsCapabilityUpdate{EventSeq: finalize.EffectiveCapability.EventSeq, Fingerprint: finalize.EffectiveCapability.Fingerprint, EffectiveModelID: finalize.EffectiveCapability.EffectiveModelID, EffectivePermissionModeID: finalize.EffectiveCapability.EffectivePermissionModeID, Writer: finalize.EffectiveCapability.Writer}) || (finalize.EffectiveCapability.SessionID != "" && finalize.EffectiveCapability.SessionID != sessionID) {
+		return store.SettingsCommand{}, errors.New("invalid settings finalization")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.SettingsCommand{}, fmt.Errorf("begin settings finalization transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	command, err := querySettingsCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	if command.ReservationVersion != finalize.ReservationVersion || command.Status != finalize.ExpectedStatus || (finalize.Writer != nil && command.Writer != *finalize.Writer) {
+		return store.SettingsCommand{}, errors.New("settings finalization is fenced")
+	}
+	if finalize.Writer != nil {
+		if err := lockCommandAuthority(ctx, tx, sessionID, store.CommandAuthority{ConnectionEpoch: finalize.Writer.ConnectionEpoch, CredentialGeneration: finalize.Writer.CredentialGeneration}); err != nil {
+			return store.SettingsCommand{}, err
+		}
+		if err := validateCurrentSettingsWriter(ctx, tx, sessionID, *finalize.Writer); err != nil {
+			return store.SettingsCommand{}, err
+		}
+	}
+	capability, err := querySettingsCapability(ctx, tx, sessionID)
+	if err != nil || !sameSettingsCapability(capability, finalize.EffectiveCapability) {
+		return store.SettingsCommand{}, errors.New("effective settings capability is not current")
+	}
+	if err := validateSettingsFinalization(command, capability, finalize, nowMS); err != nil {
+		return store.SettingsCommand{}, err
+	}
+	payload, err := store.SettingsTerminalEventPayload(command, capability, finalize.Outcome, finalize.ReasonCode)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	var latest int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM session_events WHERE session_id=?`, sessionID).Scan(&latest); err != nil {
+		return store.SettingsCommand{}, err
+	}
+	seq := latest + 1
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_events (session_id, seq, type, payload, event_time_ms, created_at_ms) VALUES (?, ?, 'session.settings.effective', ?, ?, ?)`, sessionID, seq, payload, nowMS, nowMS); err != nil {
+		return store.SettingsCommand{}, fmt.Errorf("append settings terminal event: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_settings_commands SET status=?, terminal_event_seq=?, updated_at_ms=? WHERE session_id=? AND cmd_id=? AND reservation_version=? AND status=? AND terminal_event_seq IS NULL`, finalize.Outcome, seq, nowMS, sessionID, commandID, finalize.ReservationVersion, finalize.ExpectedStatus)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return store.SettingsCommand{}, errors.New("settings finalization lost race")
+	}
+	command, err = querySettingsCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.SettingsCommand{}, fmt.Errorf("commit settings finalization: %w", err)
+	}
+	return command, nil
+}
+
+func (s *Store) SettingsCommand(ctx context.Context, sessionID, commandID string) (store.SettingsCommand, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	command, err := querySettingsCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.SettingsCommand{}, err
+	}
+	return command, nil
+}
+
+func (s *Store) PendingSettingsCommands(ctx context.Context, sessionID string) ([]store.SettingsCommand, error) {
+	if !validConnectionID(sessionID) {
+		return nil, errors.New("invalid settings pending Session")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `SELECT cmd_id FROM session_settings_commands WHERE session_id=? AND status IN ('delivery_pending','pending','recovery_pending') ORDER BY reservation_version`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	commands := []store.SettingsCommand{}
+	for rows.Next() {
+		var commandID string
+		if err := rows.Scan(&commandID); err != nil {
+			return nil, err
+		}
+		command, err := querySettingsCommand(ctx, tx, sessionID, commandID)
+		if err != nil {
+			return nil, err
+		}
+		commands = append(commands, command)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return commands, nil
+}
+
 func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1737,12 +2060,22 @@ func (s *Store) AcceptAdapterHello(ctx context.Context, sessionID string, hello 
 	if _, err := s.AdapterConnection(ctx, sessionID); err != nil {
 		return store.AdapterConnection{}, err
 	}
-	return s.updateConnection(ctx, sessionID, `UPDATE session_adapter_connections SET connection_epoch = connection_epoch + 1, accepted_fence = ?, updated_at_ms = ?
+	return s.updateConnectionAfter(ctx, sessionID, `UPDATE session_adapter_connections SET connection_epoch = connection_epoch + 1, accepted_fence = ?, updated_at_ms = ?
 WHERE session_id = ? AND active_credential_generation = ? AND active_credential_expires_at_ms > ? AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL`, true, func(nowMS, fence int64) []any {
 		return []any{fence, nowMS, sessionID, hello.CredentialGeneration, nowMS}
+	}, func(executor sqliteConnectionExecutor, connection store.AdapterConnection, _ int64) error {
+		if hello.WriterLeaseID == "" {
+			return nil
+		}
+		if len(hello.WriterLeaseID) > 255 {
+			return errors.New("invalid adapter writer lease")
+		}
+		_, err := executor.ExecContext(ctx, `INSERT INTO session_settings_live_writers (session_id, connection_epoch, credential_generation, writer_lease_id)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(session_id) DO UPDATE SET connection_epoch=excluded.connection_epoch, credential_generation=excluded.credential_generation, writer_lease_id=excluded.writer_lease_id`, sessionID, connection.ConnectionEpoch, connection.ActiveCredentialGeneration, hello.WriterLeaseID)
+		return err
 	})
 }
-
 func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
 	if !validConnectionID(sessionID) || admission.CredentialGeneration < 1 || admission.ConnectionEpoch < 1 ||
 		admission.AcceptedFence < 1 || admission.GrantFence <= admission.AcceptedFence {
@@ -1842,6 +2175,10 @@ func (s *Store) withConnectionMutation(ctx context.Context, fn func(sqliteConnec
 }
 
 func (s *Store) updateConnection(ctx context.Context, sessionID, statement string, fenced bool, args func(int64, int64) []any) (store.AdapterConnection, error) {
+	return s.updateConnectionAfter(ctx, sessionID, statement, fenced, args, nil)
+}
+
+func (s *Store) updateConnectionAfter(ctx context.Context, sessionID, statement string, fenced bool, args func(int64, int64) []any, after func(sqliteConnectionExecutor, store.AdapterConnection, int64) error) (store.AdapterConnection, error) {
 	return s.withConnectionMutation(ctx, func(executor sqliteConnectionExecutor) (store.AdapterConnection, error) {
 		result, err := executor.ExecContext(ctx, `UPDATE session_adapter_connections SET updated_at_ms = updated_at_ms WHERE session_id = ?`, sessionID)
 		if err != nil {
@@ -1874,7 +2211,16 @@ func (s *Store) updateConnection(ctx context.Context, sessionID, statement strin
 		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 			return store.AdapterConnection{}, errors.New("adapter connection state conflict")
 		}
-		return queryAdapterConnection(ctx, executor, sessionID)
+		connection, err := queryAdapterConnection(ctx, executor, sessionID)
+		if err != nil {
+			return store.AdapterConnection{}, err
+		}
+		if after != nil {
+			if err := after(executor, connection, nowMS); err != nil {
+				return store.AdapterConnection{}, fmt.Errorf("bind adapter writer lease: %w", err)
+			}
+		}
+		return connection, nil
 	})
 }
 
@@ -1998,6 +2344,40 @@ WHERE session_id = ? AND connection_epoch = ? AND active_credential_generation =
 	return nil
 }
 
+func verifySettingsCapabilityEvent(ctx context.Context, tx *sql.Tx, sessionID string, eventSeq int64) error {
+	if eventSeq < 1 {
+		return errors.New("settings capability event reference is invalid")
+	}
+	var eventType string
+	if err := tx.QueryRowContext(ctx, `SELECT type FROM session_events WHERE session_id=? AND seq=?`, sessionID, eventSeq).Scan(&eventType); err != nil || eventType != "session.settings.capabilities" {
+		return errors.New("settings capability event is not durable")
+	}
+	return nil
+}
+
+func validateCurrentSettingsWriter(ctx context.Context, tx *sql.Tx, sessionID string, writer store.SettingsWriter) error {
+	var current store.SettingsWriter
+	if err := tx.QueryRowContext(ctx, `SELECT writer_connection_epoch, writer_credential_generation, writer_lease_id FROM session_settings_capabilities WHERE session_id=?`, sessionID).Scan(&current.ConnectionEpoch, &current.CredentialGeneration, &current.LeaseID); err != nil || current != writer {
+		return errors.New("settings writer is no longer current")
+	}
+	return validateLiveSettingsWriter(ctx, tx, sessionID, writer)
+}
+func validateLiveSettingsWriter(ctx context.Context, tx *sql.Tx, sessionID string, writer store.SettingsWriter) error {
+	var current bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+SELECT 1 FROM session_settings_live_writers AS writer
+JOIN session_adapter_connections AS connection ON connection.session_id = writer.session_id
+WHERE writer.session_id=? AND writer.connection_epoch=? AND writer.credential_generation=? AND writer.writer_lease_id=?
+  AND connection.connection_epoch=writer.connection_epoch AND connection.active_credential_generation=writer.credential_generation
+  AND connection.active_credential_expires_at_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+  AND connection.revoked_at_ms IS NULL AND connection.terminal_at_ms IS NULL
+)`, sessionID, writer.ConnectionEpoch, writer.CredentialGeneration, writer.LeaseID).Scan(&current)
+	if err != nil || !current {
+		return errors.New("settings writer has no live authority")
+	}
+	return nil
+}
+
 func queryPendingCommand(ctx context.Context, tx *sql.Tx, sessionID, commandID string, nowMS int64) (store.PendingCommand, error) {
 	var command store.PendingCommand
 	var status, eventType string
@@ -2052,6 +2432,161 @@ func validatePendingCommandInput(event store.PendingEvent, request store.Pending
 		json.Unmarshal(event.Payload, &payload) != nil || payload.Role != "user" ||
 		!request.ExpiresAt.After(storeNow) || request.ExpiresAt.After(storeNow.Add(30*time.Second)) {
 		return errors.New("invalid pending command")
+	}
+	return nil
+}
+func querySettingsCapability(ctx context.Context, tx *sql.Tx, sessionID string) (store.SettingsCapability, error) {
+	var capability store.SettingsCapability
+	err := tx.QueryRowContext(ctx, `SELECT session_id, capability_event_seq, fingerprint, effective_model_id, effective_permission_mode_id, capability_version, writer_connection_epoch, writer_credential_generation, writer_lease_id FROM session_settings_capabilities WHERE session_id=?`, sessionID).Scan(
+		&capability.SessionID, &capability.EventSeq, &capability.Fingerprint, &capability.EffectiveModelID, &capability.EffectivePermissionModeID,
+		&capability.Version, &capability.Writer.ConnectionEpoch, &capability.Writer.CredentialGeneration, &capability.Writer.LeaseID,
+	)
+	if err != nil {
+		return store.SettingsCapability{}, err
+	}
+	if !validSettingsCapabilityUpdate(capability.SessionID, store.SettingsCapabilityUpdate{EventSeq: capability.EventSeq, Fingerprint: capability.Fingerprint, EffectiveModelID: capability.EffectiveModelID, EffectivePermissionModeID: capability.EffectivePermissionModeID, Writer: capability.Writer}) || capability.Version < 1 {
+		return store.SettingsCapability{}, errors.New("settings capability row is invalid")
+	}
+	return capability, nil
+}
+
+func querySettingsCommand(ctx context.Context, tx *sql.Tx, sessionID, commandID string) (store.SettingsCommand, error) {
+	var command store.SettingsCommand
+	var modelID, permissionID sql.NullString
+	var deadlineMS int64
+	var operationDeadline, terminalSeq sql.NullInt64
+	var status string
+	err := tx.QueryRowContext(ctx, `SELECT session_id, cmd_id, request_fingerprint, requested_model_id, requested_permission_mode_id, reservation_version, delivery_deadline_ms, operation_deadline_ms, writer_connection_epoch, writer_credential_generation, writer_lease_id, reserved_capability_event_seq, reserved_fingerprint, reserved_effective_model_id, reserved_effective_permission_mode_id, status, terminal_event_seq FROM session_settings_commands WHERE session_id=? AND cmd_id=?`, sessionID, commandID).Scan(
+		&command.SessionID, &command.CommandID, &command.RequestFingerprint, &modelID, &permissionID, &command.ReservationVersion,
+		&deadlineMS, &operationDeadline, &command.Writer.ConnectionEpoch, &command.Writer.CredentialGeneration, &command.Writer.LeaseID,
+		&command.ReservedCapability.EventSeq, &command.ReservedCapability.Fingerprint, &command.ReservedCapability.EffectiveModelID, &command.ReservedCapability.EffectivePermissionModeID, &status, &terminalSeq,
+	)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
+	command.DeliveryDeadline = time.UnixMilli(deadlineMS)
+	command.ReservedCapability.SessionID = sessionID
+	command.ReservedCapability.Writer = command.Writer
+	command.Status = store.SettingsCommandStatus(status)
+	if modelID.Valid {
+		command.RequestedModelID = &modelID.String
+	}
+	if permissionID.Valid {
+		command.RequestedPermissionModeID = &permissionID.String
+	}
+	if operationDeadline.Valid {
+		value := time.UnixMilli(operationDeadline.Int64)
+		command.OperationDeadline = &value
+	}
+	if terminalSeq.Valid {
+		value := terminalSeq.Int64
+		command.TerminalEventSeq = &value
+	}
+	if !validSettingsCommandRow(command) {
+		return store.SettingsCommand{}, errors.New("settings command row is invalid")
+	}
+	return command, nil
+}
+
+func validSettingsCapabilityUpdate(sessionID string, update store.SettingsCapabilityUpdate) bool {
+	return validConnectionID(sessionID) && update.EventSeq > 0 && validSettingsFingerprint(update.Fingerprint) && validSettingsID(update.EffectiveModelID) && validSettingsID(update.EffectivePermissionModeID) && validSettingsWriter(update.Writer)
+}
+
+func validSettingsCommandRequest(sessionID string, request store.SettingsCommandRequest) bool {
+	return validConnectionID(sessionID) && request.CommandID != "" && len(request.CommandID) <= 256 && validSettingsFingerprint(request.RequestFingerprint) &&
+		(request.RequestedModelID != nil || request.RequestedPermissionModeID != nil) &&
+		(request.RequestedModelID == nil || validSettingsID(*request.RequestedModelID)) &&
+		(request.RequestedPermissionModeID == nil || validSettingsID(*request.RequestedPermissionModeID)) && validSettingsWriter(request.Writer)
+}
+
+func validSettingsCommandRow(command store.SettingsCommand) bool {
+	terminal := command.Status != store.SettingsCommandDeliveryPending && command.Status != store.SettingsCommandPending && command.Status != store.SettingsCommandRecoveryPending
+	return validSettingsCommandRequest(command.SessionID, store.SettingsCommandRequest{CommandID: command.CommandID, RequestFingerprint: command.RequestFingerprint, RequestedModelID: command.RequestedModelID, RequestedPermissionModeID: command.RequestedPermissionModeID, Writer: command.Writer}) && command.ReservationVersion > 0 && !command.DeliveryDeadline.IsZero() && validSettingsStatus(command.Status) && sameSettingsCapability(command.ReservedCapability, store.SettingsCapability{SessionID: command.SessionID, EventSeq: command.ReservedCapability.EventSeq, Fingerprint: command.ReservedCapability.Fingerprint, EffectiveModelID: command.ReservedCapability.EffectiveModelID, EffectivePermissionModeID: command.ReservedCapability.EffectivePermissionModeID, Writer: command.Writer}) && ((terminal && command.TerminalEventSeq != nil) || (!terminal && command.TerminalEventSeq == nil))
+}
+
+func validSettingsWriter(writer store.SettingsWriter) bool {
+	return writer.ConnectionEpoch > 0 && writer.CredentialGeneration > 0 && writer.LeaseID != "" && len(writer.LeaseID) <= 255
+}
+func validSettingsID(value string) bool {
+	if len(value) < 1 || len(value) > 128 || !((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z') || (value[0] >= '0' && value[0] <= '9')) {
+		return false
+	}
+	for _, char := range value[1:] {
+		if !(char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '.' || char == '_' || char == ':' || char == '/' || char == '-') {
+			return false
+		}
+	}
+	return true
+}
+func validSettingsFingerprint(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	for _, char := range value[7:] {
+		if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+func validSettingsStatus(status store.SettingsCommandStatus) bool {
+	switch status {
+	case store.SettingsCommandDeliveryPending, store.SettingsCommandPending, store.SettingsCommandRecoveryPending, store.SettingsCommandApplied, store.SettingsCommandRejected, store.SettingsCommandTimeout, store.SettingsCommandUnsupported, store.SettingsCommandStaleCapability, store.SettingsCommandOutcomeUnknown, store.SettingsCommandMismatched:
+		return true
+	default:
+		return false
+	}
+}
+func validSettingsTerminalStatus(status store.SettingsCommandStatus) bool {
+	return validSettingsStatus(status) && !validSettingsNonterminalStatus(status)
+}
+func validSettingsNonterminalStatus(status store.SettingsCommandStatus) bool {
+	return status == store.SettingsCommandDeliveryPending || status == store.SettingsCommandPending || status == store.SettingsCommandRecoveryPending
+}
+func sameSettingsOptionalID(left, right *string) bool {
+	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
+}
+func sameSettingsCapability(left, right store.SettingsCapability) bool {
+	return left.SessionID == right.SessionID && left.EventSeq == right.EventSeq && left.Fingerprint == right.Fingerprint && left.EffectiveModelID == right.EffectiveModelID && left.EffectivePermissionModeID == right.EffectivePermissionModeID && left.Version == right.Version && left.Writer == right.Writer
+}
+func validSettingsReason(reason *string) bool {
+	if reason == nil || len(*reason) < 1 || len(*reason) > 64 || (*reason)[0] < 'a' || (*reason)[0] > 'z' {
+		return false
+	}
+	for _, char := range *reason {
+		if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func validateSettingsFinalization(command store.SettingsCommand, capability store.SettingsCapability, finalize store.SettingsCommandFinalize, nowMS int64) error {
+	if finalize.Outcome == store.SettingsCommandApplied {
+		if finalize.ReasonCode != nil || (command.RequestedModelID != nil && *command.RequestedModelID != capability.EffectiveModelID) || (command.RequestedPermissionModeID != nil && *command.RequestedPermissionModeID != capability.EffectivePermissionModeID) || (command.RequestedModelID == nil && command.ReservedCapability.EffectiveModelID != capability.EffectiveModelID) || (command.RequestedPermissionModeID == nil && command.ReservedCapability.EffectivePermissionModeID != capability.EffectivePermissionModeID) {
+			return errors.New("applied settings finalization does not match the request")
+		}
+	} else if !validSettingsReason(finalize.ReasonCode) {
+		return errors.New("non-applied settings finalization requires a bounded reason")
+	}
+	switch finalize.ExpectedStatus {
+	case store.SettingsCommandDeliveryPending:
+		if finalize.Writer != nil || finalize.Outcome != store.SettingsCommandRejected || finalize.ReasonCode == nil || *finalize.ReasonCode != "adapter_delivery_failed" || command.DeliveryDeadline.UnixMilli() > nowMS {
+			return errors.New("delivery-pending settings command may only reject")
+		}
+	case store.SettingsCommandPending:
+		if finalize.Writer != nil && (command.OperationDeadline == nil || command.OperationDeadline.UnixMilli() <= nowMS) {
+			return errors.New("settings operation deadline has elapsed")
+		}
+		if finalize.Writer == nil && (finalize.Outcome != store.SettingsCommandTimeout || command.OperationDeadline == nil || command.OperationDeadline.UnixMilli() > nowMS) {
+			return errors.New("unbound pending settings finalization requires an elapsed operation deadline")
+		}
+	case store.SettingsCommandRecoveryPending:
+		if finalize.Writer != nil || finalize.Outcome != store.SettingsCommandOutcomeUnknown || capability.Writer == command.Writer || capability.EventSeq <= command.ReservedCapability.EventSeq {
+			return errors.New("recovery-pending settings command may only finalize unknown without an old writer")
+		}
+	default:
+		return errors.New("settings finalization expected status is not nonterminal")
 	}
 	return nil
 }
@@ -2625,6 +3160,12 @@ CREATE TABLE IF NOT EXISTS session_adapter_connections (
 
 CREATE INDEX IF NOT EXISTS session_adapter_connections_active_expiry_idx
 ON session_adapter_connections (active_credential_expires_at_ms);
+CREATE TABLE IF NOT EXISTS session_settings_live_writers (
+    session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 255),
+    connection_epoch INTEGER NOT NULL CHECK (connection_epoch > 0),
+    credential_generation INTEGER NOT NULL CHECK (credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (length(writer_lease_id) BETWEEN 1 AND 255)
+);
 CREATE TABLE IF NOT EXISTS session_pending_commands (
     session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
     cmd_id TEXT NOT NULL CHECK (length(cmd_id) BETWEEN 1 AND 256),
@@ -2642,6 +3183,56 @@ CREATE TABLE IF NOT EXISTS session_pending_commands (
 
 CREATE INDEX IF NOT EXISTS session_pending_commands_status_expiry_idx
 ON session_pending_commands (status, expires_at_ns);
+
+CREATE TABLE IF NOT EXISTS session_settings_capabilities (
+    session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 255),
+    capability_event_seq INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 71 AND substr(fingerprint, 1, 7) = 'sha256:'),
+    effective_model_id TEXT NOT NULL CHECK (length(effective_model_id) BETWEEN 1 AND 128),
+    effective_permission_mode_id TEXT NOT NULL CHECK (length(effective_permission_mode_id) BETWEEN 1 AND 128),
+    capability_version INTEGER NOT NULL CHECK (capability_version > 0),
+    writer_connection_epoch INTEGER NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation INTEGER NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (length(writer_lease_id) BETWEEN 1 AND 255),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (session_id, capability_event_seq) REFERENCES session_events(session_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS session_settings_commands (
+    session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
+    cmd_id TEXT NOT NULL CHECK (length(cmd_id) BETWEEN 1 AND 256),
+    request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 71 AND substr(request_fingerprint, 1, 7) = 'sha256:'),
+    requested_model_id TEXT CHECK (requested_model_id IS NULL OR length(requested_model_id) BETWEEN 1 AND 128),
+    requested_permission_mode_id TEXT CHECK (requested_permission_mode_id IS NULL OR length(requested_permission_mode_id) BETWEEN 1 AND 128),
+    reservation_version INTEGER NOT NULL CHECK (reservation_version > 0),
+    delivery_deadline_ms INTEGER NOT NULL,
+    operation_deadline_ms INTEGER,
+    writer_connection_epoch INTEGER NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation INTEGER NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (length(writer_lease_id) BETWEEN 1 AND 255),
+    reserved_capability_event_seq INTEGER NOT NULL,
+    reserved_fingerprint TEXT NOT NULL CHECK (length(reserved_fingerprint) = 71 AND substr(reserved_fingerprint, 1, 7) = 'sha256:'),
+    reserved_effective_model_id TEXT NOT NULL CHECK (length(reserved_effective_model_id) BETWEEN 1 AND 128),
+    reserved_effective_permission_mode_id TEXT NOT NULL CHECK (length(reserved_effective_permission_mode_id) BETWEEN 1 AND 128),
+    status TEXT NOT NULL CHECK (status IN ('delivery_pending', 'pending', 'recovery_pending', 'applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective')),
+    terminal_event_seq INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id, cmd_id),
+    FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
+    FOREIGN KEY (session_id, reserved_capability_event_seq) REFERENCES session_events(session_id, seq),
+    CHECK (requested_model_id IS NOT NULL OR requested_permission_mode_id IS NOT NULL),
+    CHECK ((status = 'delivery_pending' AND operation_deadline_ms IS NULL AND terminal_event_seq IS NULL)
+        OR (status IN ('pending', 'recovery_pending') AND operation_deadline_ms IS NOT NULL AND terminal_event_seq IS NULL)
+        OR (status IN ('applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective') AND terminal_event_seq IS NOT NULL)),
+    CHECK (delivery_deadline_ms > created_at_ms AND delivery_deadline_ms <= created_at_ms + 5000),
+    CHECK (operation_deadline_ms IS NULL OR (operation_deadline_ms > created_at_ms AND operation_deadline_ms <= created_at_ms + 35000))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS session_settings_commands_one_nonterminal_idx
+ON session_settings_commands (session_id)
+WHERE status IN ('delivery_pending', 'pending', 'recovery_pending');
 
 CREATE TABLE IF NOT EXISTS session_event_proposals (
     session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
