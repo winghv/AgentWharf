@@ -28,8 +28,9 @@ const credentialRotationTTL = 15 * time.Minute
 
 var errReplayBufferOverflow = errors.New("replay buffer overflow")
 var (
-	errRotationActivated  = errors.New("adapter credential rotation activated")
-	errRotationFailClosed = errors.New("adapter credential rotation fail closed")
+	errRotationActivated       = errors.New("adapter credential rotation activated")
+	errRotationFailClosed      = errors.New("adapter credential rotation fail closed")
+	errSettingsTerminalReceipt = errors.New("settings terminal receipt delivery failed")
 )
 
 type WebSocketConfig struct {
@@ -1282,9 +1283,13 @@ func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter 
 }
 
 func (h *webSocketHandler) finalizeSettingsEffective(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
-	return h.withSessionPublication(ctx, event.SessionID, func() error {
+	err := h.withSessionPublication(ctx, event.SessionID, func() error {
 		return h.finalizeSettingsEffectiveLocked(ctx, adapter, event, proposalID)
 	})
+	if errors.Is(err, errSettingsTerminalReceipt) {
+		h.rejectAdapter(adapter)
+	}
+	return err
 }
 
 // finalizeSettingsEffectiveLocked keeps the Store terminal CAS and its live
@@ -1333,11 +1338,11 @@ func (h *webSocketHandler) finalizeSettingsEffectiveLocked(ctx context.Context, 
 		return err
 	}
 	seq := *finalized.TerminalEventSeq
-	if err := adapter.writeFrame(ctx, &protocol.EventReceipt{ProposalID: proposalID, Seq: seq, Status: protocol.EventReceiptAccepted}); err != nil {
-		h.rejectAdapter(adapter)
-		return err
-	}
+	receiptErr := adapter.writeFrame(ctx, &protocol.EventReceipt{ProposalID: proposalID, Seq: seq, Status: protocol.EventReceiptAccepted})
 	h.broadcastEvent(ctx, protocol.Event{Type: "session.settings.effective", SessionID: event.SessionID, Seq: &seq, Time: time.Now().UTC().UnixMilli(), Payload: payload})
+	if receiptErr != nil {
+		return fmt.Errorf("%w: %w", errSettingsTerminalReceipt, receiptErr)
+	}
 	return nil
 }
 
