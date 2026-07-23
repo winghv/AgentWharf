@@ -30,10 +30,11 @@ type PendingCommandHarness struct {
 }
 
 type SettingsCommandHarness struct {
-	Open                    func(t *testing.T) store.SettingsCommandStore
-	Reopen                  func(t *testing.T, current store.SettingsCommandStore) store.SettingsCommandStore
-	ExpireOperationDeadline func(t *testing.T, ledger store.SettingsCommandStore, sessionID, commandID string)
-	RevokeWriter            func(t *testing.T, ledger store.SettingsCommandStore, sessionID string)
+	Open                                func(t *testing.T) store.SettingsCommandStore
+	Reopen                              func(t *testing.T, current store.SettingsCommandStore) store.SettingsCommandStore
+	ExpireOperationDeadline             func(t *testing.T, ledger store.SettingsCommandStore, sessionID, commandID string)
+	ExpireFileReferenceDeliveryDeadline func(t *testing.T, ledger store.SettingsCommandStore, sessionID, commandID string)
+	RevokeWriter                        func(t *testing.T, ledger store.SettingsCommandStore, sessionID string)
 }
 
 // SettingsCommandContract fixes the durable reservation state machine shared by
@@ -42,7 +43,7 @@ type SettingsCommandHarness struct {
 // content fixtures.
 func SettingsCommandContract(t *testing.T, harness SettingsCommandHarness) {
 	t.Helper()
-	if harness.Open == nil || harness.Reopen == nil || harness.ExpireOperationDeadline == nil || harness.RevokeWriter == nil {
+	if harness.Open == nil || harness.Reopen == nil || harness.ExpireOperationDeadline == nil || harness.ExpireFileReferenceDeliveryDeadline == nil || harness.RevokeWriter == nil {
 		t.Fatal("settings-command harness is incomplete")
 	}
 	ledgerForRunControl := harness.Open(t)
@@ -464,6 +465,76 @@ func FileReferenceCommandContract(t *testing.T, ledger store.FileReferenceComman
 	if command, err := reopened.FileReferenceCommand(ctx, "ses_file_reference_replacement", replacementRequest.CommandID); err != nil || command.Status != store.FileReferenceOutcomeUnknown || command.TerminalEventSeq == nil {
 		t.Fatalf("writer replacement did not finalize file-reference unknown: %+v, %v", command, err)
 	}
+	assertFileReferenceOutcome(t, reopened, "ses_file_reference_replacement", replacementRequest.CommandID, store.FileReferenceOutcomeUnknown, nil, stringPointer("writer_lost"))
+
+	invalidWriter := bindRunControlWriter(t, reopened.(store.RunControlStore), "ses_file_reference_invalid", "lease_file_reference_invalid")
+	invalidCapabilitySeq := appendRunControlEvent(t, reopened, "ses_file_reference_invalid", "session.file_references.capabilities", `{}`)
+	if _, err := reopened.PublishFileReferenceCapability(ctx, "ses_file_reference_invalid", store.FileReferenceCapabilityUpdate{EventSeq: invalidCapabilitySeq, Fingerprint: capability.Fingerprint, Writer: invalidWriter}); err != nil {
+		t.Fatalf("publish invalid file-reference capability: %v", err)
+	}
+	invalidRequest := request
+	invalidRequest.CommandID = "cmd_file_reference_invalid"
+	invalidRequest.MessageID = "msg_file_reference_invalid"
+	invalidReserved, err := reopened.CommitFileReferenceCommand(ctx, "ses_file_reference_invalid", message, invalidRequest)
+	if err != nil || invalidReserved.Duplicate {
+		t.Fatalf("reserve invalid file-reference command: %+v, %v", invalidReserved, err)
+	}
+	if _, err := reopened.RecoverFileReferenceCommand(ctx, "ses_file_reference_invalid", invalidRequest.CommandID, "path=/private/source"); err == nil {
+		t.Fatal("delivery-pending file-reference recovery accepted arbitrary reason")
+	}
+	invalidDelivered, err := reopened.AcknowledgeFileReferenceDelivery(ctx, "ses_file_reference_invalid", invalidRequest.CommandID, invalidReserved.Command.ReservationVersion, invalidWriter)
+	if err != nil {
+		t.Fatalf("acknowledge invalid file-reference command: %v", err)
+	}
+	unsafeReason := "path=/private/source"
+	if _, err := reopened.FinalizeFileReferenceCommand(ctx, "ses_file_reference_invalid", invalidRequest.CommandID, store.FileReferenceCommandFinalize{ReservationVersion: invalidDelivered.ReservationVersion, Writer: &invalidWriter, Outcome: store.FileReferenceRejected, ReasonCode: &unsafeReason, ReferenceIndex: intPointer(0)}); err == nil {
+		t.Fatal("file-reference finalization accepted arbitrary reason")
+	}
+	if _, err := reopened.FinalizeFileReferenceCommand(ctx, "ses_file_reference_invalid", invalidRequest.CommandID, store.FileReferenceCommandFinalize{ReservationVersion: invalidDelivered.ReservationVersion, Writer: &invalidWriter, Outcome: store.FileReferenceRejected, ReasonCode: stringPointer("missing"), ReferenceIndex: intPointer(invalidRequest.ReferenceCount)}); err == nil {
+		t.Fatal("file-reference finalization accepted out-of-range index")
+	}
+	if _, err := reopened.FinalizeFileReferenceCommand(ctx, "ses_file_reference_invalid", invalidRequest.CommandID, store.FileReferenceCommandFinalize{ReservationVersion: invalidDelivered.ReservationVersion, Outcome: store.FileReferenceOutcomeUnknown, ReasonCode: stringPointer("writer_replaced")}); err == nil {
+		t.Fatal("file-reference finalization accepted invalid unknown reason")
+	}
+	invalidFinalized, err := reopened.FinalizeFileReferenceCommand(ctx, "ses_file_reference_invalid", invalidRequest.CommandID, store.FileReferenceCommandFinalize{ReservationVersion: invalidDelivered.ReservationVersion, Writer: &invalidWriter, Outcome: store.FileReferenceRejected, ReasonCode: stringPointer("missing"), ReferenceIndex: intPointer(1)})
+	if err != nil || invalidFinalized.Status != store.FileReferenceRejected || invalidFinalized.TerminalEventSeq == nil {
+		t.Fatalf("valid file-reference rejection = %+v, %v", invalidFinalized, err)
+	}
+	assertFileReferenceOutcome(t, reopened, "ses_file_reference_invalid", invalidRequest.CommandID, store.FileReferenceRejected, intPointer(1), stringPointer("missing"))
+
+	deadlineWriter := bindRunControlWriter(t, reopened.(store.RunControlStore), "ses_file_reference_deadline", "lease_file_reference_deadline")
+	deadlineCapabilitySeq := appendRunControlEvent(t, reopened, "ses_file_reference_deadline", "session.file_references.capabilities", `{}`)
+	if _, err := reopened.PublishFileReferenceCapability(ctx, "ses_file_reference_deadline", store.FileReferenceCapabilityUpdate{EventSeq: deadlineCapabilitySeq, Fingerprint: capability.Fingerprint, Writer: deadlineWriter}); err != nil {
+		t.Fatalf("publish delivery-deadline file-reference capability: %v", err)
+	}
+	deadlineRequest := request
+	deadlineRequest.CommandID = "cmd_file_reference_deadline"
+	deadlineRequest.MessageID = "msg_file_reference_deadline"
+	deadlineReserved, err := reopened.CommitFileReferenceCommand(ctx, "ses_file_reference_deadline", message, deadlineRequest)
+	if err != nil || deadlineReserved.Duplicate {
+		t.Fatalf("reserve delivery-deadline file-reference command: %+v, %v", deadlineReserved, err)
+	}
+	if _, err := reopened.RecoverFileReferenceCommand(ctx, "ses_file_reference_deadline", deadlineRequest.CommandID, "adapter_deadline"); err == nil {
+		t.Fatal("pre-deadline file-reference recovery unexpectedly succeeded")
+	}
+	reopenedSettings := harness.Reopen(t, reopened.(store.SettingsCommandStore))
+	reopened, ok = reopenedSettings.(store.FileReferenceCommandStore)
+	if !ok {
+		t.Fatal("reopened backend lost file-reference ledger")
+	}
+	harness.ExpireFileReferenceDeliveryDeadline(t, reopenedSettings, "ses_file_reference_deadline", deadlineRequest.CommandID)
+	if _, err := reopened.AcknowledgeFileReferenceDelivery(ctx, "ses_file_reference_deadline", deadlineRequest.CommandID, deadlineReserved.Command.ReservationVersion, deadlineWriter); err == nil {
+		t.Fatal("expired file-reference delivery acknowledgement unexpectedly succeeded")
+	}
+	deadlineFinalized, err := reopened.RecoverFileReferenceCommand(ctx, "ses_file_reference_deadline", deadlineRequest.CommandID, "adapter_deadline")
+	if err != nil || deadlineFinalized.Status != store.FileReferenceOutcomeUnknown || deadlineFinalized.TerminalEventSeq == nil {
+		t.Fatalf("delivery-deadline recovery = %+v, %v", deadlineFinalized, err)
+	}
+	if pending, err := reopened.PendingFileReferenceCommands(ctx, "ses_file_reference_deadline"); err != nil || len(pending) != 0 {
+		t.Fatalf("delivery-deadline recovery left a pending command: %+v, %v", pending, err)
+	}
+	assertFileReferenceOutcome(t, reopened, "ses_file_reference_deadline", deadlineRequest.CommandID, store.FileReferenceOutcomeUnknown, nil, stringPointer("adapter_deadline"))
+
 	crossWriter := bindRunControlWriter(t, reopened.(store.RunControlStore), "ses_file_reference_cross", "lease_file_reference_cross")
 	crossCapabilitySeq := appendRunControlEvent(t, reopened, "ses_file_reference_cross", "session.file_references.capabilities", `{}`)
 	if _, err := reopened.PublishFileReferenceCapability(ctx, "ses_file_reference_cross", store.FileReferenceCapabilityUpdate{EventSeq: crossCapabilitySeq, Fingerprint: capability.Fingerprint, Writer: crossWriter}); err != nil {
@@ -477,6 +548,37 @@ func FileReferenceCommandContract(t *testing.T, ledger store.FileReferenceComman
 		t.Fatalf("file-reference ledger persisted forbidden metadata: %s, %v", encoded, err)
 	}
 }
+
+func assertFileReferenceOutcome(t *testing.T, ledger store.EventStore, sessionID, commandID string, outcome store.FileReferenceCommandStatus, index *int, reason *string) {
+	t.Helper()
+	var matched []store.Event
+	if err := ledger.Replay(context.Background(), sessionID, 0, func(event store.Event) error {
+		if event.Type == "session.file_references.outcome" {
+			matched = append(matched, event)
+		}
+		return nil
+	}); err != nil || len(matched) != 1 {
+		t.Fatalf("file-reference outcome replay = %+v, %v", matched, err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(matched[0].Payload, &payload); err != nil || len(payload) != 5 {
+		t.Fatalf("file-reference outcome shape = %s, %v", matched[0].Payload, err)
+	}
+	var got struct {
+		MessageID      string                           `json:"message_id"`
+		CommandID      string                           `json:"cmd_id"`
+		Outcome        store.FileReferenceCommandStatus `json:"outcome"`
+		ReferenceIndex *int                             `json:"reference_index"`
+		Reason         *string                          `json:"reason"`
+	}
+	if err := json.Unmarshal(matched[0].Payload, &got); err != nil || got.CommandID != commandID || got.Outcome != outcome || !reflect.DeepEqual(got.ReferenceIndex, index) || !reflect.DeepEqual(got.Reason, reason) || got.MessageID == "" || bytes.Contains(matched[0].Payload, []byte("path")) || bytes.Contains(matched[0].Payload, []byte("digest")) || bytes.Contains(matched[0].Payload, []byte("bytes")) || bytes.Contains(matched[0].Payload, []byte("content")) {
+		t.Fatalf("file-reference outcome payload = %s, %v", matched[0].Payload, err)
+	}
+}
+
+func intPointer(value int) *int { return &value }
+
+func stringPointer(value string) *string { return &value }
 
 func bindRunControlWriter(t *testing.T, ledger store.RunControlStore, sessionID, leaseID string) store.RunControlWriter {
 	t.Helper()

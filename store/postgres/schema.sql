@@ -245,6 +245,7 @@ CREATE TABLE session_file_reference_commands (
     request_fingerprint TEXT NOT NULL CHECK (char_length(request_fingerprint) = 71),
     reference_count INTEGER NOT NULL CHECK (reference_count BETWEEN 1 AND 8),
     reservation_version BIGINT NOT NULL CHECK (reservation_version > 0),
+    delivery_deadline TIMESTAMPTZ NOT NULL,
     writer_connection_epoch BIGINT,
     writer_credential_generation BIGINT,
     writer_lease_id TEXT,
@@ -254,6 +255,7 @@ CREATE TABLE session_file_reference_commands (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
     PRIMARY KEY (session_id, cmd_id),
     FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
+    CHECK (delivery_deadline > created_at AND delivery_deadline <= created_at + interval '10 minutes'),
     CHECK ((status = 'delivery_pending' AND writer_connection_epoch IS NULL AND writer_credential_generation IS NULL AND writer_lease_id IS NULL AND terminal_event_seq IS NULL) OR (status = 'pending' AND writer_connection_epoch IS NOT NULL AND writer_credential_generation IS NOT NULL AND writer_lease_id IS NOT NULL AND terminal_event_seq IS NULL) OR (status IN ('delivered', 'rejected', 'outcome_unknown') AND terminal_event_seq IS NOT NULL))
 );
 CREATE UNIQUE INDEX session_file_reference_commands_one_nonterminal_idx ON session_file_reference_commands (session_id) WHERE status IN ('delivery_pending', 'pending');

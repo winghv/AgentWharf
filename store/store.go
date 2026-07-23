@@ -820,6 +820,7 @@ type FileReferenceCommand struct {
 	RequestFingerprint    string
 	ReferenceCount        int
 	ReservationVersion    int64
+	DeliveryDeadline      time.Time
 	Writer                *FileReferenceWriter
 	Status                FileReferenceCommandStatus
 	TerminalEventSeq      *int64
@@ -844,6 +845,35 @@ type FileReferenceCommandFinalize struct {
 	Outcome            FileReferenceCommandStatus
 	ReasonCode         *string
 	ReferenceIndex     *int
+}
+
+func ValidFileReferenceTerminal(outcome FileReferenceCommandStatus, referenceCount int, reason *string, index *int) bool {
+	if referenceCount < 1 || referenceCount > 8 {
+		return false
+	}
+	if outcome == FileReferenceDelivered {
+		return reason == nil && index == nil
+	}
+	if outcome == FileReferenceRejected {
+		if reason == nil || index == nil || *index < 0 || *index >= referenceCount {
+			return false
+		}
+		switch *reason {
+		case "missing", "removed", "stale_reference", "size_changed", "media_type_changed", "image_unsupported", "provider_unsupported", "unsafe_path", "quarantined", "access_denied":
+			return true
+		}
+		return false
+	}
+	if outcome == FileReferenceOutcomeUnknown {
+		if reason == nil || index != nil {
+			return false
+		}
+		switch *reason {
+		case "delivery_unconfirmed", "writer_lost", "adapter_deadline":
+			return true
+		}
+	}
+	return false
 }
 
 // FileReferenceCommandStore atomically appends an accepted user message and

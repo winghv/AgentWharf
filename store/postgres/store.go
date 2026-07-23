@@ -1093,7 +1093,11 @@ func (s *Store) CommitFileReferenceCommand(ctx context.Context, sessionID string
 	if _, err := appendPostgresRunControlEvent(ctx, tx, sessionID, message.Type, message.Payload, message.Time); err != nil {
 		return store.FileReferenceCommandReserve{}, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO session_file_reference_commands (session_id,cmd_id,message_id,capability_fingerprint,request_fingerprint,reference_count,reservation_version,status) VALUES ($1,$2,$3,$4,$5,$6,1,'delivery_pending')`, sessionID, request.CommandID, request.MessageID, request.CapabilityFingerprint, request.RequestFingerprint, request.ReferenceCount); err != nil {
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO session_file_reference_commands (session_id,cmd_id,message_id,capability_fingerprint,request_fingerprint,reference_count,reservation_version,delivery_deadline,status) VALUES ($1,$2,$3,$4,$5,$6,1,$7,'delivery_pending')`, sessionID, request.CommandID, request.MessageID, request.CapabilityFingerprint, request.RequestFingerprint, request.ReferenceCount, now.Add(10*time.Minute)); err != nil {
 		return store.FileReferenceCommandReserve{}, err
 	}
 	command, err := queryPostgresFileReferenceCommand(ctx, tx, sessionID, request.CommandID, false)
@@ -1116,6 +1120,10 @@ func (s *Store) AcknowledgeFileReferenceDelivery(ctx context.Context, sessionID,
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
 		return store.FileReferenceCommand{}, err
 	}
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
 	if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, writer); err != nil {
 		return store.FileReferenceCommand{}, err
 	}
@@ -1123,7 +1131,7 @@ func (s *Store) AcknowledgeFileReferenceDelivery(ctx context.Context, sessionID,
 	if err != nil || capability.Writer != writer {
 		return store.FileReferenceCommand{}, errors.New("file-reference writer is fenced")
 	}
-	result, err := tx.Exec(ctx, `UPDATE session_file_reference_commands SET writer_connection_epoch=$1,writer_credential_generation=$2,writer_lease_id=$3,status='pending',updated_at=clock_timestamp() WHERE session_id=$4 AND cmd_id=$5 AND reservation_version=$6 AND status='delivery_pending'`, writer.ConnectionEpoch, writer.CredentialGeneration, writer.LeaseID, sessionID, commandID, version)
+	result, err := tx.Exec(ctx, `UPDATE session_file_reference_commands SET writer_connection_epoch=$1,writer_credential_generation=$2,writer_lease_id=$3,status='pending',updated_at=clock_timestamp() WHERE session_id=$4 AND cmd_id=$5 AND reservation_version=$6 AND status='delivery_pending' AND delivery_deadline>$7`, writer.ConnectionEpoch, writer.CredentialGeneration, writer.LeaseID, sessionID, commandID, version, now)
 	if err != nil || result.RowsAffected() != 1 {
 		return store.FileReferenceCommand{}, errors.New("file-reference delivery is fenced")
 	}
@@ -1155,7 +1163,7 @@ func (s *Store) FinalizeFileReferenceCommand(ctx context.Context, sessionID, com
 	if err != nil {
 		return store.FileReferenceCommand{}, err
 	}
-	if command.ReservationVersion != finalize.ReservationVersion || command.Status != store.FileReferencePending {
+	if command.ReservationVersion != finalize.ReservationVersion || command.Status != store.FileReferencePending || !store.ValidFileReferenceTerminal(finalize.Outcome, command.ReferenceCount, finalize.ReasonCode, finalize.ReferenceIndex) {
 		return store.FileReferenceCommand{}, errors.New("file-reference finalization is fenced")
 	}
 	if finalize.Outcome != store.FileReferenceOutcomeUnknown {
@@ -1199,10 +1207,55 @@ func (s *Store) RecoverFileReferenceCommand(ctx context.Context, sessionID, comm
 	if err != nil {
 		return store.FileReferenceCommand{}, err
 	}
-	if command.Status == store.FileReferenceDeliveryPending {
-		return store.FileReferenceCommand{}, errors.New("unrouted file-reference recovery requires delivery timeout")
+	if command.Status != store.FileReferenceDeliveryPending {
+		return s.FinalizeFileReferenceCommand(ctx, sessionID, commandID, store.FileReferenceCommandFinalize{ReservationVersion: command.ReservationVersion, Outcome: store.FileReferenceOutcomeUnknown, ReasonCode: &reason})
 	}
-	return s.FinalizeFileReferenceCommand(ctx, sessionID, commandID, store.FileReferenceCommandFinalize{ReservationVersion: command.ReservationVersion, Outcome: store.FileReferenceOutcomeUnknown, ReasonCode: &reason})
+	if reason != "adapter_deadline" || !validConnectionID(sessionID) || commandID == "" {
+		return store.FileReferenceCommand{}, errors.New("invalid file-reference delivery recovery")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	defer tx.Rollback(ctx)
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	command, err = queryPostgresFileReferenceCommand(ctx, tx, sessionID, commandID, true)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	if command.Status != store.FileReferenceDeliveryPending || command.DeliveryDeadline.After(now) {
+		return store.FileReferenceCommand{}, errors.New("file-reference delivery recovery is fenced")
+	}
+	payload, err := json.Marshal(struct {
+		MessageID      string                           `json:"message_id"`
+		CommandID      string                           `json:"cmd_id"`
+		Outcome        store.FileReferenceCommandStatus `json:"outcome"`
+		ReferenceIndex *int                             `json:"reference_index"`
+		Reason         *string                          `json:"reason"`
+	}{command.MessageID, command.CommandID, store.FileReferenceOutcomeUnknown, nil, &reason})
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	seq, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.file_references.outcome", payload, now)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	result, err := tx.Exec(ctx, `UPDATE session_file_reference_commands SET status='outcome_unknown',terminal_event_seq=$1,updated_at=clock_timestamp() WHERE session_id=$2 AND cmd_id=$3 AND reservation_version=$4 AND status='delivery_pending' AND delivery_deadline<=$5 AND terminal_event_seq IS NULL`, seq, sessionID, commandID, command.ReservationVersion, now)
+	if err != nil || result.RowsAffected() != 1 {
+		return store.FileReferenceCommand{}, errors.New("file-reference delivery recovery is fenced")
+	}
+	command, err = queryPostgresFileReferenceCommand(ctx, tx, sessionID, commandID, false)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	return command, tx.Commit(ctx)
 }
 func (s *Store) FileReferenceCommand(ctx context.Context, sessionID, commandID string) (store.FileReferenceCommand, error) {
 	return queryPostgresFileReferenceCommand(ctx, s.pool, sessionID, commandID, false)
@@ -1372,7 +1425,7 @@ func fencePostgresFileReferenceCommandsAfterWriterReplacement(ctx context.Contex
 		if err := rows.Scan(&commandID, &messageID); err != nil {
 			return err
 		}
-		reason := "writer_replaced"
+		reason := "writer_lost"
 		payload, err := json.Marshal(struct {
 			MessageID      string  `json:"message_id"`
 			CommandID      string  `json:"cmd_id"`
@@ -1479,7 +1532,7 @@ func queryPostgresFileReferenceCapability(ctx context.Context, querier postgresS
 	return capability, nil
 }
 func queryPostgresFileReferenceCommand(ctx context.Context, querier postgresSettingsQuerier, sessionID, commandID string, lock bool) (store.FileReferenceCommand, error) {
-	query := `SELECT session_id,cmd_id,message_id,capability_fingerprint,request_fingerprint,reference_count,reservation_version,writer_connection_epoch,writer_credential_generation,writer_lease_id,status,terminal_event_seq FROM session_file_reference_commands WHERE session_id=$1 AND cmd_id=$2`
+	query := `SELECT session_id,cmd_id,message_id,capability_fingerprint,request_fingerprint,reference_count,reservation_version,delivery_deadline,writer_connection_epoch,writer_credential_generation,writer_lease_id,status,terminal_event_seq FROM session_file_reference_commands WHERE session_id=$1 AND cmd_id=$2`
 	if lock {
 		query += ` FOR UPDATE`
 	}
@@ -1488,11 +1541,13 @@ func queryPostgresFileReferenceCommand(ctx context.Context, querier postgresSett
 	var lease pgtype.Text
 	var terminal pgtype.Int8
 	var status string
-	err := querier.QueryRow(ctx, query, sessionID, commandID).Scan(&command.SessionID, &command.CommandID, &command.MessageID, &command.CapabilityFingerprint, &command.RequestFingerprint, &command.ReferenceCount, &command.ReservationVersion, &epoch, &generation, &lease, &status, &terminal)
+	var deadline pgtype.Timestamptz
+	err := querier.QueryRow(ctx, query, sessionID, commandID).Scan(&command.SessionID, &command.CommandID, &command.MessageID, &command.CapabilityFingerprint, &command.RequestFingerprint, &command.ReferenceCount, &command.ReservationVersion, &deadline, &epoch, &generation, &lease, &status, &terminal)
 	if err != nil {
 		return store.FileReferenceCommand{}, err
 	}
 	command.Status = store.FileReferenceCommandStatus(status)
+	command.DeliveryDeadline = deadline.Time
 	if epoch.Valid && generation.Valid && lease.Valid {
 		command.Writer = &store.FileReferenceWriter{ConnectionEpoch: epoch.Int64, CredentialGeneration: generation.Int64, LeaseID: lease.String}
 	}

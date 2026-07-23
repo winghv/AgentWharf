@@ -899,6 +899,13 @@ func TestSettingsCommandStoreContract(t *testing.T) {
 				t.Fatalf("expire settings operation deadline: %v", err)
 			}
 		},
+		ExpireFileReferenceDeliveryDeadline: func(t *testing.T, current store.SettingsCommandStore, sessionID, commandID string) {
+			t.Helper()
+			harness := current.(*sqliteCommandHarness)
+			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), `UPDATE session_file_reference_commands SET delivery_deadline_ms=created_at_ms+1 WHERE session_id=? AND cmd_id=?`, sessionID, commandID); err != nil {
+				t.Fatalf("expire file-reference delivery deadline: %v", err)
+			}
+		},
 		RevokeWriter: func(t *testing.T, current store.SettingsCommandStore, sessionID string) {
 			t.Helper()
 			harness := current.(*sqliteCommandHarness)
