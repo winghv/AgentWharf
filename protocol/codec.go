@@ -175,12 +175,27 @@ type Subscription struct {
 }
 
 type HelloAck struct {
-	ProtocolVersion int                `json:"protocol_version"`
-	Sessions        []SessionSummary   `json:"sessions"`
-	Capabilities    *HelloCapabilities `json:"capabilities,omitempty"`
+	ProtocolVersion     int                         `json:"protocol_version"`
+	Sessions            []SessionSummary            `json:"sessions"`
+	Capabilities        *HelloCapabilities          `json:"capabilities,omitempty"`
+	ConnectionAuthority *ConnectionAuthorityReceipt `json:"connection_authority,omitempty"`
 }
 
 func (*HelloAck) FrameName() FrameName { return FrameHelloAck }
+
+// ConnectionAuthorityReceipt is a v2 Adapter-only, non-secret snapshot of the
+// Store-proven live connection tuple. It is neither a bearer nor a capability:
+// consumers must fail closed when the tuple stops matching trusted lifecycle
+// state. It deliberately carries no Provider configuration, path, content, or
+// summary data.
+type ConnectionAuthorityReceipt struct {
+	SessionID            string `json:"session_id"`
+	ConnectionEpoch      int64  `json:"connection_epoch"`
+	CredentialGeneration int64  `json:"credential_generation"`
+	AcceptedFence        int64  `json:"accepted_fence"`
+	WriterLeaseID        string `json:"writer_lease_id"`
+	ExpiresAt            int64  `json:"expires_at"`
+}
 
 type HelloCapabilities struct {
 	HistoryPage      *HistoryPageCapability        `json:"history_page,omitempty"`

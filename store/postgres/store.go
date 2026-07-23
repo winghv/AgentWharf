@@ -2159,6 +2159,40 @@ func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, 
 	return adapterConnection(row), nil
 }
 
+func (s *Store) IssueAdapterConnectionAuthorityReceipt(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, writer store.SettingsWriter) (store.ConnectionAuthorityReceipt, error) {
+	if !validConnectionID(sessionID) || writer.LeaseID == "" || writer.ConnectionEpoch != admission.ConnectionEpoch || writer.CredentialGeneration != admission.CredentialGeneration {
+		return store.ConnectionAuthorityReceipt{}, errors.New("invalid adapter connection authority receipt")
+	}
+	if s.connectionTx != nil {
+		return s.issueAdapterConnectionAuthorityReceipt(ctx, sessionID, admission, writer)
+	}
+	var receipt store.ConnectionAuthorityReceipt
+	err := s.WithAdapterConnectionTransaction(ctx, func(tx store.AdapterConnectionStore) error {
+		scoped, ok := tx.(*Store)
+		if !ok {
+			return errors.New("postgres adapter receipt transaction is unavailable")
+		}
+		var err error
+		receipt, err = scoped.issueAdapterConnectionAuthorityReceipt(ctx, sessionID, admission, writer)
+		return err
+	})
+	if err != nil {
+		return store.ConnectionAuthorityReceipt{}, err
+	}
+	return receipt, nil
+}
+
+func (s *Store) issueAdapterConnectionAuthorityReceipt(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, writer store.SettingsWriter) (store.ConnectionAuthorityReceipt, error) {
+	connection, err := s.ValidateAdapterAdmission(ctx, sessionID, admission)
+	if err != nil || s.connectionTx == nil || validatePostgresLiveSettingsWriter(ctx, s.connectionTx, sessionID, writer) != nil {
+		return store.ConnectionAuthorityReceipt{}, errors.New("adapter connection authority is not live")
+	}
+	return store.ConnectionAuthorityReceipt{
+		SessionID: sessionID, ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration,
+		AcceptedFence: connection.AcceptedFence, WriterLeaseID: writer.LeaseID, ExpiresAt: connection.ActiveCredentialExpiresAt,
+	}, nil
+}
+
 func (s *Store) PrepareAdapterCredentialRotation(ctx context.Context, sessionID string, rotation store.AdapterCredentialRotation) (store.AdapterConnection, error) {
 	if !validConnectionID(sessionID) || rotation.ExpectedActiveCredentialGeneration < 1 || rotation.ExpectedEpoch < 1 ||
 		rotation.PendingGeneration < 1 || !validAttachmentText(rotation.RotationID, 255) {

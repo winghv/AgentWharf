@@ -379,20 +379,14 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, fr
 		_ = conn.Close(websocket.StatusPolicyViolation, "adapter authority lost")
 		return AcceptedPeer{}, "", err
 	}
-	ackErr := writeProtocolFrame(ctx, conn, &ack)
-	if ackErr != nil {
-		if adapter != nil {
-			h.rejectAdapter(adapter)
-			adapter.close()
-		}
-		return AcceptedPeer{}, "", ackErr
-	}
 	if adapter != nil {
-		if err := h.publishAdapter(ctx, adapter); err != nil {
+		if err := h.publishAdapterHello(ctx, adapter, &ack); err != nil {
 			h.rejectAdapter(adapter)
 			adapter.close()
 			return AcceptedPeer{}, "", err
 		}
+	} else if err := writeProtocolFrame(ctx, conn, &ack); err != nil {
+		return AcceptedPeer{}, "", err
 	}
 	*adapterOut = adapter
 	historyToken := ""
@@ -888,19 +882,57 @@ func validAdapterCredentialLineage(lineage auth.SessionCredentialLineage) bool {
 }
 
 func (h *webSocketHandler) publishAdapter(ctx context.Context, adapter *adapterConnection) error {
-	previous, unlock := h.lockAdapterAdmission(adapter.sessionID)
-	if _, err := h.adapterAuthority.store.ValidateAdapterAdmission(ctx, adapter.sessionID, adapter.admission); err != nil {
-		unlock()
+	return h.publishAdapterHello(ctx, adapter, nil)
+}
+
+// publishAdapterHello holds the per-Session admission boundary across the last
+// Store proof, v2 receipt write, and live-socket publication. A replacement
+// cannot interleave a valid receipt for an already fenced connection.
+func (h *webSocketHandler) publishAdapterHello(ctx context.Context, adapter *adapterConnection, ack *protocol.HelloAck) error {
+	if adapter == nil || h.adapterAuthority == nil {
 		return errAdapterAuthorityLost
+	}
+	previous, unlock := h.lockAdapterAdmission(adapter.sessionID)
+	defer unlock()
+	if _, err := h.adapterAuthority.store.ValidateAdapterAdmission(ctx, adapter.sessionID, adapter.admission); err != nil {
+		return errAdapterAuthorityLost
+	}
+	if ack != nil {
+		if adapter.protocolVersion == protocol.ProtocolVersionV2 {
+			receipt, err := h.issueConnectionAuthorityReceipt(ctx, adapter)
+			if err != nil {
+				return errAdapterAuthorityLost
+			}
+			ack.ConnectionAuthority = receipt
+		}
+		if err := writeProtocolFrame(ctx, adapter.conn, ack); err != nil {
+			return err
+		}
 	}
 	h.mu.Lock()
 	h.adapters[adapter.sessionID] = adapter
 	h.mu.Unlock()
-	unlock()
 	if previous != nil && previous.conn != nil {
 		previous.conn.CloseNow()
 	}
 	return nil
+}
+
+func (h *webSocketHandler) issueConnectionAuthorityReceipt(ctx context.Context, adapter *adapterConnection) (*protocol.ConnectionAuthorityReceipt, error) {
+	issuer, ok := h.adapterAuthority.store.(store.AdapterConnectionAuthorityReceiptStore)
+	if !ok {
+		return nil, errAdapterAuthorityLost
+	}
+	proof, err := issuer.IssueAdapterConnectionAuthorityReceipt(ctx, adapter.sessionID, adapter.admission, adapter.settingsWriter)
+	if err != nil || proof.SessionID != adapter.sessionID || proof.ConnectionEpoch != adapter.admission.ConnectionEpoch ||
+		proof.CredentialGeneration != adapter.admission.CredentialGeneration || proof.AcceptedFence != adapter.admission.AcceptedFence ||
+		proof.WriterLeaseID != adapter.settingsWriter.LeaseID || !proof.ExpiresAt.After(time.Now()) {
+		return nil, errAdapterAuthorityLost
+	}
+	return &protocol.ConnectionAuthorityReceipt{
+		SessionID: proof.SessionID, ConnectionEpoch: proof.ConnectionEpoch, CredentialGeneration: proof.CredentialGeneration,
+		AcceptedFence: proof.AcceptedFence, WriterLeaseID: proof.WriterLeaseID, ExpiresAt: proof.ExpiresAt.UnixMilli(),
+	}, nil
 }
 
 func (h *webSocketHandler) unregisterClient(peer *clientConnection) {

@@ -328,6 +328,18 @@ type AdapterConnectionAdmission struct {
 	GrantFence           int64
 }
 
+// ConnectionAuthorityReceipt is the Store-proven, non-secret live connection
+// tuple that a v2 Hub may relay only to the authenticated Adapter which owns
+// it. It is a fencing receipt, never a bearer or Provider configuration.
+type ConnectionAuthorityReceipt struct {
+	SessionID            string
+	ConnectionEpoch      int64
+	CredentialGeneration int64
+	AcceptedFence        int64
+	WriterLeaseID        string
+	ExpiresAt            time.Time
+}
+
 type AdapterCredentialRotation struct {
 	ExpectedActiveCredentialGeneration int64
 	ExpectedEpoch                      int64
@@ -368,6 +380,15 @@ type AdapterConnectionStore interface {
 type AdapterConnectionTransactor interface {
 	AdapterConnectionStore
 	WithAdapterConnectionTransaction(ctx context.Context, fn func(AdapterConnectionStore) error) error
+}
+
+// AdapterConnectionAuthorityReceiptStore proves that the exact admission and
+// writer lease still join to current durable connection truth in one Store
+// transaction. Implementations must reject stale, expired, revoked, terminal,
+// or replaced tuples rather than returning a downgraded receipt.
+type AdapterConnectionAuthorityReceiptStore interface {
+	AdapterConnectionStore
+	IssueAdapterConnectionAuthorityReceipt(context.Context, string, AdapterConnectionAdmission, SettingsWriter) (ConnectionAuthorityReceipt, error)
 }
 
 type AttachAttemptOutcome string

@@ -1247,6 +1247,67 @@ func TestAdapterConnectionStoreContract(t *testing.T) {
 	})
 }
 
+func TestAdapterConnectionAuthorityReceiptContract(t *testing.T) {
+	ctx := context.Background()
+	for _, terminal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("terminal_%v", terminal), func(t *testing.T) {
+			connections := newPostgresConnectionHarness(t)
+			connection, admission, writer := issuePostgresConnectionAuthorityReceipt(t, connections, time.Now().Add(time.Minute))
+			receipt, err := connections.IssueAdapterConnectionAuthorityReceipt(ctx, "ses_connection", admission, writer)
+			if err != nil || receipt.SessionID != "ses_connection" || receipt.ConnectionEpoch != connection.ConnectionEpoch || receipt.CredentialGeneration != connection.ActiveCredentialGeneration || receipt.AcceptedFence != connection.AcceptedFence || receipt.WriterLeaseID != writer.LeaseID || !receipt.ExpiresAt.Equal(connection.ActiveCredentialExpiresAt) {
+				t.Fatalf("connection authority receipt = %+v, %v", receipt, err)
+			}
+			for _, invalid := range []struct {
+				name      string
+				admission store.AdapterConnectionAdmission
+				writer    store.SettingsWriter
+			}{
+				{name: "epoch", admission: store.AdapterConnectionAdmission{CredentialGeneration: admission.CredentialGeneration, ConnectionEpoch: admission.ConnectionEpoch + 1, AcceptedFence: admission.AcceptedFence, GrantFence: admission.GrantFence}, writer: writer},
+				{name: "generation", admission: store.AdapterConnectionAdmission{CredentialGeneration: admission.CredentialGeneration + 1, ConnectionEpoch: admission.ConnectionEpoch, AcceptedFence: admission.AcceptedFence, GrantFence: admission.GrantFence}, writer: writer},
+				{name: "lease", admission: admission, writer: store.SettingsWriter{ConnectionEpoch: writer.ConnectionEpoch, CredentialGeneration: writer.CredentialGeneration, LeaseID: "replaced-opaque-lease"}},
+			} {
+				if _, err := connections.IssueAdapterConnectionAuthorityReceipt(ctx, "ses_connection", invalid.admission, invalid.writer); err == nil {
+					t.Fatalf("%s authority receipt succeeded", invalid.name)
+				}
+			}
+			column := "revoked_at"
+			if terminal {
+				column = "terminal_at"
+			}
+			if _, err := connections.pool.Exec(ctx, "UPDATE session_adapter_connections SET "+column+"=clock_timestamp() WHERE session_id='ses_connection'"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := connections.IssueAdapterConnectionAuthorityReceipt(ctx, "ses_connection", admission, writer); err == nil {
+				t.Fatal("invalidated connection issued authority receipt")
+			}
+		})
+	}
+	connections := newPostgresConnectionHarness(t)
+	_, admission, writer := issuePostgresConnectionAuthorityReceipt(t, connections, time.Now().Add(60*time.Millisecond))
+	time.Sleep(100 * time.Millisecond)
+	if _, err := connections.IssueAdapterConnectionAuthorityReceipt(ctx, "ses_connection", admission, writer); err == nil {
+		t.Fatal("expired connection issued authority receipt")
+	}
+}
+
+func issuePostgresConnectionAuthorityReceipt(t *testing.T, connections *postgresConnectionHarness, expiresAt time.Time) (store.AdapterConnection, store.AdapterConnectionAdmission, store.SettingsWriter) {
+	t.Helper()
+	if _, err := connections.InitializeAdapterConnection(context.Background(), store.AdapterConnectionInitialize{SessionID: "ses_connection", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: expiresAt}); err != nil {
+		t.Fatal(err)
+	}
+	writer := store.SettingsWriter{LeaseID: "opaque-writer-lease"}
+	connection, err := connections.AcceptAdapterHello(context.Background(), "ses_connection", store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: writer.LeaseID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := connections.AllocateAdapterGrantFence(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer.ConnectionEpoch, writer.CredentialGeneration = connection.ConnectionEpoch, connection.ActiveCredentialGeneration
+	return connection, store.AdapterConnectionAdmission{CredentialGeneration: connection.ActiveCredentialGeneration, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grant}, writer
+}
+
 func TestAdapterConnectionReopenPreservesGlobalFence(t *testing.T) {
 	harness := newPostgresConnectionHarness(t)
 	for _, sessionID := range []string{"ses_connection", "ses_connection_other"} {

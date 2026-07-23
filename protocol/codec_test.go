@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -203,6 +204,30 @@ func TestDecodeCommandAndAckExamples(t *testing.T) {
 	ack := ackFrame.(*CommandAck)
 	if ack.Status != AckAccepted {
 		t.Fatalf("ack status = %q, want accepted", ack.Status)
+	}
+}
+
+func TestHelloAckConnectionAuthorityReceiptIsMinimalAndRoundTrips(t *testing.T) {
+	ack := &HelloAck{ProtocolVersion: ProtocolVersionV2, Sessions: []SessionSummary{}, ConnectionAuthority: &ConnectionAuthorityReceipt{
+		SessionID: "ses_01H8X", ConnectionEpoch: 7, CredentialGeneration: 3, AcceptedFence: 11,
+		WriterLeaseID: "opaque-lease", ExpiresAt: 1764937800000,
+	}}
+	encoded, err := Encode(ack)
+	if err != nil {
+		t.Fatalf("Encode(hello.ack) error = %v", err)
+	}
+	for _, forbidden := range []string{"token", "bearer", "credential", "provider", "path", "content", "summary", "bytes"} {
+		if bytes.Contains(encoded, []byte(`\"`+forbidden+`\"`)) {
+			t.Fatalf("connection authority payload contains forbidden field %q: %s", forbidden, encoded)
+		}
+	}
+	frame, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode(hello.ack) error = %v", err)
+	}
+	got := frame.(*HelloAck).ConnectionAuthority
+	if got == nil || *got != *ack.ConnectionAuthority {
+		t.Fatalf("connection authority receipt = %+v, want %+v", got, ack.ConnectionAuthority)
 	}
 }
 

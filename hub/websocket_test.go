@@ -84,6 +84,49 @@ func TestWebSocketServerAcceptsAdapterWithDispatchStore(t *testing.T) {
 	}
 }
 
+func TestWebSocketV2AdapterReceivesOnlyCurrentConnectionAuthorityReceipt(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "connection-authority.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	if ack := readFrame(t, client).(*protocol.HelloAck); ack.ConnectionAuthority != nil {
+		t.Fatalf("client received adapter authority receipt: %+v", ack.ConnectionAuthority)
+	}
+
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	ack := readFrame(t, adapter).(*protocol.HelloAck)
+	if ack.ConnectionAuthority == nil {
+		t.Fatal("v2 adapter hello omitted connection authority receipt")
+	}
+	connection, err := events.AdapterConnection(ctx, "ses_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := ack.ConnectionAuthority
+	if receipt.SessionID != "ses_1" || receipt.ConnectionEpoch != connection.ConnectionEpoch || receipt.CredentialGeneration != connection.ActiveCredentialGeneration || receipt.AcceptedFence != connection.AcceptedFence || receipt.WriterLeaseID == "" || receipt.ExpiresAt != connection.ActiveCredentialExpiresAt.UnixMilli() {
+		t.Fatalf("connection authority receipt = %+v; connection = %+v", receipt, connection)
+	}
+
+	v1 := dialWebSocket(t, server.URL)
+	defer v1.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloVersionFor(t, v1, "adapter-token", "ses_1", protocol.ProtocolVersion)
+	if ack := readFrame(t, v1).(*protocol.HelloAck); ack.ConnectionAuthority != nil {
+		t.Fatalf("v1 adapter received connection authority receipt: %+v", ack.ConnectionAuthority)
+	}
+}
+
 func TestWebSocketSettingsRoutesCapabilityReserveDeliveryAndTerminalResult(t *testing.T) {
 	ctx := context.Background()
 	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "settings.db"))
@@ -3549,6 +3592,14 @@ func (s *dispatchFenceStore) ValidateAdapterAdmission(_ context.Context, session
 	return connection, nil
 }
 
+func (s *dispatchFenceStore) IssueAdapterConnectionAuthorityReceipt(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, writer store.SettingsWriter) (store.ConnectionAuthorityReceipt, error) {
+	connection, err := s.ValidateAdapterAdmission(ctx, sessionID, admission)
+	if err != nil || writer.ConnectionEpoch != connection.ConnectionEpoch || writer.CredentialGeneration != connection.ActiveCredentialGeneration || writer.LeaseID == "" {
+		return store.ConnectionAuthorityReceipt{}, errors.New("connection authority receipt is fenced")
+	}
+	return store.ConnectionAuthorityReceipt{SessionID: sessionID, ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, AcceptedFence: connection.AcceptedFence, WriterLeaseID: writer.LeaseID, ExpiresAt: connection.ActiveCredentialExpiresAt}, nil
+}
+
 func (s *dispatchFenceStore) ValidateAdapterEffectAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
 	return s.ValidateAdapterAdmission(ctx, sessionID, admission)
 }
@@ -3805,6 +3856,14 @@ func (f *fakeEventStore) ValidateAdapterAdmission(_ context.Context, sessionID s
 		return store.AdapterConnection{}, errors.New("adapter authority lost")
 	}
 	return connection, nil
+}
+
+func (f *fakeEventStore) IssueAdapterConnectionAuthorityReceipt(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, writer store.SettingsWriter) (store.ConnectionAuthorityReceipt, error) {
+	connection, err := f.ValidateAdapterAdmission(ctx, sessionID, admission)
+	if err != nil || writer.ConnectionEpoch != connection.ConnectionEpoch || writer.CredentialGeneration != connection.ActiveCredentialGeneration || writer.LeaseID == "" {
+		return store.ConnectionAuthorityReceipt{}, errors.New("connection authority receipt is fenced")
+	}
+	return store.ConnectionAuthorityReceipt{SessionID: sessionID, ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, AcceptedFence: connection.AcceptedFence, WriterLeaseID: writer.LeaseID, ExpiresAt: connection.ActiveCredentialExpiresAt}, nil
 }
 
 func (f *fakeEventStore) WithAdapterConnectionTransaction(_ context.Context, fn func(store.AdapterConnectionStore) error) error {
