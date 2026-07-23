@@ -894,20 +894,25 @@ func (h *webSocketHandler) publishAdapterHello(ctx context.Context, adapter *ada
 	}
 	previous, unlock := h.lockAdapterAdmission(adapter.sessionID)
 	defer unlock()
-	if _, err := h.adapterAuthority.store.ValidateAdapterAdmission(ctx, adapter.sessionID, adapter.admission); err != nil {
-		return errAdapterAuthorityLost
-	}
-	if ack != nil {
-		if adapter.protocolVersion == protocol.ProtocolVersionV2 {
-			receipt, err := h.issueConnectionAuthorityReceipt(ctx, adapter)
-			if err != nil {
-				return errAdapterAuthorityLost
+	if err := withAdapterAuthorityBudget(ctx, func(authorityCtx context.Context) error {
+		if _, err := h.adapterAuthority.store.ValidateAdapterAdmission(authorityCtx, adapter.sessionID, adapter.admission); err != nil {
+			return errAdapterAuthorityLost
+		}
+		if ack != nil {
+			if adapter.protocolVersion == protocol.ProtocolVersionV2 {
+				receipt, err := h.issueConnectionAuthorityReceipt(authorityCtx, adapter)
+				if err != nil {
+					return errAdapterAuthorityLost
+				}
+				ack.ConnectionAuthority = receipt
 			}
-			ack.ConnectionAuthority = receipt
+			if err := writeProtocolFrame(authorityCtx, adapter.conn, ack); err != nil {
+				return err
+			}
 		}
-		if err := writeProtocolFrame(ctx, adapter.conn, ack); err != nil {
-			return err
-		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	h.mu.Lock()
 	h.adapters[adapter.sessionID] = adapter
@@ -916,6 +921,12 @@ func (h *webSocketHandler) publishAdapterHello(ctx context.Context, adapter *ada
 		previous.conn.CloseNow()
 	}
 	return nil
+}
+
+func withAdapterAuthorityBudget(ctx context.Context, effect func(context.Context) error) error {
+	authorityCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+	defer cancel()
+	return effect(authorityCtx)
 }
 
 func (h *webSocketHandler) issueConnectionAuthorityReceipt(ctx context.Context, adapter *adapterConnection) (*protocol.ConnectionAuthorityReceipt, error) {
