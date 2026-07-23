@@ -199,6 +199,50 @@ func TestWebSocketAttentionConcurrentFanoutDeduplicatesWithoutRace(t *testing.T)
 	}
 }
 
+func TestWebSocketAttentionResubscribeWaitsForInFlightFanout(t *testing.T) {
+	ctx := context.Background()
+	events := newAttentionActivityStore(store.SessionAttentionSummary{SessionID: "ses_one", State: "ready", SummaryVersion: 1, StateOfProjection: store.AttentionProjectionComplete})
+	principal := auth.Principal{Subject: "user_1", Scopes: []auth.Scope{auth.Attention("grant_1")}}
+	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: attentionSocketAuth{principal: principal, grant: auth.AttentionGrant{Subject: "user_1", SessionIDs: []string{"ses_one"}, MaxSessions: 1, ExpiresAt: time.Now().Add(time.Minute)}}, EventStore: events})
+	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: events})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	conn := dialWebSocket(t, server.URL)
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, conn, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "attention-token"})
+	_ = readFrame(t, conn).(*protocol.HelloAck)
+	writeFrame(t, conn, &protocol.AttentionSubscribe{RequestID: "attn_old"})
+	_ = readFrame(t, conn).(*protocol.AttentionSummaryFrame)
+
+	reason := "capacity"
+	events.setSummary(store.SessionAttentionSummary{SessionID: "ses_one", State: "ready", SummaryVersion: 2, StateOfProjection: store.AttentionProjectionComplete, Blocker: &store.AttentionBlocker{Kind: store.AttentionBlockerQueued, Reason: &reason}})
+	calls := events.observeSnapshots()
+	started, release := events.blockNextSnapshot()
+	fanoutDone := make(chan error, 1)
+	go func() {
+		fanoutDone <- handler.EmitEphemeralEvent(ctx, protocol.Event{Type: "agent.activity", SessionID: "ses_one", Time: time.Now().UTC().UnixMilli(), Payload: []byte(`{}`)})
+	}()
+	<-calls
+	<-started
+	writeFrame(t, conn, &protocol.AttentionSubscribe{RequestID: "attn_new"})
+	<-calls
+	close(release)
+	if err := <-fanoutDone; err != nil {
+		t.Fatalf("blocked fanout: %v", err)
+	}
+	oldUpdate := readFrame(t, conn).(*protocol.AttentionSummaryFrame)
+	if oldUpdate.Kind != "update" || oldUpdate.RequestID != "attn_old" || len(oldUpdate.Summaries) != 1 || oldUpdate.Summaries[0].SummaryVersion != 2 {
+		t.Fatalf("old update must precede replacement snapshot: %+v", oldUpdate)
+	}
+	newSnapshot := readFrame(t, conn).(*protocol.AttentionSummaryFrame)
+	if newSnapshot.Kind != "snapshot" || newSnapshot.RequestID != "attn_new" || len(newSnapshot.Summaries) != 1 || newSnapshot.Summaries[0].SummaryVersion != 2 {
+		t.Fatalf("replacement snapshot = %+v", newSnapshot)
+	}
+	if frame, err := readFrameWithin(conn, 50*time.Millisecond); err == nil {
+		t.Fatalf("stale fanout after replacement snapshot = %+v", frame)
+	}
+}
+
 func TestWebSocketAttentionActivityRefreshDeliversLedgerOnlyUpdate(t *testing.T) {
 	ctx := context.Background()
 	events := newAttentionActivityStore(store.SessionAttentionSummary{
@@ -368,6 +412,12 @@ type attentionSocketAuth struct {
 type attentionActivityStore struct {
 	mu      sync.RWMutex
 	summary store.SessionAttentionSummary
+
+	snapshotMu      sync.Mutex
+	snapshotCalls   chan struct{}
+	blockNext       bool
+	blockedSnapshot chan struct{}
+	releaseSnapshot chan struct{}
 }
 
 func newAttentionActivityStore(summary store.SessionAttentionSummary) *attentionActivityStore {
@@ -386,10 +436,28 @@ func (s *attentionActivityStore) History(context.Context, string, *int64, int) (
 func (s *attentionActivityStore) LatestSeq(context.Context, string) (int64, error) { return 0, nil }
 func (s *attentionActivityStore) AttentionSnapshot(_ context.Context, sessionIDs []string) ([]store.SessionAttentionSummary, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	summary := s.summary
+	s.mu.RUnlock()
+	s.snapshotMu.Lock()
+	if s.snapshotCalls != nil {
+		select {
+		case s.snapshotCalls <- struct{}{}:
+		default:
+		}
+	}
+	block := s.blockNext
+	started, release := s.blockedSnapshot, s.releaseSnapshot
+	if block {
+		s.blockNext = false
+	}
+	s.snapshotMu.Unlock()
+	if block {
+		close(started)
+		<-release
+	}
 	for _, sessionID := range sessionIDs {
-		if sessionID == s.summary.SessionID {
-			return []store.SessionAttentionSummary{s.summary}, nil
+		if sessionID == summary.SessionID {
+			return []store.SessionAttentionSummary{summary}, nil
 		}
 	}
 	return nil, nil
@@ -403,6 +471,22 @@ func (s *attentionActivityStore) setSummary(summary store.SessionAttentionSummar
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.summary = summary
+}
+
+func (s *attentionActivityStore) observeSnapshots() <-chan struct{} {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	s.snapshotCalls = make(chan struct{}, 4)
+	return s.snapshotCalls
+}
+
+func (s *attentionActivityStore) blockNextSnapshot() (<-chan struct{}, chan<- struct{}) {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	s.blockNext = true
+	s.blockedSnapshot = make(chan struct{})
+	s.releaseSnapshot = make(chan struct{})
+	return s.blockedSnapshot, s.releaseSnapshot
 }
 
 type mutableAttentionSocketAuth struct {

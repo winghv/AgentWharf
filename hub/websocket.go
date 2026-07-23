@@ -209,7 +209,6 @@ type attentionSubscription struct {
 	principal   auth.Principal
 	expiryTimer *time.Timer
 	sent        map[string]protocol.AttentionSummary
-	fanoutMu    *sync.Mutex
 }
 
 // attentionActivitySink reuses the single, bounded Store activity scan for
@@ -937,9 +936,11 @@ func (h *webSocketHandler) handleAttentionSubscribe(ctx context.Context, peer *c
 		return auth.ErrUnauthorized
 	}
 	frame := attentionSummaryFrame(request.RequestID, "snapshot", summaries, fresh.SessionIDs)
+	peer.attentionMu.Lock()
+	defer peer.attentionMu.Unlock()
 	h.mu.Lock()
 	h.removeAttentionSubscriptionLocked(peer)
-	subscription := attentionSubscription{requestID: request.RequestID, sessionIDs: append([]string(nil), fresh.SessionIDs...), grant: copyAttentionGrant(fresh), principal: accepted.Principal, sent: attentionSummaryIndex(frame.Summaries), fanoutMu: &sync.Mutex{}}
+	subscription := attentionSubscription{requestID: request.RequestID, sessionIDs: append([]string(nil), fresh.SessionIDs...), grant: copyAttentionGrant(fresh), principal: accepted.Principal, sent: attentionSummaryIndex(frame.Summaries)}
 	h.attentionSubscriptions[peer] = subscription
 	for _, sessionID := range subscription.sessionIDs {
 		if h.attentionSubscribers[sessionID] == nil {
@@ -954,6 +955,8 @@ func (h *webSocketHandler) handleAttentionSubscribe(ctx context.Context, peer *c
 		return auth.ErrUnauthorized
 	}
 	timer := time.AfterFunc(delay, func() {
+		peer.attentionMu.Lock()
+		defer peer.attentionMu.Unlock()
 		h.mu.Lock()
 		h.removeAttentionSubscriptionLocked(peer)
 		h.mu.Unlock()
@@ -2716,14 +2719,14 @@ func (h *webSocketHandler) broadcastAttentionUpdate(ctx context.Context, session
 }
 
 func (h *webSocketHandler) broadcastAttentionUpdateToPeer(ctx context.Context, pageStore store.AttentionSummaryStore, peer *clientConnection, sessionID string) {
+	peer.attentionMu.Lock()
+	defer peer.attentionMu.Unlock()
 	h.mu.Lock()
 	subscription, found := h.attentionSubscriptions[peer]
 	h.mu.Unlock()
-	if !found || subscription.fanoutMu == nil {
+	if !found {
 		return
 	}
-	subscription.fanoutMu.Lock()
-	defer subscription.fanoutMu.Unlock()
 
 	principal := attentionPrincipalFor(peer, h)
 	if principal.Subject == "" {
@@ -3081,6 +3084,7 @@ type clientConnection struct {
 	writeGate               contextWriteGate
 
 	mu            sync.Mutex
+	attentionMu   sync.Mutex
 	subscriptions map[string]*subscriptionState
 }
 
