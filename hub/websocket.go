@@ -110,6 +110,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		decisions:                         make(map[string]struct{}),
 		settingsClients:                   make(map[string]*clientConnection),
 		settingsCapabilities:              make(map[string]store.SettingsCapability),
+		runControlClients:                 make(map[string]*clientConnection),
 		pendingTargetJoins:                make(map[string]*pendingTargetJoin),
 		pendingTargetJoinByAttach:         make(map[string]*pendingTargetJoin),
 	}
@@ -185,6 +186,7 @@ type webSocketHandler struct {
 	decisionOrder        []string
 	settingsClients      map[string]*clientConnection
 	settingsCapabilities map[string]store.SettingsCapability
+	runControlClients    map[string]*clientConnection
 
 	pendingTargetJoinMu       sync.Mutex
 	pendingTargetJoins        map[string]*pendingTargetJoin
@@ -306,6 +308,12 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, fr
 		if _, ok := h.events.(store.SettingsCommandStore); ok {
 			if ack.Capabilities == nil {
 				ack.Capabilities = &protocol.HelloCapabilities{}
+			}
+			if _, ok := h.events.(store.RunControlStore); ok {
+				if ack.Capabilities == nil {
+					ack.Capabilities = &protocol.HelloCapabilities{}
+				}
+				ack.Capabilities.RunControl = &protocol.RunControlCapability{SchemaVersion: 1, MaxPending: 1, CompletionTimeoutSeconds: 30}
 			}
 			ack.Capabilities.Settings = &protocol.SettingsCapability{SchemaVersion: 1, MaxPendingChanges: 1, ProviderResponseTimeoutSeconds: 30}
 		}
@@ -995,6 +1003,34 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		}
 		return nil
 	}
+	if ev.Type == "session.run.capabilities" {
+		if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+			err := errors.New("run-control capabilities are v2 Adapter-only")
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+			return err
+		}
+		if _, err := protocol.DecodeRunControlCapabilityPayload(ev.Payload); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: "invalid run-control capability"})
+			return err
+		}
+		if err := h.commitRunControlCapabilityProposal(ctx, adapter, out, ev.ProposalID); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+			return err
+		}
+		return nil
+	}
+	if ev.Type == "session.run.outcome" {
+		if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+			err := errors.New("run-control outcomes are v2 Adapter-only")
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+			return err
+		}
+		if err := h.finalizeRunControlOutcome(ctx, adapter, out, ev.ProposalID); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+			return err
+		}
+		return nil
+	}
 	if accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
 		if err := h.commitAdapterProposal(ctx, adapter, out, ev.ProposalID, nil); err != nil {
 			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
@@ -1181,6 +1217,263 @@ func (h *webSocketHandler) commitSettingsCapabilityProposal(ctx context.Context,
 	return nil
 }
 
+func (h *webSocketHandler) commitRunControlCapabilityProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	ledger, ok := h.events.(store.RunControlStore)
+	if !ok || adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 {
+		return errors.New("run-control store is not configured")
+	}
+	capability, err := protocol.DecodeRunControlCapabilityPayload(event.Payload)
+	if err != nil {
+		return err
+	}
+	return h.commitAdapterProposal(ctx, adapter, event, proposalID, func(commitCtx context.Context, seq int64) ([]protocol.Event, error) {
+		if _, err := ledger.PublishRunControlCapability(commitCtx, event.SessionID, store.RunControlCapabilityUpdate{
+			EventSeq: seq, InterruptSupported: capability.InterruptSupported, StopSupported: capability.StopSupported, Writer: adapter.settingsWriter,
+		}); err != nil {
+			return nil, fmt.Errorf("publish run-control capability: %w", err)
+		}
+		pending, err := ledger.PendingRunControls(commitCtx, event.SessionID)
+		if err != nil {
+			return nil, fmt.Errorf("list pending run controls: %w", err)
+		}
+		recovered := make([]protocol.Event, 0, len(pending))
+		for _, reservation := range pending {
+			if reservation.Writer == adapter.settingsWriter {
+				continue
+			}
+			finalized, err := ledger.RecoverRunControl(commitCtx, event.SessionID, reservation.CommandID, "recovery_unconfirmed")
+			if err != nil {
+				return nil, fmt.Errorf("recover run control: %w", err)
+			}
+			events, err := h.runControlTerminalEvents(commitCtx, event.SessionID, finalized)
+			if err != nil {
+				return nil, err
+			}
+			recovered = append(recovered, events...)
+		}
+		return recovered, nil
+	})
+}
+
+func isRunControlCommand(commandType protocol.CommandType) bool {
+	return commandType == protocol.CommandSessionInterrupt || commandType == protocol.CommandSessionStop
+}
+
+func runControlOperation(commandType protocol.CommandType) store.RunControlOperation {
+	if commandType == protocol.CommandSessionStop {
+		return store.RunControlStop
+	}
+	return store.RunControlInterrupt
+}
+
+func (h *webSocketHandler) handleRunControl(ctx context.Context, conn *managedConn, peer *clientConnection, accepted AcceptedPeer, cmd *protocol.Command) error {
+	if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "run_control_unavailable")
+		return errors.New("run controls are v2 Client-only")
+	}
+	ledger, ok := h.events.(store.RunControlStore)
+	if !ok {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "run_control_unavailable")
+		return errors.New("run-control store is not configured")
+	}
+	adapter := h.settingsCurrentAdapter(cmd.SessionID)
+	if adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "run_control_unavailable")
+		return errors.New("run-control adapter is unavailable")
+	}
+	state, stateSeq, err := h.currentRunControlState(ctx, cmd.SessionID)
+	if err != nil {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "run_control_invalid_state")
+		return err
+	}
+	reserve, err := ledger.RunControlReserve(ctx, cmd.SessionID, store.RunControlRequest{
+		CommandID: cmd.CommandID, Operation: runControlOperation(cmd.Type), PreControlState: state, PreControlStateSeq: stateSeq, Writer: adapter.settingsWriter,
+	})
+	if err != nil {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, runControlReserveFailureReason(ctx, ledger, cmd.SessionID, cmd.Type, err))
+		return err
+	}
+	if reserve.Duplicate {
+		return writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckDuplicate, "")
+	}
+
+	key := settingsCommandKey(cmd.SessionID, cmd.CommandID)
+	h.commandMu.Lock()
+	h.runControlClients[key] = peer
+	h.commandMu.Unlock()
+	routed := cloneCommand(cmd)
+	if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
+		h.removeRunControlClient(key)
+		h.unregisterAdapter(adapter)
+		_, _ = ledger.RecoverRunControl(ctx, cmd.SessionID, cmd.CommandID, "adapter_disconnected")
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		return fmt.Errorf("deliver run-control reservation: %w", err)
+	}
+	return nil
+}
+
+func runControlReserveFailureReason(ctx context.Context, ledger store.RunControlStore, sessionID string, commandType protocol.CommandType, err error) string {
+	if err == nil {
+		return "internal_error"
+	}
+	switch {
+	case strings.Contains(err.Error(), "ID is reused"):
+		return "cmd_id_reused"
+	case strings.Contains(err.Error(), "unsupported"):
+		if commandType == protocol.CommandSessionStop {
+			return "stop_unsupported"
+		}
+		return "interrupt_unsupported"
+	case strings.Contains(err.Error(), "stale"), strings.Contains(err.Error(), "writer is fenced"), strings.Contains(err.Error(), "capability"):
+		return "run_control_unavailable"
+	case strings.Contains(err.Error(), "state"):
+		return "run_control_invalid_state"
+	}
+	if pending, pendingErr := ledger.PendingRunControls(ctx, sessionID); pendingErr == nil && len(pending) > 0 {
+		return "run_control_pending"
+	}
+	return "internal_error"
+}
+
+func (h *webSocketHandler) currentRunControlState(ctx context.Context, sessionID string) (string, int64, error) {
+	if h.events == nil {
+		return "", 0, errors.New("event store is not configured")
+	}
+	var state string
+	var stateSeq int64
+	err := h.events.Replay(ctx, sessionID, 0, func(event store.Event) error {
+		if event.Type != "session.state" {
+			return nil
+		}
+		var payload struct {
+			State string `json:"state"`
+		}
+		if json.Unmarshal(event.Payload, &payload) != nil || payload.State == "" {
+			return errors.New("invalid durable session state")
+		}
+		state, stateSeq = payload.State, event.Seq
+		return nil
+	})
+	if err != nil || stateSeq < 1 {
+		if err == nil {
+			err = errors.New("durable session state is unavailable")
+		}
+		return "", 0, err
+	}
+	return state, stateSeq, nil
+}
+
+func (h *webSocketHandler) finalizeRunControlOutcome(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	ledger, ok := h.events.(store.RunControlStore)
+	if !ok || adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 {
+		return errors.New("run-control store is not configured")
+	}
+	proposal, err := protocol.DecodeRunControlOutcomePayload(event.Payload)
+	if err != nil {
+		return err
+	}
+	return h.withSessionPublication(ctx, event.SessionID, func() error {
+		return h.withAdapterEffect(ctx, adapter, func() error {
+			reservation, err := ledger.RunControl(ctx, event.SessionID, proposal.CommandID)
+			if err != nil || reservation.Outcome != store.RunControlPending || reservation.Writer != adapter.settingsWriter || string(reservation.Operation) != proposal.Operation {
+				if err == nil {
+					err = errors.New("run-control outcome is fenced")
+				}
+				return err
+			}
+			writer := adapter.settingsWriter
+			finalized, err := ledger.RunControlFinalize(ctx, event.SessionID, proposal.CommandID, store.RunControlFinalize{
+				ReservationVersion: reservation.ReservationVersion, Writer: &writer, Outcome: store.RunControlOutcome(proposal.Outcome), ReasonCode: proposal.ReasonCode,
+			})
+			if err != nil {
+				return err
+			}
+			events, err := h.runControlTerminalEvents(ctx, event.SessionID, finalized)
+			if err != nil {
+				return err
+			}
+			if len(events) == 0 || events[len(events)-1].Type != "session.run.outcome" {
+				return errors.New("run-control Store outcome does not match proposal")
+			}
+			storedOutcome, err := protocol.DecodeRunControlOutcomePayload(events[len(events)-1].Payload)
+			if err != nil || !sameRunControlOutcome(storedOutcome, proposal) {
+				return errors.New("run-control Store outcome does not match proposal")
+			}
+			if err := adapter.writeFrame(ctx, &protocol.EventReceipt{ProposalID: proposalID, Seq: *finalized.TerminalEventSeq, Status: protocol.EventReceiptAccepted}); err != nil {
+				return err
+			}
+			for _, terminal := range events {
+				h.broadcastEvent(ctx, terminal)
+			}
+			return nil
+		})
+	})
+}
+
+func sameRunControlOutcome(left, right protocol.RunControlOutcomePayload) bool {
+	if left.CommandID != right.CommandID || left.Operation != right.Operation || left.Outcome != right.Outcome {
+		return false
+	}
+	if (left.CompletionState == nil) != (right.CompletionState == nil) || (left.ReasonCode == nil) != (right.ReasonCode == nil) {
+		return false
+	}
+	return (left.CompletionState == nil || *left.CompletionState == *right.CompletionState) &&
+		(left.ReasonCode == nil || *left.ReasonCode == *right.ReasonCode)
+}
+
+func (h *webSocketHandler) runControlTerminalEvents(ctx context.Context, sessionID string, reservation store.RunControlReservation) ([]protocol.Event, error) {
+	if reservation.TerminalEventSeq == nil || reservation.Outcome == store.RunControlPending {
+		return nil, errors.New("run-control terminal event is unavailable")
+	}
+	outcome, err := h.eventAt(ctx, sessionID, *reservation.TerminalEventSeq)
+	if err != nil || outcome.Type != "session.run.outcome" {
+		if err == nil {
+			err = errors.New("run-control terminal event is invalid")
+		}
+		return nil, err
+	}
+	if _, err := protocol.DecodeRunControlOutcomePayload(outcome.Payload); err != nil {
+		return nil, err
+	}
+	events := []protocol.Event{outcome}
+	if reservation.Outcome == store.RunControlCompleted {
+		state, err := h.eventAt(ctx, sessionID, *reservation.TerminalEventSeq-1)
+		if err != nil || state.Type != "session.state" {
+			if err == nil {
+				err = errors.New("run-control completion state is unavailable")
+			}
+			return nil, err
+		}
+		events = []protocol.Event{state, outcome}
+	}
+	return events, nil
+}
+
+var errRunControlEventFound = errors.New("run-control event found")
+
+func (h *webSocketHandler) eventAt(ctx context.Context, sessionID string, seq int64) (protocol.Event, error) {
+	if h.events == nil || seq < 1 {
+		return protocol.Event{}, errors.New("durable event is unavailable")
+	}
+	var found *store.Event
+	err := h.events.Replay(ctx, sessionID, seq-1, func(event store.Event) error {
+		if event.Seq == seq {
+			copy := event
+			found = &copy
+			return errRunControlEventFound
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errRunControlEventFound) {
+		return protocol.Event{}, err
+	}
+	if found == nil {
+		return protocol.Event{}, errors.New("durable event is missing")
+	}
+	foundSeq := found.Seq
+	return protocol.Event{Type: found.Type, SessionID: found.SessionID, Seq: &foundSeq, Time: found.Time.UnixMilli(), Payload: clonePayload(found.Payload)}, nil
+}
+
 func (h *webSocketHandler) handleSettingsChange(ctx context.Context, conn *managedConn, peer *clientConnection, accepted AcceptedPeer, cmd *protocol.Command) error {
 	if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
 		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "settings_unsupported")
@@ -1237,6 +1530,9 @@ func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter 
 		return errors.New("invalid adapter command acknowledgement")
 	}
 	key := settingsCommandKey(adapter.sessionID, ack.CommandID)
+	if client := h.runControlClient(key); client != nil {
+		return h.handleRunControlCommandAck(ctx, adapter, ack, key, client)
+	}
 	client := h.settingsClient(key)
 	if client == nil {
 		return errors.New("adapter acknowledgement has no settings reservation")
@@ -1279,6 +1575,31 @@ func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter 
 		return fmt.Errorf("deliver settings execute: %w", err)
 	}
 	h.removeSettingsClient(key)
+	return writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckAccepted, "")
+}
+
+func (h *webSocketHandler) handleRunControlCommandAck(ctx context.Context, adapter *adapterConnection, ack *protocol.CommandAck, key string, client *clientConnection) error {
+	if ack.Status != protocol.AckAccepted || ack.Reason != "" || adapter.protocolVersion != protocol.ProtocolVersionV2 || h.settingsCurrentAdapter(adapter.sessionID) != adapter {
+		h.removeRunControlClient(key)
+		_ = writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		return errors.New("run-control delivery acknowledgement is rejected")
+	}
+	ledger, ok := h.events.(store.RunControlStore)
+	if !ok {
+		h.removeRunControlClient(key)
+		_ = writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckRejected, "internal_error")
+		return errors.New("run-control store is not configured")
+	}
+	reservation, err := ledger.RunControl(ctx, adapter.sessionID, ack.CommandID)
+	if err != nil || reservation.Outcome != store.RunControlPending || reservation.Writer != adapter.settingsWriter {
+		h.removeRunControlClient(key)
+		_ = writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		if err == nil {
+			err = errors.New("run-control delivery acknowledgement is fenced")
+		}
+		return err
+	}
+	h.removeRunControlClient(key)
 	return writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckAccepted, "")
 }
 
@@ -1403,6 +1724,18 @@ func (h *webSocketHandler) removeSettingsClient(key string) {
 	h.commandMu.Unlock()
 }
 
+func (h *webSocketHandler) runControlClient(key string) *clientConnection {
+	h.commandMu.Lock()
+	defer h.commandMu.Unlock()
+	return h.runControlClients[key]
+}
+
+func (h *webSocketHandler) removeRunControlClient(key string) {
+	h.commandMu.Lock()
+	delete(h.runControlClients, key)
+	h.commandMu.Unlock()
+}
+
 func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *managedConn, peer *clientConnection, accepted AcceptedPeer, cmd *protocol.Command) error {
 	if err := validateClientCommand(cmd); err != nil {
 		_ = writeCommandAck(ctx, conn, commandID(cmd), protocol.AckRejected, "invalid_command")
@@ -1416,8 +1749,8 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return err
 	}
-	if cmd.Type == protocol.CommandSettingsChange && !hasLiteralSessionControl(accepted.Principal, cmd.SessionID) {
-		err := errors.New("settings command requires literal session control scope")
+	if (cmd.Type == protocol.CommandSettingsChange || isRunControlCommand(cmd.Type)) && !hasLiteralSessionControl(accepted.Principal, cmd.SessionID) {
+		err := errors.New("settings and run-control commands require literal session control scope")
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return err
 	}
@@ -1437,6 +1770,9 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 	}
 	if cmd.Type == protocol.CommandSettingsChange {
 		return h.handleSettingsChange(ctx, conn, peer, accepted, cmd)
+	}
+	if isRunControlCommand(cmd.Type) && accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
+		return h.handleRunControl(ctx, conn, peer, accepted, cmd)
 	}
 
 	h.commandMu.Lock()

@@ -169,6 +169,125 @@ func TestWebSocketSettingsRoutesCapabilityReserveDeliveryAndTerminalResult(t *te
 	}
 }
 
+func TestWebSocketRunControlRoutesCapabilityAndStoreTerminalOutcome(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "run-control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := events.Append(ctx, "ses_1", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: json.RawMessage(`{"state":"busy"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1", LastSeq: 1}}})
+	if ack := readFrame(t, client).(*protocol.HelloAck); ack.Capabilities == nil || ack.Capabilities.RunControl == nil ||
+		ack.Capabilities.RunControl.SchemaVersion != 1 || ack.Capabilities.RunControl.MaxPending != 1 || ack.Capabilities.RunControl.CompletionTimeoutSeconds != 30 {
+		t.Fatalf("run-control hello capability = %+v", ack.Capabilities)
+	}
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	writeFrame(t, adapter, &protocol.Event{Type: "session.run.capabilities", SessionID: "ses_1", Time: 1001, ProposalID: "run_capability_1", Payload: runControlCapabilityPayload(true, true)})
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.ProposalID != "run_capability_1" || receipt.Seq != 2 {
+		t.Fatalf("run-control capability receipt = %+v", receipt)
+	}
+	if capability := readFrame(t, client).(*protocol.Event); capability.Type != "session.run.capabilities" || capability.Seq == nil || *capability.Seq != 2 {
+		t.Fatalf("run-control capability fanout = %+v", capability)
+	}
+
+	command := &protocol.Command{CommandID: "cmd_interrupt_1", Type: protocol.CommandSessionInterrupt, SessionID: "ses_1", Payload: json.RawMessage(`{}`)}
+	writeFrame(t, client, command)
+	if routed := readFrame(t, adapter).(*protocol.Command); routed.CommandID != command.CommandID || routed.Type != command.Type {
+		t.Fatalf("run-control route = %+v", routed)
+	}
+	writeFrame(t, adapter, &protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted})
+	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckAccepted || ack.Reason != "" {
+		t.Fatalf("run-control routing acknowledgement = %+v", ack)
+	}
+
+	outcome := json.RawMessage(`{"cmd_id":"cmd_interrupt_1","operation":"interrupt","outcome":"completed","completion_state":"ready","reason_code":null}`)
+	writeFrame(t, adapter, &protocol.Event{Type: "session.run.outcome", SessionID: "ses_1", Time: 1002, ProposalID: "run_outcome_1", Payload: outcome})
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.ProposalID != "run_outcome_1" || receipt.Seq != 4 {
+		t.Fatalf("run-control outcome receipt = %+v", receipt)
+	}
+	if state := readFrame(t, client).(*protocol.Event); state.Type != "session.state" || state.Seq == nil || *state.Seq != 3 || string(state.Payload) != `{"state":"ready"}` {
+		t.Fatalf("run-control completion state = %+v", state)
+	}
+	if terminal := readFrame(t, client).(*protocol.Event); terminal.Type != "session.run.outcome" || terminal.Seq == nil || *terminal.Seq != 4 || string(terminal.Payload) != string(outcome) {
+		t.Fatalf("run-control Store terminal outcome = %+v", terminal)
+	}
+	stored, err := events.RunControl(ctx, "ses_1", command.CommandID)
+	if err != nil || stored.Outcome != store.RunControlCompleted || stored.TerminalEventSeq == nil || *stored.TerminalEventSeq != 4 {
+		t.Fatalf("run-control ledger = %+v, %v", stored, err)
+	}
+}
+
+func TestWebSocketRunControlFailsClosedBeforeCapabilityOrUnsupportedControl(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		capability *json.RawMessage
+		reason     string
+	}{
+		{name: "unavailable", reason: "run_control_unavailable"},
+		{name: "unsupported", capability: pointerToRawMessage(runControlCapabilityPayload(false, true)), reason: "interrupt_unsupported"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "run-control-reject.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ledger.Close()
+			events := &settingsWebSocketStore{Store: ledger}
+			if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := events.Append(ctx, "ses_1", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: json.RawMessage(`{"state":"busy"}`)}}); err != nil {
+				t.Fatal(err)
+			}
+			server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+			client := dialWebSocket(t, server.URL)
+			defer client.Close(websocket.StatusNormalClosure, "")
+			adapter := dialWebSocket(t, server.URL)
+			defer adapter.Close(websocket.StatusNormalClosure, "")
+			writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1", LastSeq: 1}}})
+			_ = readFrame(t, client).(*protocol.HelloAck)
+			writeAdapterHelloV2(t, adapter, "adapter-token")
+			_ = readFrame(t, adapter).(*protocol.HelloAck)
+			if test.capability != nil {
+				writeFrame(t, adapter, &protocol.Event{Type: "session.run.capabilities", SessionID: "ses_1", Time: 1001, ProposalID: "run_capability_reject", Payload: *test.capability})
+				_ = readFrame(t, adapter).(*protocol.EventReceipt)
+				_ = readFrame(t, client).(*protocol.Event)
+			}
+			command := &protocol.Command{CommandID: "cmd_interrupt_reject", Type: protocol.CommandSessionInterrupt, SessionID: "ses_1", Payload: json.RawMessage(`{}`)}
+			writeFrame(t, client, command)
+			if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckRejected || ack.Reason != test.reason {
+				t.Fatalf("run-control rejection = %+v", ack)
+			}
+			if _, err := events.RunControl(ctx, "ses_1", command.CommandID); err == nil {
+				t.Fatal("rejected run control created a durable reservation")
+			}
+		})
+	}
+}
+
+func pointerToRawMessage(value json.RawMessage) *json.RawMessage { return &value }
+
+func runControlCapabilityPayload(interruptSupported, stopSupported bool) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{"schema_version":1,"interrupt_supported":%t,"stop_supported":%t}`, interruptSupported, stopSupported))
+}
+
 func TestWebSocketSettingsFinalizesReportedSuccessWithProviderMismatch(t *testing.T) {
 	ctx := context.Background()
 	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "settings-mismatch.db"))

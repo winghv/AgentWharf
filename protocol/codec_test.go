@@ -244,6 +244,39 @@ func TestSettingsEffectivePayloadRejectsNonCanonicalPayloads(t *testing.T) {
 	}
 }
 
+func TestRunControlPayloadsRequireExactCanonicalMembers(t *testing.T) {
+	capability := []byte(`{"schema_version":1,"interrupt_supported":true,"stop_supported":false}`)
+	if _, err := DecodeRunControlCapabilityPayload(capability); err != nil {
+		t.Fatalf("DecodeRunControlCapabilityPayload(valid) error = %v", err)
+	}
+	for _, raw := range []string{
+		`{"schema_version":1,"interrupt_supported":true,"stop_supported":false,"provider":"hidden"}`,
+		`{"schema_version":1,"interrupt_supported":true,"interrupt_supported":false,"stop_supported":false}`,
+		`{"schema_version":1,"interrupt_supported":"true","stop_supported":false}`,
+		`{"schema_version":1,"interrupt_supported":null,"stop_supported":false}`,
+	} {
+		if _, err := DecodeRunControlCapabilityPayload([]byte(raw)); err == nil {
+			t.Fatalf("DecodeRunControlCapabilityPayload(%s) unexpectedly succeeded", raw)
+		}
+	}
+
+	completed := []byte(`{"cmd_id":"cmd_interrupt_1","operation":"interrupt","outcome":"completed","completion_state":"ready","reason_code":null}`)
+	if _, err := DecodeRunControlOutcomePayload(completed); err != nil {
+		t.Fatalf("DecodeRunControlOutcomePayload(completed) error = %v", err)
+	}
+	for _, raw := range []string{
+		`{"cmd_id":"cmd_interrupt_1","operation":"interrupt","outcome":"completed","completion_state":null,"reason_code":null}`,
+		`{"cmd_id":"cmd_stop_1","operation":"stop","outcome":"completed","completion_state":"ready","reason_code":null}`,
+		`{"cmd_id":"cmd_interrupt_1","operation":"interrupt","outcome":"rejected","completion_state":null,"reason_code":null}`,
+		`{"cmd_id":"cmd_interrupt_1","operation":"interrupt","outcome":"completed","completion_state":"ready","reason_code":null,"writer_lease_id":"secret"}`,
+		`{"cmd_id":"cmd_interrupt_1","operation":"interrupt","outcome":"completed","completion_state":"ready","reason_code":null,"reason_code":null}`,
+	} {
+		if _, err := DecodeRunControlOutcomePayload([]byte(raw)); err == nil {
+			t.Fatalf("DecodeRunControlOutcomePayload(%s) unexpectedly succeeded", raw)
+		}
+	}
+}
+
 func TestEventReceiptRoundTripsStrictReferenceOnlyFields(t *testing.T) {
 	receipt := &EventReceipt{ProposalID: "proposal_01H8X", Seq: 42, Status: EventReceiptAccepted}
 	encoded, err := Encode(receipt)

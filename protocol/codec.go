@@ -183,6 +183,7 @@ func (*HelloAck) FrameName() FrameName { return FrameHelloAck }
 type HelloCapabilities struct {
 	HistoryPage *HistoryPageCapability `json:"history_page,omitempty"`
 	Settings    *SettingsCapability    `json:"settings,omitempty"`
+	RunControl  *RunControlCapability  `json:"run_control,omitempty"`
 }
 
 type HistoryPageCapability struct {
@@ -195,6 +196,14 @@ type SettingsCapability struct {
 	SchemaVersion                  int `json:"schema_version"`
 	MaxPendingChanges              int `json:"max_pending_changes"`
 	ProviderResponseTimeoutSeconds int `json:"provider_response_timeout_seconds"`
+}
+
+// RunControlCapability advertises the fixed v2 durable run-control contract.
+// Per-Adapter support remains in the durable session.run.capabilities event.
+type RunControlCapability struct {
+	SchemaVersion            int `json:"schema_version"`
+	MaxPending               int `json:"max_pending"`
+	CompletionTimeoutSeconds int `json:"completion_timeout_seconds"`
 }
 
 type SessionSummary struct {
@@ -298,6 +307,24 @@ type SettingsDeliveryExecute struct {
 }
 
 func (*SettingsDeliveryExecute) FrameName() FrameName { return FrameSettingsDeliveryExecute }
+
+// RunControlCapabilityPayload is the exact Adapter-owned capability proposal.
+// It deliberately contains no provider object or connection metadata.
+type RunControlCapabilityPayload struct {
+	SchemaVersion      int  `json:"schema_version"`
+	InterruptSupported bool `json:"interrupt_supported"`
+	StopSupported      bool `json:"stop_supported"`
+}
+
+// RunControlOutcomePayload is the exact Adapter completion proposal. The Hub
+// resolves it through the Store before broadcasting the Store-derived event.
+type RunControlOutcomePayload struct {
+	CommandID       string
+	Operation       string
+	Outcome         string
+	CompletionState *string
+	ReasonCode      *string
+}
 
 type Ping struct {
 	Nonce string `json:"nonce,omitempty"`
@@ -544,6 +571,83 @@ func DecodeSettingsEffectivePayload(payload json.RawMessage) (SettingsEffectiveP
 		return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
 	}
 	return out, nil
+}
+
+// DecodeRunControlCapabilityPayload accepts only the exact v2 durable
+// capability grammar before a Hub can update the run-control ledger.
+func DecodeRunControlCapabilityPayload(payload json.RawMessage) (RunControlCapabilityPayload, error) {
+	if len(payload) == 0 || len(payload) > MaxEventPayloadBytes {
+		return RunControlCapabilityPayload{}, errors.New("invalid run-control capability payload")
+	}
+	fields, err := strictObject(payload)
+	if err != nil || len(fields) != 3 {
+		return RunControlCapabilityPayload{}, errors.New("invalid run-control capability payload")
+	}
+	for key := range fields {
+		if key != "schema_version" && key != "interrupt_supported" && key != "stop_supported" {
+			return RunControlCapabilityPayload{}, errors.New("invalid run-control capability payload")
+		}
+	}
+	var out RunControlCapabilityPayload
+	if fields["schema_version"] == nil || fields["interrupt_supported"] == nil || fields["stop_supported"] == nil ||
+		json.Unmarshal(fields["schema_version"], &out.SchemaVersion) != nil ||
+		json.Unmarshal(fields["interrupt_supported"], &out.InterruptSupported) != nil ||
+		json.Unmarshal(fields["stop_supported"], &out.StopSupported) != nil || out.SchemaVersion != 1 {
+		return RunControlCapabilityPayload{}, errors.New("invalid run-control capability payload")
+	}
+	if !validRunControlBoolean(fields["interrupt_supported"]) || !validRunControlBoolean(fields["stop_supported"]) {
+		return RunControlCapabilityPayload{}, errors.New("invalid run-control capability payload")
+	}
+	return out, nil
+}
+
+func validRunControlBoolean(value json.RawMessage) bool {
+	value = bytes.TrimSpace(value)
+	return bytes.Equal(value, []byte("true")) || bytes.Equal(value, []byte("false"))
+}
+
+// DecodeRunControlOutcomePayload accepts the exact public completion proposal.
+// Reservation and writer fencing stay in Store metadata rather than this frame.
+func DecodeRunControlOutcomePayload(payload json.RawMessage) (RunControlOutcomePayload, error) {
+	if len(payload) == 0 || len(payload) > MaxEventPayloadBytes {
+		return RunControlOutcomePayload{}, errors.New("invalid run-control outcome payload")
+	}
+	fields, err := strictObject(payload)
+	if err != nil || len(fields) != 5 {
+		return RunControlOutcomePayload{}, errors.New("invalid run-control outcome payload")
+	}
+	for key := range fields {
+		if key != "cmd_id" && key != "operation" && key != "outcome" && key != "completion_state" && key != "reason_code" {
+			return RunControlOutcomePayload{}, errors.New("invalid run-control outcome payload")
+		}
+	}
+	var out RunControlOutcomePayload
+	if fields["cmd_id"] == nil || fields["operation"] == nil || fields["outcome"] == nil || fields["completion_state"] == nil || fields["reason_code"] == nil ||
+		json.Unmarshal(fields["cmd_id"], &out.CommandID) != nil || !validSettingsCommandID(out.CommandID) ||
+		json.Unmarshal(fields["operation"], &out.Operation) != nil || (out.Operation != "interrupt" && out.Operation != "stop") ||
+		json.Unmarshal(fields["outcome"], &out.Outcome) != nil || !validRunControlOutcome(out.Outcome) ||
+		json.Unmarshal(fields["completion_state"], &out.CompletionState) != nil ||
+		json.Unmarshal(fields["reason_code"], &out.ReasonCode) != nil {
+		return RunControlOutcomePayload{}, errors.New("invalid run-control outcome payload")
+	}
+	if out.Outcome == "completed" {
+		want := "ready"
+		if out.Operation == "stop" {
+			want = "ended"
+		}
+		if out.CompletionState == nil || *out.CompletionState != want || out.ReasonCode != nil {
+			return RunControlOutcomePayload{}, errors.New("invalid run-control outcome payload")
+		}
+		return out, nil
+	}
+	if out.CompletionState != nil || !validSettingsReasonPointer(out.ReasonCode) {
+		return RunControlOutcomePayload{}, errors.New("invalid run-control outcome payload")
+	}
+	return out, nil
+}
+
+func validRunControlOutcome(value string) bool {
+	return value == "completed" || value == "rejected" || value == "timeout" || value == "unsupported" || value == "outcome_unknown"
 }
 
 func validSettingsChoices(choices []SettingsCapabilityChoice, min, max int) bool {
