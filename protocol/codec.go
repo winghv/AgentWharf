@@ -181,9 +181,10 @@ type HelloAck struct {
 func (*HelloAck) FrameName() FrameName { return FrameHelloAck }
 
 type HelloCapabilities struct {
-	HistoryPage *HistoryPageCapability `json:"history_page,omitempty"`
-	Settings    *SettingsCapability    `json:"settings,omitempty"`
-	RunControl  *RunControlCapability  `json:"run_control,omitempty"`
+	HistoryPage    *HistoryPageCapability        `json:"history_page,omitempty"`
+	Settings       *SettingsCapability           `json:"settings,omitempty"`
+	RunControl     *RunControlCapability         `json:"run_control,omitempty"`
+	FileReferences *FileReferenceHelloCapability `json:"file_references,omitempty"`
 }
 
 type HistoryPageCapability struct {
@@ -204,6 +205,14 @@ type RunControlCapability struct {
 	SchemaVersion            int `json:"schema_version"`
 	MaxPending               int `json:"max_pending"`
 	CompletionTimeoutSeconds int `json:"completion_timeout_seconds"`
+}
+
+// FileReferenceHelloCapability advertises the fixed v2 grammar. Per-Adapter
+// support remains in the durable capability event.
+type FileReferenceHelloCapability struct {
+	SchemaVersion    int `json:"schema_version"`
+	MaxReferences    int `json:"max_references"`
+	MaxMetadataBytes int `json:"max_metadata_bytes"`
 }
 
 type SessionSummary struct {
@@ -307,6 +316,56 @@ type SettingsDeliveryExecute struct {
 }
 
 func (*SettingsDeliveryExecute) FrameName() FrameName { return FrameSettingsDeliveryExecute }
+
+// FileReferenceCapabilityPayload is the Adapter-owned, bounded capability
+// proposal. It contains neither Provider objects nor workspace metadata.
+type FileReferenceCapabilityPayload struct {
+	SchemaVersion int                                `json:"schema_version"`
+	Fingerprint   string                             `json:"fingerprint"`
+	MaxReferences int                                `json:"max_references"`
+	MaxTotalBytes int64                              `json:"max_total_bytes"`
+	File          FileReferenceDispositionCapability `json:"file"`
+	Image         FileReferenceImageCapability       `json:"image"`
+}
+
+type FileReferenceDispositionCapability struct {
+	Mode     string  `json:"mode"`
+	MaxBytes *int64  `json:"max_bytes"`
+	Reason   *string `json:"reason"`
+}
+
+type FileReferenceImageCapability struct {
+	Mode       string   `json:"mode"`
+	MaxBytes   *int64   `json:"max_bytes"`
+	MediaTypes []string `json:"media_types"`
+	Reason     *string  `json:"reason"`
+}
+
+// FileReferenceSendPayload is the bounded part of a v2 session.send that
+// contains references. RequestFingerprint is opaque Store metadata only.
+type FileReferenceSendPayload struct {
+	CapabilityFingerprint string
+	RequestFingerprint    string
+	ReferenceCount        int
+	HasReferences         bool
+	References            []FileReferencePart
+}
+
+type FileReferencePart struct {
+	Disposition string
+	Bytes       int64
+	MediaType   *string
+}
+
+// FileReferenceOutcomePayload is the Adapter's bounded, terminal delivery
+// proposal. The Hub checks it against the ledger before it is persisted.
+type FileReferenceOutcomePayload struct {
+	MessageID      string
+	CommandID      string
+	Outcome        string
+	ReferenceIndex *int
+	Reason         *string
+}
 
 // RunControlCapabilityPayload is the exact Adapter-owned capability proposal.
 // It deliberately contains no provider object or connection metadata.
@@ -706,6 +765,329 @@ func validSettingsReason(value string) bool {
 
 func validSettingsReasonPointer(value *string) bool {
 	return value != nil && validSettingsReason(*value)
+}
+
+// DecodeFileReferenceCapabilityPayload verifies the exact, bounded v2
+// capability proposal before the Hub commits it to its durable ledger.
+func DecodeFileReferenceCapabilityPayload(payload json.RawMessage) (FileReferenceCapabilityPayload, error) {
+	fields, err := strictObject(payload)
+	if err != nil || len(fields) != 6 {
+		return FileReferenceCapabilityPayload{}, errors.New("invalid file-reference capability")
+	}
+	for key := range fields {
+		if key != "schema_version" && key != "fingerprint" && key != "max_references" && key != "max_total_bytes" && key != "file" && key != "image" {
+			return FileReferenceCapabilityPayload{}, errors.New("invalid file-reference capability")
+		}
+	}
+	var capability FileReferenceCapabilityPayload
+	if fields["schema_version"] == nil || fields["fingerprint"] == nil || fields["max_references"] == nil || fields["max_total_bytes"] == nil || fields["file"] == nil || fields["image"] == nil ||
+		json.Unmarshal(fields["schema_version"], &capability.SchemaVersion) != nil || json.Unmarshal(fields["fingerprint"], &capability.Fingerprint) != nil ||
+		json.Unmarshal(fields["max_references"], &capability.MaxReferences) != nil || json.Unmarshal(fields["max_total_bytes"], &capability.MaxTotalBytes) != nil ||
+		decodeFileReferenceDisposition(fields["file"], &capability.File) != nil || decodeFileReferenceImage(fields["image"], &capability.Image) != nil ||
+		!validFileReferenceCapability(capability) || capability.Fingerprint != FileReferenceCapabilityFingerprint(capability) {
+		return FileReferenceCapabilityPayload{}, errors.New("invalid file-reference capability")
+	}
+	return capability, nil
+}
+
+// FileReferenceCapabilityFingerprint returns the versioned canonical digest
+// specified for a valid capability. Invalid values return an empty string.
+func FileReferenceCapabilityFingerprint(capability FileReferenceCapabilityPayload) string {
+	if capability.SchemaVersion != 1 || capability.MaxReferences < 1 || capability.MaxReferences > 8 || capability.MaxTotalBytes < 1 || capability.MaxTotalBytes > 10485760 ||
+		!validFileReferenceDisposition(capability.File, capability.MaxTotalBytes) || !validFileReferenceImage(capability.Image, capability.MaxTotalBytes) {
+		return ""
+	}
+	data := make([]byte, 0, 256)
+	data = append(data, []byte("agentwharf.file-reference-capability.v1")...)
+	data = append(data, 0, 1, byte(capability.MaxReferences))
+	var number [8]byte
+	binary.BigEndian.PutUint64(number[:], uint64(capability.MaxTotalBytes))
+	data = append(data, number[:]...)
+	appendDisposition := func(value FileReferenceDispositionCapability) {
+		if value.Mode == "allowed" {
+			data = append(data, 1)
+			binary.BigEndian.PutUint64(number[:], uint64(*value.MaxBytes))
+			data = append(data, number[:]...)
+			appendFileReferenceString(&data, "")
+			return
+		}
+		data = append(data, 0)
+		binary.BigEndian.PutUint64(number[:], 0)
+		data = append(data, number[:]...)
+		appendFileReferenceString(&data, *value.Reason)
+	}
+	appendDisposition(capability.File)
+	if capability.Image.Mode == "allowed" {
+		data = append(data, 1)
+		binary.BigEndian.PutUint64(number[:], uint64(*capability.Image.MaxBytes))
+		data = append(data, number[:]...)
+	} else {
+		data = append(data, 0)
+		binary.BigEndian.PutUint64(number[:], 0)
+		data = append(data, number[:]...)
+	}
+	data = append(data, byte(len(capability.Image.MediaTypes)))
+	for _, mediaType := range capability.Image.MediaTypes {
+		appendFileReferenceString(&data, mediaType)
+	}
+	if capability.Image.Mode == "allowed" {
+		appendFileReferenceString(&data, "")
+	} else {
+		appendFileReferenceString(&data, *capability.Image.Reason)
+	}
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("sha256:%x", digest[:])
+}
+
+func appendFileReferenceString(data *[]byte, value string) {
+	var length [2]byte
+	binary.BigEndian.PutUint16(length[:], uint16(len(value)))
+	*data = append(*data, length[:]...)
+	*data = append(*data, value...)
+}
+
+func validFileReferenceCapability(capability FileReferenceCapabilityPayload) bool {
+	return capability.SchemaVersion == 1 && validFileReferenceFingerprint(capability.Fingerprint) &&
+		FileReferenceCapabilityFingerprint(capability) != ""
+}
+
+func decodeFileReferenceDisposition(raw json.RawMessage, value *FileReferenceDispositionCapability) error {
+	fields, err := strictObject(raw)
+	if err != nil || len(fields) != 3 || fields["mode"] == nil || fields["max_bytes"] == nil || fields["reason"] == nil ||
+		json.Unmarshal(fields["mode"], &value.Mode) != nil || json.Unmarshal(fields["max_bytes"], &value.MaxBytes) != nil || json.Unmarshal(fields["reason"], &value.Reason) != nil {
+		return errors.New("invalid file-reference disposition")
+	}
+	for key := range fields {
+		if key != "mode" && key != "max_bytes" && key != "reason" {
+			return errors.New("invalid file-reference disposition")
+		}
+	}
+	return nil
+}
+
+func decodeFileReferenceImage(raw json.RawMessage, value *FileReferenceImageCapability) error {
+	fields, err := strictObject(raw)
+	if err != nil || len(fields) != 4 || fields["mode"] == nil || fields["max_bytes"] == nil || fields["media_types"] == nil || fields["reason"] == nil ||
+		json.Unmarshal(fields["mode"], &value.Mode) != nil || json.Unmarshal(fields["max_bytes"], &value.MaxBytes) != nil || json.Unmarshal(fields["media_types"], &value.MediaTypes) != nil || json.Unmarshal(fields["reason"], &value.Reason) != nil {
+		return errors.New("invalid file-reference image")
+	}
+	for key := range fields {
+		if key != "mode" && key != "max_bytes" && key != "media_types" && key != "reason" {
+			return errors.New("invalid file-reference image")
+		}
+	}
+	return nil
+}
+
+func validFileReferenceDisposition(value FileReferenceDispositionCapability, total int64) bool {
+	if value.Mode == "allowed" {
+		return value.Reason == nil && value.MaxBytes != nil && *value.MaxBytes >= 1 && *value.MaxBytes <= total
+	}
+	return value.Mode == "unsupported" && value.MaxBytes == nil && validFileReferenceReason(value.Reason)
+}
+
+func validFileReferenceImage(value FileReferenceImageCapability, total int64) bool {
+	if value.Mode == "allowed" {
+		if value.Reason != nil || value.MaxBytes == nil || *value.MaxBytes < 1 || *value.MaxBytes > total || len(value.MediaTypes) < 1 || len(value.MediaTypes) > 4 {
+			return false
+		}
+		last := ""
+		for _, mediaType := range value.MediaTypes {
+			if (mediaType != "image/png" && mediaType != "image/jpeg" && mediaType != "image/webp" && mediaType != "image/gif") || (last != "" && last >= mediaType) {
+				return false
+			}
+			last = mediaType
+		}
+		return true
+	}
+	return value.Mode == "unsupported" && value.MaxBytes == nil && len(value.MediaTypes) == 0 && validFileReferenceReason(value.Reason)
+}
+
+func validFileReferenceReason(value *string) bool {
+	return value != nil && validSettingsReason(*value)
+}
+
+// DecodeFileReferenceSendPayload validates only the new v2 reference shape.
+// Text-only session.send payloads retain their established permissive shape.
+func DecodeFileReferenceSendPayload(payload json.RawMessage) (FileReferenceSendPayload, error) {
+	fields, err := strictObject(payload)
+	if err != nil {
+		return FileReferenceSendPayload{}, errors.New("invalid session.send payload")
+	}
+	content, found := fields["content"]
+	if !found {
+		return FileReferenceSendPayload{}, nil
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(content, &parts) != nil {
+		return FileReferenceSendPayload{}, nil
+	}
+	result := FileReferenceSendPayload{}
+	nonReferenceParts := make([]map[string]json.RawMessage, 0, len(parts))
+	canonicalParts := make([]json.RawMessage, 0, len(parts))
+	for _, part := range parts {
+		partFields, err := strictObject(part)
+		if err != nil || partFields["kind"] == nil {
+			return FileReferenceSendPayload{}, errors.New("invalid session.send content")
+		}
+		var kind string
+		if json.Unmarshal(partFields["kind"], &kind) != nil {
+			return FileReferenceSendPayload{}, errors.New("invalid session.send content")
+		}
+		canonicalPart, err := json.Marshal(partFields)
+		if err != nil {
+			return FileReferenceSendPayload{}, errors.New("invalid session.send content")
+		}
+		canonicalParts = append(canonicalParts, canonicalPart)
+		if kind != "file_reference" {
+			nonReferenceParts = append(nonReferenceParts, partFields)
+			continue
+		}
+		result.HasReferences = true
+		reference, err := decodeFileReferencePart(partFields)
+		if err != nil {
+			return FileReferenceSendPayload{}, err
+		}
+		result.ReferenceCount++
+		result.References = append(result.References, reference)
+	}
+	if !result.HasReferences {
+		return result, nil
+	}
+	for _, part := range nonReferenceParts {
+		var text string
+		if len(part) != 2 || part["kind"] == nil || part["text"] == nil || json.Unmarshal(part["text"], &text) != nil {
+			return FileReferenceSendPayload{}, errors.New("invalid file-reference session.send")
+		}
+		var kind string
+		if json.Unmarshal(part["kind"], &kind) != nil || kind != "text" {
+			return FileReferenceSendPayload{}, errors.New("invalid file-reference session.send")
+		}
+	}
+	if len(fields) != 2 || fields["capability_fingerprint"] == nil || json.Unmarshal(fields["capability_fingerprint"], &result.CapabilityFingerprint) != nil || !validFileReferenceFingerprint(result.CapabilityFingerprint) || result.ReferenceCount > 8 {
+		return FileReferenceSendPayload{}, errors.New("invalid file-reference session.send")
+	}
+	for key := range fields {
+		if key != "content" && key != "capability_fingerprint" {
+			return FileReferenceSendPayload{}, errors.New("invalid file-reference session.send")
+		}
+	}
+	canonical, err := json.Marshal(struct {
+		Content               []json.RawMessage `json:"content"`
+		CapabilityFingerprint string            `json:"capability_fingerprint"`
+	}{Content: canonicalParts, CapabilityFingerprint: result.CapabilityFingerprint})
+	if err != nil || len(canonical) > 8192 {
+		return FileReferenceSendPayload{}, errors.New("invalid file-reference session.send")
+	}
+	digest := sha256.Sum256(canonical)
+	result.RequestFingerprint = fmt.Sprintf("sha256:%x", digest[:])
+	return result, nil
+}
+
+func decodeFileReferencePart(fields map[string]json.RawMessage) (FileReferencePart, error) {
+	if len(fields) != 7 {
+		return FileReferencePart{}, errors.New("invalid file-reference part")
+	}
+	for key := range fields {
+		if key != "kind" && key != "disposition" && key != "path" && key != "version" && key != "content_digest" && key != "bytes" && key != "media_type" {
+			return FileReferencePart{}, errors.New("invalid file-reference part")
+		}
+	}
+	var disposition, path, version, digest string
+	var bytes int64
+	var mediaType *string
+	if json.Unmarshal(fields["disposition"], &disposition) != nil || json.Unmarshal(fields["path"], &path) != nil || json.Unmarshal(fields["version"], &version) != nil ||
+		json.Unmarshal(fields["content_digest"], &digest) != nil || json.Unmarshal(fields["bytes"], &bytes) != nil || json.Unmarshal(fields["media_type"], &mediaType) != nil ||
+		(disposition != "file" && disposition != "image") || !validFileReferencePath(path) || !validFileReferenceOpaqueVersion(version) || !validFileReferenceFingerprint(digest) || bytes < 0 || bytes > 10485760 || !validFileReferenceMediaType(mediaType) {
+		return FileReferencePart{}, errors.New("invalid file-reference part")
+	}
+	return FileReferencePart{Disposition: disposition, Bytes: bytes, MediaType: mediaType}, nil
+}
+
+func validFileReferencePath(value string) bool {
+	if len(value) < 1 || len(value) > 1024 || !utf8.ValidString(value) || strings.HasPrefix(value, "/") || strings.Contains(value, "\\") || strings.ContainsRune(value, 0) {
+		return false
+	}
+	parts := strings.Split(value, "/")
+	if len(parts) > 32 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func validFileReferenceOpaqueVersion(value string) bool {
+	return len(value) >= 1 && len(value) <= 256 && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
+}
+
+func validFileReferenceFingerprint(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	for _, ch := range value[len("sha256:"):] {
+		if !(ch >= '0' && ch <= '9') && !(ch >= 'a' && ch <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validFileReferenceMediaType(value *string) bool {
+	if value == nil {
+		return true
+	}
+	if len(*value) < 1 || len(*value) > 127 {
+		return false
+	}
+	for _, ch := range *value {
+		if ch < 0x20 || ch > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func DecodeFileReferenceOutcomePayload(payload json.RawMessage) (FileReferenceOutcomePayload, error) {
+	fields, err := strictObject(payload)
+	if err != nil || len(fields) != 5 {
+		return FileReferenceOutcomePayload{}, errors.New("invalid file-reference outcome")
+	}
+	for key := range fields {
+		if key != "message_id" && key != "cmd_id" && key != "outcome" && key != "reference_index" && key != "reason" {
+			return FileReferenceOutcomePayload{}, errors.New("invalid file-reference outcome")
+		}
+	}
+	var result FileReferenceOutcomePayload
+	if fields["message_id"] == nil || fields["cmd_id"] == nil || fields["outcome"] == nil || fields["reference_index"] == nil || fields["reason"] == nil ||
+		json.Unmarshal(fields["message_id"], &result.MessageID) != nil || json.Unmarshal(fields["cmd_id"], &result.CommandID) != nil || json.Unmarshal(fields["outcome"], &result.Outcome) != nil ||
+		json.Unmarshal(fields["reference_index"], &result.ReferenceIndex) != nil || json.Unmarshal(fields["reason"], &result.Reason) != nil ||
+		!validSettingsCommandID(result.MessageID) || !validSettingsCommandID(result.CommandID) ||
+		(result.Outcome != "delivered" && result.Outcome != "rejected" && result.Outcome != "outcome_unknown") {
+		return FileReferenceOutcomePayload{}, errors.New("invalid file-reference outcome")
+	}
+	if result.Outcome == "delivered" && (result.ReferenceIndex != nil || result.Reason != nil) {
+		return FileReferenceOutcomePayload{}, errors.New("invalid file-reference outcome")
+	}
+	if result.Outcome == "outcome_unknown" && (result.ReferenceIndex != nil || result.Reason == nil || (*result.Reason != "delivery_unconfirmed" && *result.Reason != "writer_lost" && *result.Reason != "adapter_deadline")) {
+		return FileReferenceOutcomePayload{}, errors.New("invalid file-reference outcome")
+	}
+	if result.Outcome == "rejected" && (result.ReferenceIndex == nil || *result.ReferenceIndex < 0 || result.Reason == nil || !validFileReferenceRejectionReason(*result.Reason)) {
+		return FileReferenceOutcomePayload{}, errors.New("invalid file-reference outcome")
+	}
+	return result, nil
+}
+
+func validFileReferenceRejectionReason(reason string) bool {
+	switch reason {
+	case "missing", "removed", "stale_reference", "size_changed", "media_type_changed", "image_unsupported", "provider_unsupported", "unsafe_path", "quarantined", "access_denied":
+		return true
+	default:
+		return false
+	}
 }
 
 func validSettingsOutcome(value string) bool {

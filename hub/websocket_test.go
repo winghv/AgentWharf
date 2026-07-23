@@ -1597,6 +1597,107 @@ func TestWebSocketServerPersistsAndRoutesClientSessionSend(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerRoutesFileReferenceThroughDurableLedger(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "file-references.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	if ack := readFrame(t, client).(*protocol.HelloAck); ack.Capabilities == nil || ack.Capabilities.FileReferences == nil {
+		t.Fatalf("file-reference hello capability = %+v", ack.Capabilities)
+	}
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+	payload := fileReferenceSendPayload(t)
+	writeFrame(t, client, &protocol.Command{CommandID: "cmd_file_missing", Type: protocol.CommandSessionSend, SessionID: "ses_1", Payload: payload})
+	if ack := readCommandAckFor(t, client, "cmd_file_missing"); ack.Status != protocol.AckRejected || ack.Reason != "file_references_unsupported" {
+		t.Fatalf("missing capability ack = %+v", ack)
+	}
+	if latest, err := events.LatestSeq(ctx, "ses_1"); err != nil || latest != 0 {
+		t.Fatalf("missing capability durable state = %d, %v", latest, err)
+	}
+
+	capability := fileReferenceCapability()
+	publishFileReferenceCapability(t, adapter, "file_reference_capability", 1001, capability)
+	_ = readFrame(t, client).(*protocol.Event)
+	stalePayload := json.RawMessage(strings.Replace(string(payload), capability.Fingerprint, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1))
+	writeFrame(t, client, &protocol.Command{CommandID: "cmd_file_stale", Type: protocol.CommandSessionSend, SessionID: "ses_1", Payload: stalePayload})
+	if ack := readCommandAckFor(t, client, "cmd_file_stale"); ack.Status != protocol.AckRejected || ack.Reason != "file_references_unsupported" {
+		t.Fatalf("stale capability ack = %+v", ack)
+	}
+	if latest, err := events.LatestSeq(ctx, "ses_1"); err != nil || latest != 1 {
+		t.Fatalf("stale capability durable state = %d, %v", latest, err)
+	}
+	writeFrame(t, client, &protocol.Command{CommandID: "cmd_file_1", Type: protocol.CommandSessionSend, SessionID: "ses_1", Payload: payload})
+	routed := readFrame(t, adapter).(*protocol.Command)
+	if routed.CommandID != "cmd_file_1" || !strings.Contains(string(routed.Payload), `"message_id":"cmd_file_1"`) {
+		t.Fatalf("routed file-reference command = %+v payload=%s", routed, routed.Payload)
+	}
+	if ack := readCommandAckFor(t, client, "cmd_file_1"); ack.Status != protocol.AckAccepted {
+		t.Fatalf("file-reference ack = %+v", ack)
+	}
+	command, err := events.FileReferenceCommand(ctx, "ses_1", "cmd_file_1")
+	if err != nil || command.Status != store.FileReferencePending || command.MessageID != "cmd_file_1" || command.ReferenceCount != 1 || command.Writer == nil {
+		t.Fatalf("file-reference ledger = %+v, %v", command, err)
+	}
+	encoded, err := json.Marshal(command)
+	if err != nil || strings.Contains(string(encoded), "src/app.ts") || strings.Contains(string(encoded), "0123456789abcdef") || strings.Contains(string(encoded), "text/plain") || strings.Contains(string(encoded), "Bytes") {
+		t.Fatalf("file-reference ledger retained sensitive metadata: %s (%v)", encoded, err)
+	}
+	writeFrame(t, adapter, &protocol.Event{Type: "session.file_references.outcome", SessionID: "ses_1", Time: 1002, ProposalID: "file_reference_outcome", Payload: json.RawMessage(`{"message_id":"cmd_file_1","cmd_id":"cmd_file_1","outcome":"delivered","reference_index":null,"reason":null}`)})
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.ProposalID != "file_reference_outcome" || receipt.Seq != 3 {
+		t.Fatalf("file-reference outcome receipt = %+v", receipt)
+	}
+	if event := readFrame(t, client).(*protocol.Event); event.Type != "session.file_references.outcome" || !strings.Contains(string(event.Payload), `"outcome":"delivered"`) {
+		t.Fatalf("file-reference outcome event = %+v", event)
+	}
+}
+
+func fileReferenceCapability() protocol.FileReferenceCapabilityPayload {
+	capability := protocol.FileReferenceCapabilityPayload{
+		SchemaVersion: 1, MaxReferences: 8, MaxTotalBytes: 10485760,
+		File:  protocol.FileReferenceDispositionCapability{Mode: "allowed", MaxBytes: fileReferenceInt64(10485760)},
+		Image: protocol.FileReferenceImageCapability{Mode: "unsupported", MediaTypes: []string{}, Reason: fileReferenceString("provider_unsupported")},
+	}
+	capability.Fingerprint = protocol.FileReferenceCapabilityFingerprint(capability)
+	return capability
+}
+
+func fileReferenceSendPayload(t *testing.T) json.RawMessage {
+	t.Helper()
+	capability := fileReferenceCapability()
+	return json.RawMessage(fmt.Sprintf(`{"content":[{"kind":"text","text":"Review this"},{"kind":"file_reference","disposition":"file","path":"src/app.ts","version":"version_1","content_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","bytes":123,"media_type":"text/plain"}],"capability_fingerprint":%q}`, capability.Fingerprint))
+}
+
+func fileReferenceInt64(value int64) *int64 { return &value }
+
+func fileReferenceString(value string) *string { return &value }
+
+func publishFileReferenceCapability(t *testing.T, adapter *websocket.Conn, proposalID string, at int64, capability protocol.FileReferenceCapabilityPayload) {
+	t.Helper()
+	payload, err := json.Marshal(capability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFrame(t, adapter, &protocol.Event{Type: "session.file_references.capabilities", SessionID: "ses_1", Time: at, ProposalID: proposalID, Payload: payload})
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.ProposalID != proposalID {
+		t.Fatalf("file-reference capability receipt = %+v", receipt)
+	}
+}
+
 func TestWebSocketServerRejectsUnauthorizedClientCommand(t *testing.T) {
 	t.Parallel()
 

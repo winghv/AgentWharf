@@ -110,6 +110,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		decisions:                         make(map[string]struct{}),
 		settingsClients:                   make(map[string]*clientConnection),
 		settingsCapabilities:              make(map[string]store.SettingsCapability),
+		fileReferenceCapabilities:         make(map[string]fileReferenceCapability),
 		runControlClients:                 make(map[string]*clientConnection),
 		pendingTargetJoins:                make(map[string]*pendingTargetJoin),
 		pendingTargetJoinByAttach:         make(map[string]*pendingTargetJoin),
@@ -178,20 +179,27 @@ type webSocketHandler struct {
 	subscribers map[string]map[*clientConnection]struct{}
 	adapters    map[string]*adapterConnection
 
-	commandMu            sync.Mutex
-	pendingCommands      map[string][]queuedCommand
-	acceptedCommands     map[string]struct{}
-	acceptedCommandOrder []string
-	decisions            map[string]struct{}
-	decisionOrder        []string
-	settingsClients      map[string]*clientConnection
-	settingsCapabilities map[string]store.SettingsCapability
-	runControlClients    map[string]*clientConnection
+	commandMu                 sync.Mutex
+	pendingCommands           map[string][]queuedCommand
+	acceptedCommands          map[string]struct{}
+	acceptedCommandOrder      []string
+	decisions                 map[string]struct{}
+	decisionOrder             []string
+	settingsClients           map[string]*clientConnection
+	settingsCapabilities      map[string]store.SettingsCapability
+	fileReferenceCapabilities map[string]fileReferenceCapability
+	runControlClients         map[string]*clientConnection
 
 	pendingTargetJoinMu       sync.Mutex
 	pendingTargetJoins        map[string]*pendingTargetJoin
 	pendingTargetJoinByAttach map[string]*pendingTargetJoin
 	pendingTargetJoinTimer    func(time.Duration, func()) *time.Timer
+}
+
+type fileReferenceCapability struct {
+	payload  protocol.FileReferenceCapabilityPayload
+	writer   store.FileReferenceWriter
+	eventSeq int64
 }
 
 func (h *webSocketHandler) RunActivityDispatcher(ctx context.Context) error {
@@ -305,6 +313,12 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, fr
 	}
 	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 &&
 		len(accepted.currentSubscriptions()) > 0 {
+		if _, ok := h.events.(store.FileReferenceCommandStore); ok {
+			if ack.Capabilities == nil {
+				ack.Capabilities = &protocol.HelloCapabilities{}
+			}
+			ack.Capabilities.FileReferences = &protocol.FileReferenceHelloCapability{SchemaVersion: 1, MaxReferences: 8, MaxMetadataBytes: 8192}
+		}
 		if _, ok := h.events.(store.SettingsCommandStore); ok {
 			if ack.Capabilities == nil {
 				ack.Capabilities = &protocol.HelloCapabilities{}
@@ -975,6 +989,30 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
 		return err
 	}
+	if ev.Type == "session.file_references.capabilities" {
+		if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+			err := errors.New("file-reference capabilities are v2 Adapter-only")
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+			return err
+		}
+		if err := h.commitFileReferenceCapabilityProposal(ctx, adapter, out, ev.ProposalID); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+			return err
+		}
+		return nil
+	}
+	if ev.Type == "session.file_references.outcome" {
+		if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+			err := errors.New("file-reference outcomes are v2 Adapter-only")
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+			return err
+		}
+		if err := h.finalizeFileReferenceOutcome(ctx, adapter, out, ev.ProposalID); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+			return err
+		}
+		return nil
+	}
 	if ev.Type == "session.settings.capabilities" {
 		if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
 			err := errors.New("settings capabilities are v2 Adapter-only")
@@ -1215,6 +1253,90 @@ func (h *webSocketHandler) commitSettingsCapabilityProposal(ctx context.Context,
 		return err
 	}
 	return nil
+}
+
+func (h *webSocketHandler) commitFileReferenceCapabilityProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	ledger, ok := h.events.(store.FileReferenceCommandStore)
+	if !ok || adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 {
+		return errors.New("file-reference command store is not configured")
+	}
+	capability, err := protocol.DecodeFileReferenceCapabilityPayload(event.Payload)
+	if err != nil {
+		return err
+	}
+	return h.commitAdapterProposal(ctx, adapter, event, proposalID, func(commitCtx context.Context, seq int64) ([]protocol.Event, error) {
+		published, err := ledger.PublishFileReferenceCapability(commitCtx, event.SessionID, store.FileReferenceCapabilityUpdate{
+			EventSeq: seq, Fingerprint: capability.Fingerprint, Writer: adapter.settingsWriter,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("publish file-reference capability: %w", err)
+		}
+		if published.EventSeq != seq || published.Fingerprint != capability.Fingerprint || published.Writer != adapter.settingsWriter {
+			return nil, errors.New("file-reference capability publication is invalid")
+		}
+		h.commandMu.Lock()
+		h.fileReferenceCapabilities[event.SessionID] = fileReferenceCapability{payload: capability, writer: published.Writer, eventSeq: published.EventSeq}
+		h.commandMu.Unlock()
+		return nil, nil
+	})
+}
+
+func (h *webSocketHandler) finalizeFileReferenceOutcome(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	ledger, ok := h.events.(store.FileReferenceCommandStore)
+	if !ok || adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 {
+		return errors.New("file-reference command store is not configured")
+	}
+	proposal, err := protocol.DecodeFileReferenceOutcomePayload(event.Payload)
+	if err != nil {
+		return err
+	}
+	return h.withSessionPublication(ctx, event.SessionID, func() error {
+		return h.withAdapterEffect(ctx, adapter, func() error {
+			command, err := ledger.FileReferenceCommand(ctx, event.SessionID, proposal.CommandID)
+			if err != nil || command.MessageID != proposal.MessageID || command.Writer == nil || *command.Writer != adapter.settingsWriter || command.Status != store.FileReferencePending {
+				if err == nil {
+					err = errors.New("file-reference outcome is fenced")
+				}
+				return err
+			}
+			writer := adapter.settingsWriter
+			finalized, err := ledger.FinalizeFileReferenceCommand(ctx, event.SessionID, proposal.CommandID, store.FileReferenceCommandFinalize{
+				ReservationVersion: command.ReservationVersion, Writer: &writer, Outcome: store.FileReferenceCommandStatus(proposal.Outcome), ReasonCode: proposal.Reason, ReferenceIndex: proposal.ReferenceIndex,
+			})
+			if err != nil || finalized.TerminalEventSeq == nil {
+				if err == nil {
+					err = errors.New("file-reference outcome finalization is invalid")
+				}
+				return err
+			}
+			stored, err := h.eventAt(ctx, event.SessionID, *finalized.TerminalEventSeq)
+			if err != nil || stored.Type != "session.file_references.outcome" {
+				if err == nil {
+					err = errors.New("file-reference outcome event is invalid")
+				}
+				return err
+			}
+			persisted, err := protocol.DecodeFileReferenceOutcomePayload(stored.Payload)
+			if err != nil || !sameFileReferenceOutcome(persisted, proposal) {
+				if err == nil {
+					err = errors.New("file-reference Store outcome does not match proposal")
+				}
+				return err
+			}
+			if err := adapter.writeFrame(ctx, &protocol.EventReceipt{ProposalID: proposalID, Seq: *finalized.TerminalEventSeq, Status: protocol.EventReceiptAccepted}); err != nil {
+				return err
+			}
+			h.broadcastEvent(ctx, stored)
+			return nil
+		})
+	})
+}
+
+func sameFileReferenceOutcome(left, right protocol.FileReferenceOutcomePayload) bool {
+	if left.MessageID != right.MessageID || left.CommandID != right.CommandID || left.Outcome != right.Outcome || (left.ReferenceIndex == nil) != (right.ReferenceIndex == nil) || (left.Reason == nil) != (right.Reason == nil) {
+		return false
+	}
+	return (left.ReferenceIndex == nil || *left.ReferenceIndex == *right.ReferenceIndex) && (left.Reason == nil || *left.Reason == *right.Reason)
 }
 
 func (h *webSocketHandler) commitRunControlCapabilityProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
@@ -1774,6 +1896,16 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 	if isRunControlCommand(cmd.Type) && accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
 		return h.handleRunControl(ctx, conn, peer, accepted, cmd)
 	}
+	if cmd.Type == protocol.CommandSessionSend {
+		fileReferences, err := protocol.DecodeFileReferenceSendPayload(cmd.Payload)
+		if err != nil {
+			_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "invalid_command")
+			return err
+		}
+		if fileReferences.HasReferences {
+			return h.handleFileReferenceSend(ctx, conn, peer, accepted, cmd, fileReferences)
+		}
+	}
 
 	h.commandMu.Lock()
 	locked := true
@@ -1832,6 +1964,163 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 		return err
 	}
 	return nil
+}
+
+func (h *webSocketHandler) handleFileReferenceSend(ctx context.Context, conn *managedConn, peer *clientConnection, accepted AcceptedPeer, cmd *protocol.Command, request protocol.FileReferenceSendPayload) error {
+	if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+		err := errors.New("file references are v2 Client-only")
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "file_references_unsupported")
+		return err
+	}
+	ledger, ok := h.events.(store.FileReferenceCommandStore)
+	if !ok {
+		err := errors.New("file-reference command store is not configured")
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "file_references_unsupported")
+		return err
+	}
+	h.commandMu.Lock()
+	if _, duplicate := h.acceptedCommands[cmd.CommandID]; duplicate {
+		h.commandMu.Unlock()
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckDuplicate, "")
+		return nil
+	}
+	capability, found := h.fileReferenceCapabilities[cmd.SessionID]
+	h.commandMu.Unlock()
+	h.mu.Lock()
+	adapter := h.adapters[cmd.SessionID]
+	h.mu.Unlock()
+	if !found || capability.payload.Fingerprint != request.CapabilityFingerprint || adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 || capability.writer != adapter.settingsWriter || !fileReferenceRequestAllowed(request, capability.payload) {
+		err := errors.New("file-reference capability is unavailable")
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "file_references_unsupported")
+		return err
+	}
+	durablePayload, err := userMessagePayload(cmd)
+	if err != nil {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "invalid_command")
+		return err
+	}
+	forwardPayload, err := fileReferenceForwardPayload(cmd)
+	if err != nil {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "invalid_command")
+		return err
+	}
+	var persisted *protocol.Event
+	var reservation store.FileReferenceCommand
+	err = h.withSessionPublication(ctx, cmd.SessionID, func() error {
+		reserved, err := ledger.CommitFileReferenceCommand(ctx, cmd.SessionID, store.PendingEvent{Type: "session.message", Time: time.Now().UTC(), Payload: durablePayload}, store.FileReferenceCommandRequest{
+			CommandID: cmd.CommandID, MessageID: cmd.CommandID, CapabilityFingerprint: request.CapabilityFingerprint, RequestFingerprint: request.RequestFingerprint, ReferenceCount: request.ReferenceCount,
+		})
+		if err != nil {
+			return err
+		}
+		if reserved.Duplicate {
+			reservation = reserved.Command
+			return nil
+		}
+		writer := adapter.settingsWriter
+		reservation, err = ledger.AcknowledgeFileReferenceDelivery(ctx, cmd.SessionID, cmd.CommandID, reserved.Command.ReservationVersion, writer)
+		if err != nil || reservation.Status != store.FileReferencePending || reservation.Writer == nil || *reservation.Writer != writer {
+			if err == nil {
+				err = errors.New("file-reference delivery acknowledgement is invalid")
+			}
+			return err
+		}
+		seq, err := h.events.LatestSeq(ctx, cmd.SessionID)
+		if err != nil || seq < 1 {
+			if err == nil {
+				err = errors.New("file-reference message sequence is unavailable")
+			}
+			return err
+		}
+		persisted = &protocol.Event{Type: "session.message", SessionID: cmd.SessionID, Seq: &seq, Time: time.Now().UTC().UnixMilli(), Payload: durablePayload}
+		h.broadcastEvent(ctx, *persisted)
+		return nil
+	})
+	if err != nil {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "persist_failed")
+		return err
+	}
+	if reservation.Status != store.FileReferencePending {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckDuplicate, "")
+		return nil
+	}
+	routed := protocol.Command{CommandID: cmd.CommandID, Type: cmd.Type, SessionID: cmd.SessionID, Payload: forwardPayload}
+	if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
+		_ = h.withSessionPublication(ctx, cmd.SessionID, func() error {
+			finalized, recoverErr := ledger.RecoverFileReferenceCommand(ctx, cmd.SessionID, cmd.CommandID, "delivery_unconfirmed")
+			if recoverErr != nil || finalized.TerminalEventSeq == nil {
+				if recoverErr == nil {
+					recoverErr = errors.New("file-reference delivery recovery returned no terminal event")
+				}
+				return recoverErr
+			}
+			terminal, recoverErr := h.eventAt(ctx, cmd.SessionID, *finalized.TerminalEventSeq)
+			if recoverErr != nil || terminal.Type != "session.file_references.outcome" {
+				if recoverErr == nil {
+					recoverErr = errors.New("file-reference delivery recovery returned an invalid event")
+				}
+				return recoverErr
+			}
+			h.broadcastEvent(ctx, terminal)
+			return nil
+		})
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckAccepted, "")
+		return nil
+	}
+	h.commandMu.Lock()
+	h.markCommandAcceptedLocked(cmd.CommandID)
+	h.commandMu.Unlock()
+	h.observeCommandActivity(ctx, commandActivity(cmd, persisted))
+	return writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckAccepted, "")
+}
+
+func fileReferenceRequestAllowed(request protocol.FileReferenceSendPayload, capability protocol.FileReferenceCapabilityPayload) bool {
+	if request.ReferenceCount < 1 || request.ReferenceCount > capability.MaxReferences || len(request.References) != request.ReferenceCount {
+		return false
+	}
+	var total int64
+	for _, reference := range request.References {
+		total += reference.Bytes
+		if total > capability.MaxTotalBytes {
+			return false
+		}
+		if reference.Disposition == "file" {
+			if capability.File.Mode != "allowed" || capability.File.MaxBytes == nil || reference.Bytes > *capability.File.MaxBytes {
+				return false
+			}
+			continue
+		}
+		if capability.Image.Mode != "allowed" || capability.Image.MaxBytes == nil || reference.Bytes > *capability.Image.MaxBytes || reference.MediaType == nil {
+			return false
+		}
+		allowed := false
+		for _, mediaType := range capability.Image.MediaTypes {
+			if *reference.MediaType == mediaType {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
+func fileReferenceForwardPayload(cmd *protocol.Command) (json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(cmd.Payload, &fields); err != nil {
+		return nil, err
+	}
+	if _, found := fields["message_id"]; found {
+		return nil, errors.New("client supplied file-reference message ID")
+	}
+	messageID, err := json.Marshal(cmd.CommandID)
+	if err != nil {
+		return nil, err
+	}
+	fields["message_id"] = messageID
+	return json.Marshal(fields)
 }
 
 func (h *webSocketHandler) handleWarmAttach(ctx context.Context, conn *managedConn, accepted AcceptedPeer, cmd *protocol.Command) error {

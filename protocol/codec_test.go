@@ -34,6 +34,36 @@ func TestDecodeClientHelloExample(t *testing.T) {
 	}
 }
 
+func TestDecodeFileReferenceSendPayload(t *testing.T) {
+	maxBytes := int64(10485760)
+	reason := "provider_unsupported"
+	capability := FileReferenceCapabilityPayload{
+		SchemaVersion: 1, MaxReferences: 8, MaxTotalBytes: 10485760,
+		File:  FileReferenceDispositionCapability{Mode: "allowed", MaxBytes: &maxBytes},
+		Image: FileReferenceImageCapability{Mode: "unsupported", MediaTypes: []string{}, Reason: &reason},
+	}
+	capability.Fingerprint = FileReferenceCapabilityFingerprint(capability)
+	valid := []byte(`{"content":[{"kind":"text","text":"Review this"},{"kind":"file_reference","disposition":"file","path":"src/app.ts","version":"version_1","content_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","bytes":123,"media_type":"text/plain"}],"capability_fingerprint":"` + capability.Fingerprint + `"}`)
+	decoded, err := DecodeFileReferenceSendPayload(valid)
+	if err != nil || !decoded.HasReferences || decoded.ReferenceCount != 1 || decoded.CapabilityFingerprint != capability.Fingerprint || decoded.RequestFingerprint == "" {
+		t.Fatalf("DecodeFileReferenceSendPayload(valid) = %+v, %v", decoded, err)
+	}
+	reordered := []byte(`{"capability_fingerprint":"` + capability.Fingerprint + `","content":[{"text":"Review this","kind":"text"},{"media_type":"text/plain","bytes":123,"content_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","version":"version_1","path":"src/app.ts","disposition":"file","kind":"file_reference"}]}`)
+	if got, err := DecodeFileReferenceSendPayload(reordered); err != nil || got.RequestFingerprint != decoded.RequestFingerprint {
+		t.Fatalf("canonical file-reference request = %+v, %v", got, err)
+	}
+	for _, raw := range [][]byte{
+		[]byte(`{"content":[{"kind":"file_reference","disposition":"file","path":"../secret","version":"version_1","content_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","bytes":123,"media_type":"text/plain"}],"capability_fingerprint":"` + capability.Fingerprint + `"}`),
+		[]byte(`{"content":[{"kind":"file_reference","disposition":"file","path":"src/app.ts","version":"version_1","content_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","bytes":123,"media_type":"text/plain","url":"https://invalid"}],"capability_fingerprint":"` + capability.Fingerprint + `"}`),
+		[]byte(`{"content":[{"kind":"file_reference","disposition":"file","path":"src/app.ts","version":"version_1","content_digest":"sha256:ABCDEF","bytes":123,"media_type":"text/plain"}],"capability_fingerprint":"` + capability.Fingerprint + `"}`),
+		[]byte(`{"content":[{"kind":"file_reference","disposition":"file","path":"src/app.ts","version":"version_1","content_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","bytes":10485761,"media_type":"text/plain"}],"capability_fingerprint":"` + capability.Fingerprint + `"}`),
+	} {
+		if _, err := DecodeFileReferenceSendPayload(raw); err == nil {
+			t.Fatalf("DecodeFileReferenceSendPayload(%s) unexpectedly succeeded", raw)
+		}
+	}
+}
+
 func TestDecodeAdapterHelloExample(t *testing.T) {
 	raw := []byte(`{
 		"frame": "hello",
