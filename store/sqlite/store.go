@@ -993,7 +993,7 @@ func (s *Store) PublishRunControlCapability(ctx context.Context, sessionID strin
 	if err := verifyRunControlCapabilityEvent(ctx, tx, sessionID, update.EventSeq); err != nil {
 		return store.RunControlCapability{}, err
 	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=excluded.capability_event_seq,capability_version=excluded.capability_version,interrupt_supported=excluded.interrupt_supported,stop_supported=excluded.stop_supported,writer_connection_epoch=excluded.writer_connection_epoch,writer_credential_generation=excluded.writer_credential_generation,writer_lease_id=excluded.writer_lease_id,updated_at_ms=excluded.updated_at_ms WHERE session_run_control_capabilities.capability_event_seq < excluded.capability_event_seq`, sessionID, update.EventSeq, update.EventSeq, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID, nowMS, nowMS)
+	result, err := tx.ExecContext(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=excluded.capability_event_seq,capability_version=session_run_control_capabilities.capability_version+1,interrupt_supported=excluded.interrupt_supported,stop_supported=excluded.stop_supported,writer_connection_epoch=excluded.writer_connection_epoch,writer_credential_generation=excluded.writer_credential_generation,writer_lease_id=excluded.writer_lease_id,updated_at_ms=excluded.updated_at_ms WHERE session_run_control_capabilities.capability_event_seq < excluded.capability_event_seq`, sessionID, update.EventSeq, 1, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID, nowMS, nowMS)
 	if err != nil {
 		return store.RunControlCapability{}, fmt.Errorf("upsert run-control capability: %w", err)
 	}
@@ -1063,7 +1063,7 @@ func (s *Store) RunControlReserve(ctx context.Context, sessionID string, request
 }
 
 func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID string, finalize store.RunControlFinalize) (store.RunControlReservation, error) {
-	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || !validRunControlTerminalOutcome(finalize.Outcome) || (finalize.Outcome == store.RunControlCompleted && finalize.ReasonCode != nil) || (finalize.Outcome != store.RunControlCompleted && !validSettingsReason(finalize.ReasonCode)) {
+	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || !validRunControlTerminalOutcome(finalize.Outcome) || finalize.Outcome == store.RunControlUnsupported || (finalize.Outcome == store.RunControlCompleted && finalize.ReasonCode != nil) || (finalize.Outcome != store.RunControlCompleted && !validSettingsReason(finalize.ReasonCode)) {
 		return store.RunControlReservation{}, errors.New("invalid run-control finalization")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1170,20 +1170,30 @@ func (s *Store) PendingRunControls(ctx context.Context, sessionID string) ([]sto
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var reservations []store.RunControlReservation
+	var commandIDs []string
 	for rows.Next() {
 		var commandID string
 		if err := rows.Scan(&commandID); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
+		commandIDs = append(commandIDs, commandID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	reservations := make([]store.RunControlReservation, 0, len(commandIDs))
+	for _, commandID := range commandIDs {
 		item, err := queryRunControlReservation(ctx, s.db, sessionID, commandID)
 		if err != nil {
 			return nil, err
 		}
 		reservations = append(reservations, item)
 	}
-	return reservations, rows.Err()
+	return reservations, nil
 }
 
 func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {
@@ -2872,7 +2882,7 @@ func validRunControlState(operation store.RunControlOperation, state string) boo
 	return state == "starting" || state == "ready" || state == "busy" || state == "waiting_permission" || state == "recovering"
 }
 func validRunControlTerminalOutcome(outcome store.RunControlOutcome) bool {
-	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlOutcomeUnknown
+	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlUnsupported || outcome == store.RunControlOutcomeUnknown
 }
 func validRunControlReservation(reservation store.RunControlReservation) bool {
 	terminal := reservation.Outcome != store.RunControlPending

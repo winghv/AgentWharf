@@ -830,7 +830,7 @@ func (s *Store) PublishRunControlCapability(ctx context.Context, sessionID strin
 	if err := verifyPostgresRunControlCapabilityEvent(ctx, tx, sessionID, update.EventSeq); err != nil {
 		return store.RunControlCapability{}, err
 	}
-	result, err := tx.Exec(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id) VALUES ($1,$2,$2,$3,$4,$5,$6,$7) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=EXCLUDED.capability_event_seq,capability_version=EXCLUDED.capability_version,interrupt_supported=EXCLUDED.interrupt_supported,stop_supported=EXCLUDED.stop_supported,writer_connection_epoch=EXCLUDED.writer_connection_epoch,writer_credential_generation=EXCLUDED.writer_credential_generation,writer_lease_id=EXCLUDED.writer_lease_id,updated_at=statement_timestamp() WHERE session_run_control_capabilities.capability_event_seq < EXCLUDED.capability_event_seq`, sessionID, update.EventSeq, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID)
+	result, err := tx.Exec(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id) VALUES ($1,$2,1,$3,$4,$5,$6,$7) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=EXCLUDED.capability_event_seq,capability_version=session_run_control_capabilities.capability_version+1,interrupt_supported=EXCLUDED.interrupt_supported,stop_supported=EXCLUDED.stop_supported,writer_connection_epoch=EXCLUDED.writer_connection_epoch,writer_credential_generation=EXCLUDED.writer_credential_generation,writer_lease_id=EXCLUDED.writer_lease_id,updated_at=statement_timestamp() WHERE session_run_control_capabilities.capability_event_seq < EXCLUDED.capability_event_seq`, sessionID, update.EventSeq, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID)
 	if err != nil {
 		return store.RunControlCapability{}, err
 	}
@@ -904,7 +904,7 @@ func (s *Store) RunControlReserve(ctx context.Context, sessionID string, request
 }
 
 func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID string, finalize store.RunControlFinalize) (store.RunControlReservation, error) {
-	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || !validPostgresRunControlTerminalOutcome(finalize.Outcome) || (finalize.Outcome == store.RunControlCompleted && finalize.ReasonCode != nil) || (finalize.Outcome != store.RunControlCompleted && !validPostgresSettingsReason(finalize.ReasonCode)) {
+	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || !validPostgresRunControlTerminalOutcome(finalize.Outcome) || finalize.Outcome == store.RunControlUnsupported || (finalize.Outcome == store.RunControlCompleted && finalize.ReasonCode != nil) || (finalize.Outcome != store.RunControlCompleted && !validPostgresSettingsReason(finalize.ReasonCode)) {
 		return store.RunControlReservation{}, errors.New("invalid run-control finalization")
 	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -1009,19 +1009,27 @@ func (s *Store) PendingRunControls(ctx context.Context, sessionID string) ([]sto
 		return nil, err
 	}
 	defer rows.Close()
-	var reservations []store.RunControlReservation
+	var commandIDs []string
 	for rows.Next() {
 		var commandID string
 		if err := rows.Scan(&commandID); err != nil {
 			return nil, err
 		}
+		commandIDs = append(commandIDs, commandID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	reservations := make([]store.RunControlReservation, 0, len(commandIDs))
+	for _, commandID := range commandIDs {
 		item, err := s.RunControl(ctx, sessionID, commandID)
 		if err != nil {
 			return nil, err
 		}
 		reservations = append(reservations, item)
 	}
-	return reservations, rows.Err()
+	return reservations, nil
 }
 
 type postgresSettingsQuerier interface {
@@ -1163,7 +1171,7 @@ func validPostgresRunControlState(operation store.RunControlOperation, state str
 	return state == "starting" || state == "ready" || state == "busy" || state == "waiting_permission" || state == "recovering"
 }
 func validPostgresRunControlTerminalOutcome(outcome store.RunControlOutcome) bool {
-	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlOutcomeUnknown
+	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlUnsupported || outcome == store.RunControlOutcomeUnknown
 }
 func validPostgresRunControlReservation(reservation store.RunControlReservation) bool {
 	terminal := reservation.Outcome != store.RunControlPending
