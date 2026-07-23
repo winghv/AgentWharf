@@ -971,6 +971,217 @@ func (s *Store) PendingSettingsCommands(ctx context.Context, sessionID string) (
 	return commands, nil
 }
 
+func (s *Store) PublishRunControlCapability(ctx context.Context, sessionID string, update store.RunControlCapabilityUpdate) (store.RunControlCapability, error) {
+	if !validRunControlCapabilityUpdate(sessionID, update) {
+		return store.RunControlCapability{}, errors.New("invalid run-control capability")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.RunControlCapability{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.RunControlCapability{}, err
+	}
+	if err := lockCommandAuthority(ctx, tx, sessionID, store.CommandAuthority{ConnectionEpoch: update.Writer.ConnectionEpoch, CredentialGeneration: update.Writer.CredentialGeneration}); err != nil {
+		return store.RunControlCapability{}, err
+	}
+	if err := validateLiveSettingsWriter(ctx, tx, sessionID, update.Writer); err != nil {
+		return store.RunControlCapability{}, err
+	}
+	if err := verifyRunControlCapabilityEvent(ctx, tx, sessionID, update.EventSeq); err != nil {
+		return store.RunControlCapability{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id,created_at_ms,updated_at_ms) VALUES (?,?,1,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=excluded.capability_event_seq,capability_version=session_run_control_capabilities.capability_version+1,interrupt_supported=excluded.interrupt_supported,stop_supported=excluded.stop_supported,writer_connection_epoch=excluded.writer_connection_epoch,writer_credential_generation=excluded.writer_credential_generation,writer_lease_id=excluded.writer_lease_id,updated_at_ms=excluded.updated_at_ms`, sessionID, update.EventSeq, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID, nowMS, nowMS); err != nil {
+		return store.RunControlCapability{}, fmt.Errorf("upsert run-control capability: %w", err)
+	}
+	capability, err := queryRunControlCapability(ctx, tx, sessionID)
+	if err != nil {
+		return store.RunControlCapability{}, err
+	}
+	return capability, tx.Commit()
+}
+
+func (s *Store) RunControlReserve(ctx context.Context, sessionID string, request store.RunControlRequest) (store.RunControlReserve, error) {
+	if !validRunControlRequest(sessionID, request) {
+		return store.RunControlReserve{}, errors.New("invalid run-control reservation")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.RunControlReserve{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.RunControlReserve{}, err
+	}
+	if err := lockCommandAuthority(ctx, tx, sessionID, store.CommandAuthority{ConnectionEpoch: request.Writer.ConnectionEpoch, CredentialGeneration: request.Writer.CredentialGeneration}); err != nil {
+		return store.RunControlReserve{}, err
+	}
+	if err := validateLiveSettingsWriter(ctx, tx, sessionID, request.Writer); err != nil {
+		return store.RunControlReserve{}, err
+	}
+	existing, err := queryRunControlReservation(ctx, tx, sessionID, request.CommandID)
+	if err == nil {
+		if existing.Operation != request.Operation {
+			return store.RunControlReserve{}, errors.New("run-control command ID is reused")
+		}
+		if err := tx.Commit(); err != nil {
+			return store.RunControlReserve{}, err
+		}
+		return store.RunControlReserve{Reservation: existing, Duplicate: true}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return store.RunControlReserve{}, err
+	}
+	capability, err := queryRunControlCapability(ctx, tx, sessionID)
+	if err != nil || capability.Writer != request.Writer {
+		return store.RunControlReserve{}, errors.New("run-control capability is stale or writer is fenced")
+	}
+	if (request.Operation == store.RunControlInterrupt && !capability.InterruptSupported) || (request.Operation == store.RunControlStop && !capability.StopSupported) {
+		return store.RunControlReserve{}, errors.New("run-control operation is unsupported")
+	}
+	if err := validateRunControlPreState(ctx, tx, sessionID, request); err != nil {
+		return store.RunControlReserve{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_run_controls (session_id,cmd_id,operation,capability_version,reservation_version,pre_control_state,pre_control_state_seq,writer_connection_epoch,writer_credential_generation,writer_lease_id,deadline_ms,status,created_at_ms,updated_at_ms) VALUES (?,?,?, ?,1,?,?,?,?,?,?,'pending',?,?)`, sessionID, request.CommandID, request.Operation, capability.Version, request.PreControlState, request.PreControlStateSeq, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, nowMS+30000, nowMS, nowMS); err != nil {
+		return store.RunControlReserve{}, fmt.Errorf("insert run-control reservation: %w", err)
+	}
+	reservation, err := queryRunControlReservation(ctx, tx, sessionID, request.CommandID)
+	if err != nil {
+		return store.RunControlReserve{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.RunControlReserve{}, err
+	}
+	return store.RunControlReserve{Reservation: reservation}, nil
+}
+
+func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID string, finalize store.RunControlFinalize) (store.RunControlReservation, error) {
+	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || !validRunControlTerminalOutcome(finalize.Outcome) || (finalize.Outcome == store.RunControlCompleted && finalize.ReasonCode != nil) || (finalize.Outcome != store.RunControlCompleted && !validSettingsReason(finalize.ReasonCode)) {
+		return store.RunControlReservation{}, errors.New("invalid run-control finalization")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	reservation, err := queryRunControlReservation(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	if reservation.ReservationVersion != finalize.ReservationVersion || reservation.Outcome != store.RunControlPending {
+		return store.RunControlReservation{}, errors.New("run-control finalization is fenced")
+	}
+	if finalize.Outcome == store.RunControlCompleted || finalize.Outcome == store.RunControlRejected {
+		if finalize.Writer == nil || *finalize.Writer != reservation.Writer || reservation.Deadline.UnixMilli() <= nowMS {
+			return store.RunControlReservation{}, errors.New("run-control writer finalization is fenced")
+		}
+		if err := lockCommandAuthority(ctx, tx, sessionID, store.CommandAuthority{ConnectionEpoch: finalize.Writer.ConnectionEpoch, CredentialGeneration: finalize.Writer.CredentialGeneration}); err != nil {
+			return store.RunControlReservation{}, err
+		}
+		capability, err := queryRunControlCapability(ctx, tx, sessionID)
+		if err != nil || capability.Version != reservation.CapabilityVersion || capability.Writer != *finalize.Writer {
+			return store.RunControlReservation{}, errors.New("run-control capability changed")
+		}
+		if err := validateLiveSettingsWriter(ctx, tx, sessionID, *finalize.Writer); err != nil {
+			return store.RunControlReservation{}, err
+		}
+	} else if finalize.Writer != nil || (finalize.Outcome == store.RunControlTimeout && reservation.Deadline.UnixMilli() > nowMS) {
+		return store.RunControlReservation{}, errors.New("run-control unbound finalization is fenced")
+	}
+	if finalize.Outcome == store.RunControlCompleted {
+		if err := validateRunControlPreState(ctx, tx, sessionID, store.RunControlRequest{Operation: reservation.Operation, PreControlState: reservation.PreControlState, PreControlStateSeq: reservation.PreControlStateSeq}); err != nil {
+			return store.RunControlReservation{}, err
+		}
+		statePayload := `{"state":"ready"}`
+		if reservation.Operation == store.RunControlStop {
+			statePayload = `{"state":"ended","reason":"user_stop"}`
+		}
+		if _, err := appendRunControlEventTx(ctx, tx, sessionID, "session.state", statePayload, nowMS); err != nil {
+			return store.RunControlReservation{}, err
+		}
+	}
+	completionState := (*string)(nil)
+	if finalize.Outcome == store.RunControlCompleted {
+		value := "ready"
+		if reservation.Operation == store.RunControlStop {
+			value = "ended"
+		}
+		completionState = &value
+	}
+	payload, err := json.Marshal(struct {
+		CommandID       string                    `json:"cmd_id"`
+		Operation       store.RunControlOperation `json:"operation"`
+		Outcome         store.RunControlOutcome   `json:"outcome"`
+		CompletionState *string                   `json:"completion_state"`
+		ReasonCode      *string                   `json:"reason_code"`
+	}{reservation.CommandID, reservation.Operation, finalize.Outcome, completionState, finalize.ReasonCode})
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	terminalSeq, err := appendRunControlEventTx(ctx, tx, sessionID, "session.run.outcome", string(payload), nowMS)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_run_controls SET status=?,terminal_event_seq=?,updated_at_ms=? WHERE session_id=? AND cmd_id=? AND reservation_version=? AND status='pending' AND terminal_event_seq IS NULL`, finalize.Outcome, terminalSeq, nowMS, sessionID, commandID, finalize.ReservationVersion)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return store.RunControlReservation{}, errors.New("run-control finalization lost race")
+	}
+	reservation, err = queryRunControlReservation(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.RunControlReservation{}, err
+	}
+	return reservation, nil
+}
+
+func (s *Store) RecoverRunControl(ctx context.Context, sessionID, commandID, reason string) (store.RunControlReservation, error) {
+	if !validConnectionID(sessionID) || commandID == "" || (reason != "adapter_disconnected" && reason != "recovery_unconfirmed") {
+		return store.RunControlReservation{}, errors.New("invalid run-control recovery")
+	}
+	reservation, err := s.RunControl(ctx, sessionID, commandID)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	return s.RunControlFinalize(ctx, sessionID, commandID, store.RunControlFinalize{ReservationVersion: reservation.ReservationVersion, Outcome: store.RunControlOutcomeUnknown, ReasonCode: &reason})
+}
+
+func (s *Store) RunControl(ctx context.Context, sessionID, commandID string) (store.RunControlReservation, error) {
+	return queryRunControlReservation(ctx, s.db, sessionID, commandID)
+}
+
+func (s *Store) PendingRunControls(ctx context.Context, sessionID string) ([]store.RunControlReservation, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT cmd_id FROM session_run_controls WHERE session_id=? AND status='pending' ORDER BY reservation_version`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var reservations []store.RunControlReservation
+	for rows.Next() {
+		var commandID string
+		if err := rows.Scan(&commandID); err != nil {
+			return nil, err
+		}
+		item, err := queryRunControlReservation(ctx, s.db, sessionID, commandID)
+		if err != nil {
+			return nil, err
+		}
+		reservations = append(reservations, item)
+	}
+	return reservations, rows.Err()
+}
+
 func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2507,6 +2718,100 @@ func validSettingsCommandRow(command store.SettingsCommand) bool {
 func validSettingsWriter(writer store.SettingsWriter) bool {
 	return writer.ConnectionEpoch > 0 && writer.CredentialGeneration > 0 && writer.LeaseID != "" && len(writer.LeaseID) <= 255
 }
+
+type runControlQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func queryRunControlCapability(ctx context.Context, querier runControlQuerier, sessionID string) (store.RunControlCapability, error) {
+	var capability store.RunControlCapability
+	err := querier.QueryRowContext(ctx, `SELECT session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id FROM session_run_control_capabilities WHERE session_id=?`, sessionID).Scan(&capability.SessionID, &capability.EventSeq, &capability.Version, &capability.InterruptSupported, &capability.StopSupported, &capability.Writer.ConnectionEpoch, &capability.Writer.CredentialGeneration, &capability.Writer.LeaseID)
+	if err != nil || !validRunControlCapabilityUpdate(capability.SessionID, store.RunControlCapabilityUpdate{EventSeq: capability.EventSeq, InterruptSupported: capability.InterruptSupported, StopSupported: capability.StopSupported, Writer: capability.Writer}) || capability.Version < 1 {
+		return store.RunControlCapability{}, errors.New("run-control capability row is invalid")
+	}
+	return capability, nil
+}
+
+func queryRunControlReservation(ctx context.Context, querier runControlQuerier, sessionID, commandID string) (store.RunControlReservation, error) {
+	var reservation store.RunControlReservation
+	var deadlineMS int64
+	var status string
+	var terminal sql.NullInt64
+	err := querier.QueryRowContext(ctx, `SELECT session_id,cmd_id,operation,capability_version,reservation_version,pre_control_state,pre_control_state_seq,writer_connection_epoch,writer_credential_generation,writer_lease_id,deadline_ms,status,terminal_event_seq FROM session_run_controls WHERE session_id=? AND cmd_id=?`, sessionID, commandID).Scan(&reservation.SessionID, &reservation.CommandID, &reservation.Operation, &reservation.CapabilityVersion, &reservation.ReservationVersion, &reservation.PreControlState, &reservation.PreControlStateSeq, &reservation.Writer.ConnectionEpoch, &reservation.Writer.CredentialGeneration, &reservation.Writer.LeaseID, &deadlineMS, &status, &terminal)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	reservation.Deadline, reservation.Outcome = time.UnixMilli(deadlineMS), store.RunControlOutcome(status)
+	if terminal.Valid {
+		value := terminal.Int64
+		reservation.TerminalEventSeq = &value
+	}
+	if !validRunControlReservation(reservation) {
+		return store.RunControlReservation{}, errors.New("run-control reservation row is invalid")
+	}
+	return reservation, nil
+}
+
+func verifyRunControlCapabilityEvent(ctx context.Context, tx *sql.Tx, sessionID string, eventSeq int64) error {
+	var eventType string
+	if eventSeq < 1 || tx.QueryRowContext(ctx, `SELECT type FROM session_events WHERE session_id=? AND seq=?`, sessionID, eventSeq).Scan(&eventType) != nil || eventType != "session.run.capabilities" {
+		return errors.New("run-control capability event is not durable")
+	}
+	return nil
+}
+
+func validateRunControlPreState(ctx context.Context, tx *sql.Tx, sessionID string, request store.RunControlRequest) error {
+	var eventType, payload string
+	var latestStateSeq int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM session_events WHERE session_id=? AND type='session.state'`, sessionID).Scan(&latestStateSeq); err != nil || latestStateSeq != request.PreControlStateSeq {
+		return errors.New("run-control pre-control state is stale")
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT type,payload FROM session_events WHERE session_id=? AND seq=?`, sessionID, request.PreControlStateSeq).Scan(&eventType, &payload); err != nil || eventType != "session.state" {
+		return errors.New("run-control pre-control state is not durable")
+	}
+	var state struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal([]byte(payload), &state) != nil || state.State != request.PreControlState || !validRunControlState(request.Operation, state.State) {
+		return errors.New("run-control pre-control state is invalid")
+	}
+	return nil
+}
+
+func appendRunControlEventTx(ctx context.Context, tx *sql.Tx, sessionID, eventType, payload string, nowMS int64) (int64, error) {
+	var latest int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM session_events WHERE session_id=?`, sessionID).Scan(&latest); err != nil {
+		return 0, err
+	}
+	seq := latest + 1
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_events (session_id,seq,type,payload,event_time_ms,created_at_ms) VALUES (?,?,?,?,?,?)`, sessionID, seq, eventType, []byte(payload), nowMS, nowMS); err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+func validRunControlCapabilityUpdate(sessionID string, update store.RunControlCapabilityUpdate) bool {
+	return validConnectionID(sessionID) && update.EventSeq > 0 && validSettingsWriter(update.Writer)
+}
+func validRunControlRequest(sessionID string, request store.RunControlRequest) bool {
+	return validConnectionID(sessionID) && request.CommandID != "" && len(request.CommandID) <= 256 && validRunControlOperation(request.Operation) && request.PreControlStateSeq > 0 && validSettingsWriter(request.Writer)
+}
+func validRunControlOperation(operation store.RunControlOperation) bool {
+	return operation == store.RunControlInterrupt || operation == store.RunControlStop
+}
+func validRunControlState(operation store.RunControlOperation, state string) bool {
+	if operation == store.RunControlInterrupt {
+		return state == "busy"
+	}
+	return state == "starting" || state == "ready" || state == "busy" || state == "waiting_permission" || state == "recovering"
+}
+func validRunControlTerminalOutcome(outcome store.RunControlOutcome) bool {
+	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlUnsupported || outcome == store.RunControlOutcomeUnknown
+}
+func validRunControlReservation(reservation store.RunControlReservation) bool {
+	terminal := reservation.Outcome != store.RunControlPending
+	return validRunControlRequest(reservation.SessionID, store.RunControlRequest{CommandID: reservation.CommandID, Operation: reservation.Operation, PreControlState: reservation.PreControlState, PreControlStateSeq: reservation.PreControlStateSeq, Writer: reservation.Writer}) && reservation.CapabilityVersion > 0 && reservation.ReservationVersion > 0 && !reservation.Deadline.IsZero() && (reservation.Outcome == store.RunControlPending || validRunControlTerminalOutcome(reservation.Outcome)) && ((terminal && reservation.TerminalEventSeq != nil) || (!terminal && reservation.TerminalEventSeq == nil))
+}
 func validSettingsID(value string) bool {
 	if len(value) < 1 || len(value) > 128 || !((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z') || (value[0] >= '0' && value[0] <= '9')) {
 		return false
@@ -3233,6 +3538,43 @@ CREATE TABLE IF NOT EXISTS session_settings_commands (
 CREATE UNIQUE INDEX IF NOT EXISTS session_settings_commands_one_nonterminal_idx
 ON session_settings_commands (session_id)
 WHERE status IN ('delivery_pending', 'pending', 'recovery_pending');
+
+CREATE TABLE IF NOT EXISTS session_run_control_capabilities (
+    session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 255),
+    capability_event_seq INTEGER NOT NULL,
+    capability_version INTEGER NOT NULL CHECK (capability_version > 0),
+    interrupt_supported INTEGER NOT NULL CHECK (interrupt_supported IN (0,1)),
+    stop_supported INTEGER NOT NULL CHECK (stop_supported IN (0,1)),
+    writer_connection_epoch INTEGER NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation INTEGER NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (length(writer_lease_id) BETWEEN 1 AND 255),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (session_id, capability_event_seq) REFERENCES session_events(session_id, seq)
+);
+CREATE TABLE IF NOT EXISTS session_run_controls (
+    session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
+    cmd_id TEXT NOT NULL CHECK (length(cmd_id) BETWEEN 1 AND 256),
+    operation TEXT NOT NULL CHECK (operation IN ('interrupt','stop')),
+    capability_version INTEGER NOT NULL CHECK (capability_version > 0),
+    reservation_version INTEGER NOT NULL CHECK (reservation_version > 0),
+    pre_control_state TEXT NOT NULL CHECK (pre_control_state IN ('starting','ready','busy','waiting_permission','recovering')),
+    pre_control_state_seq INTEGER NOT NULL CHECK (pre_control_state_seq > 0),
+    writer_connection_epoch INTEGER NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation INTEGER NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (length(writer_lease_id) BETWEEN 1 AND 255),
+    deadline_ms INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','completed','rejected','timeout','unsupported','outcome_unknown')),
+    terminal_event_seq INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id,cmd_id),
+    FOREIGN KEY (session_id,terminal_event_seq) REFERENCES session_events(session_id,seq),
+    CHECK (deadline_ms > created_at_ms AND deadline_ms <= created_at_ms + 30000),
+    CHECK ((operation = 'interrupt' AND pre_control_state = 'busy') OR (operation = 'stop' AND pre_control_state IN ('starting','ready','busy','waiting_permission','recovering'))),
+    CHECK ((status = 'pending' AND terminal_event_seq IS NULL) OR (status <> 'pending' AND terminal_event_seq IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS session_run_controls_one_pending_idx ON session_run_controls (session_id) WHERE status = 'pending';
 
 CREATE TABLE IF NOT EXISTS session_event_proposals (
     session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),

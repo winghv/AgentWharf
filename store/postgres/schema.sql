@@ -187,6 +187,44 @@ CREATE TABLE session_settings_commands (
 CREATE UNIQUE INDEX session_settings_commands_one_nonterminal_idx
     ON session_settings_commands (session_id)
     WHERE status IN ('delivery_pending', 'pending', 'recovery_pending');
+
+CREATE TABLE session_run_control_capabilities (
+    session_id TEXT PRIMARY KEY REFERENCES agent_sessions(id),
+    capability_event_seq BIGINT NOT NULL,
+    capability_version BIGINT NOT NULL CHECK (capability_version > 0),
+    interrupt_supported BOOLEAN NOT NULL,
+    stop_supported BOOLEAN NOT NULL,
+    writer_connection_epoch BIGINT NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation BIGINT NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (char_length(writer_lease_id) BETWEEN 1 AND 255),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    FOREIGN KEY (session_id, capability_event_seq) REFERENCES session_events(session_id, seq)
+);
+
+CREATE TABLE session_run_controls (
+    session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+    cmd_id TEXT NOT NULL CHECK (char_length(cmd_id) BETWEEN 1 AND 256),
+    operation TEXT NOT NULL CHECK (operation IN ('interrupt', 'stop')),
+    capability_version BIGINT NOT NULL CHECK (capability_version > 0),
+    reservation_version BIGINT NOT NULL CHECK (reservation_version > 0),
+    pre_control_state TEXT NOT NULL CHECK (pre_control_state IN ('starting', 'ready', 'busy', 'waiting_permission', 'recovering')),
+    pre_control_state_seq BIGINT NOT NULL CHECK (pre_control_state_seq > 0),
+    writer_connection_epoch BIGINT NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation BIGINT NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (char_length(writer_lease_id) BETWEEN 1 AND 255),
+    deadline TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'rejected', 'timeout', 'unsupported', 'outcome_unknown')),
+    terminal_event_seq BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    PRIMARY KEY (session_id, cmd_id),
+    FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
+    CHECK (deadline > created_at AND deadline <= created_at + interval '30 seconds'),
+    CHECK ((operation = 'interrupt' AND pre_control_state = 'busy') OR (operation = 'stop' AND pre_control_state IN ('starting', 'ready', 'busy', 'waiting_permission', 'recovering'))),
+    CHECK ((status = 'pending' AND terminal_event_seq IS NULL) OR (status <> 'pending' AND terminal_event_seq IS NOT NULL))
+);
+CREATE UNIQUE INDEX session_run_controls_one_pending_idx ON session_run_controls (session_id) WHERE status = 'pending';
 CREATE SEQUENCE session_adapter_connection_accepted_fence_seq AS BIGINT MINVALUE 1 START WITH 1;
 CREATE TABLE session_attachments (
     attach_id TEXT PRIMARY KEY CHECK (char_length(attach_id) BETWEEN 1 AND 255),

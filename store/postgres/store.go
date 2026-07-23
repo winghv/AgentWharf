@@ -811,8 +811,304 @@ func (s *Store) PendingSettingsCommands(ctx context.Context, sessionID string) (
 	return commands, nil
 }
 
+func (s *Store) PublishRunControlCapability(ctx context.Context, sessionID string, update store.RunControlCapabilityUpdate) (store.RunControlCapability, error) {
+	if !validPostgresRunControlCapabilityUpdate(sessionID, update) {
+		return store.RunControlCapability{}, errors.New("invalid run-control capability")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.RunControlCapability{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, update.Writer); err != nil {
+		return store.RunControlCapability{}, err
+	}
+	if err := verifyPostgresRunControlCapabilityEvent(ctx, tx, sessionID, update.EventSeq); err != nil {
+		return store.RunControlCapability{}, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id) VALUES ($1,$2,1,$3,$4,$5,$6,$7) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=EXCLUDED.capability_event_seq,capability_version=session_run_control_capabilities.capability_version+1,interrupt_supported=EXCLUDED.interrupt_supported,stop_supported=EXCLUDED.stop_supported,writer_connection_epoch=EXCLUDED.writer_connection_epoch,writer_credential_generation=EXCLUDED.writer_credential_generation,writer_lease_id=EXCLUDED.writer_lease_id,updated_at=statement_timestamp()`, sessionID, update.EventSeq, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID); err != nil {
+		return store.RunControlCapability{}, err
+	}
+	capability, err := queryPostgresRunControlCapability(ctx, tx, sessionID, false)
+	if err != nil {
+		return store.RunControlCapability{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.RunControlCapability{}, err
+	}
+	return capability, nil
+}
+
+func (s *Store) RunControlReserve(ctx context.Context, sessionID string, request store.RunControlRequest) (store.RunControlReserve, error) {
+	if !validPostgresRunControlRequest(sessionID, request) {
+		return store.RunControlReserve{}, errors.New("invalid run-control reservation")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.RunControlReserve{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, request.Writer); err != nil {
+		return store.RunControlReserve{}, err
+	}
+	existing, err := queryPostgresRunControlReservation(ctx, tx, sessionID, request.CommandID, true)
+	if err == nil {
+		if existing.Operation != request.Operation {
+			return store.RunControlReserve{}, errors.New("run-control command ID is reused")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return store.RunControlReserve{}, err
+		}
+		return store.RunControlReserve{Reservation: existing, Duplicate: true}, nil
+	}
+	if err != nil && err != pgx.ErrNoRows {
+		return store.RunControlReserve{}, err
+	}
+	capability, err := queryPostgresRunControlCapability(ctx, tx, sessionID, true)
+	if err != nil || capability.Writer != request.Writer {
+		return store.RunControlReserve{}, errors.New("run-control capability is stale or writer is fenced")
+	}
+	if (request.Operation == store.RunControlInterrupt && !capability.InterruptSupported) || (request.Operation == store.RunControlStop && !capability.StopSupported) {
+		return store.RunControlReserve{}, errors.New("run-control operation is unsupported")
+	}
+	if err := validatePostgresRunControlPreState(ctx, tx, sessionID, request); err != nil {
+		return store.RunControlReserve{}, err
+	}
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return store.RunControlReserve{}, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO session_run_controls (session_id,cmd_id,operation,capability_version,reservation_version,pre_control_state,pre_control_state_seq,writer_connection_epoch,writer_credential_generation,writer_lease_id,deadline,status) VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,'pending')`, sessionID, request.CommandID, request.Operation, capability.Version, request.PreControlState, request.PreControlStateSeq, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, now.Add(30*time.Second)); err != nil {
+		return store.RunControlReserve{}, err
+	}
+	reservation, err := queryPostgresRunControlReservation(ctx, tx, sessionID, request.CommandID, false)
+	if err != nil {
+		return store.RunControlReserve{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.RunControlReserve{}, err
+	}
+	return store.RunControlReserve{Reservation: reservation}, nil
+}
+
+func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID string, finalize store.RunControlFinalize) (store.RunControlReservation, error) {
+	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || !validPostgresRunControlTerminalOutcome(finalize.Outcome) || (finalize.Outcome == store.RunControlCompleted && finalize.ReasonCode != nil) || (finalize.Outcome != store.RunControlCompleted && !validPostgresSettingsReason(finalize.ReasonCode)) {
+		return store.RunControlReservation{}, errors.New("invalid run-control finalization")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	reservation, err := queryPostgresRunControlReservation(ctx, tx, sessionID, commandID, true)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	if reservation.ReservationVersion != finalize.ReservationVersion || reservation.Outcome != store.RunControlPending {
+		return store.RunControlReservation{}, errors.New("run-control finalization is fenced")
+	}
+	if finalize.Outcome == store.RunControlCompleted || finalize.Outcome == store.RunControlRejected {
+		if finalize.Writer == nil || *finalize.Writer != reservation.Writer || !reservation.Deadline.After(now) {
+			return store.RunControlReservation{}, errors.New("run-control writer finalization is fenced")
+		}
+		capability, err := queryPostgresRunControlCapability(ctx, tx, sessionID, true)
+		if err != nil || capability.Version != reservation.CapabilityVersion || capability.Writer != *finalize.Writer {
+			return store.RunControlReservation{}, errors.New("run-control capability changed")
+		}
+		if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, *finalize.Writer); err != nil {
+			return store.RunControlReservation{}, err
+		}
+	} else if finalize.Writer != nil || (finalize.Outcome == store.RunControlTimeout && reservation.Deadline.After(now)) {
+		return store.RunControlReservation{}, errors.New("run-control unbound finalization is fenced")
+	}
+	if finalize.Outcome == store.RunControlCompleted {
+		if err := validatePostgresRunControlPreState(ctx, tx, sessionID, store.RunControlRequest{Operation: reservation.Operation, PreControlState: reservation.PreControlState, PreControlStateSeq: reservation.PreControlStateSeq}); err != nil {
+			return store.RunControlReservation{}, err
+		}
+		payload := `{"state":"ready"}`
+		if reservation.Operation == store.RunControlStop {
+			payload = `{"state":"ended","reason":"user_stop"}`
+		}
+		if _, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.state", []byte(payload), now); err != nil {
+			return store.RunControlReservation{}, err
+		}
+	}
+	completionState := (*string)(nil)
+	if finalize.Outcome == store.RunControlCompleted {
+		value := "ready"
+		if reservation.Operation == store.RunControlStop {
+			value = "ended"
+		}
+		completionState = &value
+	}
+	payload, err := json.Marshal(struct {
+		CommandID       string                    `json:"cmd_id"`
+		Operation       store.RunControlOperation `json:"operation"`
+		Outcome         store.RunControlOutcome   `json:"outcome"`
+		CompletionState *string                   `json:"completion_state"`
+		ReasonCode      *string                   `json:"reason_code"`
+	}{reservation.CommandID, reservation.Operation, finalize.Outcome, completionState, finalize.ReasonCode})
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	terminalSeq, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.run.outcome", payload, now)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	result, err := tx.Exec(ctx, `UPDATE session_run_controls SET status=$1,terminal_event_seq=$2,updated_at=clock_timestamp() WHERE session_id=$3 AND cmd_id=$4 AND reservation_version=$5 AND status='pending' AND terminal_event_seq IS NULL`, finalize.Outcome, terminalSeq, sessionID, commandID, finalize.ReservationVersion)
+	if err != nil || result.RowsAffected() != 1 {
+		return store.RunControlReservation{}, errors.New("run-control finalization lost race")
+	}
+	reservation, err = queryPostgresRunControlReservation(ctx, tx, sessionID, commandID, false)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.RunControlReservation{}, err
+	}
+	return reservation, nil
+}
+
+func (s *Store) RecoverRunControl(ctx context.Context, sessionID, commandID, reason string) (store.RunControlReservation, error) {
+	if !validConnectionID(sessionID) || commandID == "" || (reason != "adapter_disconnected" && reason != "recovery_unconfirmed") {
+		return store.RunControlReservation{}, errors.New("invalid run-control recovery")
+	}
+	reservation, err := s.RunControl(ctx, sessionID, commandID)
+	if err != nil {
+		return store.RunControlReservation{}, err
+	}
+	return s.RunControlFinalize(ctx, sessionID, commandID, store.RunControlFinalize{ReservationVersion: reservation.ReservationVersion, Outcome: store.RunControlOutcomeUnknown, ReasonCode: &reason})
+}
+
+func (s *Store) RunControl(ctx context.Context, sessionID, commandID string) (store.RunControlReservation, error) {
+	return queryPostgresRunControlReservation(ctx, s.pool, sessionID, commandID, false)
+}
+func (s *Store) PendingRunControls(ctx context.Context, sessionID string) ([]store.RunControlReservation, error) {
+	rows, err := s.pool.Query(ctx, `SELECT cmd_id FROM session_run_controls WHERE session_id=$1 AND status='pending' ORDER BY reservation_version`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var reservations []store.RunControlReservation
+	for rows.Next() {
+		var commandID string
+		if err := rows.Scan(&commandID); err != nil {
+			return nil, err
+		}
+		item, err := s.RunControl(ctx, sessionID, commandID)
+		if err != nil {
+			return nil, err
+		}
+		reservations = append(reservations, item)
+	}
+	return reservations, rows.Err()
+}
+
 type postgresSettingsQuerier interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func queryPostgresRunControlCapability(ctx context.Context, querier postgresSettingsQuerier, sessionID string, lock bool) (store.RunControlCapability, error) {
+	query := `SELECT session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id FROM session_run_control_capabilities WHERE session_id=$1`
+	if lock {
+		query += ` FOR UPDATE`
+	}
+	var capability store.RunControlCapability
+	if err := querier.QueryRow(ctx, query, sessionID).Scan(&capability.SessionID, &capability.EventSeq, &capability.Version, &capability.InterruptSupported, &capability.StopSupported, &capability.Writer.ConnectionEpoch, &capability.Writer.CredentialGeneration, &capability.Writer.LeaseID); err != nil {
+		return store.RunControlCapability{}, err
+	}
+	if !validPostgresRunControlCapabilityUpdate(capability.SessionID, store.RunControlCapabilityUpdate{EventSeq: capability.EventSeq, InterruptSupported: capability.InterruptSupported, StopSupported: capability.StopSupported, Writer: capability.Writer}) || capability.Version < 1 {
+		return store.RunControlCapability{}, errors.New("run-control capability row is invalid")
+	}
+	return capability, nil
+}
+
+func queryPostgresRunControlReservation(ctx context.Context, querier postgresSettingsQuerier, sessionID, commandID string, lock bool) (store.RunControlReservation, error) {
+	query := `SELECT session_id,cmd_id,operation,capability_version,reservation_version,pre_control_state,pre_control_state_seq,writer_connection_epoch,writer_credential_generation,writer_lease_id,deadline,status,terminal_event_seq FROM session_run_controls WHERE session_id=$1 AND cmd_id=$2`
+	if lock {
+		query += ` FOR UPDATE`
+	}
+	var reservation store.RunControlReservation
+	var terminal pgtype.Int8
+	var status string
+	if err := querier.QueryRow(ctx, query, sessionID, commandID).Scan(&reservation.SessionID, &reservation.CommandID, &reservation.Operation, &reservation.CapabilityVersion, &reservation.ReservationVersion, &reservation.PreControlState, &reservation.PreControlStateSeq, &reservation.Writer.ConnectionEpoch, &reservation.Writer.CredentialGeneration, &reservation.Writer.LeaseID, &reservation.Deadline, &status, &terminal); err != nil {
+		return store.RunControlReservation{}, err
+	}
+	reservation.Outcome = store.RunControlOutcome(status)
+	if terminal.Valid {
+		value := terminal.Int64
+		reservation.TerminalEventSeq = &value
+	}
+	if !validPostgresRunControlReservation(reservation) {
+		return store.RunControlReservation{}, errors.New("run-control reservation row is invalid")
+	}
+	return reservation, nil
+}
+
+func verifyPostgresRunControlCapabilityEvent(ctx context.Context, querier postgresSettingsQuerier, sessionID string, eventSeq int64) error {
+	var eventType string
+	if eventSeq < 1 || querier.QueryRow(ctx, `SELECT type FROM session_events WHERE session_id=$1 AND seq=$2`, sessionID, eventSeq).Scan(&eventType) != nil || eventType != "session.run.capabilities" {
+		return errors.New("run-control capability event is not durable")
+	}
+	return nil
+}
+
+func validatePostgresRunControlPreState(ctx context.Context, tx pgx.Tx, sessionID string, request store.RunControlRequest) error {
+	var latest int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(seq),0) FROM session_events WHERE session_id=$1 AND type='session.state'`, sessionID).Scan(&latest); err != nil || latest != request.PreControlStateSeq {
+		return errors.New("run-control pre-control state is stale")
+	}
+	var eventType string
+	var payload []byte
+	if err := tx.QueryRow(ctx, `SELECT type,payload FROM session_events WHERE session_id=$1 AND seq=$2`, sessionID, request.PreControlStateSeq).Scan(&eventType, &payload); err != nil || eventType != "session.state" {
+		return errors.New("run-control pre-control state is not durable")
+	}
+	var state struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(payload, &state) != nil || state.State != request.PreControlState || !validPostgresRunControlState(request.Operation, state.State) {
+		return errors.New("run-control pre-control state is invalid")
+	}
+	return nil
+}
+
+func appendPostgresRunControlEvent(ctx context.Context, tx pgx.Tx, sessionID, eventType string, payload []byte, now time.Time) (int64, error) {
+	var latest int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(seq),0) FROM session_events WHERE session_id=$1`, sessionID).Scan(&latest); err != nil {
+		return 0, err
+	}
+	seq := latest + 1
+	if _, err := tx.Exec(ctx, `INSERT INTO session_events (session_id,seq,type,payload,created_at) VALUES ($1,$2,$3,$4::jsonb,$5)`, sessionID, seq, eventType, string(payload), now); err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+func validPostgresRunControlCapabilityUpdate(sessionID string, update store.RunControlCapabilityUpdate) bool {
+	return validConnectionID(sessionID) && update.EventSeq > 0 && validPostgresSettingsWriter(update.Writer)
+}
+func validPostgresRunControlRequest(sessionID string, request store.RunControlRequest) bool {
+	return validConnectionID(sessionID) && validPostgresSettingsID(request.CommandID) && validPostgresRunControlOperation(request.Operation) && request.PreControlStateSeq > 0 && validPostgresSettingsWriter(request.Writer)
+}
+func validPostgresRunControlOperation(operation store.RunControlOperation) bool {
+	return operation == store.RunControlInterrupt || operation == store.RunControlStop
+}
+func validPostgresRunControlState(operation store.RunControlOperation, state string) bool {
+	if operation == store.RunControlInterrupt {
+		return state == "busy"
+	}
+	return state == "starting" || state == "ready" || state == "busy" || state == "waiting_permission" || state == "recovering"
+}
+func validPostgresRunControlTerminalOutcome(outcome store.RunControlOutcome) bool {
+	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlUnsupported || outcome == store.RunControlOutcomeUnknown
+}
+func validPostgresRunControlReservation(reservation store.RunControlReservation) bool {
+	terminal := reservation.Outcome != store.RunControlPending
+	return validPostgresRunControlRequest(reservation.SessionID, store.RunControlRequest{CommandID: reservation.CommandID, Operation: reservation.Operation, PreControlState: reservation.PreControlState, PreControlStateSeq: reservation.PreControlStateSeq, Writer: reservation.Writer}) && reservation.CapabilityVersion > 0 && reservation.ReservationVersion > 0 && !reservation.Deadline.IsZero() && (reservation.Outcome == store.RunControlPending || validPostgresRunControlTerminalOutcome(reservation.Outcome)) && ((terminal && reservation.TerminalEventSeq != nil) || (!terminal && reservation.TerminalEventSeq == nil))
 }
 
 func postgresSettingsNow(ctx context.Context, querier postgresSettingsQuerier) (time.Time, error) {

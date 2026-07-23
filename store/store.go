@@ -693,3 +693,91 @@ type SettingsCommandStore interface {
 	SettingsCommand(ctx context.Context, sessionID string, commandID string) (SettingsCommand, error)
 	PendingSettingsCommands(ctx context.Context, sessionID string) ([]SettingsCommand, error)
 }
+
+// RunControlOperation is deliberately limited to the two v2 completion
+// controls. It is Store metadata, never a Provider value.
+type RunControlOperation string
+
+const (
+	RunControlInterrupt RunControlOperation = "interrupt"
+	RunControlStop      RunControlOperation = "stop"
+)
+
+type RunControlOutcome string
+
+const (
+	RunControlPending        RunControlOutcome = "pending"
+	RunControlCompleted      RunControlOutcome = "completed"
+	RunControlRejected       RunControlOutcome = "rejected"
+	RunControlTimeout        RunControlOutcome = "timeout"
+	RunControlUnsupported    RunControlOutcome = "unsupported"
+	RunControlOutcomeUnknown RunControlOutcome = "outcome_unknown"
+)
+
+// RunControlWriter is the trusted, connection-lifecycle-bound tuple. The
+// opaque lease is shared with the existing adapter writer fence, not exposed
+// in a protocol payload.
+type RunControlWriter = SettingsWriter
+
+type RunControlCapability struct {
+	SessionID          string
+	EventSeq           int64
+	Version            int64
+	InterruptSupported bool
+	StopSupported      bool
+	Writer             RunControlWriter
+}
+
+type RunControlCapabilityUpdate struct {
+	EventSeq           int64
+	InterruptSupported bool
+	StopSupported      bool
+	Writer             RunControlWriter
+}
+
+type RunControlRequest struct {
+	CommandID          string
+	Operation          RunControlOperation
+	PreControlState    string
+	PreControlStateSeq int64
+	Writer             RunControlWriter
+}
+
+type RunControlReservation struct {
+	SessionID          string
+	CommandID          string
+	Operation          RunControlOperation
+	CapabilityVersion  int64
+	ReservationVersion int64
+	PreControlState    string
+	PreControlStateSeq int64
+	Writer             RunControlWriter
+	Deadline           time.Time
+	Outcome            RunControlOutcome
+	TerminalEventSeq   *int64
+}
+
+type RunControlReserve struct {
+	Reservation RunControlReservation
+	Duplicate   bool
+}
+
+type RunControlFinalize struct {
+	ReservationVersion int64
+	Writer             *RunControlWriter
+	Outcome            RunControlOutcome
+	ReasonCode         *string
+}
+
+// RunControlStore owns the durable capability/reservation/outcome ledger.
+// The Hub remains responsible for authorization and routing; it cannot create
+// an outcome by appending a public event directly.
+type RunControlStore interface {
+	EventStore
+	PublishRunControlCapability(ctx context.Context, sessionID string, update RunControlCapabilityUpdate) (RunControlCapability, error)
+	RunControlReserve(ctx context.Context, sessionID string, request RunControlRequest) (RunControlReserve, error)
+	RunControlFinalize(ctx context.Context, sessionID, commandID string, finalize RunControlFinalize) (RunControlReservation, error)
+	RecoverRunControl(ctx context.Context, sessionID, commandID string, reason string) (RunControlReservation, error)
+	RunControl(ctx context.Context, sessionID, commandID string) (RunControlReservation, error)
+	PendingRunControls(ctx context.Context, sessionID string) ([]RunControlReservation, error)
+}

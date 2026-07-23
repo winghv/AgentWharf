@@ -45,6 +45,12 @@ func SettingsCommandContract(t *testing.T, harness SettingsCommandHarness) {
 	if harness.Open == nil || harness.Reopen == nil || harness.ExpireOperationDeadline == nil || harness.RevokeWriter == nil {
 		t.Fatal("settings-command harness is incomplete")
 	}
+	ledgerForRunControl := harness.Open(t)
+	runControl, ok := ledgerForRunControl.(store.RunControlStore)
+	if !ok {
+		t.Fatal("settings-command backend does not implement the run-control ledger")
+	}
+	RunControlContract(t, runControl, harness)
 	ctx := context.Background()
 	capability := store.SettingsCapabilityUpdate{
 		Fingerprint:      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -270,6 +276,146 @@ func SettingsCommandContract(t *testing.T, harness SettingsCommandHarness) {
 		return nil
 	}); err != nil || terminalEvents != 5 {
 		t.Fatalf("settings terminal events = %d, %v; want exactly five", terminalEvents, err)
+	}
+}
+
+// RunControlContract fixes the v2 durable run-control state machine. It uses
+// the existing backend harness solely to reopen the same durable Store; no
+// Settings behavior is asserted here.
+func RunControlContract(t *testing.T, ledger store.RunControlStore, harness SettingsCommandHarness) {
+	t.Helper()
+	ctx := context.Background()
+	writer := bindRunControlWriter(t, ledger, "ses_run_control_1", "lease_run_control_1")
+	stateSeq := appendRunControlEvent(t, ledger, "ses_run_control_1", "session.state", `{"state":"busy"}`)
+	capabilitySeq := appendRunControlEvent(t, ledger, "ses_run_control_1", "session.run.capabilities", `{}`)
+	capability, err := ledger.PublishRunControlCapability(ctx, "ses_run_control_1", store.RunControlCapabilityUpdate{
+		EventSeq: capabilitySeq, InterruptSupported: true, StopSupported: true, Writer: writer,
+	})
+	if err != nil || capability.Version != 1 || capability.Writer != writer {
+		t.Fatalf("PublishRunControlCapability() = %+v, %v", capability, err)
+	}
+	request := store.RunControlRequest{CommandID: "cmd_interrupt_1", Operation: store.RunControlInterrupt, PreControlState: "busy", PreControlStateSeq: stateSeq, Writer: writer}
+	reserved, err := ledger.RunControlReserve(ctx, "ses_run_control_1", request)
+	if err != nil || reserved.Duplicate || reserved.Reservation.Outcome != store.RunControlPending || reserved.Reservation.CapabilityVersion != capability.Version || reserved.Reservation.ReservationVersion != 1 || !reserved.Reservation.Deadline.After(time.Now()) {
+		t.Fatalf("RunControlReserve() = %+v, %v", reserved, err)
+	}
+	if retry, err := ledger.RunControlReserve(ctx, "ses_run_control_1", request); err != nil || !retry.Duplicate || !reflect.DeepEqual(retry.Reservation, reserved.Reservation) {
+		t.Fatalf("exact RunControlReserve retry = %+v, %v", retry, err)
+	}
+	changed := request
+	changed.Operation = store.RunControlStop
+	if _, err := ledger.RunControlReserve(ctx, "ses_run_control_1", changed); err == nil {
+		t.Fatal("different-operation cmd_id retry unexpectedly succeeded")
+	}
+	second := request
+	second.CommandID = "cmd_interrupt_2"
+	if _, err := ledger.RunControlReserve(ctx, "ses_run_control_1", second); err == nil {
+		t.Fatal("second nonterminal run control unexpectedly succeeded")
+	}
+	stale := writer
+	stale.LeaseID = "lease_stale"
+	if _, err := ledger.RunControlFinalize(ctx, "ses_run_control_1", request.CommandID, store.RunControlFinalize{ReservationVersion: reserved.Reservation.ReservationVersion, Writer: &stale, Outcome: store.RunControlCompleted}); err == nil {
+		t.Fatal("stale writer completed run control")
+	}
+	completed, err := ledger.RunControlFinalize(ctx, "ses_run_control_1", request.CommandID, store.RunControlFinalize{ReservationVersion: reserved.Reservation.ReservationVersion, Writer: &writer, Outcome: store.RunControlCompleted})
+	if err != nil || completed.Outcome != store.RunControlCompleted || completed.TerminalEventSeq == nil || *completed.TerminalEventSeq != capabilitySeq+2 {
+		t.Fatalf("RunControlFinalize(completed interrupt) = %+v, %v", completed, err)
+	}
+	assertRunControlCompletionOrder(t, ledger, "ses_run_control_1", capabilitySeq+1, *completed.TerminalEventSeq, "ready", request)
+	if _, err := ledger.RunControlFinalize(ctx, "ses_run_control_1", request.CommandID, store.RunControlFinalize{ReservationVersion: reserved.Reservation.ReservationVersion, Writer: &writer, Outcome: store.RunControlCompleted}); err == nil {
+		t.Fatal("second terminal run-control finalize unexpectedly succeeded")
+	}
+
+	stopStateSeq := appendRunControlEvent(t, ledger, "ses_run_control_1", "session.state", `{"state":"ready"}`)
+	stopRequest := store.RunControlRequest{CommandID: "cmd_stop_1", Operation: store.RunControlStop, PreControlState: "ready", PreControlStateSeq: stopStateSeq, Writer: writer}
+	stopReserved, err := ledger.RunControlReserve(ctx, "ses_run_control_1", stopRequest)
+	if err != nil || stopReserved.Duplicate {
+		t.Fatalf("stop RunControlReserve() = %+v, %v", stopReserved, err)
+	}
+	settingsLedger, ok := ledger.(store.SettingsCommandStore)
+	if !ok {
+		t.Fatal("run-control backend cannot use the durable reopen harness")
+	}
+	reopened, ok := harness.Reopen(t, settingsLedger).(store.RunControlStore)
+	if !ok {
+		t.Fatal("reopened backend does not implement the run-control ledger")
+	}
+	pending, err := reopened.PendingRunControls(ctx, "ses_run_control_1")
+	if err != nil || len(pending) != 1 || !reflect.DeepEqual(pending[0], stopReserved.Reservation) {
+		t.Fatalf("restart pending run-control recovery = %+v, %v", pending, err)
+	}
+	recovered, err := reopened.RecoverRunControl(ctx, "ses_run_control_1", stopRequest.CommandID, "recovery_unconfirmed")
+	if err != nil || recovered.Outcome != store.RunControlOutcomeUnknown || recovered.TerminalEventSeq == nil {
+		t.Fatalf("RecoverRunControl() = %+v, %v", recovered, err)
+	}
+	if commands, err := reopened.PendingRunControls(ctx, "ses_run_control_1"); err != nil || len(commands) != 0 {
+		t.Fatalf("recovered run control remained pending: %+v, %v", commands, err)
+	}
+
+	unsupportedWriter := bindRunControlWriter(t, reopened, "ses_run_control_unsupported", "lease_run_control_unsupported")
+	unsupportedState := appendRunControlEvent(t, reopened, "ses_run_control_unsupported", "session.state", `{"state":"busy"}`)
+	unsupportedCapability := appendRunControlEvent(t, reopened, "ses_run_control_unsupported", "session.run.capabilities", `{}`)
+	if _, err := reopened.PublishRunControlCapability(ctx, "ses_run_control_unsupported", store.RunControlCapabilityUpdate{EventSeq: unsupportedCapability, Writer: unsupportedWriter}); err != nil {
+		t.Fatalf("publish unsupported run-control capability: %v", err)
+	}
+	if _, err := reopened.RunControlReserve(ctx, "ses_run_control_unsupported", store.RunControlRequest{CommandID: "cmd_interrupt_unsupported", Operation: store.RunControlInterrupt, PreControlState: "busy", PreControlStateSeq: unsupportedState, Writer: unsupportedWriter}); err == nil {
+		t.Fatal("unsupported run-control capability created a reservation")
+	}
+}
+
+func bindRunControlWriter(t *testing.T, ledger store.RunControlStore, sessionID, leaseID string) store.RunControlWriter {
+	t.Helper()
+	connections, ok := ledger.(store.AdapterConnectionStore)
+	if !ok {
+		t.Fatal("run-control backend lacks trusted adapter connection storage")
+	}
+	current, err := connections.AdapterConnection(context.Background(), sessionID)
+	if err != nil {
+		if _, err := connections.InitializeAdapterConnection(context.Background(), store.AdapterConnectionInitialize{SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+			t.Fatalf("initialize run-control writer: %v", err)
+		}
+		current, err = connections.AdapterConnection(context.Background(), sessionID)
+		if err != nil {
+			t.Fatalf("read initialized run-control writer connection: %v", err)
+		}
+	}
+	connection, err := connections.AcceptAdapterHello(context.Background(), sessionID, store.AdapterHello{CredentialGeneration: current.ActiveCredentialGeneration, WriterLeaseID: leaseID})
+	if err != nil {
+		t.Fatalf("accept run-control writer hello: %v", err)
+	}
+	return store.RunControlWriter{ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: leaseID}
+}
+
+func appendRunControlEvent(t *testing.T, ledger store.EventStore, sessionID, eventType, payload string) int64 {
+	t.Helper()
+	seq, err := ledger.Append(context.Background(), sessionID, []store.PendingEvent{{Type: eventType, Time: time.Now(), Payload: json.RawMessage(payload)}})
+	if err != nil {
+		t.Fatalf("append %s: %v", eventType, err)
+	}
+	return seq
+}
+
+func assertRunControlCompletionOrder(t *testing.T, ledger store.EventStore, sessionID string, stateSeq, outcomeSeq int64, state string, request store.RunControlRequest) {
+	t.Helper()
+	var events []store.Event
+	if err := ledger.Replay(context.Background(), sessionID, stateSeq-1, func(event store.Event) error {
+		events = append(events, event)
+		return nil
+	}); err != nil || len(events) != 2 || events[0].Seq != stateSeq || events[0].Type != "session.state" || events[1].Seq != outcomeSeq || events[1].Type != "session.run.outcome" {
+		t.Fatalf("run-control completion replay = %+v, %v", events, err)
+	}
+	var gotState struct {
+		State string `json:"state"`
+	}
+	var outcome struct {
+		CommandID       string                    `json:"cmd_id"`
+		Operation       store.RunControlOperation `json:"operation"`
+		Outcome         store.RunControlOutcome   `json:"outcome"`
+		CompletionState *string                   `json:"completion_state"`
+		ReasonCode      *string                   `json:"reason_code"`
+	}
+	if json.Unmarshal(events[0].Payload, &gotState) != nil || gotState.State != state || json.Unmarshal(events[1].Payload, &outcome) != nil || outcome.CommandID != request.CommandID || outcome.Operation != request.Operation || outcome.Outcome != store.RunControlCompleted || outcome.CompletionState == nil || *outcome.CompletionState != state || outcome.ReasonCode != nil {
+		t.Fatalf("run-control completion payload = state=%s outcome=%+v", string(events[0].Payload), outcome)
 	}
 }
 
