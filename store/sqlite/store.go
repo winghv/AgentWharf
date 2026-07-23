@@ -2318,10 +2318,12 @@ func (s *Store) TerminateAdapterConnectionBeforeHello(ctx context.Context, sessi
 	if !validConnectionID(sessionID) || termination.ExpectedActiveCredentialGeneration < 1 {
 		return store.AdapterConnection{}, errors.New("invalid pre-hello adapter connection termination")
 	}
-	return s.updateConnection(ctx, sessionID, `UPDATE session_adapter_connections SET revoked_at_ms = COALESCE(revoked_at_ms, ?), terminal_at_ms = COALESCE(terminal_at_ms, ?), updated_at_ms = ?
+	return s.updateConnectionAfter(ctx, sessionID, `UPDATE session_adapter_connections SET revoked_at_ms = COALESCE(revoked_at_ms, ?), terminal_at_ms = COALESCE(terminal_at_ms, ?), updated_at_ms = ?
 WHERE session_id = ? AND active_credential_generation = ? AND connection_epoch = 0 AND accepted_fence = 0 AND pending_credential_generation IS NULL AND prior_recovery_credential_generation IS NULL AND rotation_id IS NULL
 AND ((revoked_at_ms IS NULL AND terminal_at_ms IS NULL) OR revoked_at_ms = terminal_at_ms)`, false, func(nowMS, _ int64) []any {
 		return []any{nowMS, nowMS, nowMS, sessionID, termination.ExpectedActiveCredentialGeneration}
+	}, func(executor sqliteConnectionExecutor, _ store.AdapterConnection, nowMS int64) error {
+		return fenceRunControlsAfterWriterReplacement(ctx, executor, sessionID, nowMS)
 	})
 }
 
@@ -2870,7 +2872,7 @@ func validRunControlState(operation store.RunControlOperation, state string) boo
 	return state == "starting" || state == "ready" || state == "busy" || state == "waiting_permission" || state == "recovering"
 }
 func validRunControlTerminalOutcome(outcome store.RunControlOutcome) bool {
-	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlUnsupported || outcome == store.RunControlOutcomeUnknown
+	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlOutcomeUnknown
 }
 func validRunControlReservation(reservation store.RunControlReservation) bool {
 	terminal := reservation.Outcome != store.RunControlPending

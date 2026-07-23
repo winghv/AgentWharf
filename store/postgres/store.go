@@ -820,6 +820,10 @@ func (s *Store) PublishRunControlCapability(ctx context.Context, sessionID strin
 		return store.RunControlCapability{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.RunControlCapability{}, err
+	}
 	if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, update.Writer); err != nil {
 		return store.RunControlCapability{}, err
 	}
@@ -1089,8 +1093,8 @@ func validatePostgresRunControlPreState(ctx context.Context, tx pgx.Tx, sessionI
 }
 
 func appendPostgresRunControlEvent(ctx context.Context, tx pgx.Tx, sessionID, eventType string, payload []byte, now time.Time) (int64, error) {
-	var latest int64
-	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(seq),0) FROM session_events WHERE session_id=$1`, sessionID).Scan(&latest); err != nil {
+	latest, err := db.New(tx).LatestSessionEventSeq(ctx, sessionID)
+	if err != nil {
 		return 0, err
 	}
 	seq := latest + 1
@@ -1159,7 +1163,7 @@ func validPostgresRunControlState(operation store.RunControlOperation, state str
 	return state == "starting" || state == "ready" || state == "busy" || state == "waiting_permission" || state == "recovering"
 }
 func validPostgresRunControlTerminalOutcome(outcome store.RunControlOutcome) bool {
-	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlUnsupported || outcome == store.RunControlOutcomeUnknown
+	return outcome == store.RunControlCompleted || outcome == store.RunControlRejected || outcome == store.RunControlTimeout || outcome == store.RunControlOutcomeUnknown
 }
 func validPostgresRunControlReservation(reservation store.RunControlReservation) bool {
 	terminal := reservation.Outcome != store.RunControlPending
@@ -1688,15 +1692,38 @@ func (s *Store) TerminateAdapterConnectionBeforeHello(ctx context.Context, sessi
 	if !validConnectionID(sessionID) || termination.ExpectedActiveCredentialGeneration < 1 {
 		return store.AdapterConnection{}, errors.New("invalid pre-hello adapter connection termination")
 	}
-	queries, err := s.adapterConnectionQueries()
+	if s.connectionTx != nil {
+		queries := db.New(s.connectionTx)
+		if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+			return store.AdapterConnection{}, err
+		}
+		row, err := queries.TerminateAdapterConnectionBeforeHello(ctx, db.TerminateAdapterConnectionBeforeHelloParams{SessionID: sessionID, ExpectedActiveGeneration: termination.ExpectedActiveCredentialGeneration})
+		if err != nil {
+			return store.AdapterConnection{}, fmt.Errorf("terminate pre-hello adapter connection: %w", err)
+		}
+		if err := fencePostgresRunControlsAfterWriterReplacement(ctx, s.connectionTx, sessionID); err != nil {
+			return store.AdapterConnection{}, err
+		}
+		return adapterConnection(db.SessionAdapterConnection(row)), nil
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return store.AdapterConnection{}, err
 	}
-	row, err := queries.TerminateAdapterConnectionBeforeHello(ctx, db.TerminateAdapterConnectionBeforeHelloParams{
-		SessionID: sessionID, ExpectedActiveGeneration: termination.ExpectedActiveCredentialGeneration,
-	})
+	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.TerminateAdapterConnectionBeforeHello(ctx, db.TerminateAdapterConnectionBeforeHelloParams{SessionID: sessionID, ExpectedActiveGeneration: termination.ExpectedActiveCredentialGeneration})
 	if err != nil {
 		return store.AdapterConnection{}, fmt.Errorf("terminate pre-hello adapter connection: %w", err)
+	}
+	if err := fencePostgresRunControlsAfterWriterReplacement(ctx, tx, sessionID); err != nil {
+		return store.AdapterConnection{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.AdapterConnection{}, err
 	}
 	return adapterConnection(db.SessionAdapterConnection(row)), nil
 }
