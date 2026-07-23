@@ -1265,20 +1265,29 @@ func (s *Store) PendingFileReferenceCommands(ctx context.Context, sessionID stri
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var commands []store.FileReferenceCommand
+	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, err
 		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	commands := make([]store.FileReferenceCommand, 0, len(ids))
+	for _, id := range ids {
 		command, err := s.FileReferenceCommand(ctx, sessionID, id)
 		if err != nil {
 			return nil, err
 		}
 		commands = append(commands, command)
 	}
-	return commands, rows.Err()
+	return commands, nil
 }
 
 type postgresSettingsQuerier interface {

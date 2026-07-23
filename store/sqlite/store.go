@@ -1441,20 +1441,31 @@ func (s *Store) PendingFileReferenceCommands(ctx context.Context, sessionID stri
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var commands []store.FileReferenceCommand
+	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	commands := make([]store.FileReferenceCommand, 0, len(ids))
+	for _, id := range ids {
 		command, err := s.FileReferenceCommand(ctx, sessionID, id)
 		if err != nil {
 			return nil, err
 		}
 		commands = append(commands, command)
 	}
-	return commands, rows.Err()
+	return commands, nil
 }
 
 func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {

@@ -522,6 +522,11 @@ func FileReferenceCommandContract(t *testing.T, ledger store.FileReferenceComman
 	if !ok {
 		t.Fatal("reopened backend lost file-reference ledger")
 	}
+	pendingCtx, cancelPending := context.WithTimeout(ctx, time.Second)
+	defer cancelPending()
+	if pending, err := reopened.PendingFileReferenceCommands(pendingCtx, "ses_file_reference_deadline"); err != nil || len(pending) != 1 || pending[0].CommandID != deadlineRequest.CommandID || pending[0].Status != store.FileReferenceDeliveryPending {
+		t.Fatalf("reopened pending file-reference command enumeration = %+v, %v", pending, err)
+	}
 	harness.ExpireFileReferenceDeliveryDeadline(t, reopenedSettings, "ses_file_reference_deadline", deadlineRequest.CommandID)
 	if _, err := reopened.AcknowledgeFileReferenceDelivery(ctx, "ses_file_reference_deadline", deadlineRequest.CommandID, deadlineReserved.Command.ReservationVersion, deadlineWriter); err == nil {
 		t.Fatal("expired file-reference delivery acknowledgement unexpectedly succeeded")
