@@ -993,8 +993,12 @@ func (s *Store) PublishRunControlCapability(ctx context.Context, sessionID strin
 	if err := verifyRunControlCapabilityEvent(ctx, tx, sessionID, update.EventSeq); err != nil {
 		return store.RunControlCapability{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id,created_at_ms,updated_at_ms) VALUES (?,?,1,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=excluded.capability_event_seq,capability_version=session_run_control_capabilities.capability_version+1,interrupt_supported=excluded.interrupt_supported,stop_supported=excluded.stop_supported,writer_connection_epoch=excluded.writer_connection_epoch,writer_credential_generation=excluded.writer_credential_generation,writer_lease_id=excluded.writer_lease_id,updated_at_ms=excluded.updated_at_ms`, sessionID, update.EventSeq, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID, nowMS, nowMS); err != nil {
+	result, err := tx.ExecContext(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=excluded.capability_event_seq,capability_version=excluded.capability_version,interrupt_supported=excluded.interrupt_supported,stop_supported=excluded.stop_supported,writer_connection_epoch=excluded.writer_connection_epoch,writer_credential_generation=excluded.writer_credential_generation,writer_lease_id=excluded.writer_lease_id,updated_at_ms=excluded.updated_at_ms WHERE session_run_control_capabilities.capability_event_seq < excluded.capability_event_seq`, sessionID, update.EventSeq, update.EventSeq, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID, nowMS, nowMS)
+	if err != nil {
 		return store.RunControlCapability{}, fmt.Errorf("upsert run-control capability: %w", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return store.RunControlCapability{}, errors.New("run-control capability event is stale")
 	}
 	capability, err := queryRunControlCapability(ctx, tx, sessionID)
 	if err != nil {
@@ -2144,6 +2148,63 @@ type sqliteConnectionExecutor interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+func fenceRunControlsAfterWriterReplacement(ctx context.Context, executor sqliteConnectionExecutor, sessionID string, nowMS int64) error {
+	if _, err := executor.ExecContext(ctx, `DELETE FROM session_run_control_capabilities WHERE session_id=?`, sessionID); err != nil {
+		return err
+	}
+	rows, err := executor.(interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	}).QueryContext(ctx, `SELECT cmd_id,operation,reservation_version FROM session_run_controls WHERE session_id=? AND status='pending'`, sessionID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var commandID string
+		var operation store.RunControlOperation
+		var version int64
+		if err := rows.Scan(&commandID, &operation, &version); err != nil {
+			return err
+		}
+		payload, err := json.Marshal(struct {
+			CommandID       string                    `json:"cmd_id"`
+			Operation       store.RunControlOperation `json:"operation"`
+			Outcome         store.RunControlOutcome   `json:"outcome"`
+			CompletionState *string                   `json:"completion_state"`
+			ReasonCode      *string                   `json:"reason_code"`
+		}{commandID, operation, store.RunControlOutcomeUnknown, nil, stringPointer("adapter_disconnected")})
+		if err != nil {
+			return err
+		}
+		seq, err := appendRunControlEventExecutor(ctx, executor, sessionID, "session.run.outcome", string(payload), nowMS)
+		if err != nil {
+			return err
+		}
+		result, err := executor.ExecContext(ctx, `UPDATE session_run_controls SET status='outcome_unknown',terminal_event_seq=?,updated_at_ms=? WHERE session_id=? AND cmd_id=? AND reservation_version=? AND status='pending'`, seq, nowMS, sessionID, commandID, version)
+		if err != nil {
+			return err
+		}
+		if changed, _ := result.RowsAffected(); changed != 1 {
+			return errors.New("run-control replacement fence lost race")
+		}
+	}
+	return rows.Err()
+}
+
+func appendRunControlEventExecutor(ctx context.Context, executor sqliteConnectionExecutor, sessionID, eventType, payload string, nowMS int64) (int64, error) {
+	var latest int64
+	if err := executor.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM session_events WHERE session_id=?`, sessionID).Scan(&latest); err != nil {
+		return 0, err
+	}
+	seq := latest + 1
+	if _, err := executor.ExecContext(ctx, `INSERT INTO session_events (session_id,seq,type,payload,event_time_ms,created_at_ms) VALUES (?,?,?,?,?,?)`, sessionID, seq, eventType, []byte(payload), nowMS, nowMS); err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+func stringPointer(value string) *string { return &value }
+
 func (s *Store) AllocateAdapterGrantFence(ctx context.Context) (int64, error) {
 	fence, err := s.allocateAdapterFence(ctx)
 	if err != nil {
@@ -2274,9 +2335,9 @@ func (s *Store) AcceptAdapterHello(ctx context.Context, sessionID string, hello 
 	return s.updateConnectionAfter(ctx, sessionID, `UPDATE session_adapter_connections SET connection_epoch = connection_epoch + 1, accepted_fence = ?, updated_at_ms = ?
 WHERE session_id = ? AND active_credential_generation = ? AND active_credential_expires_at_ms > ? AND revoked_at_ms IS NULL AND terminal_at_ms IS NULL`, true, func(nowMS, fence int64) []any {
 		return []any{fence, nowMS, sessionID, hello.CredentialGeneration, nowMS}
-	}, func(executor sqliteConnectionExecutor, connection store.AdapterConnection, _ int64) error {
+	}, func(executor sqliteConnectionExecutor, connection store.AdapterConnection, nowMS int64) error {
 		if hello.WriterLeaseID == "" {
-			return nil
+			return fenceRunControlsAfterWriterReplacement(ctx, executor, sessionID, nowMS)
 		}
 		if len(hello.WriterLeaseID) > 255 {
 			return errors.New("invalid adapter writer lease")
@@ -2284,7 +2345,10 @@ WHERE session_id = ? AND active_credential_generation = ? AND active_credential_
 		_, err := executor.ExecContext(ctx, `INSERT INTO session_settings_live_writers (session_id, connection_epoch, credential_generation, writer_lease_id)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(session_id) DO UPDATE SET connection_epoch=excluded.connection_epoch, credential_generation=excluded.credential_generation, writer_lease_id=excluded.writer_lease_id`, sessionID, connection.ConnectionEpoch, connection.ActiveCredentialGeneration, hello.WriterLeaseID)
-		return err
+		if err != nil {
+			return err
+		}
+		return fenceRunControlsAfterWriterReplacement(ctx, executor, sessionID, nowMS)
 	})
 }
 func (s *Store) ValidateAdapterAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {

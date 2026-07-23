@@ -291,7 +291,7 @@ func RunControlContract(t *testing.T, ledger store.RunControlStore, harness Sett
 	capability, err := ledger.PublishRunControlCapability(ctx, "ses_run_control_1", store.RunControlCapabilityUpdate{
 		EventSeq: capabilitySeq, InterruptSupported: true, StopSupported: true, Writer: writer,
 	})
-	if err != nil || capability.Version != 1 || capability.Writer != writer {
+	if err != nil || capability.Version != capabilitySeq || capability.Writer != writer {
 		t.Fatalf("PublishRunControlCapability() = %+v, %v", capability, err)
 	}
 	request := store.RunControlRequest{CommandID: "cmd_interrupt_1", Operation: store.RunControlInterrupt, PreControlState: "busy", PreControlStateSeq: stateSeq, Writer: writer}
@@ -360,6 +360,24 @@ func RunControlContract(t *testing.T, ledger store.RunControlStore, harness Sett
 	}
 	if _, err := reopened.RunControlReserve(ctx, "ses_run_control_unsupported", store.RunControlRequest{CommandID: "cmd_interrupt_unsupported", Operation: store.RunControlInterrupt, PreControlState: "busy", PreControlStateSeq: unsupportedState, Writer: unsupportedWriter}); err == nil {
 		t.Fatal("unsupported run-control capability created a reservation")
+	}
+
+	replacementWriter := bindRunControlWriter(t, reopened, "ses_run_control_replacement", "lease_run_control_old")
+	replacementState := appendRunControlEvent(t, reopened, "ses_run_control_replacement", "session.state", `{"state":"busy"}`)
+	replacementCapability := appendRunControlEvent(t, reopened, "ses_run_control_replacement", "session.run.capabilities", `{}`)
+	if _, err := reopened.PublishRunControlCapability(ctx, "ses_run_control_replacement", store.RunControlCapabilityUpdate{EventSeq: replacementCapability, InterruptSupported: true, Writer: replacementWriter}); err != nil {
+		t.Fatalf("publish replacement capability: %v", err)
+	}
+	replacementRequest := store.RunControlRequest{CommandID: "cmd_interrupt_replacement", Operation: store.RunControlInterrupt, PreControlState: "busy", PreControlStateSeq: replacementState, Writer: replacementWriter}
+	if _, err := reopened.RunControlReserve(ctx, "ses_run_control_replacement", replacementRequest); err != nil {
+		t.Fatalf("reserve replacement fixture: %v", err)
+	}
+	_ = bindRunControlWriter(t, reopened, "ses_run_control_replacement", "lease_run_control_new")
+	if pending, err := reopened.PendingRunControls(ctx, "ses_run_control_replacement"); err != nil || len(pending) != 0 {
+		t.Fatalf("writer replacement left a pending control: %+v, %v", pending, err)
+	}
+	if recovered, err := reopened.RunControl(ctx, "ses_run_control_replacement", replacementRequest.CommandID); err != nil || recovered.Outcome != store.RunControlOutcomeUnknown || recovered.TerminalEventSeq == nil {
+		t.Fatalf("writer replacement did not finalize unknown: %+v, %v", recovered, err)
 	}
 }
 

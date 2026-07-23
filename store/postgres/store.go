@@ -826,8 +826,12 @@ func (s *Store) PublishRunControlCapability(ctx context.Context, sessionID strin
 	if err := verifyPostgresRunControlCapabilityEvent(ctx, tx, sessionID, update.EventSeq); err != nil {
 		return store.RunControlCapability{}, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id) VALUES ($1,$2,1,$3,$4,$5,$6,$7) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=EXCLUDED.capability_event_seq,capability_version=session_run_control_capabilities.capability_version+1,interrupt_supported=EXCLUDED.interrupt_supported,stop_supported=EXCLUDED.stop_supported,writer_connection_epoch=EXCLUDED.writer_connection_epoch,writer_credential_generation=EXCLUDED.writer_credential_generation,writer_lease_id=EXCLUDED.writer_lease_id,updated_at=statement_timestamp()`, sessionID, update.EventSeq, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID); err != nil {
+	result, err := tx.Exec(ctx, `INSERT INTO session_run_control_capabilities (session_id,capability_event_seq,capability_version,interrupt_supported,stop_supported,writer_connection_epoch,writer_credential_generation,writer_lease_id) VALUES ($1,$2,$2,$3,$4,$5,$6,$7) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=EXCLUDED.capability_event_seq,capability_version=EXCLUDED.capability_version,interrupt_supported=EXCLUDED.interrupt_supported,stop_supported=EXCLUDED.stop_supported,writer_connection_epoch=EXCLUDED.writer_connection_epoch,writer_credential_generation=EXCLUDED.writer_credential_generation,writer_lease_id=EXCLUDED.writer_lease_id,updated_at=statement_timestamp() WHERE session_run_control_capabilities.capability_event_seq < EXCLUDED.capability_event_seq`, sessionID, update.EventSeq, update.InterruptSupported, update.StopSupported, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID)
+	if err != nil {
 		return store.RunControlCapability{}, err
+	}
+	if result.RowsAffected() != 1 {
+		return store.RunControlCapability{}, errors.New("run-control capability event is stale")
 	}
 	capability, err := queryPostgresRunControlCapability(ctx, tx, sessionID, false)
 	if err != nil {
@@ -848,6 +852,10 @@ func (s *Store) RunControlReserve(ctx context.Context, sessionID string, request
 		return store.RunControlReserve{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.RunControlReserve{}, err
+	}
 	if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, request.Writer); err != nil {
 		return store.RunControlReserve{}, err
 	}
@@ -900,6 +908,10 @@ func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID str
 		return store.RunControlReservation{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.RunControlReservation{}, err
+	}
 	now, err := postgresSettingsNow(ctx, tx)
 	if err != nil {
 		return store.RunControlReservation{}, err
@@ -1086,6 +1098,49 @@ func appendPostgresRunControlEvent(ctx context.Context, tx pgx.Tx, sessionID, ev
 		return 0, err
 	}
 	return seq, nil
+}
+
+func fencePostgresRunControlsAfterWriterReplacement(ctx context.Context, tx pgx.Tx, sessionID string) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM session_run_control_capabilities WHERE session_id=$1`, sessionID); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `SELECT cmd_id,operation,reservation_version FROM session_run_controls WHERE session_id=$1 AND status='pending' FOR UPDATE`, sessionID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var commandID string
+		var operation store.RunControlOperation
+		var version int64
+		if err := rows.Scan(&commandID, &operation, &version); err != nil {
+			return err
+		}
+		reason := "adapter_disconnected"
+		payload, err := json.Marshal(struct {
+			CommandID       string                    `json:"cmd_id"`
+			Operation       store.RunControlOperation `json:"operation"`
+			Outcome         store.RunControlOutcome   `json:"outcome"`
+			CompletionState *string                   `json:"completion_state"`
+			ReasonCode      *string                   `json:"reason_code"`
+		}{commandID, operation, store.RunControlOutcomeUnknown, nil, &reason})
+		if err != nil {
+			return err
+		}
+		seq, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.run.outcome", payload, now)
+		if err != nil {
+			return err
+		}
+		result, err := tx.Exec(ctx, `UPDATE session_run_controls SET status='outcome_unknown',terminal_event_seq=$1,updated_at=clock_timestamp() WHERE session_id=$2 AND cmd_id=$3 AND reservation_version=$4 AND status='pending'`, seq, sessionID, commandID, version)
+		if err != nil || result.RowsAffected() != 1 {
+			return errors.New("run-control replacement fence lost race")
+		}
+	}
+	return rows.Err()
 }
 
 func validPostgresRunControlCapabilityUpdate(sessionID string, update store.RunControlCapabilityUpdate) bool {
@@ -1653,18 +1708,7 @@ func (s *Store) AcceptAdapterHello(ctx context.Context, sessionID string, hello 
 	if hello.WriterLeaseID != "" && len(hello.WriterLeaseID) > 255 {
 		return store.AdapterConnection{}, errors.New("invalid adapter writer lease")
 	}
-	if hello.WriterLeaseID != "" {
-		return s.acceptAdapterHelloWithWriterLease(ctx, sessionID, hello)
-	}
-	queries, err := s.adapterConnectionQueries()
-	if err != nil {
-		return store.AdapterConnection{}, err
-	}
-	row, err := queries.AcceptAdapterHello(ctx, db.AcceptAdapterHelloParams{SessionID: sessionID, CredentialGeneration: hello.CredentialGeneration})
-	if err != nil {
-		return store.AdapterConnection{}, fmt.Errorf("accept adapter hello: %w", err)
-	}
-	return adapterConnection(row), nil
+	return s.acceptAdapterHelloWithWriterLease(ctx, sessionID, hello)
 }
 func (s *Store) acceptAdapterHelloWithWriterLease(ctx context.Context, sessionID string, hello store.AdapterHello) (store.AdapterConnection, error) {
 	if s.connectionTx != nil {
@@ -1688,15 +1732,24 @@ func (s *Store) acceptAdapterHelloWithWriterLease(ctx context.Context, sessionID
 	return connection, nil
 }
 func acceptAdapterHelloWithWriterLeaseTx(ctx context.Context, tx pgx.Tx, sessionID string, hello store.AdapterHello) (store.AdapterConnection, error) {
-	row, err := db.New(tx).AcceptAdapterHello(ctx, db.AcceptAdapterHelloParams{SessionID: sessionID, CredentialGeneration: hello.CredentialGeneration})
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.AcceptAdapterHello(ctx, db.AcceptAdapterHelloParams{SessionID: sessionID, CredentialGeneration: hello.CredentialGeneration})
 	if err != nil {
 		return store.AdapterConnection{}, fmt.Errorf("accept adapter hello: %w", err)
 	}
 	connection := adapterConnection(row)
-	if _, err := tx.Exec(ctx, `INSERT INTO session_settings_live_writers (session_id,connection_epoch,credential_generation,writer_lease_id)
+	if hello.WriterLeaseID != "" {
+		if _, err := tx.Exec(ctx, `INSERT INTO session_settings_live_writers (session_id,connection_epoch,credential_generation,writer_lease_id)
 VALUES ($1,$2,$3,$4)
 ON CONFLICT (session_id) DO UPDATE SET connection_epoch=EXCLUDED.connection_epoch,credential_generation=EXCLUDED.credential_generation,writer_lease_id=EXCLUDED.writer_lease_id`, sessionID, connection.ConnectionEpoch, connection.ActiveCredentialGeneration, hello.WriterLeaseID); err != nil {
-		return store.AdapterConnection{}, fmt.Errorf("bind adapter writer lease: %w", err)
+			return store.AdapterConnection{}, fmt.Errorf("bind adapter writer lease: %w", err)
+		}
+	}
+	if err := fencePostgresRunControlsAfterWriterReplacement(ctx, tx, sessionID); err != nil {
+		return store.AdapterConnection{}, err
 	}
 	return connection, nil
 }
