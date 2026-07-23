@@ -58,6 +58,7 @@ type recoveryTuple struct {
 // still proves the same Store-issued, non-secret connection tuple.
 type ConnectionAuthorityLifecycle interface {
 	VerifyConnectionAuthority(context.Context, store.ConnectionAuthorityReceipt) error
+	RunWithConnectionAuthority(context.Context, store.ConnectionAuthorityReceipt, func(context.Context) error) error
 }
 
 type RecoveryAuthority struct {
@@ -81,6 +82,19 @@ func (a RecoveryAuthority) verify(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	return a.lifecycle.VerifyConnectionAuthority(ctx, a.receipt)
+}
+
+func (a RecoveryAuthority) run(ctx context.Context, run func(context.Context) error) error {
+	if err := validateRecoveryAuthority(a); err != nil {
+		return err
+	}
+	if run == nil {
+		return ErrRecoveryAuthorityLost
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return a.lifecycle.RunWithConnectionAuthority(ctx, a.receipt, run)
 }
 
 type GroupSupervisorConfig struct {
@@ -111,6 +125,7 @@ type supervisedWorker struct {
 	worker       SessionWorkerRunner
 	workspaceKey store.WorkspaceLeaseKey
 	recovery     *RecoveryAuthority
+	runMu        *sync.Mutex
 }
 
 // GroupSupervisor owns bounded in-process membership. Durable lease release
@@ -187,7 +202,7 @@ func (s *GroupSupervisor) Admit(ctx context.Context, admission GroupWorkerAdmiss
 	if worker == nil {
 		return fmt.Errorf("construct session worker: %w", ErrInvalidGroupWorkerAdmission)
 	}
-	s.bySession[admission.SessionID] = supervisedWorker{worker: worker}
+	s.bySession[admission.SessionID] = supervisedWorker{worker: worker, runMu: &sync.Mutex{}}
 	s.byWorkspace[admission.Lease.Key] = admission.SessionID
 	return nil
 }
@@ -237,7 +252,7 @@ func (s *GroupSupervisor) Recover(ctx context.Context, recovery GroupWorkerRecov
 		}
 	}
 	authority := recovery.Authority
-	s.bySession[recovery.Admission.SessionID] = supervisedWorker{worker: worker, workspaceKey: recovery.Admission.Lease.Key, recovery: &authority}
+	s.bySession[recovery.Admission.SessionID] = supervisedWorker{worker: worker, workspaceKey: recovery.Admission.Lease.Key, recovery: &authority, runMu: &sync.Mutex{}}
 	s.byWorkspace[recovery.Admission.Lease.Key] = recovery.Admission.SessionID
 	return nil
 }
@@ -247,11 +262,16 @@ func (s *GroupSupervisor) Run(ctx context.Context, sessionID string) error {
 	if err != nil {
 		return err
 	}
+	if member.runMu != nil {
+		member.runMu.Lock()
+		defer member.runMu.Unlock()
+	}
 	if member.recovery != nil {
-		if err := member.recovery.verify(ctx); err != nil {
+		if err := member.recovery.run(ctx, member.worker.Run); err != nil {
 			s.fenceRecoveredWorker(sessionID, member)
 			return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
 		}
+		return nil
 	}
 	return member.worker.Run(ctx)
 }

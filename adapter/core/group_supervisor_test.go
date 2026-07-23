@@ -309,6 +309,29 @@ func TestGroupSupervisorRunFencesRecoveredWorkerForLifecycleInvalidation(t *test
 	}
 }
 
+func TestGroupSupervisorAtomicLifecycleFencePreventsProviderStartAfterRevocation(t *testing.T) {
+	leases := &recordingWorkspaceLeaseReserver{}
+	verifier := &recordingRecoveryVerifier{revokeBeforeRun: true}
+	worker := &fakeGroupWorker{}
+	group, err := NewGroupSupervisor(GroupSupervisorConfig{
+		MaxWorkers: 1,
+		Leases:     leases,
+		NewWorker:  func(SessionWorkerConfig) (SessionWorkerRunner, error) { return worker, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewGroupSupervisor() error = %v", err)
+	}
+	if err := group.Recover(context.Background(), validGroupWorkerRecovery("worker_1", "ses_1", 1, verifier)); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if err := group.Run(context.Background(), "ses_1"); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("Run(revoked before atomic start) error = %v, want ErrRecoveryAuthorityLost", err)
+	}
+	if worker.runs != 0 || group.WorkerCount() != 0 {
+		t.Fatalf("atomic lifecycle fence started or retained Provider: runs=%d workers=%d", worker.runs, group.WorkerCount())
+	}
+}
+
 func TestGroupSupervisorRecoveryDeniesSecondWorkerWithoutActivation(t *testing.T) {
 	leases := &recordingWorkspaceLeaseReserver{}
 	verifier := &recordingRecoveryVerifier{}
@@ -465,13 +488,25 @@ func (g callbackMultiWorkerGate) AllowMultiWorker(ctx context.Context) error {
 }
 
 type recordingRecoveryVerifier struct {
-	calls int
-	err   error
+	calls           int
+	err             error
+	revokeBeforeRun bool
 }
 
 func (v *recordingRecoveryVerifier) VerifyConnectionAuthority(_ context.Context, _ store.ConnectionAuthorityReceipt) error {
 	v.calls++
 	return v.err
+}
+
+func (v *recordingRecoveryVerifier) RunWithConnectionAuthority(ctx context.Context, _ store.ConnectionAuthorityReceipt, run func(context.Context) error) error {
+	v.calls++
+	if v.err != nil {
+		return v.err
+	}
+	if v.revokeBeforeRun {
+		return errors.New("connection authority revoked before Provider start")
+	}
+	return run(ctx)
 }
 
 type callbackRecoveryLifecycle struct {
@@ -480,6 +515,13 @@ type callbackRecoveryLifecycle struct {
 
 func (v callbackRecoveryLifecycle) VerifyConnectionAuthority(ctx context.Context, receipt store.ConnectionAuthorityReceipt) error {
 	return v.verify(ctx, receipt)
+}
+
+func (v callbackRecoveryLifecycle) RunWithConnectionAuthority(ctx context.Context, receipt store.ConnectionAuthorityReceipt, run func(context.Context) error) error {
+	if err := v.verify(ctx, receipt); err != nil {
+		return err
+	}
+	return run(ctx)
 }
 
 func supervisorLockAvailable(group *GroupSupervisor) bool {
