@@ -218,6 +218,58 @@ func TestWebSocketSettingsFinalizesReportedSuccessWithProviderMismatch(t *testin
 	}
 }
 
+func TestWebSocketSettingsReplacementRecoversPendingReservation(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "settings-recovery.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	first := dialWebSocket(t, server.URL)
+	defer first.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeAdapterHelloV2(t, first, "adapter-token")
+	_ = readFrame(t, first).(*protocol.HelloAck)
+	publishSettingsCapability(t, first, "capability_before_recovery", 1001, settingsCapabilityPayload("sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000", "balanced"))
+	_ = readFrame(t, client).(*protocol.Event)
+
+	command := &protocol.Command{CommandID: "cmd_settings_recovery", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","model_id":"reasoning"}`)}
+	writeFrame(t, client, command)
+	_ = readFrame(t, first).(*protocol.Command)
+	writeFrame(t, first, &protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted})
+	_ = readFrame(t, first).(*protocol.SettingsDeliveryExecute)
+	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckAccepted {
+		t.Fatalf("delivery acknowledgement = %+v", ack)
+	}
+
+	replacement := dialWebSocket(t, server.URL)
+	defer replacement.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, replacement, "adapter-token")
+	_ = readFrame(t, replacement).(*protocol.HelloAck)
+	publishSettingsCapability(t, replacement, "capability_after_recovery", 1002, settingsCapabilityPayload("sha256:5e6c6921513d5a3e3ed9f5fc0a67bb94e55a66f822a76b1ced587d5a908e2761", "reasoning"))
+	if capability := readFrame(t, client).(*protocol.Event); capability.Type != "session.settings.capabilities" || capability.Seq == nil || *capability.Seq != 2 {
+		t.Fatalf("replacement capability fanout = %+v", capability)
+	}
+	terminal := readFrame(t, client).(*protocol.Event)
+	if terminal.Type != "session.settings.effective" || terminal.Seq == nil || *terminal.Seq != 3 ||
+		!strings.Contains(string(terminal.Payload), `"outcome":"outcome_unknown"`) || !strings.Contains(string(terminal.Payload), `"reason_code":"recovery_unconfirmed"`) || strings.Contains(string(terminal.Payload), "writer_lease") {
+		t.Fatalf("replacement recovery terminal = %+v", terminal)
+	}
+	stored, err := events.SettingsCommand(ctx, "ses_1", command.CommandID)
+	if err != nil || stored.Status != store.SettingsCommandOutcomeUnknown || stored.TerminalEventSeq == nil || *stored.TerminalEventSeq != 3 {
+		t.Fatalf("replacement recovery ledger = %+v, %v", stored, err)
+	}
+}
+
 func publishSettingsCapability(t *testing.T, adapter *websocket.Conn, proposalID string, at int64, payload json.RawMessage) {
 	t.Helper()
 	writeFrame(t, adapter, &protocol.Event{Type: "session.settings.capabilities", SessionID: "ses_1", Time: at, ProposalID: proposalID, Payload: payload})
@@ -1330,6 +1382,26 @@ func TestWebSocketServerRejectsSettingsChangeWithoutLiteralControlScope(t *testi
 	}
 	if calls := events.appended(); len(calls) != 0 {
 		t.Fatalf("settings command persisted before literal control authorization: %+v", calls)
+	}
+}
+
+func TestWebSocketServerRejectsV1SettingsWithLiteralReason(t *testing.T) {
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersion, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	if ack := readFrame(t, client).(*protocol.HelloAck); ack.Capabilities != nil && ack.Capabilities.Settings != nil {
+		t.Fatalf("v1 hello acknowledged Settings capability: %+v", ack.Capabilities)
+	}
+	command := &protocol.Command{CommandID: "cmd_settings_v1", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","model_id":"reasoning"}`)}
+	writeFrame(t, client, command)
+	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "settings_unsupported" {
+		t.Fatalf("v1 Settings acknowledgement = %+v", ack)
+	}
+	if calls := events.appended(); len(calls) != 0 {
+		t.Fatalf("v1 Settings command reached the Store: %+v", calls)
 	}
 }
 

@@ -466,10 +466,19 @@ func DecodeSettingsCapabilityPayload(payload json.RawMessage) (SettingsCapabilit
 			return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
 		}
 	}
+	models, err := decodeSettingsCapabilityChoices(fields["models"])
+	if err != nil {
+		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+	}
+	permissionModes, err := decodeSettingsCapabilityChoices(fields["permission_modes"])
+	if err != nil {
+		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+	}
 	var out SettingsCapabilityPayload
+	out.Models = models
+	out.PermissionModes = permissionModes
 	if json.Unmarshal(fields["schema_version"], &out.SchemaVersion) != nil || out.SchemaVersion != 1 ||
 		json.Unmarshal(fields["fingerprint"], &out.Fingerprint) != nil || !validSettingsFingerprint(out.Fingerprint) ||
-		json.Unmarshal(fields["models"], &out.Models) != nil || json.Unmarshal(fields["permission_modes"], &out.PermissionModes) != nil ||
 		json.Unmarshal(fields["effective_model_id"], &out.EffectiveModelID) != nil || json.Unmarshal(fields["effective_permission_mode_id"], &out.EffectivePermissionModeID) != nil ||
 		json.Unmarshal(fields["model_change"], &out.ModelChange) != nil || json.Unmarshal(fields["permission_change"], &out.PermissionChange) != nil ||
 		json.Unmarshal(fields["model_read_only_reason"], &out.ModelReadOnlyReason) != nil || json.Unmarshal(fields["permission_read_only_reason"], &out.PermissionReadOnlyReason) != nil {
@@ -485,6 +494,27 @@ func DecodeSettingsCapabilityPayload(payload json.RawMessage) (SettingsCapabilit
 		return SettingsCapabilityPayload{}, errors.New("settings capability fingerprint mismatch")
 	}
 	return out, nil
+}
+
+func decodeSettingsCapabilityChoices(data json.RawMessage) ([]SettingsCapabilityChoice, error) {
+	var entries []json.RawMessage
+	if json.Unmarshal(data, &entries) != nil {
+		return nil, errors.New("invalid settings capability choices")
+	}
+	choices := make([]SettingsCapabilityChoice, len(entries))
+	for index, entry := range entries {
+		fields, err := strictObject(entry)
+		if err != nil || len(fields) != 2 || fields["id"] == nil || fields["label"] == nil ||
+			json.Unmarshal(fields["id"], &choices[index].ID) != nil || json.Unmarshal(fields["label"], &choices[index].Label) != nil {
+			return nil, errors.New("invalid settings capability choice")
+		}
+		for key := range fields {
+			if key != "id" && key != "label" {
+				return nil, errors.New("invalid settings capability choice")
+			}
+		}
+	}
+	return choices, nil
 }
 
 // DecodeSettingsEffectivePayload validates the exact terminal result grammar

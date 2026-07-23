@@ -194,6 +194,18 @@ func TestSettingsCommandRejectsNonCanonicalPayloads(t *testing.T) {
 	}
 }
 
+func TestSettingsCapabilityPayloadRejectsNonCanonicalChoices(t *testing.T) {
+	for _, raw := range []string{
+		`{"schema_version":1,"fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","models":[{"id":"balanced","label":"Balanced","provider":"hidden"},{"id":"reasoning","label":"Reasoning"}],"permission_modes":[{"id":"ask","label":"Ask first"},{"id":"workspace","label":"Workspace"}],"effective_model_id":"balanced","effective_permission_mode_id":"ask","model_change":"allowed","permission_change":"allowed","model_read_only_reason":null,"permission_read_only_reason":null}`,
+		`{"schema_version":1,"fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","models":[{"id":"balanced","id":"balanced","label":"Balanced"},{"id":"reasoning","label":"Reasoning"}],"permission_modes":[{"id":"ask","label":"Ask first"},{"id":"workspace","label":"Workspace"}],"effective_model_id":"balanced","effective_permission_mode_id":"ask","model_change":"allowed","permission_change":"allowed","model_read_only_reason":null,"permission_read_only_reason":null}`,
+		`{"schema_version":1,"fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","models":[{"id":"balanced","label":"Balanced"},{"id":"reasoning","label":"Reasoning"}],"permission_modes":[{"id":"ask","label":"Ask first","extra":true},{"id":"workspace","label":"Workspace"}],"effective_model_id":"balanced","effective_permission_mode_id":"ask","model_change":"allowed","permission_change":"allowed","model_read_only_reason":null,"permission_read_only_reason":null}`,
+	} {
+		if _, err := DecodeSettingsCapabilityPayload([]byte(raw)); err == nil {
+			t.Fatalf("DecodeSettingsCapabilityPayload(%s) unexpectedly succeeded", raw)
+		}
+	}
+}
+
 func TestSettingsDeliveryExecuteFrameIsStrictAndV2Bounded(t *testing.T) {
 	valid := `{"frame":"settings.delivery.execute","session_id":"ses_1","cmd_id":"cmd_settings_1","reservation_version":7,"operation_timeout_ms":30000}`
 	frame, err := Decode([]byte(valid))

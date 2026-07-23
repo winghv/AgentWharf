@@ -1013,7 +1013,7 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 	})
 }
 
-func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string, afterCommit func(context.Context, int64) error) error {
+func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string, afterCommit func(context.Context, int64) ([]protocol.Event, error)) error {
 	proposals, ok := h.events.(store.ProposedEventStore)
 	if !ok {
 		return errors.New("proposed event store is not configured")
@@ -1047,8 +1047,10 @@ func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *a
 		if receipt.SessionID != event.SessionID || receipt.ProposalID != proposalID || receipt.Seq < 1 || receipt.Status != store.ProposedEventAccepted {
 			return errors.New("proposed event store returned an invalid receipt")
 		}
+		var afterEvents []protocol.Event
 		if afterCommit != nil {
-			if err := afterCommit(ctx, receipt.Seq); err != nil {
+			afterEvents, err = afterCommit(ctx, receipt.Seq)
+			if err != nil {
 				return err
 			}
 		}
@@ -1064,6 +1066,9 @@ func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *a
 		cancelReceipt()
 		broadcastCtx, cancelBroadcast := context.WithTimeout(context.Background(), adapterAuthorityPollInterval)
 		h.broadcastEvent(broadcastCtx, event)
+		for _, afterEvent := range afterEvents {
+			h.broadcastEvent(broadcastCtx, afterEvent)
+		}
 		cancelBroadcast()
 		return nil
 	}); err != nil {
@@ -1084,14 +1089,14 @@ func (h *webSocketHandler) commitSettingsCapabilityProposal(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	return h.commitAdapterProposal(ctx, adapter, event, proposalID, func(commitCtx context.Context, seq int64) error {
+	if err := h.commitAdapterProposal(ctx, adapter, event, proposalID, func(commitCtx context.Context, seq int64) ([]protocol.Event, error) {
 		h.commandMu.Lock()
 		cached, alreadyPublished := h.settingsCapabilities[event.SessionID]
 		h.commandMu.Unlock()
 		if alreadyPublished && cached.EventSeq == seq && cached.Fingerprint == capability.Fingerprint &&
 			cached.EffectiveModelID == capability.EffectiveModelID && cached.EffectivePermissionModeID == capability.EffectivePermissionModeID &&
 			cached.Writer == adapter.settingsWriter {
-			return nil
+			return nil, nil
 		}
 		published, err := ledger.PublishSettingsCapability(commitCtx, event.SessionID, store.SettingsCapabilityUpdate{
 			EventSeq:                  seq,
@@ -1101,18 +1106,60 @@ func (h *webSocketHandler) commitSettingsCapabilityProposal(ctx context.Context,
 			Writer:                    adapter.settingsWriter,
 		})
 		if err != nil {
-			return fmt.Errorf("publish settings capability: %w", err)
+			return nil, fmt.Errorf("publish settings capability: %w", err)
 		}
 		h.commandMu.Lock()
 		h.settingsCapabilities[event.SessionID] = published
 		h.commandMu.Unlock()
-		return nil
-	})
+		pending, err := ledger.PendingSettingsCommands(commitCtx, event.SessionID)
+		if err != nil {
+			return nil, fmt.Errorf("list pending settings commands: %w", err)
+		}
+		recovered := make([]protocol.Event, 0, len(pending))
+		for _, command := range pending {
+			if (command.Status != store.SettingsCommandPending && command.Status != store.SettingsCommandRecoveryPending) || command.Writer == adapter.settingsWriter {
+				continue
+			}
+			if command.Status == store.SettingsCommandPending {
+				command, err = ledger.RecoverSettingsCommand(commitCtx, event.SessionID, command.CommandID, command.Writer)
+				if err != nil {
+					return nil, fmt.Errorf("recover settings command: %w", err)
+				}
+				if command.Status != store.SettingsCommandRecoveryPending {
+					return nil, errors.New("settings recovery returned an invalid command")
+				}
+			}
+			reason := "recovery_unconfirmed"
+			finalized, err := ledger.FinalizeSettingsCommand(commitCtx, event.SessionID, command.CommandID, store.SettingsCommandFinalize{
+				ReservationVersion:  command.ReservationVersion,
+				ExpectedStatus:      store.SettingsCommandRecoveryPending,
+				Outcome:             store.SettingsCommandOutcomeUnknown,
+				ReasonCode:          &reason,
+				EffectiveCapability: published,
+			})
+			if err != nil || finalized.TerminalEventSeq == nil {
+				if err == nil {
+					err = errors.New("settings recovery returned no terminal event")
+				}
+				return nil, err
+			}
+			payload, err := store.SettingsTerminalEventPayload(finalized, published, finalized.Status, &reason)
+			if err != nil {
+				return nil, err
+			}
+			terminalSeq := *finalized.TerminalEventSeq
+			recovered = append(recovered, protocol.Event{Type: "session.settings.effective", SessionID: event.SessionID, Seq: &terminalSeq, Time: time.Now().UTC().UnixMilli(), Payload: payload})
+		}
+		return recovered, nil
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (h *webSocketHandler) handleSettingsChange(ctx context.Context, conn *managedConn, peer *clientConnection, accepted AcceptedPeer, cmd *protocol.Command) error {
 	if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
-		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "unsupported")
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "settings_unsupported")
 		return errors.New("settings changes are v2 Client-only")
 	}
 	ledger, ok := h.events.(store.SettingsCommandStore)
