@@ -1196,6 +1196,219 @@ func (s *Store) PendingRunControls(ctx context.Context, sessionID string) ([]sto
 	return reservations, nil
 }
 
+func (s *Store) PublishFileReferenceCapability(ctx context.Context, sessionID string, update store.FileReferenceCapabilityUpdate) (store.FileReferenceCapability, error) {
+	if !validFileReferenceCapabilityUpdate(sessionID, update) {
+		return store.FileReferenceCapability{}, errors.New("invalid file-reference capability")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	defer tx.Rollback()
+	now, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	if err := lockCommandAuthority(ctx, tx, sessionID, store.CommandAuthority{ConnectionEpoch: update.Writer.ConnectionEpoch, CredentialGeneration: update.Writer.CredentialGeneration}); err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	if err := validateLiveSettingsWriter(ctx, tx, sessionID, update.Writer); err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	var typ string
+	if tx.QueryRowContext(ctx, `SELECT type FROM session_events WHERE session_id=? AND seq=?`, sessionID, update.EventSeq).Scan(&typ) != nil || typ != "session.file_references.capabilities" {
+		return store.FileReferenceCapability{}, errors.New("file-reference capability event is invalid")
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO session_file_reference_capabilities (session_id,capability_event_seq,capability_fingerprint,writer_connection_epoch,writer_credential_generation,writer_lease_id,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=excluded.capability_event_seq,capability_fingerprint=excluded.capability_fingerprint,writer_connection_epoch=excluded.writer_connection_epoch,writer_credential_generation=excluded.writer_credential_generation,writer_lease_id=excluded.writer_lease_id,updated_at_ms=excluded.updated_at_ms WHERE session_file_reference_capabilities.capability_event_seq < excluded.capability_event_seq`, sessionID, update.EventSeq, update.Fingerprint, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID, now, now)
+	if err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return store.FileReferenceCapability{}, errors.New("file-reference capability is stale")
+	}
+	capability, err := queryFileReferenceCapability(ctx, tx, sessionID)
+	if err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	return capability, tx.Commit()
+}
+
+func (s *Store) CommitFileReferenceCommand(ctx context.Context, sessionID string, message store.PendingEvent, request store.FileReferenceCommandRequest) (store.FileReferenceCommandReserve, error) {
+	if !validFileReferenceRequest(sessionID, request) || message.Type != "session.message" || !json.Valid(message.Payload) {
+		return store.FileReferenceCommandReserve{}, errors.New("invalid file-reference command")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	defer tx.Rollback()
+	now, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	existing, err := queryFileReferenceCommand(ctx, tx, sessionID, request.CommandID)
+	if err == nil {
+		if existing.MessageID != request.MessageID || existing.CapabilityFingerprint != request.CapabilityFingerprint || existing.RequestFingerprint != request.RequestFingerprint || existing.ReferenceCount != request.ReferenceCount {
+			return store.FileReferenceCommandReserve{}, errors.New("file-reference command ID is reused")
+		}
+		if err := tx.Commit(); err != nil {
+			return store.FileReferenceCommandReserve{}, err
+		}
+		return store.FileReferenceCommandReserve{Command: existing, Duplicate: true}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	capability, err := queryFileReferenceCapability(ctx, tx, sessionID)
+	if err != nil || capability.Fingerprint != request.CapabilityFingerprint || validateLiveSettingsWriter(ctx, tx, sessionID, capability.Writer) != nil {
+		return store.FileReferenceCommandReserve{}, errors.New("file-reference capability is stale")
+	}
+	if _, err := appendRunControlEventTx(ctx, tx, sessionID, message.Type, string(message.Payload), now); err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO session_file_reference_commands (session_id,cmd_id,message_id,capability_fingerprint,request_fingerprint,reference_count,reservation_version,status,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,?,1,'delivery_pending',?,?)`, sessionID, request.CommandID, request.MessageID, request.CapabilityFingerprint, request.RequestFingerprint, request.ReferenceCount, now, now); err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	command, err := queryFileReferenceCommand(ctx, tx, sessionID, request.CommandID)
+	if err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	return store.FileReferenceCommandReserve{Command: command}, nil
+}
+
+func (s *Store) AcknowledgeFileReferenceDelivery(ctx context.Context, sessionID, commandID string, version int64, writer store.FileReferenceWriter) (store.FileReferenceCommand, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	defer tx.Rollback()
+	if !validConnectionID(sessionID) || !validSettingsWriter(writer) || version < 1 {
+		return store.FileReferenceCommand{}, errors.New("invalid file-reference delivery")
+	}
+	if err := lockCommandAuthority(ctx, tx, sessionID, store.CommandAuthority{ConnectionEpoch: writer.ConnectionEpoch, CredentialGeneration: writer.CredentialGeneration}); err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	if err := validateLiveSettingsWriter(ctx, tx, sessionID, writer); err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	capability, err := queryFileReferenceCapability(ctx, tx, sessionID)
+	if err != nil || capability.Writer != writer {
+		return store.FileReferenceCommand{}, errors.New("file-reference writer is fenced")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_file_reference_commands SET writer_connection_epoch=?,writer_credential_generation=?,writer_lease_id=?,status='pending',updated_at_ms=? WHERE session_id=? AND cmd_id=? AND reservation_version=? AND status='delivery_pending'`, writer.ConnectionEpoch, writer.CredentialGeneration, writer.LeaseID, time.Now().UnixMilli(), sessionID, commandID, version)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return store.FileReferenceCommand{}, errors.New("file-reference delivery is fenced")
+	}
+	command, err := queryFileReferenceCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	return command, tx.Commit()
+}
+
+func (s *Store) FinalizeFileReferenceCommand(ctx context.Context, sessionID, commandID string, finalize store.FileReferenceCommandFinalize) (store.FileReferenceCommand, error) {
+	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || (finalize.Outcome != store.FileReferenceDelivered && finalize.Outcome != store.FileReferenceRejected && finalize.Outcome != store.FileReferenceOutcomeUnknown) {
+		return store.FileReferenceCommand{}, errors.New("invalid file-reference finalization")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	defer tx.Rollback()
+	now, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	command, err := queryFileReferenceCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	if command.ReservationVersion != finalize.ReservationVersion || command.Status != store.FileReferencePending {
+		return store.FileReferenceCommand{}, errors.New("file-reference finalization is fenced")
+	}
+	if finalize.Outcome != store.FileReferenceOutcomeUnknown {
+		if finalize.Writer == nil || command.Writer == nil || *finalize.Writer != *command.Writer {
+			return store.FileReferenceCommand{}, errors.New("file-reference writer finalization is fenced")
+		}
+		if err := lockCommandAuthority(ctx, tx, sessionID, store.CommandAuthority{ConnectionEpoch: finalize.Writer.ConnectionEpoch, CredentialGeneration: finalize.Writer.CredentialGeneration}); err != nil {
+			return store.FileReferenceCommand{}, err
+		}
+		if err := validateLiveSettingsWriter(ctx, tx, sessionID, *finalize.Writer); err != nil {
+			return store.FileReferenceCommand{}, err
+		}
+		capability, err := queryFileReferenceCapability(ctx, tx, sessionID)
+		if err != nil || capability.Writer != *finalize.Writer || capability.Fingerprint != command.CapabilityFingerprint {
+			return store.FileReferenceCommand{}, errors.New("file-reference capability is fenced")
+		}
+	}
+	payload, err := json.Marshal(struct {
+		MessageID      string                           `json:"message_id"`
+		CommandID      string                           `json:"cmd_id"`
+		Outcome        store.FileReferenceCommandStatus `json:"outcome"`
+		ReferenceIndex *int                             `json:"reference_index"`
+		Reason         *string                          `json:"reason"`
+	}{command.MessageID, command.CommandID, finalize.Outcome, finalize.ReferenceIndex, finalize.ReasonCode})
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	seq, err := appendRunControlEventTx(ctx, tx, sessionID, "session.file_references.outcome", string(payload), now)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE session_file_reference_commands SET status=?,terminal_event_seq=?,updated_at_ms=? WHERE session_id=? AND cmd_id=? AND reservation_version=? AND status='pending' AND terminal_event_seq IS NULL`, finalize.Outcome, seq, now, sessionID, commandID, finalize.ReservationVersion)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return store.FileReferenceCommand{}, errors.New("file-reference terminal update is fenced")
+	}
+	command, err = queryFileReferenceCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	return command, tx.Commit()
+}
+
+func (s *Store) RecoverFileReferenceCommand(ctx context.Context, sessionID, commandID, reason string) (store.FileReferenceCommand, error) {
+	command, err := s.FileReferenceCommand(ctx, sessionID, commandID)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	if command.Status == store.FileReferenceDeliveryPending {
+		return store.FileReferenceCommand{}, errors.New("unrouted file-reference recovery requires delivery timeout")
+	}
+	return s.FinalizeFileReferenceCommand(ctx, sessionID, commandID, store.FileReferenceCommandFinalize{ReservationVersion: command.ReservationVersion, Outcome: store.FileReferenceOutcomeUnknown, ReasonCode: &reason})
+}
+func (s *Store) FileReferenceCommand(ctx context.Context, sessionID, commandID string) (store.FileReferenceCommand, error) {
+	return queryFileReferenceCommand(ctx, s.db, sessionID, commandID)
+}
+func (s *Store) PendingFileReferenceCommands(ctx context.Context, sessionID string) ([]store.FileReferenceCommand, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT cmd_id FROM session_file_reference_commands WHERE session_id=? AND status IN ('delivery_pending','pending') ORDER BY reservation_version`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var commands []store.FileReferenceCommand
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		command, err := s.FileReferenceCommand(ctx, sessionID, id)
+		if err != nil {
+			return nil, err
+		}
+		commands = append(commands, command)
+	}
+	return commands, rows.Err()
+}
+
 func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2198,6 +2411,51 @@ func fenceRunControlsAfterWriterReplacement(ctx context.Context, executor sqlite
 			return errors.New("run-control replacement fence lost race")
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return fenceFileReferenceCommandsAfterWriterReplacement(ctx, executor, sessionID, nowMS)
+}
+
+func fenceFileReferenceCommandsAfterWriterReplacement(ctx context.Context, executor sqliteConnectionExecutor, sessionID string, nowMS int64) error {
+	if _, err := executor.ExecContext(ctx, `DELETE FROM session_file_reference_capabilities WHERE session_id=?`, sessionID); err != nil {
+		return err
+	}
+	rows, err := executor.(interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	}).QueryContext(ctx, `SELECT cmd_id,message_id FROM session_file_reference_commands WHERE session_id=? AND status IN ('delivery_pending','pending')`, sessionID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var commandID, messageID string
+		if err := rows.Scan(&commandID, &messageID); err != nil {
+			return err
+		}
+		reason := "writer_replaced"
+		payload, err := json.Marshal(struct {
+			MessageID      string  `json:"message_id"`
+			CommandID      string  `json:"cmd_id"`
+			Outcome        string  `json:"outcome"`
+			ReferenceIndex *int    `json:"reference_index"`
+			Reason         *string `json:"reason"`
+		}{messageID, commandID, "outcome_unknown", nil, &reason})
+		if err != nil {
+			return err
+		}
+		seq, err := appendRunControlEventExecutor(ctx, executor, sessionID, "session.file_references.outcome", string(payload), nowMS)
+		if err != nil {
+			return err
+		}
+		result, err := executor.ExecContext(ctx, `UPDATE session_file_reference_commands SET status='outcome_unknown',terminal_event_seq=?,updated_at_ms=? WHERE session_id=? AND cmd_id=? AND status IN ('delivery_pending','pending')`, seq, nowMS, sessionID, commandID)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return errors.New("file-reference replacement fence lost race")
+		}
+	}
 	return rows.Err()
 }
 
@@ -2797,6 +3055,47 @@ func validSettingsWriter(writer store.SettingsWriter) bool {
 
 type runControlQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type fileReferenceQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func queryFileReferenceCapability(ctx context.Context, querier fileReferenceQuerier, sessionID string) (store.FileReferenceCapability, error) {
+	var capability store.FileReferenceCapability
+	err := querier.QueryRowContext(ctx, `SELECT session_id,capability_event_seq,capability_fingerprint,writer_connection_epoch,writer_credential_generation,writer_lease_id FROM session_file_reference_capabilities WHERE session_id=?`, sessionID).Scan(&capability.SessionID, &capability.EventSeq, &capability.Fingerprint, &capability.Writer.ConnectionEpoch, &capability.Writer.CredentialGeneration, &capability.Writer.LeaseID)
+	if err != nil || !validFileReferenceCapabilityUpdate(capability.SessionID, store.FileReferenceCapabilityUpdate{EventSeq: capability.EventSeq, Fingerprint: capability.Fingerprint, Writer: capability.Writer}) {
+		return store.FileReferenceCapability{}, errors.New("file-reference capability row is invalid")
+	}
+	return capability, nil
+}
+
+func queryFileReferenceCommand(ctx context.Context, querier fileReferenceQuerier, sessionID, commandID string) (store.FileReferenceCommand, error) {
+	var command store.FileReferenceCommand
+	var epoch, generation sql.NullInt64
+	var lease sql.NullString
+	var terminal sql.NullInt64
+	var status string
+	err := querier.QueryRowContext(ctx, `SELECT session_id,cmd_id,message_id,capability_fingerprint,request_fingerprint,reference_count,reservation_version,writer_connection_epoch,writer_credential_generation,writer_lease_id,status,terminal_event_seq FROM session_file_reference_commands WHERE session_id=? AND cmd_id=?`, sessionID, commandID).Scan(&command.SessionID, &command.CommandID, &command.MessageID, &command.CapabilityFingerprint, &command.RequestFingerprint, &command.ReferenceCount, &command.ReservationVersion, &epoch, &generation, &lease, &status, &terminal)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	command.Status = store.FileReferenceCommandStatus(status)
+	if epoch.Valid && generation.Valid && lease.Valid {
+		command.Writer = &store.FileReferenceWriter{ConnectionEpoch: epoch.Int64, CredentialGeneration: generation.Int64, LeaseID: lease.String}
+	}
+	if terminal.Valid {
+		value := terminal.Int64
+		command.TerminalEventSeq = &value
+	}
+	return command, nil
+}
+
+func validFileReferenceCapabilityUpdate(sessionID string, update store.FileReferenceCapabilityUpdate) bool {
+	return validConnectionID(sessionID) && update.EventSeq > 0 && validSettingsFingerprint(update.Fingerprint) && validSettingsWriter(update.Writer)
+}
+func validFileReferenceRequest(sessionID string, request store.FileReferenceCommandRequest) bool {
+	return validConnectionID(sessionID) && request.CommandID != "" && len(request.CommandID) <= 256 && request.MessageID != "" && len(request.MessageID) <= 256 && validSettingsFingerprint(request.CapabilityFingerprint) && validSettingsFingerprint(request.RequestFingerprint) && request.ReferenceCount >= 1 && request.ReferenceCount <= 8
 }
 
 func queryRunControlCapability(ctx context.Context, querier runControlQuerier, sessionID string) (store.RunControlCapability, error) {
@@ -3651,6 +3950,38 @@ CREATE TABLE IF NOT EXISTS session_run_controls (
     CHECK ((status = 'pending' AND terminal_event_seq IS NULL) OR (status <> 'pending' AND terminal_event_seq IS NOT NULL))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS session_run_controls_one_pending_idx ON session_run_controls (session_id) WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS session_file_reference_capabilities (
+    session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 255),
+    capability_event_seq INTEGER NOT NULL,
+    capability_fingerprint TEXT NOT NULL CHECK (length(capability_fingerprint) = 71),
+    writer_connection_epoch INTEGER NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation INTEGER NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (length(writer_lease_id) BETWEEN 1 AND 255),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (session_id, capability_event_seq) REFERENCES session_events(session_id, seq)
+);
+CREATE TABLE IF NOT EXISTS session_file_reference_commands (
+    session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
+    cmd_id TEXT NOT NULL CHECK (length(cmd_id) BETWEEN 1 AND 256),
+    message_id TEXT NOT NULL CHECK (length(message_id) BETWEEN 1 AND 256),
+    capability_fingerprint TEXT NOT NULL CHECK (length(capability_fingerprint) = 71),
+    request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 71),
+    reference_count INTEGER NOT NULL CHECK (reference_count BETWEEN 1 AND 8),
+    reservation_version INTEGER NOT NULL CHECK (reservation_version > 0),
+    writer_connection_epoch INTEGER,
+    writer_credential_generation INTEGER,
+    writer_lease_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('delivery_pending', 'pending', 'delivered', 'rejected', 'outcome_unknown')),
+    terminal_event_seq INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id, cmd_id),
+    FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
+    CHECK ((status = 'delivery_pending' AND writer_connection_epoch IS NULL AND writer_credential_generation IS NULL AND writer_lease_id IS NULL AND terminal_event_seq IS NULL) OR (status = 'pending' AND writer_connection_epoch IS NOT NULL AND writer_credential_generation IS NOT NULL AND writer_lease_id IS NOT NULL AND terminal_event_seq IS NULL) OR (status IN ('delivered', 'rejected', 'outcome_unknown') AND terminal_event_seq IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS session_file_reference_commands_one_nonterminal_idx ON session_file_reference_commands (session_id) WHERE status IN ('delivery_pending', 'pending');
 
 CREATE TABLE IF NOT EXISTS session_event_proposals (
     session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),

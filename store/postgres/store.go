@@ -1032,6 +1032,202 @@ func (s *Store) PendingRunControls(ctx context.Context, sessionID string) ([]sto
 	return reservations, nil
 }
 
+func (s *Store) PublishFileReferenceCapability(ctx context.Context, sessionID string, update store.FileReferenceCapabilityUpdate) (store.FileReferenceCapability, error) {
+	if !validPostgresFileReferenceCapabilityUpdate(sessionID, update) {
+		return store.FileReferenceCapability{}, errors.New("invalid file-reference capability")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	defer tx.Rollback(ctx)
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, update.Writer); err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	var eventType string
+	if err := tx.QueryRow(ctx, `SELECT type FROM session_events WHERE session_id=$1 AND seq=$2`, sessionID, update.EventSeq).Scan(&eventType); err != nil || eventType != "session.file_references.capabilities" {
+		return store.FileReferenceCapability{}, errors.New("file-reference capability event is invalid")
+	}
+	result, err := tx.Exec(ctx, `INSERT INTO session_file_reference_capabilities (session_id,capability_event_seq,capability_fingerprint,writer_connection_epoch,writer_credential_generation,writer_lease_id) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=EXCLUDED.capability_event_seq,capability_fingerprint=EXCLUDED.capability_fingerprint,writer_connection_epoch=EXCLUDED.writer_connection_epoch,writer_credential_generation=EXCLUDED.writer_credential_generation,writer_lease_id=EXCLUDED.writer_lease_id,updated_at=clock_timestamp() WHERE session_file_reference_capabilities.capability_event_seq < EXCLUDED.capability_event_seq`, sessionID, update.EventSeq, update.Fingerprint, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID)
+	if err != nil || result.RowsAffected() != 1 {
+		return store.FileReferenceCapability{}, errors.New("file-reference capability is stale")
+	}
+	capability, err := queryPostgresFileReferenceCapability(ctx, tx, sessionID, false)
+	if err != nil {
+		return store.FileReferenceCapability{}, err
+	}
+	return capability, tx.Commit(ctx)
+}
+
+func (s *Store) CommitFileReferenceCommand(ctx context.Context, sessionID string, message store.PendingEvent, request store.FileReferenceCommandRequest) (store.FileReferenceCommandReserve, error) {
+	if !validPostgresFileReferenceRequest(sessionID, request) || message.Type != "session.message" || !json.Valid(message.Payload) {
+		return store.FileReferenceCommandReserve{}, errors.New("invalid file-reference command")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	defer tx.Rollback(ctx)
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	existing, err := queryPostgresFileReferenceCommand(ctx, tx, sessionID, request.CommandID, true)
+	if err == nil {
+		if existing.MessageID != request.MessageID || existing.CapabilityFingerprint != request.CapabilityFingerprint || existing.RequestFingerprint != request.RequestFingerprint || existing.ReferenceCount != request.ReferenceCount {
+			return store.FileReferenceCommandReserve{}, errors.New("file-reference command ID is reused")
+		}
+		return store.FileReferenceCommandReserve{Command: existing, Duplicate: true}, tx.Commit(ctx)
+	}
+	if err != pgx.ErrNoRows {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	capability, err := queryPostgresFileReferenceCapability(ctx, tx, sessionID, true)
+	if err != nil || capability.Fingerprint != request.CapabilityFingerprint || validatePostgresLiveSettingsWriter(ctx, tx, sessionID, capability.Writer) != nil {
+		return store.FileReferenceCommandReserve{}, errors.New("file-reference capability is stale")
+	}
+	if _, err := appendPostgresRunControlEvent(ctx, tx, sessionID, message.Type, message.Payload, message.Time); err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO session_file_reference_commands (session_id,cmd_id,message_id,capability_fingerprint,request_fingerprint,reference_count,reservation_version,status) VALUES ($1,$2,$3,$4,$5,$6,1,'delivery_pending')`, sessionID, request.CommandID, request.MessageID, request.CapabilityFingerprint, request.RequestFingerprint, request.ReferenceCount); err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	command, err := queryPostgresFileReferenceCommand(ctx, tx, sessionID, request.CommandID, false)
+	if err != nil {
+		return store.FileReferenceCommandReserve{}, err
+	}
+	return store.FileReferenceCommandReserve{Command: command}, tx.Commit(ctx)
+}
+
+func (s *Store) AcknowledgeFileReferenceDelivery(ctx context.Context, sessionID, commandID string, version int64, writer store.FileReferenceWriter) (store.FileReferenceCommand, error) {
+	if !validConnectionID(sessionID) || !validPostgresSettingsWriter(writer) || version < 1 {
+		return store.FileReferenceCommand{}, errors.New("invalid file-reference delivery")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	defer tx.Rollback(ctx)
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, writer); err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	capability, err := queryPostgresFileReferenceCapability(ctx, tx, sessionID, true)
+	if err != nil || capability.Writer != writer {
+		return store.FileReferenceCommand{}, errors.New("file-reference writer is fenced")
+	}
+	result, err := tx.Exec(ctx, `UPDATE session_file_reference_commands SET writer_connection_epoch=$1,writer_credential_generation=$2,writer_lease_id=$3,status='pending',updated_at=clock_timestamp() WHERE session_id=$4 AND cmd_id=$5 AND reservation_version=$6 AND status='delivery_pending'`, writer.ConnectionEpoch, writer.CredentialGeneration, writer.LeaseID, sessionID, commandID, version)
+	if err != nil || result.RowsAffected() != 1 {
+		return store.FileReferenceCommand{}, errors.New("file-reference delivery is fenced")
+	}
+	command, err := queryPostgresFileReferenceCommand(ctx, tx, sessionID, commandID, false)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	return command, tx.Commit(ctx)
+}
+
+func (s *Store) FinalizeFileReferenceCommand(ctx context.Context, sessionID, commandID string, finalize store.FileReferenceCommandFinalize) (store.FileReferenceCommand, error) {
+	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || (finalize.Outcome != store.FileReferenceDelivered && finalize.Outcome != store.FileReferenceRejected && finalize.Outcome != store.FileReferenceOutcomeUnknown) {
+		return store.FileReferenceCommand{}, errors.New("invalid file-reference finalization")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	defer tx.Rollback(ctx)
+	queries := db.New(tx)
+	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	command, err := queryPostgresFileReferenceCommand(ctx, tx, sessionID, commandID, true)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	if command.ReservationVersion != finalize.ReservationVersion || command.Status != store.FileReferencePending {
+		return store.FileReferenceCommand{}, errors.New("file-reference finalization is fenced")
+	}
+	if finalize.Outcome != store.FileReferenceOutcomeUnknown {
+		if finalize.Writer == nil || command.Writer == nil || *finalize.Writer != *command.Writer {
+			return store.FileReferenceCommand{}, errors.New("file-reference writer finalization is fenced")
+		}
+		if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, *finalize.Writer); err != nil {
+			return store.FileReferenceCommand{}, err
+		}
+		capability, err := queryPostgresFileReferenceCapability(ctx, tx, sessionID, true)
+		if err != nil || capability.Writer != *finalize.Writer || capability.Fingerprint != command.CapabilityFingerprint {
+			return store.FileReferenceCommand{}, errors.New("file-reference capability is fenced")
+		}
+	}
+	payload, err := json.Marshal(struct {
+		MessageID      string                           `json:"message_id"`
+		CommandID      string                           `json:"cmd_id"`
+		Outcome        store.FileReferenceCommandStatus `json:"outcome"`
+		ReferenceIndex *int                             `json:"reference_index"`
+		Reason         *string                          `json:"reason"`
+	}{command.MessageID, command.CommandID, finalize.Outcome, finalize.ReferenceIndex, finalize.ReasonCode})
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	seq, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.file_references.outcome", payload, now)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	result, err := tx.Exec(ctx, `UPDATE session_file_reference_commands SET status=$1,terminal_event_seq=$2,updated_at=clock_timestamp() WHERE session_id=$3 AND cmd_id=$4 AND reservation_version=$5 AND status='pending' AND terminal_event_seq IS NULL`, finalize.Outcome, seq, sessionID, commandID, finalize.ReservationVersion)
+	if err != nil || result.RowsAffected() != 1 {
+		return store.FileReferenceCommand{}, errors.New("file-reference terminal update is fenced")
+	}
+	command, err = queryPostgresFileReferenceCommand(ctx, tx, sessionID, commandID, false)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	return command, tx.Commit(ctx)
+}
+func (s *Store) RecoverFileReferenceCommand(ctx context.Context, sessionID, commandID, reason string) (store.FileReferenceCommand, error) {
+	command, err := s.FileReferenceCommand(ctx, sessionID, commandID)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	if command.Status == store.FileReferenceDeliveryPending {
+		return store.FileReferenceCommand{}, errors.New("unrouted file-reference recovery requires delivery timeout")
+	}
+	return s.FinalizeFileReferenceCommand(ctx, sessionID, commandID, store.FileReferenceCommandFinalize{ReservationVersion: command.ReservationVersion, Outcome: store.FileReferenceOutcomeUnknown, ReasonCode: &reason})
+}
+func (s *Store) FileReferenceCommand(ctx context.Context, sessionID, commandID string) (store.FileReferenceCommand, error) {
+	return queryPostgresFileReferenceCommand(ctx, s.pool, sessionID, commandID, false)
+}
+func (s *Store) PendingFileReferenceCommands(ctx context.Context, sessionID string) ([]store.FileReferenceCommand, error) {
+	rows, err := s.pool.Query(ctx, `SELECT cmd_id FROM session_file_reference_commands WHERE session_id=$1 AND status IN ('delivery_pending','pending') ORDER BY reservation_version`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var commands []store.FileReferenceCommand
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		command, err := s.FileReferenceCommand(ctx, sessionID, id)
+		if err != nil {
+			return nil, err
+		}
+		commands = append(commands, command)
+	}
+	return commands, rows.Err()
+}
+
 type postgresSettingsQuerier interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
@@ -1152,6 +1348,50 @@ func fencePostgresRunControlsAfterWriterReplacement(ctx context.Context, tx pgx.
 			return errors.New("run-control replacement fence lost race")
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return fencePostgresFileReferenceCommandsAfterWriterReplacement(ctx, tx, sessionID)
+}
+
+func fencePostgresFileReferenceCommandsAfterWriterReplacement(ctx context.Context, tx pgx.Tx, sessionID string) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM session_file_reference_capabilities WHERE session_id=$1`, sessionID); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `SELECT cmd_id,message_id FROM session_file_reference_commands WHERE session_id=$1 AND status IN ('delivery_pending','pending') FOR UPDATE`, sessionID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var commandID, messageID string
+		if err := rows.Scan(&commandID, &messageID); err != nil {
+			return err
+		}
+		reason := "writer_replaced"
+		payload, err := json.Marshal(struct {
+			MessageID      string  `json:"message_id"`
+			CommandID      string  `json:"cmd_id"`
+			Outcome        string  `json:"outcome"`
+			ReferenceIndex *int    `json:"reference_index"`
+			Reason         *string `json:"reason"`
+		}{messageID, commandID, "outcome_unknown", nil, &reason})
+		if err != nil {
+			return err
+		}
+		seq, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.file_references.outcome", payload, now)
+		if err != nil {
+			return err
+		}
+		result, err := tx.Exec(ctx, `UPDATE session_file_reference_commands SET status='outcome_unknown',terminal_event_seq=$1,updated_at=clock_timestamp() WHERE session_id=$2 AND cmd_id=$3 AND status IN ('delivery_pending','pending')`, seq, sessionID, commandID)
+		if err != nil || result.RowsAffected() != 1 {
+			return errors.New("file-reference replacement fence lost race")
+		}
+	}
 	return rows.Err()
 }
 
@@ -1218,6 +1458,49 @@ WHERE writer.session_id=$1 AND writer.connection_epoch=$2 AND writer.credential_
 		return errors.New("settings writer has no live authority")
 	}
 	return nil
+}
+
+func validPostgresFileReferenceCapabilityUpdate(sessionID string, update store.FileReferenceCapabilityUpdate) bool {
+	return validConnectionID(sessionID) && update.EventSeq > 0 && validPostgresSettingsFingerprint(update.Fingerprint) && validPostgresSettingsWriter(update.Writer)
+}
+func validPostgresFileReferenceRequest(sessionID string, request store.FileReferenceCommandRequest) bool {
+	return validConnectionID(sessionID) && validPostgresSettingsID(request.CommandID) && validPostgresSettingsID(request.MessageID) && validPostgresSettingsFingerprint(request.CapabilityFingerprint) && validPostgresSettingsFingerprint(request.RequestFingerprint) && request.ReferenceCount >= 1 && request.ReferenceCount <= 8
+}
+func queryPostgresFileReferenceCapability(ctx context.Context, querier postgresSettingsQuerier, sessionID string, lock bool) (store.FileReferenceCapability, error) {
+	query := `SELECT session_id,capability_event_seq,capability_fingerprint,writer_connection_epoch,writer_credential_generation,writer_lease_id FROM session_file_reference_capabilities WHERE session_id=$1`
+	if lock {
+		query += ` FOR UPDATE`
+	}
+	var capability store.FileReferenceCapability
+	err := querier.QueryRow(ctx, query, sessionID).Scan(&capability.SessionID, &capability.EventSeq, &capability.Fingerprint, &capability.Writer.ConnectionEpoch, &capability.Writer.CredentialGeneration, &capability.Writer.LeaseID)
+	if err != nil || !validPostgresFileReferenceCapabilityUpdate(capability.SessionID, store.FileReferenceCapabilityUpdate{EventSeq: capability.EventSeq, Fingerprint: capability.Fingerprint, Writer: capability.Writer}) {
+		return store.FileReferenceCapability{}, errors.New("file-reference capability row is invalid")
+	}
+	return capability, nil
+}
+func queryPostgresFileReferenceCommand(ctx context.Context, querier postgresSettingsQuerier, sessionID, commandID string, lock bool) (store.FileReferenceCommand, error) {
+	query := `SELECT session_id,cmd_id,message_id,capability_fingerprint,request_fingerprint,reference_count,reservation_version,writer_connection_epoch,writer_credential_generation,writer_lease_id,status,terminal_event_seq FROM session_file_reference_commands WHERE session_id=$1 AND cmd_id=$2`
+	if lock {
+		query += ` FOR UPDATE`
+	}
+	var command store.FileReferenceCommand
+	var epoch, generation pgtype.Int8
+	var lease pgtype.Text
+	var terminal pgtype.Int8
+	var status string
+	err := querier.QueryRow(ctx, query, sessionID, commandID).Scan(&command.SessionID, &command.CommandID, &command.MessageID, &command.CapabilityFingerprint, &command.RequestFingerprint, &command.ReferenceCount, &command.ReservationVersion, &epoch, &generation, &lease, &status, &terminal)
+	if err != nil {
+		return store.FileReferenceCommand{}, err
+	}
+	command.Status = store.FileReferenceCommandStatus(status)
+	if epoch.Valid && generation.Valid && lease.Valid {
+		command.Writer = &store.FileReferenceWriter{ConnectionEpoch: epoch.Int64, CredentialGeneration: generation.Int64, LeaseID: lease.String}
+	}
+	if terminal.Valid {
+		value := terminal.Int64
+		command.TerminalEventSeq = &value
+	}
+	return command, nil
 }
 
 func queryPostgresSettingsCapability(ctx context.Context, querier postgresSettingsQuerier, sessionID string, lock bool) (store.SettingsCapability, error) {

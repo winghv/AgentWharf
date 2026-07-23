@@ -51,6 +51,11 @@ func SettingsCommandContract(t *testing.T, harness SettingsCommandHarness) {
 		t.Fatal("settings-command backend does not implement the run-control ledger")
 	}
 	RunControlContract(t, runControl, harness)
+	fileReferences, ok := ledgerForRunControl.(store.FileReferenceCommandStore)
+	if !ok {
+		t.Fatal("settings-command backend does not implement the file-reference ledger")
+	}
+	FileReferenceCommandContract(t, fileReferences, harness)
 	ctx := context.Background()
 	capability := store.SettingsCapabilityUpdate{
 		Fingerprint:      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -386,6 +391,90 @@ func RunControlContract(t *testing.T, ledger store.RunControlStore, harness Sett
 	}
 	if recovered, err := reopened.RunControl(ctx, "ses_run_control_replacement", replacementRequest.CommandID); err != nil || recovered.Outcome != store.RunControlOutcomeUnknown || recovered.TerminalEventSeq == nil {
 		t.Fatalf("writer replacement did not finalize unknown: %+v, %v", recovered, err)
+	}
+}
+
+func FileReferenceCommandContract(t *testing.T, ledger store.FileReferenceCommandStore, harness SettingsCommandHarness) {
+	t.Helper()
+	ctx := context.Background()
+	writer := bindRunControlWriter(t, ledger.(store.RunControlStore), "ses_file_reference_1", "lease_file_reference_1")
+	capabilitySeq := appendRunControlEvent(t, ledger, "ses_file_reference_1", "session.file_references.capabilities", `{}`)
+	capability, err := ledger.PublishFileReferenceCapability(ctx, "ses_file_reference_1", store.FileReferenceCapabilityUpdate{
+		EventSeq: capabilitySeq, Fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Writer: writer,
+	})
+	if err != nil || capability.EventSeq != capabilitySeq || capability.Writer != writer {
+		t.Fatalf("PublishFileReferenceCapability() = %+v, %v", capability, err)
+	}
+	request := store.FileReferenceCommandRequest{
+		CommandID: "cmd_file_reference_1", MessageID: "msg_file_reference_1", CapabilityFingerprint: capability.Fingerprint,
+		RequestFingerprint: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", ReferenceCount: 2,
+	}
+	message := store.PendingEvent{Type: "session.message", Time: time.Now(), Payload: json.RawMessage(`{"content":"opaque"}`)}
+	reserved, err := ledger.CommitFileReferenceCommand(ctx, "ses_file_reference_1", message, request)
+	if err != nil || reserved.Duplicate || reserved.Command.Status != store.FileReferenceDeliveryPending || reserved.Command.Writer != nil || reserved.Command.TerminalEventSeq != nil {
+		t.Fatalf("CommitFileReferenceCommand() = %+v, %v", reserved, err)
+	}
+	if retry, err := ledger.CommitFileReferenceCommand(ctx, "ses_file_reference_1", message, request); err != nil || !retry.Duplicate || !reflect.DeepEqual(retry.Command, reserved.Command) {
+		t.Fatalf("exact file-reference retry = %+v, %v", retry, err)
+	}
+	changed := request
+	changed.ReferenceCount = 1
+	if _, err := ledger.CommitFileReferenceCommand(ctx, "ses_file_reference_1", message, changed); err == nil {
+		t.Fatal("changed file-reference cmd_id retry unexpectedly succeeded")
+	}
+	if _, err := ledger.AcknowledgeFileReferenceDelivery(ctx, "ses_file_reference_1", request.CommandID, reserved.Command.ReservationVersion, store.FileReferenceWriter{ConnectionEpoch: writer.ConnectionEpoch, CredentialGeneration: writer.CredentialGeneration, LeaseID: "stale"}); err == nil {
+		t.Fatal("stale writer acknowledged file-reference delivery")
+	}
+	delivered, err := ledger.AcknowledgeFileReferenceDelivery(ctx, "ses_file_reference_1", request.CommandID, reserved.Command.ReservationVersion, writer)
+	if err != nil || delivered.Status != store.FileReferencePending || delivered.Writer == nil || *delivered.Writer != writer {
+		t.Fatalf("AcknowledgeFileReferenceDelivery() = %+v, %v", delivered, err)
+	}
+	finalized, err := ledger.FinalizeFileReferenceCommand(ctx, "ses_file_reference_1", request.CommandID, store.FileReferenceCommandFinalize{ReservationVersion: delivered.ReservationVersion, Writer: &writer, Outcome: store.FileReferenceDelivered})
+	if err != nil || finalized.Status != store.FileReferenceDelivered || finalized.TerminalEventSeq == nil {
+		t.Fatalf("FinalizeFileReferenceCommand() = %+v, %v", finalized, err)
+	}
+	if _, err := ledger.FinalizeFileReferenceCommand(ctx, "ses_file_reference_1", request.CommandID, store.FileReferenceCommandFinalize{ReservationVersion: delivered.ReservationVersion, Writer: &writer, Outcome: store.FileReferenceDelivered}); err == nil {
+		t.Fatal("second file-reference terminal finalization unexpectedly succeeded")
+	}
+	settingsLedger, ok := ledger.(store.SettingsCommandStore)
+	if !ok {
+		t.Fatal("file-reference backend cannot use durable reopen harness")
+	}
+	reopened, ok := harness.Reopen(t, settingsLedger).(store.FileReferenceCommandStore)
+	if !ok {
+		t.Fatal("reopened backend does not implement the file-reference ledger")
+	}
+	if command, err := reopened.FileReferenceCommand(ctx, "ses_file_reference_1", request.CommandID); err != nil || !reflect.DeepEqual(command, finalized) {
+		t.Fatalf("reopened file-reference command = %+v, %v", command, err)
+	}
+	replacementWriter := bindRunControlWriter(t, reopened.(store.RunControlStore), "ses_file_reference_replacement", "lease_file_reference_old")
+	replacementCapabilitySeq := appendRunControlEvent(t, reopened, "ses_file_reference_replacement", "session.file_references.capabilities", `{}`)
+	if _, err := reopened.PublishFileReferenceCapability(ctx, "ses_file_reference_replacement", store.FileReferenceCapabilityUpdate{EventSeq: replacementCapabilitySeq, Fingerprint: capability.Fingerprint, Writer: replacementWriter}); err != nil {
+		t.Fatalf("publish replacement file-reference capability: %v", err)
+	}
+	replacementRequest := request
+	replacementRequest.MessageID = "msg_file_reference_replacement"
+	if _, err := reopened.CommitFileReferenceCommand(ctx, "ses_file_reference_replacement", message, replacementRequest); err != nil {
+		t.Fatalf("reserve replacement file-reference command: %v", err)
+	}
+	_ = bindRunControlWriter(t, reopened.(store.RunControlStore), "ses_file_reference_replacement", "lease_file_reference_new")
+	if pending, err := reopened.PendingFileReferenceCommands(ctx, "ses_file_reference_replacement"); err != nil || len(pending) != 0 {
+		t.Fatalf("writer replacement left a pending file-reference command: %+v, %v", pending, err)
+	}
+	if command, err := reopened.FileReferenceCommand(ctx, "ses_file_reference_replacement", replacementRequest.CommandID); err != nil || command.Status != store.FileReferenceOutcomeUnknown || command.TerminalEventSeq == nil {
+		t.Fatalf("writer replacement did not finalize file-reference unknown: %+v, %v", command, err)
+	}
+	crossWriter := bindRunControlWriter(t, reopened.(store.RunControlStore), "ses_file_reference_cross", "lease_file_reference_cross")
+	crossCapabilitySeq := appendRunControlEvent(t, reopened, "ses_file_reference_cross", "session.file_references.capabilities", `{}`)
+	if _, err := reopened.PublishFileReferenceCapability(ctx, "ses_file_reference_cross", store.FileReferenceCapabilityUpdate{EventSeq: crossCapabilitySeq, Fingerprint: capability.Fingerprint, Writer: crossWriter}); err != nil {
+		t.Fatalf("publish cross-session file-reference capability: %v", err)
+	}
+	if _, err := reopened.CommitFileReferenceCommand(ctx, "ses_file_reference_cross", message, request); err != nil {
+		t.Fatalf("cross-session file-reference cmd_id unexpectedly conflicted: %v", err)
+	}
+	encoded, err := json.Marshal(finalized)
+	if err != nil || bytes.Contains(encoded, []byte("path")) || bytes.Contains(encoded, []byte("digest")) || bytes.Contains(encoded, []byte("bytes")) || bytes.Contains(encoded, []byte("content")) {
+		t.Fatalf("file-reference ledger persisted forbidden metadata: %s, %v", encoded, err)
 	}
 }
 

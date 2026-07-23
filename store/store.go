@@ -781,3 +781,81 @@ type RunControlStore interface {
 	RunControl(ctx context.Context, sessionID, commandID string) (RunControlReservation, error)
 	PendingRunControls(ctx context.Context, sessionID string) ([]RunControlReservation, error)
 }
+
+// FileReferenceWriter is the trusted Adapter connection tuple. It is never a
+// client-visible field and must be revalidated against the live connection.
+type FileReferenceWriter = SettingsWriter
+
+type FileReferenceCapability struct {
+	SessionID   string
+	EventSeq    int64
+	Fingerprint string
+	Writer      FileReferenceWriter
+}
+
+type FileReferenceCapabilityUpdate struct {
+	EventSeq    int64
+	Fingerprint string
+	Writer      FileReferenceWriter
+}
+
+type FileReferenceCommandStatus string
+
+const (
+	FileReferenceDeliveryPending FileReferenceCommandStatus = "delivery_pending"
+	FileReferencePending         FileReferenceCommandStatus = "pending"
+	FileReferenceDelivered       FileReferenceCommandStatus = "delivered"
+	FileReferenceRejected        FileReferenceCommandStatus = "rejected"
+	FileReferenceOutcomeUnknown  FileReferenceCommandStatus = "outcome_unknown"
+)
+
+// FileReferenceCommand intentionally contains no path, filename, digest, byte
+// count, media type or file content. Those fields live only in the durable
+// user message and the Adapter's trusted workspace boundary.
+type FileReferenceCommand struct {
+	SessionID             string
+	CommandID             string
+	MessageID             string
+	CapabilityFingerprint string
+	RequestFingerprint    string
+	ReferenceCount        int
+	ReservationVersion    int64
+	Writer                *FileReferenceWriter
+	Status                FileReferenceCommandStatus
+	TerminalEventSeq      *int64
+}
+
+type FileReferenceCommandRequest struct {
+	CommandID             string
+	MessageID             string
+	CapabilityFingerprint string
+	RequestFingerprint    string
+	ReferenceCount        int
+}
+
+type FileReferenceCommandReserve struct {
+	Command   FileReferenceCommand
+	Duplicate bool
+}
+
+type FileReferenceCommandFinalize struct {
+	ReservationVersion int64
+	Writer             *FileReferenceWriter
+	Outcome            FileReferenceCommandStatus
+	ReasonCode         *string
+	ReferenceIndex     *int
+}
+
+// FileReferenceCommandStore atomically appends an accepted user message and
+// its opaque command ledger record. Hub routing and protocol decoding remain
+// outside this Store boundary.
+type FileReferenceCommandStore interface {
+	EventStore
+	PublishFileReferenceCapability(ctx context.Context, sessionID string, update FileReferenceCapabilityUpdate) (FileReferenceCapability, error)
+	CommitFileReferenceCommand(ctx context.Context, sessionID string, message PendingEvent, request FileReferenceCommandRequest) (FileReferenceCommandReserve, error)
+	AcknowledgeFileReferenceDelivery(ctx context.Context, sessionID, commandID string, reservationVersion int64, writer FileReferenceWriter) (FileReferenceCommand, error)
+	FinalizeFileReferenceCommand(ctx context.Context, sessionID, commandID string, finalize FileReferenceCommandFinalize) (FileReferenceCommand, error)
+	RecoverFileReferenceCommand(ctx context.Context, sessionID, commandID, reason string) (FileReferenceCommand, error)
+	FileReferenceCommand(ctx context.Context, sessionID, commandID string) (FileReferenceCommand, error)
+	PendingFileReferenceCommands(ctx context.Context, sessionID string) ([]FileReferenceCommand, error)
+}

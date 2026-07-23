@@ -225,6 +225,38 @@ CREATE TABLE session_run_controls (
     CHECK ((status = 'pending' AND terminal_event_seq IS NULL) OR (status <> 'pending' AND terminal_event_seq IS NOT NULL))
 );
 CREATE UNIQUE INDEX session_run_controls_one_pending_idx ON session_run_controls (session_id) WHERE status = 'pending';
+
+CREATE TABLE session_file_reference_capabilities (
+    session_id TEXT PRIMARY KEY REFERENCES agent_sessions(id),
+    capability_event_seq BIGINT NOT NULL,
+    capability_fingerprint TEXT NOT NULL CHECK (char_length(capability_fingerprint) = 71),
+    writer_connection_epoch BIGINT NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation BIGINT NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (char_length(writer_lease_id) BETWEEN 1 AND 255),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    FOREIGN KEY (session_id, capability_event_seq) REFERENCES session_events(session_id, seq)
+);
+CREATE TABLE session_file_reference_commands (
+    session_id TEXT NOT NULL REFERENCES agent_sessions(id),
+    cmd_id TEXT NOT NULL CHECK (char_length(cmd_id) BETWEEN 1 AND 256),
+    message_id TEXT NOT NULL CHECK (char_length(message_id) BETWEEN 1 AND 256),
+    capability_fingerprint TEXT NOT NULL CHECK (char_length(capability_fingerprint) = 71),
+    request_fingerprint TEXT NOT NULL CHECK (char_length(request_fingerprint) = 71),
+    reference_count INTEGER NOT NULL CHECK (reference_count BETWEEN 1 AND 8),
+    reservation_version BIGINT NOT NULL CHECK (reservation_version > 0),
+    writer_connection_epoch BIGINT,
+    writer_credential_generation BIGINT,
+    writer_lease_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('delivery_pending', 'pending', 'delivered', 'rejected', 'outcome_unknown')),
+    terminal_event_seq BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    PRIMARY KEY (session_id, cmd_id),
+    FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
+    CHECK ((status = 'delivery_pending' AND writer_connection_epoch IS NULL AND writer_credential_generation IS NULL AND writer_lease_id IS NULL AND terminal_event_seq IS NULL) OR (status = 'pending' AND writer_connection_epoch IS NOT NULL AND writer_credential_generation IS NOT NULL AND writer_lease_id IS NOT NULL AND terminal_event_seq IS NULL) OR (status IN ('delivered', 'rejected', 'outcome_unknown') AND terminal_event_seq IS NOT NULL))
+);
+CREATE UNIQUE INDEX session_file_reference_commands_one_nonterminal_idx ON session_file_reference_commands (session_id) WHERE status IN ('delivery_pending', 'pending');
 CREATE SEQUENCE session_adapter_connection_accepted_fence_seq AS BIGINT MINVALUE 1 START WITH 1;
 CREATE TABLE session_attachments (
     attach_id TEXT PRIMARY KEY CHECK (char_length(attach_id) BETWEEN 1 AND 255),
