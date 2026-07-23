@@ -53,20 +53,128 @@ type recoveryTuple struct {
 	Quarantined          bool
 }
 
-// ConnectionAuthorityLifecycle is the Adapter connection lifecycle that owns the
-// current T42B0 receipt. A RecoveryAuthority is usable only while this lifecycle
-// still proves the same Store-issued, non-secret connection tuple.
-type ConnectionAuthorityLifecycle interface {
-	VerifyConnectionAuthority(context.Context, store.ConnectionAuthorityReceipt) error
-	RunWithConnectionAuthority(context.Context, store.ConnectionAuthorityReceipt, func(context.Context) error) error
+// ConnectionAuthorityLifecycle is the concrete Adapter-side fence for one
+// T42B0 Store-issued, non-secret receipt. The Store reader is checked before
+// recovery construction and again while the lifecycle read lock spans the
+// final receipt check and Provider-start callback.
+type ConnectionAuthorityLifecycle struct {
+	mu                sync.RWMutex
+	current           store.ConnectionAuthorityReceipt
+	authorityStore    store.AdapterConnectionStore
+	revoked           bool
+	verificationCalls int
+}
+
+func NewConnectionAuthorityLifecycle(receipt store.ConnectionAuthorityReceipt, authorityStore store.AdapterConnectionStore) (*ConnectionAuthorityLifecycle, error) {
+	if authorityStore == nil {
+		return nil, ErrRecoveryAuthorityLost
+	}
+	if err := validateConnectionAuthorityReceipt(receipt); err != nil {
+		return nil, err
+	}
+	return &ConnectionAuthorityLifecycle{current: receipt, authorityStore: authorityStore}, nil
+}
+
+func (l *ConnectionAuthorityLifecycle) VerifyConnectionAuthority(ctx context.Context, receipt store.ConnectionAuthorityReceipt) error {
+	if l == nil {
+		return ErrRecoveryAuthorityLost
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.verificationCalls++
+	if err := l.validateLocked(receipt); err != nil {
+		return err
+	}
+	return l.validateStore(ctx, receipt)
+}
+
+// RunWithConnectionAuthority makes final validation and Provider start one
+// lifecycle-critical section. Revocation/replacement waits for the callback.
+func (l *ConnectionAuthorityLifecycle) RunWithConnectionAuthority(ctx context.Context, receipt store.ConnectionAuthorityReceipt, run func(context.Context) error) error {
+	if l == nil || run == nil {
+		return ErrRecoveryAuthorityLost
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if err := l.validateLocked(receipt); err != nil {
+		return err
+	}
+	if err := l.validateStore(ctx, receipt); err != nil {
+		return err
+	}
+	return run(ctx)
+}
+
+func (l *ConnectionAuthorityLifecycle) Replace(receipt store.ConnectionAuthorityReceipt) error {
+	if l == nil || validateConnectionAuthorityReceipt(receipt) != nil {
+		return ErrRecoveryAuthorityLost
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.revoked {
+		return ErrRecoveryAuthorityLost
+	}
+	l.current = receipt
+	return nil
+}
+
+func (l *ConnectionAuthorityLifecycle) Revoke() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.revoked = true
+	l.mu.Unlock()
+}
+
+func (l *ConnectionAuthorityLifecycle) verificationCount() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.verificationCalls
+}
+
+func (l *ConnectionAuthorityLifecycle) validateLocked(receipt store.ConnectionAuthorityReceipt) error {
+	if l.revoked || !sameConnectionAuthority(l.current, receipt) {
+		return ErrRecoveryAuthorityLost
+	}
+	return validateConnectionAuthorityReceipt(receipt)
+}
+
+func (l *ConnectionAuthorityLifecycle) validateStore(ctx context.Context, receipt store.ConnectionAuthorityReceipt) error {
+	if l == nil || l.authorityStore == nil {
+		return ErrRecoveryAuthorityLost
+	}
+	connection, err := l.authorityStore.AdapterConnection(ctx, receipt.SessionID)
+	if err != nil {
+		return ErrRecoveryAuthorityLost
+	}
+	if connection.SessionID != receipt.SessionID ||
+		connection.ConnectionEpoch != receipt.ConnectionEpoch ||
+		connection.AcceptedFence != receipt.AcceptedFence ||
+		connection.ActiveCredentialGeneration != receipt.CredentialGeneration ||
+		!connection.ActiveCredentialExpiresAt.Equal(receipt.ExpiresAt) ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil ||
+		!connection.ActiveCredentialExpiresAt.After(time.Now()) {
+		return ErrRecoveryAuthorityLost
+	}
+	return nil
 }
 
 type RecoveryAuthority struct {
 	receipt   store.ConnectionAuthorityReceipt
-	lifecycle ConnectionAuthorityLifecycle
+	lifecycle *ConnectionAuthorityLifecycle
 }
 
-func NewRecoveryAuthority(receipt store.ConnectionAuthorityReceipt, lifecycle ConnectionAuthorityLifecycle) (RecoveryAuthority, error) {
+func NewRecoveryAuthority(receipt store.ConnectionAuthorityReceipt, lifecycle *ConnectionAuthorityLifecycle) (RecoveryAuthority, error) {
 	authority := RecoveryAuthority{receipt: receipt, lifecycle: lifecycle}
 	if err := validateRecoveryAuthority(authority); err != nil {
 		return RecoveryAuthority{}, err
@@ -385,15 +493,27 @@ func validateGroupWorkerRecovery(recovery GroupWorkerRecovery) error {
 }
 
 func validateRecoveryAuthority(authority RecoveryAuthority) error {
-	if authority.lifecycle == nil {
+	if authority.lifecycle == nil || authority.lifecycle.authorityStore == nil {
 		return ErrRecoveryAuthorityLost
 	}
-	receipt := authority.receipt
+	return validateConnectionAuthorityReceipt(authority.receipt)
+}
+
+func validateConnectionAuthorityReceipt(receipt store.ConnectionAuthorityReceipt) error {
 	if receipt.SessionID == "" || receipt.ConnectionEpoch < 1 || receipt.CredentialGeneration < 1 ||
 		receipt.AcceptedFence < 1 || receipt.WriterLeaseID == "" || receipt.ExpiresAt.IsZero() || !receipt.ExpiresAt.After(time.Now()) {
 		return ErrRecoveryAuthorityLost
 	}
 	return nil
+}
+
+func sameConnectionAuthority(left, right store.ConnectionAuthorityReceipt) bool {
+	return left.SessionID == right.SessionID &&
+		left.ConnectionEpoch == right.ConnectionEpoch &&
+		left.CredentialGeneration == right.CredentialGeneration &&
+		left.AcceptedFence == right.AcceptedFence &&
+		left.WriterLeaseID == right.WriterLeaseID &&
+		left.ExpiresAt.Equal(right.ExpiresAt)
 }
 
 func isZeroWorkspaceLeaseKey(key store.WorkspaceLeaseKey) bool {
