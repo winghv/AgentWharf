@@ -39,6 +39,8 @@ const (
 	FramePong                         FrameName = "pong"
 	FrameError                        FrameName = "error"
 	FrameHistoryPage                  FrameName = "history.page"
+	FrameAttentionSubscribe           FrameName = "attention.subscribe"
+	FrameAttentionSummary             FrameName = "attention.summary"
 	FrameTargetJoinChallenge          FrameName = "target.join.challenge"
 	FrameTargetJoin                   FrameName = "target.join"
 	FrameTargetJoinCredential         FrameName = "target.join.credential"
@@ -181,14 +183,19 @@ type HelloAck struct {
 func (*HelloAck) FrameName() FrameName { return FrameHelloAck }
 
 type HelloCapabilities struct {
-	HistoryPage    *HistoryPageCapability        `json:"history_page,omitempty"`
-	Settings       *SettingsCapability           `json:"settings,omitempty"`
-	RunControl     *RunControlCapability         `json:"run_control,omitempty"`
-	FileReferences *FileReferenceHelloCapability `json:"file_references,omitempty"`
+	HistoryPage      *HistoryPageCapability        `json:"history_page,omitempty"`
+	AttentionSummary *AttentionSummaryCapability   `json:"attention_summary,omitempty"`
+	Settings         *SettingsCapability           `json:"settings,omitempty"`
+	RunControl       *RunControlCapability         `json:"run_control,omitempty"`
+	FileReferences   *FileReferenceHelloCapability `json:"file_references,omitempty"`
 }
 
 type HistoryPageCapability struct {
 	MaxLimit int `json:"max_limit"`
+}
+
+type AttentionSummaryCapability struct {
+	MaxSessions int `json:"max_sessions"`
 }
 
 // SettingsCapability advertises fixed v2 protocol limits. It does not claim
@@ -434,6 +441,48 @@ type HistoryPageResponse struct {
 
 func (*HistoryPageResponse) FrameName() FrameName { return FrameHistoryPage }
 
+// AttentionSubscribe carries no Session ID or cursor. Membership is derived
+// exclusively from the current Auth-owned attention grant.
+type AttentionSubscribe struct {
+	RequestID string `json:"request_id"`
+}
+
+func (*AttentionSubscribe) FrameName() FrameName { return FrameAttentionSubscribe }
+
+type AttentionSummary struct {
+	SessionID       string               `json:"session_id"`
+	LatestSeq       int64                `json:"latest_seq"`
+	State           string               `json:"state"`
+	Permission      *AttentionPermission `json:"permission,omitempty"`
+	TerminalOutcome *string              `json:"terminal_outcome,omitempty"`
+	LatestChangeSeq *int64               `json:"latest_change_seq,omitempty"`
+	Blocker         *AttentionBlocker    `json:"blocker,omitempty"`
+	SummaryVersion  int64                `json:"summary_version"`
+	SummaryState    string               `json:"summary_state"`
+}
+
+type AttentionPermission struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+type AttentionBlocker struct {
+	Kind              string  `json:"kind"`
+	Reason            *string `json:"reason,omitempty"`
+	ExpiresAt         *int64  `json:"expires_at,omitempty"`
+	BlockingSessionID *string `json:"blocking_session_id,omitempty"`
+	Operation         *string `json:"operation,omitempty"`
+}
+
+type AttentionSummaryFrame struct {
+	RequestID         string             `json:"request_id"`
+	Kind              string             `json:"kind"`
+	SubscriptionState string             `json:"subscription_state"`
+	Summaries         []AttentionSummary `json:"summaries"`
+}
+
+func (*AttentionSummaryFrame) FrameName() FrameName { return FrameAttentionSummary }
+
 func Decode(data []byte) (Frame, error) {
 	var env struct {
 		Frame FrameName `json:"frame"`
@@ -463,6 +512,10 @@ func Decode(data []byte) (Frame, error) {
 		return decodeInto(data, &Error{})
 	case FrameHistoryPage:
 		return decodeHistoryPage(data)
+	case FrameAttentionSubscribe:
+		return decodeAttentionSubscribe(data)
+	case FrameAttentionSummary:
+		return decodeAttentionSummary(data)
 	case FrameTargetJoin:
 		return decodeTargetJoin(data)
 	case FrameTargetJoinChallenge:
@@ -482,6 +535,168 @@ func Decode(data []byte) (Frame, error) {
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownFrame, env.Frame)
 	}
+}
+
+func decodeAttentionSubscribe(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameAttentionSubscribe, "request_id")
+	if err != nil {
+		return nil, fmt.Errorf("decode attention.subscribe: invalid frame")
+	}
+	var out AttentionSubscribe
+	if json.Unmarshal(fields["request_id"], &out.RequestID) != nil || !validSettingsCommandID(out.RequestID) {
+		return nil, fmt.Errorf("decode attention.subscribe: invalid frame")
+	}
+	return &out, nil
+}
+
+func decodeAttentionSummary(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameAttentionSummary, "request_id", "kind", "subscription_state", "summaries")
+	if err != nil {
+		return nil, errors.New("decode attention.summary: invalid frame")
+	}
+	var out AttentionSummaryFrame
+	if json.Unmarshal(fields["request_id"], &out.RequestID) != nil || json.Unmarshal(fields["kind"], &out.Kind) != nil ||
+		json.Unmarshal(fields["subscription_state"], &out.SubscriptionState) != nil ||
+		!validSettingsCommandID(out.RequestID) || (out.Kind != "snapshot" && out.Kind != "update") ||
+		(out.SubscriptionState != "complete" && out.SubscriptionState != "incomplete") {
+		return nil, errors.New("decode attention.summary: invalid frame")
+	}
+	var errSummaries error
+	out.Summaries, errSummaries = decodeAttentionSummaries(fields["summaries"])
+	if errSummaries != nil {
+		return nil, errors.New("decode attention.summary: invalid frame")
+	}
+	seen := make(map[string]struct{}, len(out.Summaries))
+	for _, summary := range out.Summaries {
+		if !validAttentionSummary(summary) {
+			return nil, errors.New("decode attention.summary: invalid frame")
+		}
+		if _, duplicate := seen[summary.SessionID]; duplicate {
+			return nil, errors.New("decode attention.summary: invalid frame")
+		}
+		seen[summary.SessionID] = struct{}{}
+	}
+	return &out, nil
+}
+
+func decodeAttentionSummaries(raw json.RawMessage) ([]AttentionSummary, error) {
+	var entries []json.RawMessage
+	if json.Unmarshal(raw, &entries) != nil || len(entries) > 64 {
+		return nil, errors.New("invalid summaries")
+	}
+	result := make([]AttentionSummary, 0, len(entries))
+	for _, entry := range entries {
+		fields, err := strictObject(entry)
+		if err != nil {
+			return nil, err
+		}
+		allowed := map[string]bool{"session_id": true, "latest_seq": true, "state": true, "permission": true, "terminal_outcome": true, "latest_change_seq": true, "blocker": true, "summary_version": true, "summary_state": true}
+		for key := range fields {
+			if !allowed[key] {
+				return nil, errors.New("unknown summary field")
+			}
+		}
+		var summary AttentionSummary
+		if fields["session_id"] == nil || fields["latest_seq"] == nil || fields["state"] == nil || fields["summary_version"] == nil || fields["summary_state"] == nil ||
+			json.Unmarshal(fields["session_id"], &summary.SessionID) != nil || json.Unmarshal(fields["latest_seq"], &summary.LatestSeq) != nil ||
+			json.Unmarshal(fields["state"], &summary.State) != nil || json.Unmarshal(fields["summary_version"], &summary.SummaryVersion) != nil || json.Unmarshal(fields["summary_state"], &summary.SummaryState) != nil ||
+			decodeOptionalAttentionPermission(fields["permission"], &summary.Permission) != nil || decodeOptionalString(fields["terminal_outcome"], &summary.TerminalOutcome) != nil ||
+			decodeOptionalInt64(fields["latest_change_seq"], &summary.LatestChangeSeq) != nil || decodeOptionalAttentionBlocker(fields["blocker"], &summary.Blocker) != nil || !validAttentionSummary(summary) {
+			return nil, errors.New("invalid summary")
+		}
+		result = append(result, summary)
+	}
+	return result, nil
+}
+
+func decodeOptionalAttentionPermission(raw json.RawMessage, out **AttentionPermission) error {
+	if raw == nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	fields, err := strictObject(raw)
+	if err != nil || len(fields) != 2 || fields["id"] == nil || fields["status"] == nil {
+		return errors.New("invalid permission")
+	}
+	value := &AttentionPermission{}
+	if json.Unmarshal(fields["id"], &value.ID) != nil || json.Unmarshal(fields["status"], &value.Status) != nil {
+		return errors.New("invalid permission")
+	}
+	*out = value
+	return nil
+}
+
+func decodeOptionalAttentionBlocker(raw json.RawMessage, out **AttentionBlocker) error {
+	if raw == nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	fields, err := strictObject(raw)
+	if err != nil || fields["kind"] == nil {
+		return errors.New("invalid blocker")
+	}
+	allowed := map[string]bool{"kind": true, "reason": true, "expires_at": true, "blocking_session_id": true, "operation": true}
+	for key := range fields {
+		if !allowed[key] {
+			return errors.New("invalid blocker")
+		}
+	}
+	value := &AttentionBlocker{}
+	if json.Unmarshal(fields["kind"], &value.Kind) != nil || decodeOptionalString(fields["reason"], &value.Reason) != nil ||
+		decodeOptionalInt64(fields["expires_at"], &value.ExpiresAt) != nil || decodeOptionalString(fields["blocking_session_id"], &value.BlockingSessionID) != nil ||
+		decodeOptionalString(fields["operation"], &value.Operation) != nil {
+		return errors.New("invalid blocker")
+	}
+	*out = value
+	return nil
+}
+
+func decodeOptionalString(raw json.RawMessage, out **string) error {
+	if raw == nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return errors.New("invalid optional string")
+	}
+	*out = &value
+	return nil
+}
+
+func decodeOptionalInt64(raw json.RawMessage, out **int64) error {
+	if raw == nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var value int64
+	if json.Unmarshal(raw, &value) != nil {
+		return errors.New("invalid optional int")
+	}
+	*out = &value
+	return nil
+}
+
+func validAttentionSummary(summary AttentionSummary) bool {
+	if !validSettingsCommandID(summary.SessionID) || summary.LatestSeq < 0 || summary.SummaryVersion < 0 ||
+		(summary.SummaryState != "complete" && summary.SummaryState != "incomplete") || summary.State == "" {
+		return false
+	}
+	if summary.Permission != nil && (!validSettingsCommandID(summary.Permission.ID) || summary.Permission.Status != "pending") {
+		return false
+	}
+	if summary.Blocker == nil {
+		return true
+	}
+	blocker := summary.Blocker
+	if blocker.Kind != "queued" && blocker.Kind != "reauthorization_required" && blocker.Kind != "new_run_required" && blocker.Kind != "outcome_unknown" {
+		return false
+	}
+	if blocker.Kind != "queued" && (blocker.Reason != nil || blocker.ExpiresAt != nil || blocker.BlockingSessionID != nil) {
+		return false
+	}
+	if blocker.Kind != "outcome_unknown" && blocker.Operation != nil {
+		return false
+	}
+	return (blocker.Reason == nil || validSettingsIdentifier(*blocker.Reason)) &&
+		(blocker.BlockingSessionID == nil || validSettingsCommandID(*blocker.BlockingSessionID)) &&
+		(blocker.Operation == nil || validSettingsIdentifier(*blocker.Operation))
 }
 
 func decodeCommand(data []byte) (Frame, error) {

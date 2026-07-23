@@ -24,18 +24,20 @@ var (
 type Kind string
 
 const (
-	KindSession Kind = "session"
-	KindGroup   Kind = "group"
-	KindAPI     Kind = "api"
+	KindSession   Kind = "session"
+	KindGroup     Kind = "group"
+	KindAPI       Kind = "api"
+	KindAttention Kind = "attention"
 )
 
 type Access string
 
 const (
-	AccessControl Access = "control"
-	AccessView    Access = "view"
-	AccessAdapter Access = "adapter"
-	AccessAll     Access = "*"
+	AccessControl   Access = "control"
+	AccessView      Access = "view"
+	AccessAdapter   Access = "adapter"
+	AccessAll       Access = "*"
+	AccessAttention Access = "attention"
 )
 
 type Scope struct {
@@ -53,6 +55,45 @@ type Principal struct {
 type Authenticator interface {
 	Authenticate(ctx context.Context, token string) (Principal, error)
 	Authorize(ctx context.Context, principal Principal, scope Scope) error
+}
+
+// AttentionGrant is the bounded, Auth-owned membership truth for one
+// summary-only connection. It intentionally contains no bearer, content, or
+// platform Task/Run metadata.
+type AttentionGrant struct {
+	Subject     string
+	SessionIDs  []string
+	MaxSessions int
+	ExpiresAt   time.Time
+}
+
+// AttentionAuthorizer is deliberately separate from ordinary scope checks so
+// control, view, group, and API authority cannot upgrade into attention.
+type AttentionAuthorizer interface {
+	AuthorizeAttention(context.Context, Principal) (AttentionGrant, error)
+}
+
+const maxAttentionSessions = 64
+
+func EvaluateAttentionAuthorization(principal Principal, grant AttentionGrant, now time.Time) (AttentionGrant, error) {
+	if principal.Subject == "" || principal.Subject != grant.Subject || len(principal.Scopes) != 1 ||
+		principal.Scopes[0].Kind != KindAttention || principal.Scopes[0].Access != AccessAttention ||
+		principal.Scopes[0].ID == "" || grant.MaxSessions < 1 || grant.MaxSessions > maxAttentionSessions ||
+		len(grant.SessionIDs) == 0 || len(grant.SessionIDs) > maxAttentionSessions || !grant.ExpiresAt.After(now) {
+		return AttentionGrant{}, ErrUnauthorized
+	}
+	seen := make(map[string]struct{}, len(grant.SessionIDs))
+	for _, sessionID := range grant.SessionIDs {
+		if sessionID == "" || len(sessionID) > 255 {
+			return AttentionGrant{}, ErrUnauthorized
+		}
+		if _, duplicate := seen[sessionID]; duplicate {
+			return AttentionGrant{}, ErrUnauthorized
+		}
+		seen[sessionID] = struct{}{}
+	}
+	grant.SessionIDs = append([]string(nil), grant.SessionIDs[:min(grant.MaxSessions, len(grant.SessionIDs))]...)
+	return grant, nil
 }
 
 type SessionAdmissionMode string
@@ -442,6 +483,8 @@ func ParseScope(raw string) (Scope, error) {
 	switch {
 	case len(parts) == 2 && parts[0] == string(KindAPI) && parts[1] == string(AccessAll):
 		return API(), nil
+	case len(parts) == 2 && parts[0] == string(KindAttention) && parts[1] != "":
+		return Attention(parts[1]), nil
 	case len(parts) == 3 && parts[0] == string(KindSession) && parts[1] != "":
 		switch parts[2] {
 		case string(AccessControl):
@@ -480,9 +523,16 @@ func API() Scope {
 	return Scope{Kind: KindAPI, Access: AccessAll}
 }
 
+func Attention(grantID string) Scope {
+	return Scope{Kind: KindAttention, ID: grantID, Access: AccessAttention}
+}
+
 func (s Scope) String() string {
 	if s.Kind == KindAPI && s.Access == AccessAll {
 		return "api:*"
+	}
+	if s.Kind == KindAttention && s.Access == AccessAttention {
+		return strings.Join([]string{string(s.Kind), s.ID}, ":")
 	}
 	return strings.Join([]string{string(s.Kind), s.ID, string(s.Access)}, ":")
 }
@@ -499,6 +549,10 @@ func (s Scope) Validate() error {
 		}
 	case KindGroup:
 		if s.ID != "" && s.Access == AccessControl {
+			return nil
+		}
+	case KindAttention:
+		if s.ID != "" && len(s.ID) <= 255 && s.Access == AccessAttention {
 			return nil
 		}
 	}
@@ -522,7 +576,7 @@ func Authorize(principal Principal, requested Scope) error {
 
 func allows(granted Scope, requested Scope) bool {
 	if granted.Kind == KindAPI && granted.Access == AccessAll {
-		return requested.Access != AccessAdapter
+		return requested.Access != AccessAdapter && requested.Access != AccessAttention
 	}
 
 	if granted.Kind != requested.Kind || granted.ID != requested.ID {

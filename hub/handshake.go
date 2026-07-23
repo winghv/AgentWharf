@@ -59,6 +59,7 @@ type AcceptedPeer struct {
 	Subscribed      []protocol.Subscription
 	Admissions      map[string]auth.SessionAdmissionDecision
 	AdmissionClaims map[string]auth.SessionAdmissionClaim
+	AttentionOnly   bool
 }
 
 func NewHandshake(cfg HandshakeConfig) *Handshake {
@@ -162,6 +163,26 @@ func negotiateHelloVersion(hello *protocol.Hello) (int, error) {
 }
 
 func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, principal auth.Principal, selectedVersion int) (protocol.HelloAck, AcceptedPeer, error) {
+	if attentionPrincipal(principal) {
+		if selectedVersion != protocol.ProtocolVersionV2 {
+			return protocol.HelloAck{}, AcceptedPeer{}, ErrVersionUnsupported
+		}
+		if len(hello.Subscriptions) != 0 {
+			return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+		}
+		authorizer, ok := h.authenticator.(auth.AttentionAuthorizer)
+		if !ok {
+			return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+		}
+		if _, err := attentionGrant(ctx, authorizer, principal); err != nil {
+			return protocol.HelloAck{}, AcceptedPeer{}, err
+		}
+		return protocol.HelloAck{
+			ProtocolVersion: selectedVersion,
+			Sessions:        []protocol.SessionSummary{},
+			Capabilities:    &protocol.HelloCapabilities{AttentionSummary: &protocol.AttentionSummaryCapability{MaxSessions: 64}},
+		}, AcceptedPeer{Role: protocol.RoleClient, ProtocolVersion: selectedVersion, Principal: principal, AttentionOnly: true}, nil
+	}
 	if len(hello.Subscriptions) == 0 {
 		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: client subscriptions are required", ErrInvalidHello)
 	}
@@ -211,6 +232,35 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 	}
 
 	return ack, accepted, nil
+}
+
+func attentionPrincipal(principal auth.Principal) bool {
+	return len(principal.Scopes) == 1 && principal.Scopes[0].Kind == auth.KindAttention && principal.Scopes[0].Access == auth.AccessAttention
+}
+
+func attentionGrant(ctx context.Context, authorizer auth.AttentionAuthorizer, principal auth.Principal) (auth.AttentionGrant, error) {
+	grant, err := authorizer.AuthorizeAttention(ctx, principal)
+	if err != nil {
+		return auth.AttentionGrant{}, auth.ErrUnauthorized
+	}
+	grant, err = auth.EvaluateAttentionAuthorization(principal, grant, time.Now())
+	if err != nil {
+		return auth.AttentionGrant{}, auth.ErrUnauthorized
+	}
+	return grant, nil
+}
+
+// AuthorizeAttention rechecks the Auth-owned grant for a live attention
+// connection. Callers must not cache it across a Store read or websocket send.
+func (h *Handshake) AuthorizeAttention(ctx context.Context, principal auth.Principal) (auth.AttentionGrant, error) {
+	if h == nil || h.authenticator == nil || !attentionPrincipal(principal) {
+		return auth.AttentionGrant{}, auth.ErrUnauthorized
+	}
+	authorizer, ok := h.authenticator.(auth.AttentionAuthorizer)
+	if !ok {
+		return auth.AttentionGrant{}, auth.ErrUnauthorized
+	}
+	return attentionGrant(ctx, authorizer, principal)
 }
 
 func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, principal auth.Principal, selectedVersion int) (protocol.HelloAck, AcceptedPeer, error) {

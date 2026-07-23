@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -105,6 +107,8 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		adapterAdmissionLocks:             make(map[string]chan struct{}),
 		subscribers:                       make(map[string]map[*clientConnection]struct{}),
 		adapters:                          make(map[string]*adapterConnection),
+		attentionSubscribers:              make(map[string]map[*clientConnection]struct{}),
+		attentionSubscriptions:            make(map[*clientConnection]attentionSubscription),
 		pendingCommands:                   make(map[string][]queuedCommand),
 		acceptedCommands:                  make(map[string]struct{}),
 		decisions:                         make(map[string]struct{}),
@@ -121,7 +125,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 			pages, _ = cfg.EventStore.(store.AttentionSummaryPageStore)
 		}
 		if pages != nil {
-			handler.activityDispatcher = NewActivityDispatcher(pages, cfg.ActivitySink, ActivityDispatcherConfig{})
+			handler.activityDispatcher = NewActivityDispatcher(pages, attentionActivitySink{sink: cfg.ActivitySink, handler: handler}, ActivityDispatcherConfig{})
 		} else {
 			handler.activityDispatcherErr = errors.New("activity sink requires an attention summary page store")
 		}
@@ -175,9 +179,11 @@ type webSocketHandler struct {
 	activityDispatcher                *ActivityDispatcher
 	activityDispatcherErr             error
 
-	mu          sync.Mutex
-	subscribers map[string]map[*clientConnection]struct{}
-	adapters    map[string]*adapterConnection
+	mu                     sync.Mutex
+	subscribers            map[string]map[*clientConnection]struct{}
+	adapters               map[string]*adapterConnection
+	attentionSubscribers   map[string]map[*clientConnection]struct{}
+	attentionSubscriptions map[*clientConnection]attentionSubscription
 
 	commandMu                 sync.Mutex
 	pendingCommands           map[string][]queuedCommand
@@ -194,6 +200,33 @@ type webSocketHandler struct {
 	pendingTargetJoins        map[string]*pendingTargetJoin
 	pendingTargetJoinByAttach map[string]*pendingTargetJoin
 	pendingTargetJoinTimer    func(time.Duration, func()) *time.Timer
+}
+
+type attentionSubscription struct {
+	requestID   string
+	sessionIDs  []string
+	grant       auth.AttentionGrant
+	principal   auth.Principal
+	expiryTimer *time.Timer
+	sent        map[string]protocol.AttentionSummary
+}
+
+// attentionActivitySink reuses the single, bounded Store activity scan for
+// ledger-only summary changes. The configured sink remains the delivery owner;
+// a failed callback is retried by the dispatcher before attention fanout runs.
+type attentionActivitySink struct {
+	sink    ActivitySink
+	handler *webSocketHandler
+}
+
+func (s attentionActivitySink) PublishActivitySummary(ctx context.Context, summary ActivitySummary) error {
+	if err := s.sink.PublishActivitySummary(ctx, summary); err != nil {
+		return err
+	}
+	if s.handler != nil {
+		s.handler.broadcastAttentionUpdate(ctx, summary.SessionID)
+	}
+	return nil
 }
 
 type fileReferenceCapability struct {
@@ -410,7 +443,20 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *managedConn, acce
 		case *protocol.Pong:
 			continue
 		case *protocol.HistoryPageRequest:
+			if accepted.AttentionOnly {
+				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "attention connections cannot page history"})
+				continue
+			}
 			if err := h.handleHistoryPage(ctx, conn, accepted, historyToken, peer, adapter, typed); err != nil {
+				return
+			}
+		case *protocol.AttentionSubscribe:
+			if !accepted.AttentionOnly || peer == nil || accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "attention_unsupported", Message: "attention subscription is unavailable"})
+				continue
+			}
+			if err := h.handleAttentionSubscribe(ctx, peer, accepted, typed); err != nil {
+				_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
 				return
 			}
 		case *protocol.Event:
@@ -863,6 +909,110 @@ func (h *webSocketHandler) unregisterClient(peer *clientConnection) {
 		if len(h.subscribers[sessionID]) == 0 {
 			delete(h.subscribers, sessionID)
 		}
+	}
+	h.removeAttentionSubscriptionLocked(peer)
+}
+
+func (h *webSocketHandler) handleAttentionSubscribe(ctx context.Context, peer *clientConnection, accepted AcceptedPeer, request *protocol.AttentionSubscribe) error {
+	if request == nil || peer == nil || !accepted.AttentionOnly || h.handshake == nil {
+		return auth.ErrUnauthorized
+	}
+	grant, err := h.handshake.AuthorizeAttention(ctx, accepted.Principal)
+	if err != nil {
+		return err
+	}
+	pageStore, ok := h.events.(store.AttentionSummaryStore)
+	if !ok {
+		return errors.New("attention summary store is not configured")
+	}
+	summaries, err := pageStore.AttentionSnapshot(ctx, grant.SessionIDs)
+	if err != nil {
+		return err
+	}
+	// Recheck after the Store read so revocation/membership replacement cannot
+	// race a snapshot into the websocket write path.
+	fresh, err := h.handshake.AuthorizeAttention(ctx, accepted.Principal)
+	if err != nil || !sameAttentionGrant(grant, fresh) {
+		return auth.ErrUnauthorized
+	}
+	frame := attentionSummaryFrame(request.RequestID, "snapshot", summaries, fresh.SessionIDs)
+	h.mu.Lock()
+	h.removeAttentionSubscriptionLocked(peer)
+	subscription := attentionSubscription{requestID: request.RequestID, sessionIDs: append([]string(nil), fresh.SessionIDs...), grant: copyAttentionGrant(fresh), principal: accepted.Principal, sent: attentionSummaryIndex(frame.Summaries)}
+	h.attentionSubscriptions[peer] = subscription
+	for _, sessionID := range subscription.sessionIDs {
+		if h.attentionSubscribers[sessionID] == nil {
+			h.attentionSubscribers[sessionID] = make(map[*clientConnection]struct{})
+		}
+		h.attentionSubscribers[sessionID][peer] = struct{}{}
+	}
+	h.mu.Unlock()
+	delay := time.Until(fresh.ExpiresAt)
+	if delay <= 0 {
+		h.unregisterClient(peer)
+		return auth.ErrUnauthorized
+	}
+	timer := time.AfterFunc(delay, func() {
+		h.mu.Lock()
+		h.removeAttentionSubscriptionLocked(peer)
+		h.mu.Unlock()
+		_ = peer.close(websocket.StatusPolicyViolation, "attention authorization expired")
+	})
+	h.mu.Lock()
+	current, found := h.attentionSubscriptions[peer]
+	if found && current.requestID == request.RequestID && sameAttentionGrant(current.grant, fresh) {
+		current.expiryTimer = timer
+		h.attentionSubscriptions[peer] = current
+		h.mu.Unlock()
+	} else {
+		h.mu.Unlock()
+		timer.Stop()
+		return auth.ErrUnauthorized
+	}
+	if latest, err := h.handshake.AuthorizeAttention(ctx, accepted.Principal); err != nil || !sameAttentionGrant(latest, fresh) {
+		h.unregisterClient(peer)
+		return auth.ErrUnauthorized
+	}
+	if err := peer.writeFrame(ctx, frame); err != nil {
+		h.unregisterClient(peer)
+		return err
+	}
+	return nil
+}
+
+func (h *webSocketHandler) removeAttentionSubscriptionLocked(peer *clientConnection) {
+	subscription, found := h.attentionSubscriptions[peer]
+	if !found {
+		return
+	}
+	if subscription.expiryTimer != nil {
+		subscription.expiryTimer.Stop()
+	}
+	for _, sessionID := range subscription.sessionIDs {
+		delete(h.attentionSubscribers[sessionID], peer)
+		if len(h.attentionSubscribers[sessionID]) == 0 {
+			delete(h.attentionSubscribers, sessionID)
+		}
+	}
+	delete(h.attentionSubscriptions, peer)
+}
+
+func (h *webSocketHandler) removeAttentionMembershipLocked(peer *clientConnection, sessionID string) {
+	subscription, found := h.attentionSubscriptions[peer]
+	if !found {
+		return
+	}
+	for index, member := range subscription.sessionIDs {
+		if member != sessionID {
+			continue
+		}
+		subscription.sessionIDs = append(subscription.sessionIDs[:index], subscription.sessionIDs[index+1:]...)
+		delete(h.attentionSubscribers[sessionID], peer)
+		if len(h.attentionSubscribers[sessionID]) == 0 {
+			delete(h.attentionSubscribers, sessionID)
+		}
+		h.attentionSubscriptions[peer] = subscription
+		return
 	}
 }
 
@@ -2545,6 +2695,180 @@ func (h *webSocketHandler) broadcastEvent(ctx context.Context, ev protocol.Event
 			}
 		}
 	}
+	h.broadcastAttentionUpdate(ctx, ev.SessionID)
+}
+
+func (h *webSocketHandler) broadcastAttentionUpdate(ctx context.Context, sessionID string) {
+	pageStore, ok := h.events.(store.AttentionSummaryStore)
+	if !ok || h.handshake == nil {
+		return
+	}
+	h.mu.Lock()
+	targets := make([]*clientConnection, 0, len(h.attentionSubscribers[sessionID]))
+	for peer := range h.attentionSubscribers[sessionID] {
+		targets = append(targets, peer)
+	}
+	h.mu.Unlock()
+	for _, peer := range targets {
+		h.mu.Lock()
+		subscription, found := h.attentionSubscriptions[peer]
+		h.mu.Unlock()
+		if !found {
+			continue
+		}
+		principal := attentionPrincipalFor(peer, h)
+		if principal.Subject == "" {
+			h.unregisterClient(peer)
+			_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
+			continue
+		}
+		grant, err := h.handshake.AuthorizeAttention(ctx, principal)
+		if err != nil || !sameAttentionGrant(subscription.grant, grant) {
+			h.unregisterClient(peer)
+			_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
+			continue
+		}
+		summaries, err := pageStore.AttentionSnapshot(ctx, []string{sessionID})
+		if err != nil {
+			continue
+		}
+		fresh, err := h.handshake.AuthorizeAttention(ctx, principal)
+		if err != nil || !sameAttentionGrant(fresh, grant) {
+			h.unregisterClient(peer)
+			_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
+			continue
+		}
+		frame := attentionSummaryFrame(subscription.requestID, "update", summaries, subscription.sessionIDs)
+		if attentionFrameUnchanged(frame, subscription.sent) {
+			continue
+		}
+		writeCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+		err = peer.writeFrame(writeCtx, frame)
+		cancel()
+		if err != nil {
+			h.unregisterClient(peer)
+			continue
+		}
+		h.mu.Lock()
+		current, found := h.attentionSubscriptions[peer]
+		if found && current.requestID == subscription.requestID && sameSessionIDs(current.sessionIDs, subscription.sessionIDs) && sameAttentionGrant(current.grant, subscription.grant) {
+			if current.sent == nil {
+				current.sent = make(map[string]protocol.AttentionSummary)
+			}
+			for sessionID, summary := range attentionSummaryIndex(frame.Summaries) {
+				current.sent[sessionID] = summary
+			}
+			h.attentionSubscriptions[peer] = current
+		}
+		h.mu.Unlock()
+		for _, summary := range summaries {
+			if summary.SessionID == sessionID && summary.TerminalOutcome != nil {
+				h.mu.Lock()
+				h.removeAttentionMembershipLocked(peer, sessionID)
+				h.mu.Unlock()
+			}
+		}
+	}
+}
+
+func attentionPrincipalFor(peer *clientConnection, h *webSocketHandler) auth.Principal {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.attentionSubscriptions[peer].principal
+}
+
+func sameSessionIDs(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameAttentionGrant(left, right auth.AttentionGrant) bool {
+	return left.Subject == right.Subject && left.MaxSessions == right.MaxSessions && left.ExpiresAt.Equal(right.ExpiresAt) && sameSessionIDs(left.SessionIDs, right.SessionIDs)
+}
+
+func copyAttentionGrant(grant auth.AttentionGrant) auth.AttentionGrant {
+	grant.SessionIDs = append([]string(nil), grant.SessionIDs...)
+	return grant
+}
+
+func attentionSummaryFrame(requestID, kind string, summaries []store.SessionAttentionSummary, members []string) *protocol.AttentionSummaryFrame {
+	memberSet := make(map[string]struct{}, len(members))
+	for _, sessionID := range members {
+		memberSet[sessionID] = struct{}{}
+	}
+	out := &protocol.AttentionSummaryFrame{RequestID: requestID, Kind: kind, SubscriptionState: "complete", Summaries: make([]protocol.AttentionSummary, 0, len(summaries))}
+	for _, summary := range summaries {
+		if _, authorized := memberSet[summary.SessionID]; !authorized {
+			continue
+		}
+		converted := protocol.AttentionSummary{SessionID: summary.SessionID, LatestSeq: summary.LatestSeq, State: summary.State, TerminalOutcome: summary.TerminalOutcome, LatestChangeSeq: summary.LatestChangeSeq, SummaryVersion: summary.SummaryVersion, SummaryState: summary.StateOfProjection}
+		if converted.State == "" {
+			converted.State = "unknown"
+		}
+		if converted.SummaryState != "complete" {
+			converted.SummaryState = "incomplete"
+			out.SubscriptionState = "incomplete"
+		}
+		if summary.Permission != nil {
+			converted.Permission = &protocol.AttentionPermission{ID: summary.Permission.ID, Status: summary.Permission.Status}
+		}
+		if summary.Blocker != nil {
+			blocker := &protocol.AttentionBlocker{Kind: summary.Blocker.Kind, Reason: summary.Blocker.Reason, Operation: summary.Blocker.Operation}
+			if summary.Blocker.ExpiresAt != nil {
+				value := summary.Blocker.ExpiresAt.UTC().UnixMilli()
+				blocker.ExpiresAt = &value
+			}
+			if summary.Blocker.BlockingSessionID != nil {
+				if _, allowed := memberSet[*summary.Blocker.BlockingSessionID]; allowed {
+					value := *summary.Blocker.BlockingSessionID
+					blocker.BlockingSessionID = &value
+				}
+			}
+			converted.Blocker = blocker
+		}
+		out.Summaries = append(out.Summaries, converted)
+	}
+	present := make(map[string]struct{}, len(out.Summaries))
+	for _, summary := range out.Summaries {
+		present[summary.SessionID] = struct{}{}
+	}
+	if kind == "snapshot" {
+		for _, sessionID := range members {
+			if _, found := present[sessionID]; !found {
+				out.SubscriptionState = "incomplete"
+				out.Summaries = append(out.Summaries, protocol.AttentionSummary{SessionID: sessionID, LatestSeq: 0, State: "unknown", SummaryVersion: 0, SummaryState: "incomplete"})
+			}
+		}
+	}
+	sort.Slice(out.Summaries, func(left, right int) bool { return out.Summaries[left].SessionID < out.Summaries[right].SessionID })
+	return out
+}
+
+func attentionSummaryIndex(summaries []protocol.AttentionSummary) map[string]protocol.AttentionSummary {
+	index := make(map[string]protocol.AttentionSummary, len(summaries))
+	for _, summary := range summaries {
+		index[summary.SessionID] = summary
+	}
+	return index
+}
+
+func attentionFrameUnchanged(frame *protocol.AttentionSummaryFrame, prior map[string]protocol.AttentionSummary) bool {
+	if len(frame.Summaries) == 0 {
+		return true
+	}
+	for _, summary := range frame.Summaries {
+		if previous, found := prior[summary.SessionID]; !found || !reflect.DeepEqual(previous, summary) {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *webSocketHandler) withSessionPublication(ctx context.Context, sessionID string, publish func() error) error {
