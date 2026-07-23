@@ -176,6 +176,62 @@ func TestDecodeCommandAndAckExamples(t *testing.T) {
 	}
 }
 
+func TestSettingsCommandRejectsNonCanonicalPayloads(t *testing.T) {
+	valid := `{"frame":"command","cmd_id":"cmd_settings_1","type":"session.settings.change","session_id":"ses_1","payload":{"capability_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model_id":"reasoning"}}`
+	if _, err := Decode([]byte(valid)); err != nil {
+		t.Fatalf("Decode(valid settings command) error = %v", err)
+	}
+	for _, raw := range []string{
+		`{"frame":"command","cmd_id":"cmd_settings_1","type":"session.settings.change","session_id":"ses_1","payload":{"capability_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`,
+		`{"frame":"command","cmd_id":"cmd_settings_1","type":"session.settings.change","session_id":"ses_1","payload":{"capability_fingerprint":"sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","model_id":"reasoning"}}`,
+		`{"frame":"command","cmd_id":"cmd_settings_1","type":"session.settings.change","session_id":"ses_1","payload":{"capability_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model_id":"reasoning","extra":true}}`,
+		`{"frame":"command","cmd_id":"cmd_settings_1","type":"session.settings.change","session_id":"ses_1","payload":{"capability_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model_id":"reasoning","model_id":"balanced"}}`,
+		`{"frame":"command","cmd_id":"cmd_settings_1","type":"session.settings.change","session_id":"ses_1","payload":{"capability_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model_id":"reasoning"},"extra":true}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) unexpectedly succeeded", raw)
+		}
+	}
+}
+
+func TestSettingsDeliveryExecuteFrameIsStrictAndV2Bounded(t *testing.T) {
+	valid := `{"frame":"settings.delivery.execute","session_id":"ses_1","cmd_id":"cmd_settings_1","reservation_version":7,"operation_timeout_ms":30000}`
+	frame, err := Decode([]byte(valid))
+	if err != nil {
+		t.Fatalf("Decode(valid settings delivery) error = %v", err)
+	}
+	if frame.FrameName() != FrameName("settings.delivery.execute") {
+		t.Fatalf("decoded frame = %q", frame.FrameName())
+	}
+	for _, raw := range []string{
+		`{"frame":"settings.delivery.execute","session_id":"ses_1","cmd_id":"cmd_settings_1","reservation_version":0,"operation_timeout_ms":30000}`,
+		`{"frame":"settings.delivery.execute","session_id":"ses_1","cmd_id":"cmd_settings_1","reservation_version":7,"operation_timeout_ms":1}`,
+		`{"frame":"settings.delivery.execute","session_id":"ses_1","cmd_id":"cmd_settings_1","reservation_version":7,"operation_timeout_ms":30000,"extra":true}`,
+		`{"frame":"settings.delivery.execute","session_id":"ses_1","cmd_id":"cmd_settings_1","reservation_version":7,"reservation_version":8,"operation_timeout_ms":30000}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) unexpectedly succeeded", raw)
+		}
+	}
+}
+
+func TestSettingsEffectivePayloadRejectsNonCanonicalPayloads(t *testing.T) {
+	valid := []byte(`{"cmd_id":"cmd_settings_1","request_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","effective_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outcome":"applied","effective_model_id":"reasoning","effective_permission_mode_id":"ask","reason_code":null}`)
+	if _, err := DecodeSettingsEffectivePayload(valid); err != nil {
+		t.Fatalf("DecodeSettingsEffectivePayload(valid) error = %v", err)
+	}
+	for _, raw := range []string{
+		`{"cmd_id":"cmd_settings_1","request_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","effective_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outcome":"applied","effective_model_id":"reasoning","effective_permission_mode_id":"ask","reason_code":"unexpected"}`,
+		`{"cmd_id":"cmd_settings_1","request_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","effective_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outcome":"rejected","effective_model_id":"reasoning","effective_permission_mode_id":"ask","reason_code":null}`,
+		`{"cmd_id":"cmd_settings_1","request_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","effective_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outcome":"applied","effective_model_id":"reasoning","effective_permission_mode_id":"ask","reason_code":null,"extra":true}`,
+		`{"cmd_id":"cmd_settings_1","request_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","effective_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outcome":"applied","effective_model_id":"reasoning","effective_permission_mode_id":"ask","reason_code":null,"reason_code":null}`,
+	} {
+		if _, err := DecodeSettingsEffectivePayload([]byte(raw)); err == nil {
+			t.Fatalf("DecodeSettingsEffectivePayload(%s) unexpectedly succeeded", raw)
+		}
+	}
+}
+
 func TestEventReceiptRoundTripsStrictReferenceOnlyFields(t *testing.T) {
 	receipt := &EventReceipt{ProposalID: "proposal_01H8X", Seq: 42, Status: EventReceiptAccepted}
 	encoded, err := Encode(receipt)

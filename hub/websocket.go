@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,6 +107,8 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		pendingCommands:                   make(map[string][]queuedCommand),
 		acceptedCommands:                  make(map[string]struct{}),
 		decisions:                         make(map[string]struct{}),
+		settingsClients:                   make(map[string]*clientConnection),
+		settingsCapabilities:              make(map[string]store.SettingsCapability),
 		pendingTargetJoins:                make(map[string]*pendingTargetJoin),
 		pendingTargetJoinByAttach:         make(map[string]*pendingTargetJoin),
 	}
@@ -179,6 +182,8 @@ type webSocketHandler struct {
 	acceptedCommandOrder []string
 	decisions            map[string]struct{}
 	decisionOrder        []string
+	settingsClients      map[string]*clientConnection
+	settingsCapabilities map[string]store.SettingsCapability
 
 	pendingTargetJoinMu       sync.Mutex
 	pendingTargetJoins        map[string]*pendingTargetJoin
@@ -223,6 +228,7 @@ type adapterConnection struct {
 	handler            *webSocketHandler
 	admission          store.AdapterConnectionAdmission
 	credentialEvidence auth.SessionCredentialEvidence
+	settingsWriter     store.SettingsWriter
 	events             *adapterEventBatcher
 }
 
@@ -296,6 +302,12 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, fr
 	}
 	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 &&
 		len(accepted.currentSubscriptions()) > 0 {
+		if _, ok := h.events.(store.SettingsCommandStore); ok {
+			if ack.Capabilities == nil {
+				ack.Capabilities = &protocol.HelloCapabilities{}
+			}
+			ack.Capabilities.Settings = &protocol.SettingsCapability{SchemaVersion: 1, MaxPendingChanges: 1, ProviderResponseTimeoutSeconds: 30}
+		}
 		if _, ok := h.events.(store.HistoryStore); ok {
 			if ack.Capabilities == nil {
 				ack.Capabilities = &protocol.HelloCapabilities{}
@@ -394,14 +406,17 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *managedConn, acce
 				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "adapter command frames are not accepted"})
 				continue
 			}
-			if err := h.handleClientCommand(ctx, conn, accepted, typed); err != nil {
+			if err := h.handleClientCommand(ctx, conn, peer, accepted, typed); err != nil {
 				continue
 			}
 		case *protocol.CommandAck:
 			if accepted.Role != protocol.RoleAdapter {
 				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "client command ack frames are not accepted"})
+				continue
 			}
-			continue
+			if err := h.handleAdapterCommandAck(ctx, adapter, typed); err != nil {
+				continue
+			}
 		case *protocol.CredentialRotationRequest:
 			if accepted.Role != protocol.RoleAdapter || accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
 				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "credential rotation is v2 Adapter-only"})
@@ -744,11 +759,11 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *managedCon
 	if err != nil {
 		return nil, errAdapterAuthorityLost
 	}
-	admission, err := h.adapterAuthority.admit(ctx, accepted.SessionID, generation, credentialExpiresAt, allowInitialize)
+	admitted, err := h.adapterAuthority.admit(ctx, accepted.SessionID, generation, credentialExpiresAt, allowInitialize)
 	if err != nil {
 		return nil, err
 	}
-	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, protocolVersion: accepted.ProtocolVersion, handler: h, admission: admission, credentialEvidence: evidence}
+	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, protocolVersion: accepted.ProtocolVersion, handler: h, admission: admitted.admission, credentialEvidence: evidence, settingsWriter: admitted.writer}
 	if h.events != nil {
 		fencedStore := fencedAdapterEventStore{handler: h, adapter: adapter}
 		adapter.events = newAdapterEventBatcher(adapterEventBatcherConfig{
@@ -951,8 +966,36 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
 		return err
 	}
+	if ev.Type == "session.settings.capabilities" {
+		if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+			err := errors.New("settings capabilities are v2 Adapter-only")
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+			return err
+		}
+		if _, err := protocol.DecodeSettingsCapabilityPayload(ev.Payload); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: "invalid settings capability"})
+			return err
+		}
+		if err := h.commitSettingsCapabilityProposal(ctx, adapter, out, ev.ProposalID); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+			return err
+		}
+		return nil
+	}
+	if ev.Type == "session.settings.effective" {
+		if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+			err := errors.New("settings effective results are v2 Adapter-only")
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: err.Error()})
+			return err
+		}
+		if err := h.finalizeSettingsEffective(ctx, adapter, out, ev.ProposalID); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
+			return err
+		}
+		return nil
+	}
 	if accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
-		if err := h.commitAdapterProposal(ctx, adapter, out, ev.ProposalID); err != nil {
+		if err := h.commitAdapterProposal(ctx, adapter, out, ev.ProposalID, nil); err != nil {
 			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
 			return err
 		}
@@ -970,7 +1013,7 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 	})
 }
 
-func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string, afterCommit func(context.Context, int64) error) error {
 	proposals, ok := h.events.(store.ProposedEventStore)
 	if !ok {
 		return errors.New("proposed event store is not configured")
@@ -1004,6 +1047,11 @@ func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *a
 		if receipt.SessionID != event.SessionID || receipt.ProposalID != proposalID || receipt.Seq < 1 || receipt.Status != store.ProposedEventAccepted {
 			return errors.New("proposed event store returned an invalid receipt")
 		}
+		if afterCommit != nil {
+			if err := afterCommit(ctx, receipt.Seq); err != nil {
+				return err
+			}
+		}
 
 		seq := receipt.Seq
 		event.Seq = &seq
@@ -1027,7 +1075,252 @@ func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *a
 	return nil
 }
 
-func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *managedConn, accepted AcceptedPeer, cmd *protocol.Command) error {
+func (h *webSocketHandler) commitSettingsCapabilityProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	ledger, ok := h.events.(store.SettingsCommandStore)
+	if !ok || adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 {
+		return errors.New("settings command store is not configured")
+	}
+	capability, err := protocol.DecodeSettingsCapabilityPayload(event.Payload)
+	if err != nil {
+		return err
+	}
+	return h.commitAdapterProposal(ctx, adapter, event, proposalID, func(commitCtx context.Context, seq int64) error {
+		h.commandMu.Lock()
+		cached, alreadyPublished := h.settingsCapabilities[event.SessionID]
+		h.commandMu.Unlock()
+		if alreadyPublished && cached.EventSeq == seq && cached.Fingerprint == capability.Fingerprint &&
+			cached.EffectiveModelID == capability.EffectiveModelID && cached.EffectivePermissionModeID == capability.EffectivePermissionModeID &&
+			cached.Writer == adapter.settingsWriter {
+			return nil
+		}
+		published, err := ledger.PublishSettingsCapability(commitCtx, event.SessionID, store.SettingsCapabilityUpdate{
+			EventSeq:                  seq,
+			Fingerprint:               capability.Fingerprint,
+			EffectiveModelID:          capability.EffectiveModelID,
+			EffectivePermissionModeID: capability.EffectivePermissionModeID,
+			Writer:                    adapter.settingsWriter,
+		})
+		if err != nil {
+			return fmt.Errorf("publish settings capability: %w", err)
+		}
+		h.commandMu.Lock()
+		h.settingsCapabilities[event.SessionID] = published
+		h.commandMu.Unlock()
+		return nil
+	})
+}
+
+func (h *webSocketHandler) handleSettingsChange(ctx context.Context, conn *managedConn, peer *clientConnection, accepted AcceptedPeer, cmd *protocol.Command) error {
+	if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "unsupported")
+		return errors.New("settings changes are v2 Client-only")
+	}
+	ledger, ok := h.events.(store.SettingsCommandStore)
+	if !ok {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "internal_error")
+		return errors.New("settings command store is not configured")
+	}
+	change, err := protocol.DecodeSettingsChangePayload(cmd.Payload)
+	if err != nil {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "invalid_command")
+		return err
+	}
+	adapter := h.settingsCurrentAdapter(cmd.SessionID)
+	if adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_offline")
+		return errors.New("settings adapter is offline")
+	}
+
+	reserve, err := ledger.SettingsCommandReserve(ctx, cmd.SessionID, store.SettingsCommandRequest{
+		CommandID:                 cmd.CommandID,
+		RequestFingerprint:        change.CapabilityFingerprint,
+		RequestedModelID:          change.RequestedModelID,
+		RequestedPermissionModeID: change.RequestedPermissionModeID,
+		Writer:                    adapter.settingsWriter,
+	})
+	if err != nil {
+		reason := settingsReserveFailureReason(ctx, ledger, cmd.SessionID, err)
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, reason)
+		return err
+	}
+	if reserve.Duplicate {
+		return writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckDuplicate, "")
+	}
+
+	key := settingsCommandKey(cmd.SessionID, cmd.CommandID)
+	h.commandMu.Lock()
+	h.settingsClients[key] = peer
+	h.commandMu.Unlock()
+	routed := cloneCommand(cmd)
+	if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
+		h.removeSettingsClient(key)
+		h.unregisterAdapter(adapter)
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_offline")
+		return fmt.Errorf("deliver settings reservation: %w", err)
+	}
+	return nil
+}
+
+func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter *adapterConnection, ack *protocol.CommandAck) error {
+	if adapter == nil || ack == nil || ack.CommandID == "" {
+		return errors.New("invalid adapter command acknowledgement")
+	}
+	key := settingsCommandKey(adapter.sessionID, ack.CommandID)
+	client := h.settingsClient(key)
+	if client == nil {
+		return errors.New("adapter acknowledgement has no settings reservation")
+	}
+	if ack.Status != protocol.AckAccepted || ack.Reason != "" || adapter.protocolVersion != protocol.ProtocolVersionV2 || h.settingsCurrentAdapter(adapter.sessionID) != adapter {
+		h.removeSettingsClient(key)
+		_ = writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		return errors.New("settings delivery acknowledgement is rejected")
+	}
+	ledger, ok := h.events.(store.SettingsCommandStore)
+	if !ok {
+		h.removeSettingsClient(key)
+		_ = writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckRejected, "internal_error")
+		return errors.New("settings command store is not configured")
+	}
+	command, err := ledger.SettingsCommand(ctx, adapter.sessionID, ack.CommandID)
+	if err != nil || command.Writer != adapter.settingsWriter || command.Status != store.SettingsCommandDeliveryPending {
+		h.removeSettingsClient(key)
+		_ = writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		if err == nil {
+			err = errors.New("settings delivery acknowledgement is fenced")
+		}
+		return err
+	}
+	command, err = ledger.AcknowledgeSettingsCommandDelivery(ctx, adapter.sessionID, ack.CommandID, command.ReservationVersion, adapter.settingsWriter)
+	if err != nil || command.Status != store.SettingsCommandPending || command.Writer != adapter.settingsWriter {
+		h.removeSettingsClient(key)
+		_ = writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		if err == nil {
+			err = errors.New("settings delivery acknowledgement returned an invalid command")
+		}
+		return err
+	}
+	if err := h.writeDurableAdapterFrame(ctx, adapter, &protocol.SettingsDeliveryExecute{
+		SessionID: adapter.sessionID, CommandID: ack.CommandID, ReservationVersion: command.ReservationVersion, OperationTimeoutMS: 30000,
+	}); err != nil {
+		h.removeSettingsClient(key)
+		h.unregisterAdapter(adapter)
+		_ = writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		return fmt.Errorf("deliver settings execute: %w", err)
+	}
+	h.removeSettingsClient(key)
+	return writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckAccepted, "")
+}
+
+func (h *webSocketHandler) finalizeSettingsEffective(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	ledger, ok := h.events.(store.SettingsCommandStore)
+	if !ok || adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 {
+		return errors.New("settings command store is not configured")
+	}
+	effective, err := protocol.DecodeSettingsEffectivePayload(event.Payload)
+	if err != nil {
+		return err
+	}
+	command, err := ledger.SettingsCommand(ctx, event.SessionID, effective.CommandID)
+	if err != nil || command.RequestFingerprint != effective.RequestFingerprint || command.Writer != adapter.settingsWriter || command.Status != store.SettingsCommandPending {
+		if err == nil {
+			err = errors.New("settings effective result is fenced")
+		}
+		return err
+	}
+	h.commandMu.Lock()
+	capability, found := h.settingsCapabilities[event.SessionID]
+	h.commandMu.Unlock()
+	if !found || capability.Fingerprint != effective.EffectiveFingerprint || capability.EffectiveModelID != effective.EffectiveModelID ||
+		capability.EffectivePermissionModeID != effective.EffectivePermissionModeID || capability.Writer != adapter.settingsWriter {
+		return errors.New("settings effective capability is not current")
+	}
+	outcome, reason := settingsFinalizationOutcome(command, capability, effective)
+	writer := adapter.settingsWriter
+	finalized, err := ledger.FinalizeSettingsCommand(ctx, event.SessionID, effective.CommandID, store.SettingsCommandFinalize{
+		ReservationVersion:  command.ReservationVersion,
+		ExpectedStatus:      store.SettingsCommandPending,
+		Writer:              &writer,
+		Outcome:             outcome,
+		ReasonCode:          reason,
+		EffectiveCapability: capability,
+	})
+	if err != nil || finalized.TerminalEventSeq == nil {
+		if err == nil {
+			err = errors.New("settings finalization returned no terminal event")
+		}
+		return err
+	}
+	payload, err := store.SettingsTerminalEventPayload(finalized, capability, finalized.Status, reason)
+	if err != nil {
+		return err
+	}
+	seq := *finalized.TerminalEventSeq
+	if err := adapter.writeFrame(ctx, &protocol.EventReceipt{ProposalID: proposalID, Seq: seq, Status: protocol.EventReceiptAccepted}); err != nil {
+		h.rejectAdapter(adapter)
+		return err
+	}
+	h.broadcastEvent(ctx, protocol.Event{Type: "session.settings.effective", SessionID: event.SessionID, Seq: &seq, Time: time.Now().UTC().UnixMilli(), Payload: payload})
+	return nil
+}
+
+func settingsFinalizationOutcome(command store.SettingsCommand, capability store.SettingsCapability, effective protocol.SettingsEffectivePayload) (store.SettingsCommandStatus, *string) {
+	outcome := store.SettingsCommandStatus(effective.Outcome)
+	if outcome == store.SettingsCommandApplied {
+		modelMatches := command.RequestedModelID == nil && capability.EffectiveModelID == command.ReservedCapability.EffectiveModelID ||
+			command.RequestedModelID != nil && capability.EffectiveModelID == *command.RequestedModelID
+		permissionMatches := command.RequestedPermissionModeID == nil && capability.EffectivePermissionModeID == command.ReservedCapability.EffectivePermissionModeID ||
+			command.RequestedPermissionModeID != nil && capability.EffectivePermissionModeID == *command.RequestedPermissionModeID
+		if modelMatches && permissionMatches {
+			return outcome, effective.ReasonCode
+		}
+	} else if outcome != store.SettingsCommandOutcomeUnknown && outcome != store.SettingsCommandMismatched &&
+		capability.EffectiveModelID == command.ReservedCapability.EffectiveModelID &&
+		capability.EffectivePermissionModeID == command.ReservedCapability.EffectivePermissionModeID {
+		return outcome, effective.ReasonCode
+	} else if outcome == store.SettingsCommandOutcomeUnknown || outcome == store.SettingsCommandMismatched {
+		return outcome, effective.ReasonCode
+	}
+	reason := "provider_mismatched_effective"
+	return store.SettingsCommandMismatched, &reason
+}
+
+func settingsReserveFailureReason(ctx context.Context, ledger store.SettingsCommandStore, sessionID string, err error) string {
+	if err == nil {
+		return "internal_error"
+	}
+	switch {
+	case strings.Contains(err.Error(), "ID is reused"):
+		return "cmd_id_reused"
+	case strings.Contains(err.Error(), "capability is stale"), strings.Contains(err.Error(), "settings writer"):
+		return "stale_capability"
+	}
+	if pending, pendingErr := ledger.PendingSettingsCommands(ctx, sessionID); pendingErr == nil && len(pending) > 0 {
+		return "settings_change_pending"
+	}
+	return "internal_error"
+}
+
+func settingsCommandKey(sessionID, commandID string) string { return sessionID + "\x00" + commandID }
+
+func (h *webSocketHandler) settingsCurrentAdapter(sessionID string) *adapterConnection {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.adapters[sessionID]
+}
+
+func (h *webSocketHandler) settingsClient(key string) *clientConnection {
+	h.commandMu.Lock()
+	defer h.commandMu.Unlock()
+	return h.settingsClients[key]
+}
+
+func (h *webSocketHandler) removeSettingsClient(key string) {
+	h.commandMu.Lock()
+	delete(h.settingsClients, key)
+	h.commandMu.Unlock()
+}
+
+func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *managedConn, peer *clientConnection, accepted AcceptedPeer, cmd *protocol.Command) error {
 	if err := validateClientCommand(cmd); err != nil {
 		_ = writeCommandAck(ctx, conn, commandID(cmd), protocol.AckRejected, "invalid_command")
 		return err
@@ -1037,6 +1330,11 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 	}
 	if !subscribesTo(accepted.Subscribed, cmd.SessionID) {
 		err := fmt.Errorf("client is not subscribed to session %s", cmd.SessionID)
+		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
+		return err
+	}
+	if cmd.Type == protocol.CommandSettingsChange && !hasLiteralSessionControl(accepted.Principal, cmd.SessionID) {
+		err := errors.New("settings command requires literal session control scope")
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return err
 	}
@@ -1053,6 +1351,9 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 	if err := h.handshake.authenticator.Authorize(ctx, accepted.Principal, auth.SessionControl(cmd.SessionID)); err != nil {
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return err
+	}
+	if cmd.Type == protocol.CommandSettingsChange {
+		return h.handleSettingsChange(ctx, conn, peer, accepted, cmd)
 	}
 
 	h.commandMu.Lock()
@@ -1226,6 +1527,8 @@ func commandAdmissionAction(commandType protocol.CommandType) auth.SessionAdmiss
 		return auth.SessionAdmissionPermission
 	case protocol.CommandSessionInterrupt, protocol.CommandSessionStop:
 		return auth.SessionAdmissionRunControl
+	case protocol.CommandSettingsChange:
+		return auth.SessionAdmissionSettings
 	default:
 		return ""
 	}
@@ -1553,9 +1856,21 @@ func validateClientCommand(cmd *protocol.Command) error {
 	case protocol.CommandSessionSend, protocol.CommandPermissionRespond, protocol.CommandSessionInterrupt, protocol.CommandSessionStop,
 		protocol.CommandSessionAttach:
 		return nil
+	case protocol.CommandSettingsChange:
+		_, err := protocol.DecodeSettingsChangePayload(cmd.Payload)
+		return err
 	default:
 		return fmt.Errorf("unsupported command type %q", cmd.Type)
 	}
+}
+
+func hasLiteralSessionControl(principal auth.Principal, sessionID string) bool {
+	for _, scope := range principal.Scopes {
+		if scope.Kind == auth.KindSession && scope.ID == sessionID && scope.Access == auth.AccessControl {
+			return true
+		}
+	}
+	return false
 }
 
 func commandID(cmd *protocol.Command) string {
@@ -1936,6 +2251,14 @@ func writeCommandAck(ctx context.Context, conn *managedConn, commandID string, s
 		Status:    status,
 		Reason:    reason,
 	})
+}
+
+func writeClientCommandAck(ctx context.Context, peer *clientConnection, conn *managedConn, commandID string, status protocol.AckStatus, reason string) error {
+	ack := &protocol.CommandAck{CommandID: commandID, Status: status, Reason: reason}
+	if peer != nil {
+		return peer.writeFrame(ctx, ack)
+	}
+	return writeCommandAck(ctx, conn, commandID, status, reason)
 }
 
 func protocolErrorCode(err error) string {

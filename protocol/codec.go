@@ -2,10 +2,17 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -39,6 +46,7 @@ const (
 	FrameCredentialRotationCredential FrameName = "credential.rotation.credential"
 	FrameCredentialRotationPossession FrameName = "credential.rotation.possession"
 	FrameCredentialRotationActivation FrameName = "credential.rotation.activation"
+	FrameSettingsDeliveryExecute      FrameName = "settings.delivery.execute"
 )
 
 const (
@@ -49,6 +57,8 @@ const (
 	MaxTargetJoinNonceBytes      = 128
 	MaxTargetJoinCredentialBytes = 4096
 	MaxCredentialRotationIDBytes = 256
+	MaxSettingsIdentifierBytes   = 128
+	MaxSettingsCommandIDBytes    = 255
 )
 
 type Role string
@@ -66,6 +76,7 @@ const (
 	CommandSessionInterrupt  CommandType = "session.interrupt"
 	CommandSessionStop       CommandType = "session.stop"
 	CommandSessionAttach     CommandType = "session.attach"
+	CommandSettingsChange    CommandType = "session.settings.change"
 )
 
 type AckStatus string
@@ -171,10 +182,19 @@ func (*HelloAck) FrameName() FrameName { return FrameHelloAck }
 
 type HelloCapabilities struct {
 	HistoryPage *HistoryPageCapability `json:"history_page,omitempty"`
+	Settings    *SettingsCapability    `json:"settings,omitempty"`
 }
 
 type HistoryPageCapability struct {
 	MaxLimit int `json:"max_limit"`
+}
+
+// SettingsCapability advertises fixed v2 protocol limits. It does not claim
+// that a particular Adapter control is mutable.
+type SettingsCapability struct {
+	SchemaVersion                  int `json:"schema_version"`
+	MaxPendingChanges              int `json:"max_pending_changes"`
+	ProviderResponseTimeoutSeconds int `json:"provider_response_timeout_seconds"`
 }
 
 type SessionSummary struct {
@@ -231,6 +251,53 @@ type CommandAck struct {
 }
 
 func (*CommandAck) FrameName() FrameName { return FrameCommandAck }
+
+// SettingsChange is the bounded Client request interpreted by the Hub. It
+// deliberately contains only opaque identifiers, never Provider objects.
+type SettingsChange struct {
+	CapabilityFingerprint     string
+	RequestedModelID          *string
+	RequestedPermissionModeID *string
+}
+
+type SettingsCapabilityChoice struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+type SettingsCapabilityPayload struct {
+	SchemaVersion             int                        `json:"schema_version"`
+	Fingerprint               string                     `json:"fingerprint"`
+	Models                    []SettingsCapabilityChoice `json:"models"`
+	PermissionModes           []SettingsCapabilityChoice `json:"permission_modes"`
+	EffectiveModelID          string                     `json:"effective_model_id"`
+	EffectivePermissionModeID string                     `json:"effective_permission_mode_id"`
+	ModelChange               string                     `json:"model_change"`
+	PermissionChange          string                     `json:"permission_change"`
+	ModelReadOnlyReason       *string                    `json:"model_read_only_reason"`
+	PermissionReadOnlyReason  *string                    `json:"permission_read_only_reason"`
+}
+
+// SettingsEffectivePayload is the Adapter's bounded result proposal. The Hub
+// resolves it to durable capability metadata before it can finalize a command.
+type SettingsEffectivePayload struct {
+	CommandID                 string
+	RequestFingerprint        string
+	EffectiveFingerprint      string
+	Outcome                   string
+	EffectiveModelID          string
+	EffectivePermissionModeID string
+	ReasonCode                *string
+}
+
+type SettingsDeliveryExecute struct {
+	SessionID          string `json:"session_id"`
+	CommandID          string `json:"cmd_id"`
+	ReservationVersion int64  `json:"reservation_version"`
+	OperationTimeoutMS int64  `json:"operation_timeout_ms"`
+}
+
+func (*SettingsDeliveryExecute) FrameName() FrameName { return FrameSettingsDeliveryExecute }
 
 type Ping struct {
 	Nonce string `json:"nonce,omitempty"`
@@ -299,7 +366,7 @@ func Decode(data []byte) (Frame, error) {
 	case FrameEventReceipt:
 		return decodeEventReceipt(data)
 	case FrameCommand:
-		return decodeInto(data, &Command{})
+		return decodeCommand(data)
 	case FrameCommandAck:
 		return decodeInto(data, &CommandAck{})
 	case FramePing:
@@ -324,9 +391,290 @@ func Decode(data []byte) (Frame, error) {
 		return decodeCredentialRotationPossession(data)
 	case FrameCredentialRotationActivation:
 		return decodeCredentialRotationActivation(data)
+	case FrameSettingsDeliveryExecute:
+		return decodeSettingsDeliveryExecute(data)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownFrame, env.Frame)
 	}
+}
+
+func decodeCommand(data []byte) (Frame, error) {
+	decoded, err := decodeInto(data, &Command{})
+	if err != nil {
+		return nil, err
+	}
+	command := decoded.(*Command)
+	if command.Type != CommandSettingsChange {
+		return command, nil
+	}
+	fields, err := targetJoinFields(data, FrameCommand, "cmd_id", "type", "session_id", "payload")
+	if err != nil || !validSettingsCommandID(command.CommandID) || !validSettingsCommandID(command.SessionID) {
+		return nil, errors.New("decode settings command: invalid command")
+	}
+	if _, err := DecodeSettingsChangePayload(fields["payload"]); err != nil {
+		return nil, fmt.Errorf("decode settings command: %w", err)
+	}
+	return command, nil
+}
+
+// DecodeSettingsChangePayload validates the exact, provider-neutral command
+// grammar before Hub routing can touch the durable Settings ledger.
+func DecodeSettingsChangePayload(payload json.RawMessage) (SettingsChange, error) {
+	fields, err := strictObject(payload)
+	if err != nil || len(fields) < 2 || len(fields) > 3 {
+		return SettingsChange{}, errors.New("invalid settings change payload")
+	}
+	for key := range fields {
+		if key != "capability_fingerprint" && key != "model_id" && key != "permission_mode_id" {
+			return SettingsChange{}, errors.New("invalid settings change payload")
+		}
+	}
+	var change SettingsChange
+	if fields["capability_fingerprint"] == nil || json.Unmarshal(fields["capability_fingerprint"], &change.CapabilityFingerprint) != nil || !validSettingsFingerprint(change.CapabilityFingerprint) {
+		return SettingsChange{}, errors.New("invalid settings capability fingerprint")
+	}
+	if raw := fields["model_id"]; raw != nil {
+		var value string
+		if json.Unmarshal(raw, &value) != nil || !validSettingsIdentifier(value) {
+			return SettingsChange{}, errors.New("invalid settings model id")
+		}
+		change.RequestedModelID = &value
+	}
+	if raw := fields["permission_mode_id"]; raw != nil {
+		var value string
+		if json.Unmarshal(raw, &value) != nil || !validSettingsIdentifier(value) {
+			return SettingsChange{}, errors.New("invalid settings permission mode id")
+		}
+		change.RequestedPermissionModeID = &value
+	}
+	if change.RequestedModelID == nil && change.RequestedPermissionModeID == nil {
+		return SettingsChange{}, errors.New("settings change requires a requested value")
+	}
+	return change, nil
+}
+
+// DecodeSettingsCapabilityPayload validates the exact durable capability
+// event grammar and recomputes its canonical fingerprint.
+func DecodeSettingsCapabilityPayload(payload json.RawMessage) (SettingsCapabilityPayload, error) {
+	fields, err := strictObject(payload)
+	if err != nil || len(fields) != 10 {
+		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+	}
+	allowed := map[string]bool{"schema_version": true, "fingerprint": true, "models": true, "permission_modes": true, "effective_model_id": true, "effective_permission_mode_id": true, "model_change": true, "permission_change": true, "model_read_only_reason": true, "permission_read_only_reason": true}
+	for key := range fields {
+		if !allowed[key] {
+			return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+		}
+	}
+	var out SettingsCapabilityPayload
+	if json.Unmarshal(fields["schema_version"], &out.SchemaVersion) != nil || out.SchemaVersion != 1 ||
+		json.Unmarshal(fields["fingerprint"], &out.Fingerprint) != nil || !validSettingsFingerprint(out.Fingerprint) ||
+		json.Unmarshal(fields["models"], &out.Models) != nil || json.Unmarshal(fields["permission_modes"], &out.PermissionModes) != nil ||
+		json.Unmarshal(fields["effective_model_id"], &out.EffectiveModelID) != nil || json.Unmarshal(fields["effective_permission_mode_id"], &out.EffectivePermissionModeID) != nil ||
+		json.Unmarshal(fields["model_change"], &out.ModelChange) != nil || json.Unmarshal(fields["permission_change"], &out.PermissionChange) != nil ||
+		json.Unmarshal(fields["model_read_only_reason"], &out.ModelReadOnlyReason) != nil || json.Unmarshal(fields["permission_read_only_reason"], &out.PermissionReadOnlyReason) != nil {
+		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+	}
+	if !validSettingsChoices(out.Models, 1, 32) || !validSettingsChoices(out.PermissionModes, 1, 16) ||
+		!validSettingsIdentifier(out.EffectiveModelID) || !validSettingsIdentifier(out.EffectivePermissionModeID) ||
+		!settingsChoiceContains(out.Models, out.EffectiveModelID) || !settingsChoiceContains(out.PermissionModes, out.EffectivePermissionModeID) ||
+		!validSettingsChangeMode(out.ModelChange, out.ModelReadOnlyReason, len(out.Models)) || !validSettingsChangeMode(out.PermissionChange, out.PermissionReadOnlyReason, len(out.PermissionModes)) {
+		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+	}
+	if out.Fingerprint != settingsCapabilityFingerprint(out) {
+		return SettingsCapabilityPayload{}, errors.New("settings capability fingerprint mismatch")
+	}
+	return out, nil
+}
+
+// DecodeSettingsEffectivePayload validates the exact terminal result grammar
+// without allowing the Adapter to select durable outcome metadata itself.
+func DecodeSettingsEffectivePayload(payload json.RawMessage) (SettingsEffectivePayload, error) {
+	fields, err := strictObject(payload)
+	if err != nil || len(fields) != 7 {
+		return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
+	}
+	allowed := map[string]bool{"cmd_id": true, "request_fingerprint": true, "effective_fingerprint": true, "outcome": true, "effective_model_id": true, "effective_permission_mode_id": true, "reason_code": true}
+	for key := range fields {
+		if !allowed[key] {
+			return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
+		}
+	}
+	var out SettingsEffectivePayload
+	if json.Unmarshal(fields["cmd_id"], &out.CommandID) != nil || !validSettingsCommandID(out.CommandID) ||
+		json.Unmarshal(fields["request_fingerprint"], &out.RequestFingerprint) != nil || !validSettingsFingerprint(out.RequestFingerprint) ||
+		json.Unmarshal(fields["effective_fingerprint"], &out.EffectiveFingerprint) != nil || !validSettingsFingerprint(out.EffectiveFingerprint) ||
+		json.Unmarshal(fields["outcome"], &out.Outcome) != nil || !validSettingsOutcome(out.Outcome) ||
+		json.Unmarshal(fields["effective_model_id"], &out.EffectiveModelID) != nil || !validSettingsIdentifier(out.EffectiveModelID) ||
+		json.Unmarshal(fields["effective_permission_mode_id"], &out.EffectivePermissionModeID) != nil || !validSettingsIdentifier(out.EffectivePermissionModeID) ||
+		json.Unmarshal(fields["reason_code"], &out.ReasonCode) != nil {
+		return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
+	}
+	if (out.Outcome == "applied" && out.ReasonCode != nil) || (out.Outcome != "applied" && !validSettingsReasonPointer(out.ReasonCode)) {
+		return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
+	}
+	return out, nil
+}
+
+func validSettingsChoices(choices []SettingsCapabilityChoice, min, max int) bool {
+	if len(choices) < min || len(choices) > max {
+		return false
+	}
+	last := ""
+	for _, choice := range choices {
+		if !validSettingsIdentifier(choice.ID) || !validSettingsLabel(choice.Label) || (last != "" && choice.ID <= last) {
+			return false
+		}
+		last = choice.ID
+	}
+	return true
+}
+
+func validSettingsLabel(value string) bool {
+	if len(value) < 1 || len(value) > 128 || !utf8.ValidString(value) || norm.NFC.String(value) != value {
+		return false
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func settingsChoiceContains(choices []SettingsCapabilityChoice, id string) bool {
+	for _, choice := range choices {
+		if choice.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func validSettingsChangeMode(mode string, reason *string, choices int) bool {
+	if mode == "allowed" {
+		return choices >= 2 && reason == nil
+	}
+	return mode == "read_only" && reason != nil && len(*reason) >= 1 && len(*reason) <= 64 && validSettingsReason(*reason)
+}
+
+func validSettingsReason(value string) bool {
+	if len(value) == 0 || len(value) > 64 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, ch := range value[1:] {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func validSettingsReasonPointer(value *string) bool {
+	return value != nil && validSettingsReason(*value)
+}
+
+func validSettingsOutcome(value string) bool {
+	switch value {
+	case "applied", "rejected", "timeout", "unsupported", "stale_capability", "outcome_unknown", "mismatched_effective":
+		return true
+	default:
+		return false
+	}
+}
+
+func settingsCapabilityFingerprint(capability SettingsCapabilityPayload) string {
+	data := make([]byte, 0, 512)
+	appendString := func(value string) {
+		var length [2]byte
+		binary.BigEndian.PutUint16(length[:], uint16(len(value)))
+		data = append(data, length[:]...)
+		data = append(data, value...)
+	}
+	data = append(data, []byte("agentwharf.settings-capability.v1")...)
+	data = append(data, 0, 1, byte(len(capability.Models)))
+	for _, choice := range capability.Models {
+		appendString(choice.ID)
+		appendString(choice.Label)
+	}
+	data = append(data, byte(len(capability.PermissionModes)))
+	for _, choice := range capability.PermissionModes {
+		appendString(choice.ID)
+		appendString(choice.Label)
+	}
+	appendString(capability.EffectiveModelID)
+	appendString(capability.EffectivePermissionModeID)
+	if capability.ModelChange == "allowed" {
+		data = append(data, 1)
+	} else {
+		data = append(data, 0)
+	}
+	if capability.PermissionChange == "allowed" {
+		data = append(data, 1)
+	} else {
+		data = append(data, 0)
+	}
+	if capability.ModelReadOnlyReason == nil {
+		appendString("")
+	} else {
+		appendString(*capability.ModelReadOnlyReason)
+	}
+	if capability.PermissionReadOnlyReason == nil {
+		appendString("")
+	} else {
+		appendString(*capability.PermissionReadOnlyReason)
+	}
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("sha256:%x", digest[:])
+}
+
+func decodeSettingsDeliveryExecute(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameSettingsDeliveryExecute, "session_id", "cmd_id", "reservation_version", "operation_timeout_ms")
+	if err != nil {
+		return nil, errors.New("decode settings delivery: invalid frame")
+	}
+	var out SettingsDeliveryExecute
+	if json.Unmarshal(fields["session_id"], &out.SessionID) != nil || json.Unmarshal(fields["cmd_id"], &out.CommandID) != nil ||
+		json.Unmarshal(fields["reservation_version"], &out.ReservationVersion) != nil || json.Unmarshal(fields["operation_timeout_ms"], &out.OperationTimeoutMS) != nil ||
+		!validSettingsCommandID(out.SessionID) || !validSettingsCommandID(out.CommandID) || out.ReservationVersion < 1 || out.OperationTimeoutMS != 30000 {
+		return nil, errors.New("decode settings delivery: invalid frame")
+	}
+	return &out, nil
+}
+
+func validSettingsCommandID(value string) bool {
+	return len(value) > 0 && len(value) <= MaxSettingsCommandIDBytes
+}
+
+func validSettingsIdentifier(value string) bool {
+	if len(value) == 0 || len(value) > MaxSettingsIdentifierBytes {
+		return false
+	}
+	for index := 0; index < len(value); index += 1 {
+		ch := value[index]
+		if index == 0 {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+				return false
+			}
+			continue
+		}
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || strings.ContainsRune("._:/-", rune(ch))) {
+			return false
+		}
+	}
+	return true
+}
+
+func validSettingsFingerprint(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	for _, ch := range value[len("sha256:"):] {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeTargetJoin(data []byte) (Frame, error) {

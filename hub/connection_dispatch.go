@@ -2,6 +2,8 @@ package hub
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"time"
 
@@ -22,6 +24,11 @@ type adapterDispatchStore interface {
 type adapterDispatchAuthority struct {
 	store             adapterDispatchStore
 	adapterCredential func(context.Context, string, auth.Principal, string) (int64, int64, bool, error)
+}
+
+type admittedAdapter struct {
+	admission store.AdapterConnectionAdmission
+	writer    store.SettingsWriter
 }
 
 func newAdapterDispatchAuthority(handshake *Handshake, candidate any) *adapterDispatchAuthority {
@@ -45,9 +52,9 @@ func (a *adapterDispatchAuthority) authenticate(ctx context.Context, token strin
 	return generation, time.Unix(0, expiresAt), allowInitialize, nil
 }
 
-func (a *adapterDispatchAuthority) admit(ctx context.Context, sessionID string, generation int64, expiresAt time.Time, allowInitialize bool) (store.AdapterConnectionAdmission, error) {
+func (a *adapterDispatchAuthority) admit(ctx context.Context, sessionID string, generation int64, expiresAt time.Time, allowInitialize bool) (admittedAdapter, error) {
 	if generation < 1 || !expiresAt.After(time.Now()) {
-		return store.AdapterConnectionAdmission{}, errAdapterAuthorityLost
+		return admittedAdapter{}, errAdapterAuthorityLost
 	}
 	var err error
 	if allowInitialize {
@@ -58,18 +65,30 @@ func (a *adapterDispatchAuthority) admit(ctx context.Context, sessionID string, 
 		}
 	}
 	if err != nil {
-		return store.AdapterConnectionAdmission{}, errAdapterAuthorityLost
+		return admittedAdapter{}, errAdapterAuthorityLost
 	}
-	connection, err := a.store.AcceptAdapterHello(ctx, sessionID, store.AdapterHello{CredentialGeneration: generation})
+	leaseID, err := newSettingsWriterLeaseID()
 	if err != nil {
-		return store.AdapterConnectionAdmission{}, errAdapterAuthorityLost
+		return admittedAdapter{}, errAdapterAuthorityLost
+	}
+	connection, err := a.store.AcceptAdapterHello(ctx, sessionID, store.AdapterHello{CredentialGeneration: generation, WriterLeaseID: leaseID})
+	if err != nil {
+		return admittedAdapter{}, errAdapterAuthorityLost
 	}
 	grantFence, err := a.store.AllocateAdapterGrantFence(ctx)
 	if err != nil {
-		return store.AdapterConnectionAdmission{}, errAdapterAuthorityLost
+		return admittedAdapter{}, errAdapterAuthorityLost
 	}
 	admission := store.AdapterConnectionAdmission{CredentialGeneration: generation, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grantFence}
-	return admission, nil
+	return admittedAdapter{admission: admission, writer: store.SettingsWriter{ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: generation, LeaseID: leaseID}}, nil
+}
+
+func newSettingsWriterLeaseID() (string, error) {
+	var random [32]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(random[:]), nil
 }
 func (h *webSocketHandler) validateAdapter(ctx context.Context, adapter *adapterConnection) error {
 	_, authorityErr := h.adapterAuthority.store.ValidateAdapterAdmission(ctx, adapter.sessionID, adapter.admission)

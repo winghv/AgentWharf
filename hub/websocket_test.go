@@ -84,6 +84,152 @@ func TestWebSocketServerAcceptsAdapterWithDispatchStore(t *testing.T) {
 	}
 }
 
+func TestWebSocketSettingsRoutesCapabilityReserveDeliveryAndTerminalResult(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "settings.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	frame := readFrame(t, client)
+	clientAck, ok := frame.(*protocol.HelloAck)
+	if !ok {
+		t.Fatalf("settings client hello = %#v", frame)
+	}
+	if clientAck.Capabilities == nil || clientAck.Capabilities.Settings == nil ||
+		clientAck.Capabilities.Settings.SchemaVersion != 1 || clientAck.Capabilities.Settings.MaxPendingChanges != 1 ||
+		clientAck.Capabilities.Settings.ProviderResponseTimeoutSeconds != 30 {
+		t.Fatalf("settings hello capability = %+v", clientAck.Capabilities)
+	}
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+
+	publishSettingsCapability(t, adapter, "capability_initial", 1001, settingsCapabilityPayload("sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000", "balanced"))
+	if event := readFrame(t, client).(*protocol.Event); event.Type != "session.settings.capabilities" || event.Seq == nil || *event.Seq != 1 {
+		t.Fatalf("initial capability fanout = %+v", event)
+	}
+	stale := &protocol.Command{CommandID: "cmd_settings_stale", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","model_id":"reasoning"}`)}
+	writeFrame(t, client, stale)
+	if ack := readCommandAckFor(t, client, stale.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "stale_capability" {
+		t.Fatalf("stale settings acknowledgement = %+v", ack)
+	}
+
+	command := &protocol.Command{CommandID: "cmd_settings_route", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","model_id":"reasoning"}`)}
+	writeFrame(t, client, command)
+	delivered := readFrame(t, adapter).(*protocol.Command)
+	if delivered.CommandID != command.CommandID || delivered.Type != protocol.CommandSettingsChange || string(delivered.Payload) != string(command.Payload) {
+		t.Fatalf("settings delivery = %+v", delivered)
+	}
+	pending := &protocol.Command{CommandID: "cmd_settings_pending", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","model_id":"balanced"}`)}
+	writeFrame(t, client, pending)
+	if ack := readCommandAckFor(t, client, pending.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "settings_change_pending" {
+		t.Fatalf("pending settings acknowledgement = %+v", ack)
+	}
+	writeFrame(t, adapter, &protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted})
+	execute := readFrame(t, adapter).(*protocol.SettingsDeliveryExecute)
+	if execute.SessionID != "ses_1" || execute.CommandID != command.CommandID || execute.ReservationVersion != 1 || execute.OperationTimeoutMS != 30000 {
+		t.Fatalf("settings execute = %+v", execute)
+	}
+	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckAccepted || ack.Reason != "" {
+		t.Fatalf("client delivery acknowledgement = %+v", ack)
+	}
+	writeFrame(t, client, command)
+	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckDuplicate || ack.Reason != "" {
+		t.Fatalf("duplicate settings acknowledgement = %+v", ack)
+	}
+
+	publishSettingsCapability(t, adapter, "capability_effective", 1002, settingsCapabilityPayload("sha256:5e6c6921513d5a3e3ed9f5fc0a67bb94e55a66f822a76b1ced587d5a908e2761", "reasoning"))
+	if event := readFrame(t, client).(*protocol.Event); event.Type != "session.settings.capabilities" || event.Seq == nil || *event.Seq != 2 {
+		t.Fatalf("effective capability fanout = %+v", event)
+	}
+	writeFrame(t, adapter, &protocol.Event{Type: "session.settings.effective", SessionID: "ses_1", Time: 1003, ProposalID: "effective_result", Payload: json.RawMessage(`{"cmd_id":"cmd_settings_route","request_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","effective_fingerprint":"sha256:5e6c6921513d5a3e3ed9f5fc0a67bb94e55a66f822a76b1ced587d5a908e2761","outcome":"applied","effective_model_id":"reasoning","effective_permission_mode_id":"ask","reason_code":null}`)})
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.ProposalID != "effective_result" || receipt.Seq != 3 {
+		t.Fatalf("settings terminal receipt = %+v", receipt)
+	}
+	terminal := readFrame(t, client).(*protocol.Event)
+	if terminal.Type != "session.settings.effective" || terminal.Seq == nil || *terminal.Seq != 3 || strings.Contains(string(terminal.Payload), "writer_lease") {
+		t.Fatalf("settings terminal fanout = %+v", terminal)
+	}
+	stored, err := events.SettingsCommand(ctx, "ses_1", command.CommandID)
+	if err != nil || stored.Status != store.SettingsCommandApplied || stored.TerminalEventSeq == nil || *stored.TerminalEventSeq != 3 {
+		t.Fatalf("settings command terminal state = %+v, %v", stored, err)
+	}
+}
+
+func TestWebSocketSettingsFinalizesReportedSuccessWithProviderMismatch(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "settings-mismatch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	payload := settingsCapabilityPayload("sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000", "balanced")
+	publishSettingsCapability(t, adapter, "capability_initial", 1001, payload)
+	_ = readFrame(t, client).(*protocol.Event)
+
+	command := &protocol.Command{CommandID: "cmd_settings_mismatch", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","model_id":"reasoning"}`)}
+	writeFrame(t, client, command)
+	_ = readFrame(t, adapter).(*protocol.Command)
+	writeFrame(t, adapter, &protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted})
+	_ = readFrame(t, adapter).(*protocol.SettingsDeliveryExecute)
+	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckAccepted {
+		t.Fatalf("delivery acknowledgement = %+v", ack)
+	}
+	publishSettingsCapability(t, adapter, "capability_readback", 1002, payload)
+	_ = readFrame(t, client).(*protocol.Event)
+	writeFrame(t, adapter, &protocol.Event{Type: "session.settings.effective", SessionID: "ses_1", Time: 1003, ProposalID: "mismatch_result", Payload: json.RawMessage(`{"cmd_id":"cmd_settings_mismatch","request_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","effective_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","outcome":"applied","effective_model_id":"balanced","effective_permission_mode_id":"ask","reason_code":null}`)})
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.ProposalID != "mismatch_result" || receipt.Seq != 3 {
+		t.Fatalf("mismatch terminal receipt = %+v", receipt)
+	}
+	terminal := readFrame(t, client).(*protocol.Event)
+	if terminal.Type != "session.settings.effective" || !strings.Contains(string(terminal.Payload), `"outcome":"mismatched_effective"`) || !strings.Contains(string(terminal.Payload), `"reason_code":"provider_mismatched_effective"`) {
+		t.Fatalf("mismatch terminal event = %+v", terminal)
+	}
+	stored, err := events.SettingsCommand(ctx, "ses_1", command.CommandID)
+	if err != nil || stored.Status != store.SettingsCommandMismatched {
+		t.Fatalf("mismatch terminal state = %+v, %v", stored, err)
+	}
+}
+
+func publishSettingsCapability(t *testing.T, adapter *websocket.Conn, proposalID string, at int64, payload json.RawMessage) {
+	t.Helper()
+	writeFrame(t, adapter, &protocol.Event{Type: "session.settings.capabilities", SessionID: "ses_1", Time: at, ProposalID: proposalID, Payload: payload})
+	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.ProposalID != proposalID {
+		t.Fatalf("settings capability receipt = %+v", receipt)
+	}
+}
+
+func settingsCapabilityPayload(fingerprint, effectiveModel string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{"schema_version":1,"fingerprint":%q,"models":[{"id":"balanced","label":"Balanced"},{"id":"reasoning","label":"Reasoning"}],"permission_modes":[{"id":"ask","label":"Ask first"},{"id":"workspace","label":"Workspace"}],"effective_model_id":%q,"effective_permission_mode_id":"ask","model_change":"allowed","permission_change":"allowed","model_read_only_reason":null,"permission_read_only_reason":null}`, fingerprint, effectiveModel))
+}
+
 func TestWebSocketServerDeliversCommittedPendingCommandAfterAdapterReconnect(t *testing.T) {
 	events := newFakeEventStore(map[string]int64{"ses_1": 1}, map[string][]store.Event{
 		"ses_1": {{SessionID: "ses_1", Seq: 1, Type: "session.message", Payload: json.RawMessage(`{"role":"user","content":"resume"}`)}},
@@ -1156,6 +1302,34 @@ func TestWebSocketServerRejectsUnauthorizedClientCommand(t *testing.T) {
 	ack := readFrame(t, client).(*protocol.CommandAck)
 	if ack.CommandID != "cmd_unauthorized" || ack.Status != protocol.AckRejected || ack.Reason != "unauthorized" {
 		t.Fatalf("client ack = %+v", ack)
+	}
+}
+
+func TestWebSocketServerRejectsSettingsChangeWithoutLiteralControlScope(t *testing.T) {
+	t.Parallel()
+
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+
+	writeClientHello(t, client, "view-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeFrame(t, client, &protocol.Command{
+		CommandID: "cmd_settings_view_only",
+		Type:      protocol.CommandType("session.settings.change"),
+		SessionID: "ses_1",
+		Payload:   json.RawMessage(`{"capability_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model_id":"reasoning"}`),
+	})
+
+	ack := readFrame(t, client).(*protocol.CommandAck)
+	if ack.CommandID != "cmd_settings_view_only" || ack.Status != protocol.AckRejected || ack.Reason != "unauthorized" {
+		t.Fatalf("settings client ack = %+v", ack)
+	}
+	if calls := events.appended(); len(calls) != 0 {
+		t.Fatalf("settings command persisted before literal control authorization: %+v", calls)
 	}
 }
 
@@ -2580,6 +2754,15 @@ type fakeEventStore struct {
 	replayCalls   int
 	pending       map[string]store.PendingCommand
 	proposals     map[string]fakeProposal
+}
+
+type settingsWebSocketStore struct{ *sqlite.Store }
+
+func (s *settingsWebSocketStore) SessionAdmissionTruth(_ context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
+	if sessionID != "ses_1" {
+		return store.SessionAdmissionTruth{}, errors.New("unknown settings session")
+	}
+	return store.SessionAdmissionTruth{SessionID: sessionID, Exists: true, Complete: true, Live: true}, nil
 }
 
 type fakeProposal struct {
