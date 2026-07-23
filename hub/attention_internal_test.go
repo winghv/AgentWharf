@@ -26,4 +26,24 @@ func TestAttentionSummaryFrameRedactsUngrantableBlockerReference(t *testing.T) {
 	}
 }
 
+func TestOldAttentionExpiryCannotRemoveRenewedSubscription(t *testing.T) {
+	peer := &clientConnection{}
+	handler := &webSocketHandler{
+		attentionSubscribers:   make(map[string]map[*clientConnection]struct{}),
+		attentionSubscriptions: make(map[*clientConnection]attentionSubscription),
+	}
+	handler.attentionSubscriptions[peer] = attentionSubscription{generation: 2, sessionIDs: []string{"ses_renewed"}}
+	handler.attentionSubscribers["ses_renewed"] = map[*clientConnection]struct{}{peer: {}}
+
+	// This is the exact callback path after the old timer was already runnable.
+	handler.expireAttentionSubscription(peer, 1)
+	current, found := handler.attentionSubscriptions[peer]
+	if !found || current.generation != 2 {
+		t.Fatalf("old expiry removed renewed subscription: %+v found=%v", current, found)
+	}
+	if _, found := handler.attentionSubscribers["ses_renewed"][peer]; !found {
+		t.Fatal("old expiry removed renewed live membership")
+	}
+}
+
 func pointerString(value string) *string { return &value }

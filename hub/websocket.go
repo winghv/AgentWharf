@@ -959,17 +959,7 @@ func (h *webSocketHandler) handleAttentionSubscribe(ctx context.Context, peer *c
 	}
 	generation := subscription.generation
 	timer := time.AfterFunc(delay, func() {
-		peer.attentionMu.Lock()
-		defer peer.attentionMu.Unlock()
-		h.mu.Lock()
-		current, found := h.attentionSubscriptions[peer]
-		if found && current.generation == generation {
-			h.removeAttentionSubscriptionLocked(peer)
-		}
-		h.mu.Unlock()
-		if found && current.generation == generation {
-			_ = peer.close(websocket.StatusPolicyViolation, "attention authorization expired")
-		}
+		h.expireAttentionSubscription(peer, generation)
 	})
 	h.mu.Lock()
 	current, found := h.attentionSubscriptions[peer]
@@ -991,6 +981,20 @@ func (h *webSocketHandler) handleAttentionSubscribe(ctx context.Context, peer *c
 		return err
 	}
 	return nil
+}
+
+func (h *webSocketHandler) expireAttentionSubscription(peer *clientConnection, generation uint64) {
+	peer.attentionMu.Lock()
+	defer peer.attentionMu.Unlock()
+	h.mu.Lock()
+	current, found := h.attentionSubscriptions[peer]
+	if found && current.generation == generation {
+		h.removeAttentionSubscriptionLocked(peer)
+	}
+	h.mu.Unlock()
+	if found && current.generation == generation {
+		_ = peer.close(websocket.StatusPolicyViolation, "attention authorization expired")
+	}
 }
 
 func (h *webSocketHandler) removeAttentionSubscriptionLocked(peer *clientConnection) {
