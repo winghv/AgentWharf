@@ -1666,6 +1666,22 @@ func TestWebSocketServerRoutesFileReferenceThroughDurableLedger(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerRejectsV1FileReferenceWithoutDurableMutation(t *testing.T) {
+	events := newFakeEventStore(map[string]int64{"ses_1": 0}, nil)
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeClientHello(t, client, "client-token", 0)
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeFrame(t, client, &protocol.Command{CommandID: "cmd_file_v1", Type: protocol.CommandSessionSend, SessionID: "ses_1", Payload: fileReferenceSendPayload(t)})
+	if ack := readCommandAckFor(t, client, "cmd_file_v1"); ack.Status != protocol.AckRejected || ack.Reason != "file_references_unsupported" {
+		t.Fatalf("v1 file-reference ack = %+v", ack)
+	}
+	if calls := events.appended(); len(calls) != 0 {
+		t.Fatalf("v1 file-reference reached durable Store: %+v", calls)
+	}
+}
+
 func fileReferenceCapability() protocol.FileReferenceCapabilityPayload {
 	capability := protocol.FileReferenceCapabilityPayload{
 		SchemaVersion: 1, MaxReferences: 8, MaxTotalBytes: 10485760,
