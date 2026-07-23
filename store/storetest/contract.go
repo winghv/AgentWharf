@@ -291,14 +291,14 @@ func RunControlContract(t *testing.T, ledger store.RunControlStore, harness Sett
 	capability, err := ledger.PublishRunControlCapability(ctx, "ses_run_control_1", store.RunControlCapabilityUpdate{
 		EventSeq: capabilitySeq, InterruptSupported: true, StopSupported: true, Writer: writer,
 	})
-	if err != nil || capability.Version != 1 || capability.EventSeq != capabilitySeq || capability.Writer != writer {
+	if err != nil || capability.Version != capabilitySeq || capability.EventSeq != capabilitySeq || capability.Writer != writer {
 		t.Fatalf("PublishRunControlCapability() = %+v, %v", capability, err)
 	}
 	refreshedCapabilitySeq := appendRunControlEvent(t, ledger, "ses_run_control_1", "session.run.capabilities", `{}`)
 	capability, err = ledger.PublishRunControlCapability(ctx, "ses_run_control_1", store.RunControlCapabilityUpdate{
 		EventSeq: refreshedCapabilitySeq, InterruptSupported: true, StopSupported: true, Writer: writer,
 	})
-	if err != nil || capability.Version != 2 || capability.EventSeq != refreshedCapabilitySeq || capability.Writer != writer {
+	if err != nil || capability.Version != refreshedCapabilitySeq || capability.EventSeq != refreshedCapabilitySeq || capability.Writer != writer {
 		t.Fatalf("PublishRunControlCapability(refresh) = %+v, %v", capability, err)
 	}
 	capabilitySeq = refreshedCapabilitySeq
