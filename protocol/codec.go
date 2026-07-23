@@ -50,6 +50,8 @@ const (
 	FrameCredentialRotationActivation FrameName = "credential.rotation.activation"
 	FrameSettingsDeliveryExecute      FrameName = "settings.delivery.execute"
 	FrameProviderStart                FrameName = "provider.start"
+	FrameProviderStartPrepare         FrameName = "provider.start.prepare"
+	FrameProviderStartStarted         FrameName = "provider.start.started"
 	FrameProviderStartAck             FrameName = "provider.start.ack"
 )
 
@@ -205,6 +207,18 @@ type ConnectionAuthorityReceipt struct {
 type ProviderStart struct{}
 
 func (*ProviderStart) FrameName() FrameName { return FrameProviderStart }
+
+// ProviderStartPrepare is Hub-to-Adapter only. It confirms that the Hub holds
+// the bounded Store transaction; it is not permission to forward work.
+type ProviderStartPrepare struct{}
+
+func (*ProviderStartPrepare) FrameName() FrameName { return FrameProviderStartPrepare }
+
+// ProviderStartStarted confirms that the Adapter crossed the process-start
+// boundary while the Hub's Store admission transaction remains open.
+type ProviderStartStarted struct{}
+
+func (*ProviderStartStarted) FrameName() FrameName { return FrameProviderStartStarted }
 
 type ProviderStartStatus string
 
@@ -573,6 +587,10 @@ func Decode(data []byte) (Frame, error) {
 		return decodeSettingsDeliveryExecute(data)
 	case FrameProviderStart:
 		return decodeProviderStart(data)
+	case FrameProviderStartPrepare:
+		return decodeProviderStartPrepare(data)
+	case FrameProviderStartStarted:
+		return decodeProviderStartStarted(data)
 	case FrameProviderStartAck:
 		return decodeProviderStartAck(data)
 	default:
@@ -585,6 +603,20 @@ func decodeProviderStart(data []byte) (Frame, error) {
 		return nil, targetJoinError(FrameProviderStart)
 	}
 	return &ProviderStart{}, nil
+}
+
+func decodeProviderStartPrepare(data []byte) (Frame, error) {
+	if _, err := targetJoinFields(data, FrameProviderStartPrepare); err != nil {
+		return nil, targetJoinError(FrameProviderStartPrepare)
+	}
+	return &ProviderStartPrepare{}, nil
+}
+
+func decodeProviderStartStarted(data []byte) (Frame, error) {
+	if _, err := targetJoinFields(data, FrameProviderStartStarted); err != nil {
+		return nil, targetJoinError(FrameProviderStartStarted)
+	}
+	return &ProviderStartStarted{}, nil
 }
 
 func decodeProviderStartAck(data []byte) (Frame, error) {

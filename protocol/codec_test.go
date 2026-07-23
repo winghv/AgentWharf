@@ -232,7 +232,7 @@ func TestHelloAckConnectionAuthorityReceiptIsMinimalAndRoundTrips(t *testing.T) 
 }
 
 func TestProviderStartFramesAreStrictAndReferenceOnly(t *testing.T) {
-	for _, frame := range []Frame{&ProviderStart{}, &ProviderStartAck{Status: ProviderStartAdmitted}, &ProviderStartAck{Status: ProviderStartRejected}} {
+	for _, frame := range []Frame{&ProviderStart{}, &ProviderStartPrepare{}, &ProviderStartStarted{}, &ProviderStartAck{Status: ProviderStartAdmitted}, &ProviderStartAck{Status: ProviderStartRejected}} {
 		encoded, err := Encode(frame)
 		if err != nil {
 			t.Fatalf("Encode(%T): %v", frame, err)
@@ -243,6 +243,8 @@ func TestProviderStartFramesAreStrictAndReferenceOnly(t *testing.T) {
 	}
 	for _, raw := range []string{
 		`{"frame":"provider.start","workspace_key":"forbidden"}`,
+		`{"frame":"provider.start.prepare","lease_id":"forbidden"}`,
+		`{"frame":"provider.start.started","provider":"forbidden"}`,
 		`{"frame":"provider.start.ack","status":"admitted","provider":"forbidden"}`,
 		`{"frame":"provider.start.ack","status":"unknown"}`,
 	} {

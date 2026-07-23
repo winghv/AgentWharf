@@ -152,6 +152,10 @@ func TestWebSocketV2ProviderStartUsesStoreLinearizedAdmission(t *testing.T) {
 		t.Fatalf("ReserveWorkspaceLease() = %v", err)
 	}
 	writeFrame(t, adapter, &protocol.ProviderStart{})
+	if _, ok := readFrame(t, adapter).(*protocol.ProviderStartPrepare); !ok {
+		t.Fatal("provider start did not enter the Store-held prepare phase")
+	}
+	writeFrame(t, adapter, &protocol.ProviderStartStarted{})
 	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Status != protocol.ProviderStartAdmitted {
 		t.Fatalf("provider start ack = %+v", ack)
 	}

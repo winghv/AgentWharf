@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -75,6 +76,19 @@ func TestProviderStartAdmissionContract(t *testing.T) {
 		}
 		if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err == nil {
 			t.Fatal("duplicate provider start was admitted")
+		}
+	})
+
+	t.Run("callback failure leaves the lease reserved", func(t *testing.T) {
+		harness, admission, key := newAdmission(t)
+		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+			return errors.New("provider did not start")
+		}); err == nil {
+			t.Fatal("failed provider start callback was admitted")
+		}
+		lease, err := harness.WorkspaceLease(context.Background(), key)
+		if err != nil || lease.Status != store.WorkspaceLeaseReserved {
+			t.Fatalf("failed callback lease = %+v, %v", lease, err)
 		}
 	})
 

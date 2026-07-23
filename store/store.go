@@ -406,6 +406,7 @@ type ProviderStartAdmission struct {
 type ProviderStartAdmissionStore interface {
 	EventStore
 	RecordProviderStartAdmission(context.Context, ProviderStartAdmission) (WorkspaceLease, error)
+	WithProviderStartAdmission(context.Context, ProviderStartAdmission, func(context.Context) error) (WorkspaceLease, error)
 }
 
 type AttachAttemptOutcome string

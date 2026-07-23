@@ -1874,8 +1874,20 @@ func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *ada
 		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Status: protocol.ProviderStartRejected})
 	}
 	err := withAdapterAuthorityBudget(ctx, func(admissionCtx context.Context) error {
-		_, err := admissions.RecordProviderStartAdmission(admissionCtx, store.ProviderStartAdmission{
+		_, err := admissions.WithProviderStartAdmission(admissionCtx, store.ProviderStartAdmission{
 			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter,
+		}, func(startCtx context.Context) error {
+			if err := adapter.writeFrame(startCtx, &protocol.ProviderStartPrepare{}); err != nil {
+				return fmt.Errorf("send provider start prepare: %w", err)
+			}
+			frame, err := readProtocolFrame(startCtx, adapter.conn)
+			if err != nil {
+				return fmt.Errorf("read provider start proof: %w", err)
+			}
+			if _, ok := frame.(*protocol.ProviderStartStarted); !ok {
+				return fmt.Errorf("provider start proof = %T", frame)
+			}
+			return nil
 		})
 		return err
 	})

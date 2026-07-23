@@ -1170,6 +1170,94 @@ func TestProviderStartAdmissionLinearizesLiveConnectionAndWorkspaceLease(t *test
 		}
 	})
 
+	t.Run("callback failure leaves the lease reserved", func(t *testing.T) {
+		harness, admission, key := newAdmission(t)
+		defer harness.Close()
+		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+			return errors.New("provider did not start")
+		}); err == nil {
+			t.Fatal("failed provider start callback was admitted")
+		}
+		lease, err := harness.WorkspaceLease(context.Background(), key)
+		if err != nil || lease.Status != store.WorkspaceLeaseReserved {
+			t.Fatalf("failed callback lease = %+v, %v", lease, err)
+		}
+	})
+
+	for _, mutation := range []struct {
+		name   string
+		mutate func(context.Context, *sqliteWorkspaceLeaseHarness, store.WorkspaceLeaseKey) error
+	}{
+		{"replacement", func(ctx context.Context, h *sqliteWorkspaceLeaseHarness, _ store.WorkspaceLeaseKey) error {
+			_, err := h.AcceptAdapterHello(ctx, "ses_workspace", store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: "lease_replaced"})
+			return err
+		}},
+		{"revocation", func(ctx context.Context, h *sqliteWorkspaceLeaseHarness, _ store.WorkspaceLeaseKey) error {
+			_, err := openRawSQLite(t, h.path).ExecContext(ctx, `UPDATE session_adapter_connections SET revoked_at_ms=CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`)
+			return err
+		}},
+		{"terminal", func(ctx context.Context, h *sqliteWorkspaceLeaseHarness, _ store.WorkspaceLeaseKey) error {
+			_, err := openRawSQLite(t, h.path).ExecContext(ctx, `UPDATE session_adapter_connections SET terminal_at_ms=CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`)
+			return err
+		}},
+		{"quarantine", func(ctx context.Context, h *sqliteWorkspaceLeaseHarness, key store.WorkspaceLeaseKey) error {
+			_, err := h.QuarantineWorkspaceLease(ctx, key, 1)
+			return err
+		}},
+	} {
+		t.Run(mutation.name+" cannot interleave the start callback", func(t *testing.T) {
+			harness, admission, key := newAdmission(t)
+			defer harness.Close()
+			started := make(chan struct{})
+			release := make(chan struct{})
+			type admissionResult struct {
+				lease store.WorkspaceLease
+				err   error
+			}
+			admissionDone := make(chan admissionResult, 1)
+			go func() {
+				lease, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+					close(started)
+					<-release
+					return nil
+				})
+				admissionDone <- admissionResult{lease: lease, err: err}
+			}()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("provider start callback did not acquire Store truth")
+			}
+			mutationDone := make(chan error, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				defer cancel()
+				mutationDone <- mutation.mutate(ctx, harness, key)
+			}()
+			mutationFinished := false
+			select {
+			case err := <-mutationDone:
+				mutationFinished = true
+				if err == nil {
+					t.Fatalf("%s committed while provider start callback held Store truth", mutation.name)
+				}
+			case <-time.After(50 * time.Millisecond):
+			}
+			close(release)
+			result := <-admissionDone
+			if result.err != nil || result.lease.Status != store.WorkspaceLeaseStartReceived {
+				t.Fatalf("Store-held provider start admission = %+v, %v", result.lease, result.err)
+			}
+			if !mutationFinished {
+				select {
+				case <-mutationDone:
+				case <-time.After(time.Second):
+					t.Fatalf("%s mutation did not finish", mutation.name)
+				}
+			}
+		})
+	}
+
 	for _, invalidation := range []struct {
 		name  string
 		apply func(*sqliteWorkspaceLeaseHarness, store.WorkspaceLeaseKey)

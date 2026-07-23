@@ -2762,6 +2762,13 @@ func (s *Store) RecordWorkspaceStartReceived(ctx context.Context, key store.Work
 // start_received. The Hub derives the lease from durable tuple truth; the
 // Adapter cannot nominate a workspace or bypass quarantine.
 func (s *Store) RecordProviderStartAdmission(ctx context.Context, request store.ProviderStartAdmission) (store.WorkspaceLease, error) {
+	return s.WithProviderStartAdmission(ctx, request, nil)
+}
+
+// WithProviderStartAdmission keeps the Store's connection and writer-lease
+// locks through the physical start proof. Its callback cannot inspect or
+// mutate Store state, keeping workspace selection Store-owned.
+func (s *Store) WithProviderStartAdmission(ctx context.Context, request store.ProviderStartAdmission, callback func(context.Context) error) (store.WorkspaceLease, error) {
 	if s.pool == nil || !validConnectionID(request.SessionID) || request.Writer.LeaseID == "" ||
 		request.Writer.ConnectionEpoch != request.Admission.ConnectionEpoch || request.Writer.CredentialGeneration != request.Admission.CredentialGeneration {
 		return store.WorkspaceLease{}, errors.New("invalid provider start admission")
@@ -2791,6 +2798,11 @@ FOR UPDATE`, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.C
 	rows.Close()
 	if rows.Err() != nil {
 		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+	}
+	if callback != nil {
+		if err := callback(ctx); err != nil {
+			return store.WorkspaceLease{}, fmt.Errorf("provider start callback: %w", err)
+		}
 	}
 	row, err := db.New(tx).RecordWorkspaceStartReceived(ctx, db.RecordWorkspaceStartReceivedParams{
 		WorkspaceKey: key, ExpectedVersion: version, WorkerID: workerID, SessionID: request.SessionID,

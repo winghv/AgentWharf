@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -1392,6 +1393,67 @@ func TestRunWrapV2ProviderDoesNotStartAfterAdmissionRejection(t *testing.T) {
 	}
 }
 
+func TestRunWrapV2ProviderStopsAfterFinalAdmissionRejection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	marker := filepath.Join(t.TempDir(), "provider-state")
+	t.Setenv("AGENTWHARF_START_BLOCK_HELPER", "1")
+	t.Setenv("AGENTWHARF_START_BLOCK_MARKER", marker)
+	proofSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		if _, err := readFrameFromConn(ctx, conn); err != nil {
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_v2", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_v2", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_v2", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
+			return
+		}
+		if frame, err := readFrameFromConn(ctx, conn); err != nil || frame.FrameName() != protocol.FrameProviderStart {
+			t.Errorf("provider start request = %T, %v", frame, err)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{}); err != nil {
+			return
+		}
+		if frame, err := readFrameFromConn(ctx, conn); err != nil || frame.FrameName() != protocol.FrameProviderStartStarted {
+			t.Errorf("provider start proof = %T, %v", frame, err)
+			return
+		}
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if content, err := os.ReadFile(marker); err == nil && string(content) == "ready" {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if content, _ := os.ReadFile(marker); string(content) != "ready" {
+			t.Errorf("provider did not become ready before final rejection: %q", content)
+			return
+		}
+		proofSeen <- struct{}{}
+		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Status: protocol.ProviderStartRejected})
+	}))
+	defer server.Close()
+	_, err := runWrap(ctx, wrapConfig{HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_v2", Provider: "claude-code", AdapterToken: "adapter-token", Format: "jsonstream", ProtocolVersion: protocol.ProtocolVersionV2, ProviderCommand: []string{os.Args[0]}}, nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "provider start admission rejected") {
+		t.Fatalf("runWrap(v2 final rejected start) error = %v", err)
+	}
+	assertSignal(t, proofSeen, "provider start proof")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if content, err := os.ReadFile(marker); err == nil && string(content) == "stopped" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	content, _ := os.ReadFile(marker)
+	t.Fatalf("started provider was not stopped after final rejection: %q", content)
+}
+
 func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1743,6 +1805,10 @@ func assertSignal(t *testing.T, ch <-chan struct{}, name string) {
 }
 
 func TestMain(m *testing.M) {
+	if os.Getenv("AGENTWHARF_START_BLOCK_HELPER") == "1" {
+		runWrapStartBlockProviderHelper()
+		return
+	}
 	if os.Getenv("AGENTWHARF_ACP_PERMISSION_HELPER") == "1" {
 		runWrapACPPermissionProviderHelper()
 		return
@@ -1792,6 +1858,21 @@ func runWrapProviderHelper() {
 		os.Exit(4)
 	}
 	_, _ = fmt.Fprintf(os.Stdout, `{"type":"assistant","message":{"id":"reply_1","content":[{"type":"text","text":"provider saw %s"}]}}`+"\n", cmd.CommandID)
+	os.Exit(0)
+}
+
+func runWrapStartBlockProviderHelper() {
+	marker := os.Getenv("AGENTWHARF_START_BLOCK_MARKER")
+	if marker == "" {
+		os.Exit(30)
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt)
+	if os.WriteFile(marker, []byte("ready"), 0600) != nil {
+		os.Exit(30)
+	}
+	<-signals
+	_ = os.WriteFile(marker, []byte("stopped"), 0600)
 	os.Exit(0)
 }
 
