@@ -127,6 +127,53 @@ func TestWebSocketV2AdapterReceivesOnlyCurrentConnectionAuthorityReceipt(t *test
 	}
 }
 
+func TestWebSocketV2ProviderStartUsesStoreLinearizedAdmission(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "provider-start.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	receipt := readFrame(t, adapter).(*protocol.HelloAck).ConnectionAuthority
+	if receipt == nil {
+		t.Fatal("v2 adapter receipt missing")
+	}
+	var key store.WorkspaceLeaseKey
+	key[0] = 42
+	if _, err := events.ReserveWorkspaceLease(ctx, store.WorkspaceLeaseReserve{Key: key, Owner: store.WorkspaceLeaseOwner{WorkerID: "worker_start", SessionID: receipt.SessionID, ConnectionEpoch: receipt.ConnectionEpoch, CredentialGeneration: receipt.CredentialGeneration, LeaseID: receipt.WriterLeaseID}, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatalf("ReserveWorkspaceLease() = %v", err)
+	}
+	writeFrame(t, adapter, &protocol.ProviderStart{})
+	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Status != protocol.ProviderStartAdmitted {
+		t.Fatalf("provider start ack = %+v", ack)
+	}
+	lease, err := events.WorkspaceLease(ctx, key)
+	if err != nil || lease.Status != store.WorkspaceLeaseStartReceived {
+		t.Fatalf("workspace start receipt = %+v, %v", lease, err)
+	}
+	writeFrame(t, adapter, &protocol.ProviderStart{})
+	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Status != protocol.ProviderStartRejected {
+		t.Fatalf("duplicate provider start ack = %+v", ack)
+	}
+
+	v1 := dialWebSocket(t, server.URL)
+	defer v1.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloVersionFor(t, v1, "adapter-token", "ses_1", protocol.ProtocolVersion)
+	_ = readFrame(t, v1).(*protocol.HelloAck)
+	writeFrame(t, v1, &protocol.ProviderStart{})
+	if _, ok := readFrame(t, v1).(*protocol.Error); !ok {
+		t.Fatal("v1 Adapter start was not rejected")
+	}
+}
+
 func TestWebSocketSettingsRoutesCapabilityReserveDeliveryAndTerminalResult(t *testing.T) {
 	ctx := context.Background()
 	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "settings.db"))

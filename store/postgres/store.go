@@ -2757,6 +2757,61 @@ func (s *Store) RecordWorkspaceStartReceived(ctx context.Context, key store.Work
 	return workspaceLease(row)
 }
 
+// RecordProviderStartAdmission uses one PostgreSQL transaction to lock the
+// exact Adapter connection and its sole reserved writer lease before recording
+// start_received. The Hub derives the lease from durable tuple truth; the
+// Adapter cannot nominate a workspace or bypass quarantine.
+func (s *Store) RecordProviderStartAdmission(ctx context.Context, request store.ProviderStartAdmission) (store.WorkspaceLease, error) {
+	if s.pool == nil || !validConnectionID(request.SessionID) || request.Writer.LeaseID == "" ||
+		request.Writer.ConnectionEpoch != request.Admission.ConnectionEpoch || request.Writer.CredentialGeneration != request.Admission.CredentialGeneration {
+		return store.WorkspaceLease{}, errors.New("invalid provider start admission")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("begin provider start admission: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	bound := &Store{connectionTx: tx}
+	if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
+		return store.WorkspaceLease{}, errors.New("provider start authority lost")
+	}
+	rows, err := tx.Query(ctx, `SELECT workspace_key, version, worker_id FROM session_workspace_leases
+WHERE session_id=$1 AND connection_epoch=$2 AND credential_generation=$3 AND lease_id=$4 AND status='reserved'
+FOR UPDATE`, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID)
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("lock provider workspace lease: %w", err)
+	}
+	defer rows.Close()
+	var key string
+	var version int64
+	var workerID string
+	if !rows.Next() || rows.Scan(&key, &version, &workerID) != nil || rows.Next() || rows.Err() != nil {
+		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+	}
+	rows.Close()
+	if rows.Err() != nil {
+		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+	}
+	row, err := db.New(tx).RecordWorkspaceStartReceived(ctx, db.RecordWorkspaceStartReceivedParams{
+		WorkspaceKey: key, ExpectedVersion: version, WorkerID: workerID, SessionID: request.SessionID,
+		ConnectionEpoch: request.Writer.ConnectionEpoch, CredentialGeneration: request.Writer.CredentialGeneration, LeaseID: request.Writer.LeaseID,
+	})
+	if err != nil {
+		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+	}
+	if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
+		return store.WorkspaceLease{}, errors.New("provider start authority lost")
+	}
+	lease, err := workspaceLease(row)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("commit provider start admission: %w", err)
+	}
+	return lease, nil
+}
+
 func (s *Store) QuarantineWorkspaceLease(ctx context.Context, key store.WorkspaceLeaseKey, expectedVersion int64) (store.WorkspaceLease, error) {
 	if s.pool == nil {
 		return store.WorkspaceLease{}, errors.New("postgres event store pool is nil")

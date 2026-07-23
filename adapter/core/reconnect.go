@@ -14,9 +14,10 @@ var (
 )
 
 type AdapterConnectionConfig struct {
-	SessionID string
-	Provider  string
-	Token     string
+	SessionID       string
+	Provider        string
+	Token           string
+	ProtocolVersion int
 }
 
 type AdapterConnectionState struct {
@@ -36,6 +37,12 @@ func NewAdapterConnectionState(cfg AdapterConnectionConfig) (*AdapterConnectionS
 	if cfg.Token == "" {
 		return nil, fmt.Errorf("%w: token is required", ErrInvalidAdapterConnectionConfig)
 	}
+	if cfg.ProtocolVersion == 0 {
+		cfg.ProtocolVersion = protocol.ProtocolVersion
+	}
+	if cfg.ProtocolVersion != protocol.ProtocolVersion && cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
+		return nil, fmt.Errorf("%w: unsupported protocol version", ErrInvalidAdapterConnectionConfig)
+	}
 	return &AdapterConnectionState{cfg: cfg}, nil
 }
 
@@ -45,7 +52,7 @@ func (s *AdapterConnectionState) Hello() protocol.Hello {
 	s.mu.Unlock()
 
 	return protocol.Hello{
-		ProtocolVersion: protocol.ProtocolVersion,
+		ProtocolVersion: s.cfg.ProtocolVersion,
 		Role:            protocol.RoleAdapter,
 		Token:           s.cfg.Token,
 		SessionID:       s.cfg.SessionID,
@@ -55,11 +62,14 @@ func (s *AdapterConnectionState) Hello() protocol.Hello {
 }
 
 func (s *AdapterConnectionState) MarkAccepted(ack protocol.HelloAck) (protocol.SessionSummary, error) {
-	if ack.ProtocolVersion != protocol.ProtocolVersion {
+	if ack.ProtocolVersion != s.cfg.ProtocolVersion {
 		return protocol.SessionSummary{}, fmt.Errorf("%w: protocol version %d", ErrInvalidHelloAck, ack.ProtocolVersion)
 	}
-	if ack.Capabilities != nil {
+	if s.cfg.ProtocolVersion == protocol.ProtocolVersion && (ack.Capabilities != nil || ack.ConnectionAuthority != nil) {
 		return protocol.SessionSummary{}, fmt.Errorf("%w: v1 acknowledgement includes capabilities", ErrInvalidHelloAck)
+	}
+	if s.cfg.ProtocolVersion == protocol.ProtocolVersionV2 && !validConnectionAuthorityReceipt(ack.ConnectionAuthority, s.cfg.SessionID) {
+		return protocol.SessionSummary{}, fmt.Errorf("%w: v2 acknowledgement omits or corrupts connection authority", ErrInvalidHelloAck)
 	}
 	if len(ack.Sessions) != 1 {
 		return protocol.SessionSummary{}, fmt.Errorf("%w: expected one session summary", ErrInvalidHelloAck)
@@ -77,4 +87,9 @@ func (s *AdapterConnectionState) MarkAccepted(ack protocol.HelloAck) (protocol.S
 	s.accepted = true
 	s.mu.Unlock()
 	return summary, nil
+}
+
+func validConnectionAuthorityReceipt(receipt *protocol.ConnectionAuthorityReceipt, sessionID string) bool {
+	return receipt != nil && receipt.SessionID == sessionID && receipt.ConnectionEpoch > 0 && receipt.CredentialGeneration > 0 &&
+		receipt.AcceptedFence > 0 && receipt.WriterLeaseID != "" && receipt.ExpiresAt > 0
 }

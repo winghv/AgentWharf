@@ -2730,6 +2730,63 @@ func (s *Store) IssueAdapterConnectionAuthorityReceipt(ctx context.Context, sess
 	return receipt, nil
 }
 
+// RecordProviderStartAdmission makes the durable start_received transition the
+// linearization point for Provider start. The matching WorkspaceLease is found
+// only from the Store-owned writer tuple, never from Adapter input.
+func (s *Store) RecordProviderStartAdmission(ctx context.Context, request store.ProviderStartAdmission) (store.WorkspaceLease, error) {
+	if s == nil || s.db == nil || !validConnectionID(request.SessionID) || request.Writer.LeaseID == "" ||
+		request.Writer.ConnectionEpoch != request.Admission.ConnectionEpoch || request.Writer.CredentialGeneration != request.Admission.CredentialGeneration {
+		return store.WorkspaceLease{}, errors.New("invalid provider start admission")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("begin provider start admission: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	bound := &Store{db: s.db, fenceDB: s.fenceDB, connectionTx: tx}
+	if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
+		return store.WorkspaceLease{}, errors.New("provider start authority lost")
+	}
+	nowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	rows, err := tx.QueryContext(ctx, `UPDATE session_workspace_leases
+SET status='start_received', version=version+1, updated_at_ms=?
+WHERE workspace_key IN (
+  SELECT workspace_key FROM session_workspace_leases
+  WHERE session_id=? AND connection_epoch=? AND credential_generation=? AND lease_id=?
+    AND status='reserved' AND expires_at_ns > ?
+    AND (child_scope_expires_at_ns IS NULL OR child_scope_expires_at_ns > ?)
+)
+AND status='reserved'
+RETURNING workspace_key`, nowMS, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, nowMS*int64(time.Millisecond), nowMS*int64(time.Millisecond))
+	if err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("record provider start admission: %w", err)
+	}
+	defer rows.Close()
+	var key store.WorkspaceLeaseKey
+	var raw []byte
+	if !rows.Next() || rows.Scan(&raw) != nil || rows.Next() || rows.Err() != nil || len(raw) != len(key) {
+		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+	}
+	copy(key[:], raw)
+	if err := rows.Close(); err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("close provider start admission rows: %w", err)
+	}
+	if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
+		return store.WorkspaceLease{}, errors.New("provider start authority lost")
+	}
+	lease, err := querySQLiteWorkspaceLease(ctx, tx, key)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return store.WorkspaceLease{}, fmt.Errorf("commit provider start admission: %w", err)
+	}
+	return lease, nil
+}
+
 func (s *Store) issueAdapterConnectionAuthorityReceipt(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, writer store.SettingsWriter) (store.ConnectionAuthorityReceipt, error) {
 	connection, err := s.ValidateAdapterAdmission(ctx, sessionID, admission)
 	if err != nil || s.connectionTx == nil || validateLiveSettingsWriter(ctx, s.connectionTx, sessionID, writer) != nil {

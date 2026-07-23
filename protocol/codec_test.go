@@ -231,6 +231,27 @@ func TestHelloAckConnectionAuthorityReceiptIsMinimalAndRoundTrips(t *testing.T) 
 	}
 }
 
+func TestProviderStartFramesAreStrictAndReferenceOnly(t *testing.T) {
+	for _, frame := range []Frame{&ProviderStart{}, &ProviderStartAck{Status: ProviderStartAdmitted}, &ProviderStartAck{Status: ProviderStartRejected}} {
+		encoded, err := Encode(frame)
+		if err != nil {
+			t.Fatalf("Encode(%T): %v", frame, err)
+		}
+		if _, err := Decode(encoded); err != nil {
+			t.Fatalf("Decode(%T): %v", frame, err)
+		}
+	}
+	for _, raw := range []string{
+		`{"frame":"provider.start","workspace_key":"forbidden"}`,
+		`{"frame":"provider.start.ack","status":"admitted","provider":"forbidden"}`,
+		`{"frame":"provider.start.ack","status":"unknown"}`,
+	} {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode(%s) accepted non-minimal provider-start frame", raw)
+		}
+	}
+}
+
 func TestSettingsCommandRejectsNonCanonicalPayloads(t *testing.T) {
 	valid := `{"frame":"command","cmd_id":"cmd_settings_1","type":"session.settings.change","session_id":"ses_1","payload":{"capability_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model_id":"reasoning"}}`
 	if _, err := Decode([]byte(valid)); err != nil {

@@ -49,6 +49,8 @@ const (
 	FrameCredentialRotationPossession FrameName = "credential.rotation.possession"
 	FrameCredentialRotationActivation FrameName = "credential.rotation.activation"
 	FrameSettingsDeliveryExecute      FrameName = "settings.delivery.execute"
+	FrameProviderStart                FrameName = "provider.start"
+	FrameProviderStartAck             FrameName = "provider.start.ack"
 )
 
 const (
@@ -196,6 +198,28 @@ type ConnectionAuthorityReceipt struct {
 	WriterLeaseID        string `json:"writer_lease_id"`
 	ExpiresAt            int64  `json:"expires_at"`
 }
+
+// ProviderStart requests the v2 Adapter-only Store-linearized start admission.
+// The Adapter never selects a workspace or authority tuple: the Hub binds this
+// empty request to its authenticated live connection.
+type ProviderStart struct{}
+
+func (*ProviderStart) FrameName() FrameName { return FrameProviderStart }
+
+type ProviderStartStatus string
+
+const (
+	ProviderStartAdmitted ProviderStartStatus = "admitted"
+	ProviderStartRejected ProviderStartStatus = "rejected"
+)
+
+// ProviderStartAck is deliberately reference-only. It neither reveals the
+// selected workspace nor carries Provider configuration or credentials.
+type ProviderStartAck struct {
+	Status ProviderStartStatus `json:"status"`
+}
+
+func (*ProviderStartAck) FrameName() FrameName { return FrameProviderStartAck }
 
 type HelloCapabilities struct {
 	HistoryPage      *HistoryPageCapability        `json:"history_page,omitempty"`
@@ -547,9 +571,32 @@ func Decode(data []byte) (Frame, error) {
 		return decodeCredentialRotationActivation(data)
 	case FrameSettingsDeliveryExecute:
 		return decodeSettingsDeliveryExecute(data)
+	case FrameProviderStart:
+		return decodeProviderStart(data)
+	case FrameProviderStartAck:
+		return decodeProviderStartAck(data)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownFrame, env.Frame)
 	}
+}
+
+func decodeProviderStart(data []byte) (Frame, error) {
+	if _, err := targetJoinFields(data, FrameProviderStart); err != nil {
+		return nil, targetJoinError(FrameProviderStart)
+	}
+	return &ProviderStart{}, nil
+}
+
+func decodeProviderStartAck(data []byte) (Frame, error) {
+	fields, err := targetJoinFields(data, FrameProviderStartAck, "status")
+	if err != nil {
+		return nil, targetJoinError(FrameProviderStartAck)
+	}
+	var status ProviderStartStatus
+	if json.Unmarshal(fields["status"], &status) != nil || (status != ProviderStartAdmitted && status != ProviderStartRejected) {
+		return nil, targetJoinError(FrameProviderStartAck)
+	}
+	return &ProviderStartAck{Status: status}, nil
 }
 
 func decodeAttentionSubscribe(data []byte) (Frame, error) {

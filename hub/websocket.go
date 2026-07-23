@@ -482,6 +482,14 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *managedConn, acce
 			if err := h.handleAdapterCommandAck(ctx, adapter, typed); err != nil {
 				continue
 			}
+		case *protocol.ProviderStart:
+			if accepted.Role != protocol.RoleAdapter || accepted.ProtocolVersion != protocol.ProtocolVersionV2 || adapter == nil {
+				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "provider start is v2 Adapter-only"})
+				continue
+			}
+			if err := h.handleProviderStart(ctx, adapter); err != nil {
+				return
+			}
 		case *protocol.CredentialRotationRequest:
 			if accepted.Role != protocol.RoleAdapter || accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
 				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "credential rotation is v2 Adapter-only"})
@@ -1855,6 +1863,26 @@ func (h *webSocketHandler) handleSettingsChange(ctx context.Context, conn *manag
 		return fmt.Errorf("deliver settings reservation: %w", err)
 	}
 	return nil
+}
+
+func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *adapterConnection) error {
+	if adapter == nil || h.events == nil {
+		return errAdapterAuthorityLost
+	}
+	admissions, ok := h.events.(store.ProviderStartAdmissionStore)
+	if !ok {
+		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Status: protocol.ProviderStartRejected})
+	}
+	err := withAdapterAuthorityBudget(ctx, func(admissionCtx context.Context) error {
+		_, err := admissions.RecordProviderStartAdmission(admissionCtx, store.ProviderStartAdmission{
+			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter,
+		})
+		return err
+	})
+	if err != nil {
+		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Status: protocol.ProviderStartRejected})
+	}
+	return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Status: protocol.ProviderStartAdmitted})
 }
 
 func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter *adapterConnection, ack *protocol.CommandAck) error {

@@ -198,6 +198,7 @@ type wrapConfig struct {
 	ProviderCommand    []string
 	HealthMarker       string
 	ProviderCredential *core.ProcessCredential
+	ProtocolVersion    int
 }
 
 type heartbeatConfig struct {
@@ -289,14 +290,15 @@ func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
 
 func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	cfg := wrapConfig{
-		HubURL:       envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
-		SessionID:    envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
-		Agent:        envOrDefault("AGENTWHARF_AGENT", "claude"),
-		Provider:     envOrDefault("AGENTWHARF_PROVIDER", ""),
-		AdapterToken: envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
-		Format:       envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
-		SecretDir:    envOrDefault("AGENTWHARF_SECRET_DIR", ""),
-		CloudAPIURL:  envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", "")),
+		HubURL:          envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
+		SessionID:       envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
+		Agent:           envOrDefault("AGENTWHARF_AGENT", "claude"),
+		Provider:        envOrDefault("AGENTWHARF_PROVIDER", ""),
+		AdapterToken:    envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
+		Format:          envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
+		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
+		CloudAPIURL:     envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", "")),
+		ProtocolVersion: protocol.ProtocolVersion,
 	}
 	var useACP bool
 	var useJSONStream bool
@@ -314,6 +316,7 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL, usually ending in /v1")
 	flags.BoolVar(&useACP, "acp", false, "read ACP JSON frames from stdin")
 	flags.BoolVar(&useJSONStream, "jsonstream", false, "read Claude stream-json lines from stdin")
+	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", cfg.ProtocolVersion, "Adapter protocol version (1 or 2)")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
 	}
@@ -356,6 +359,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	flags.StringVar(&cfg.SecretDir, "secret-dir", cfg.SecretDir, "directory containing injected secret files for masking")
 	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL")
 	flags.BoolVar(&cfg.Pair, "pair", cfg.Pair, "pair this machine with SuperWHV before connecting")
+	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", protocol.ProtocolVersion, "Adapter protocol version (1 or 2)")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
 	}
@@ -465,6 +469,12 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	cfg.SecretDir = filepath.Clean(cfg.SecretDir)
 	if cfg.SecretDir == "." {
 		cfg.SecretDir = ""
+	}
+	if cfg.ProtocolVersion == 0 {
+		cfg.ProtocolVersion = protocol.ProtocolVersion
+	}
+	if cfg.ProtocolVersion != protocol.ProtocolVersion && cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
+		return wrapConfig{}, errors.New("wrap protocol version must be 1 or 2")
 	}
 	if marker := strings.TrimSpace(os.Getenv("SUPERWHV_FIXED_ENTRY_HEALTH_PATH")); marker != "" {
 		uid, uidErr := strconv.ParseUint(os.Getenv("AGENTWHARF_PROVIDER_UID"), 10, 32)
@@ -607,9 +617,10 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	state, err := core.NewAdapterConnectionState(core.AdapterConnectionConfig{
-		SessionID: cfg.SessionID,
-		Provider:  cfg.Provider,
-		Token:     cfg.AdapterToken,
+		SessionID:       cfg.SessionID,
+		Provider:        cfg.Provider,
+		Token:           cfg.AdapterToken,
+		ProtocolVersion: cfg.ProtocolVersion,
 	})
 	if err != nil {
 		return cfg, err
@@ -635,6 +646,22 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	}
 
 	if len(cfg.ProviderCommand) > 0 {
+		if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
+			if ack.ConnectionAuthority == nil {
+				return cfg, errors.New("provider start requires v2 connection authority")
+			}
+			if err := writeCLIProtocolFrame(ctx, conn, &protocol.ProviderStart{}); err != nil {
+				return cfg, fmt.Errorf("request provider start admission: %w", err)
+			}
+			frame, err := readCLIProtocolFrame(ctx, conn)
+			if err != nil {
+				return cfg, fmt.Errorf("read provider start admission: %w", err)
+			}
+			start, ok := frame.(*protocol.ProviderStartAck)
+			if !ok || start.Status != protocol.ProviderStartAdmitted {
+				return cfg, errors.New("provider start admission rejected")
+			}
+		}
 		return cfg, runWrapProvider(ctx, cfg, conn, masker)
 	}
 

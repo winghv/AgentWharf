@@ -1137,6 +1137,72 @@ func TestWorkspaceLeaseRejectsExpiredStartAndReleasesQuarantine(t *testing.T) {
 	})
 }
 
+func TestProviderStartAdmissionLinearizesLiveConnectionAndWorkspaceLease(t *testing.T) {
+	newAdmission := func(t *testing.T) (*sqliteWorkspaceLeaseHarness, store.ProviderStartAdmission, store.WorkspaceLeaseKey) {
+		t.Helper()
+		harness := newSQLiteWorkspaceLeaseHarness(t, filepath.Join(t.TempDir(), "events.db"))
+		connection, err := harness.AcceptAdapterHello(context.Background(), "ses_workspace", store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: "lease_provider_start"})
+		if err != nil {
+			t.Fatalf("AcceptAdapterHello() = %v", err)
+		}
+		var key store.WorkspaceLeaseKey
+		key[0] = 91
+		owner := store.WorkspaceLeaseOwner{WorkerID: "worker_provider_start", SessionID: "ses_workspace", ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: "lease_provider_start"}
+		if _, err := harness.ReserveWorkspaceLease(context.Background(), store.WorkspaceLeaseReserve{Key: key, Owner: owner, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+			t.Fatalf("ReserveWorkspaceLease() = %v", err)
+		}
+		fence, err := harness.AllocateAdapterGrantFence(context.Background())
+		if err != nil {
+			t.Fatalf("AllocateAdapterGrantFence() = %v", err)
+		}
+		return harness, store.ProviderStartAdmission{SessionID: "ses_workspace", Admission: store.AdapterConnectionAdmission{CredentialGeneration: connection.ActiveCredentialGeneration, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: fence}, Writer: store.SettingsWriter{ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: "lease_provider_start"}}, key
+	}
+
+	t.Run("commits exactly one durable start receipt", func(t *testing.T) {
+		harness, admission, key := newAdmission(t)
+		defer harness.Close()
+		lease, err := harness.RecordProviderStartAdmission(context.Background(), admission)
+		if err != nil || lease.Key != key || lease.Status != store.WorkspaceLeaseStartReceived {
+			t.Fatalf("RecordProviderStartAdmission() = %+v, %v", lease, err)
+		}
+		if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err == nil {
+			t.Fatal("duplicate provider start was admitted")
+		}
+	})
+
+	for _, invalidation := range []struct {
+		name  string
+		apply func(*sqliteWorkspaceLeaseHarness, store.WorkspaceLeaseKey)
+	}{
+		{"replacement", func(h *sqliteWorkspaceLeaseHarness, _ store.WorkspaceLeaseKey) {
+			_, _ = h.AcceptAdapterHello(context.Background(), "ses_workspace", store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: "lease_replaced"})
+		}},
+		{"revocation", func(h *sqliteWorkspaceLeaseHarness, _ store.WorkspaceLeaseKey) {
+			_, _ = openRawSQLite(t, h.path).ExecContext(context.Background(), `UPDATE session_adapter_connections SET revoked_at_ms=CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`)
+		}},
+		{"terminal", func(h *sqliteWorkspaceLeaseHarness, _ store.WorkspaceLeaseKey) {
+			_, _ = openRawSQLite(t, h.path).ExecContext(context.Background(), `UPDATE session_adapter_connections SET terminal_at_ms=CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`)
+		}},
+		{"quarantine", func(h *sqliteWorkspaceLeaseHarness, key store.WorkspaceLeaseKey) {
+			lease, _ := h.WorkspaceLease(context.Background(), key)
+			_, _ = h.QuarantineWorkspaceLease(context.Background(), key, lease.Version)
+		}},
+	} {
+		t.Run(invalidation.name, func(t *testing.T) {
+			harness, admission, key := newAdmission(t)
+			defer harness.Close()
+			invalidation.apply(harness, key)
+			if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err == nil {
+				t.Fatal("invalidated provider start was admitted")
+			}
+			lease, err := harness.WorkspaceLease(context.Background(), key)
+			if err != nil || lease.Status == store.WorkspaceLeaseStartReceived {
+				t.Fatalf("invalidated lease = %+v, %v", lease, err)
+			}
+		})
+	}
+}
+
 type sqliteWorkspaceLeaseHarness struct {
 	*sqlite.Store
 	path string

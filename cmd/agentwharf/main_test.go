@@ -1347,6 +1347,51 @@ func TestRunWrapProviderCommandWritesHubCommandsToProviderStdin(t *testing.T) {
 	}
 }
 
+func TestRunWrapV2ProviderDoesNotStartAfterAdmissionRejection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	startSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		frame, err := readFrameFromConn(ctx, conn)
+		if err != nil {
+			return
+		}
+		hello, ok := frame.(*protocol.Hello)
+		if !ok || hello.ProtocolVersion != protocol.ProtocolVersionV2 {
+			t.Errorf("hello = %+v", frame)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_v2", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_v2", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_v2", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
+			return
+		}
+		frame, err = readFrameFromConn(ctx, conn)
+		if err != nil {
+			return
+		}
+		if _, ok := frame.(*protocol.ProviderStart); !ok {
+			t.Errorf("provider start frame = %T", frame)
+			return
+		}
+		startSeen <- struct{}{}
+		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Status: protocol.ProviderStartRejected})
+	}))
+	defer server.Close()
+	_, err := runWrap(ctx, wrapConfig{HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_v2", Provider: "claude-code", AdapterToken: "adapter-token", Format: "jsonstream", ProtocolVersion: protocol.ProtocolVersionV2, ProviderCommand: []string{os.Args[0]}}, nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "provider start admission rejected") {
+		t.Fatalf("runWrap(v2 rejected start) error = %v", err)
+	}
+	select {
+	case <-startSeen:
+	case <-time.After(time.Second):
+		t.Fatal("v2 provider start request was not observed")
+	}
+}
+
 func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

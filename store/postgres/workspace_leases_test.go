@@ -46,6 +46,63 @@ SET status = 'canceled', queue_reason = NULL, expires_at = NULL,
 	})
 }
 
+func TestProviderStartAdmissionContract(t *testing.T) {
+	newAdmission := func(t *testing.T) (*postgresWorkspaceLeaseHarness, store.ProviderStartAdmission, store.WorkspaceLeaseKey) {
+		t.Helper()
+		harness := newPostgresWorkspaceLeaseHarness(t)
+		var key store.WorkspaceLeaseKey
+		key[0] = 73
+		owner := store.WorkspaceLeaseOwner{WorkerID: "worker_provider_start", SessionID: "ses_workspace", ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_provider_start"}
+		if _, err := harness.ReserveWorkspaceLease(context.Background(), store.WorkspaceLeaseReserve{Key: key, Owner: owner, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+			t.Fatalf("ReserveWorkspaceLease() = %v", err)
+		}
+		var fence int64
+		for fence <= 1 {
+			var err error
+			fence, err = harness.AllocateAdapterGrantFence(context.Background())
+			if err != nil {
+				t.Fatalf("AllocateAdapterGrantFence() = %v", err)
+			}
+		}
+		return harness, store.ProviderStartAdmission{SessionID: "ses_workspace", Admission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, GrantFence: fence}, Writer: store.SettingsWriter{ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_provider_start"}}, key
+	}
+
+	t.Run("commits exactly one start receipt", func(t *testing.T) {
+		harness, admission, key := newAdmission(t)
+		lease, err := harness.RecordProviderStartAdmission(context.Background(), admission)
+		if err != nil || lease.Key != key || lease.Status != store.WorkspaceLeaseStartReceived {
+			t.Fatalf("RecordProviderStartAdmission() = %+v, %v", lease, err)
+		}
+		if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err == nil {
+			t.Fatal("duplicate provider start was admitted")
+		}
+	})
+
+	for _, invalidation := range []struct {
+		name      string
+		statement string
+	}{
+		{"replacement", "UPDATE session_adapter_connections SET connection_epoch=2, accepted_fence=2"},
+		{"revocation", "UPDATE session_adapter_connections SET revoked_at=clock_timestamp()"},
+		{"terminal", "UPDATE session_adapter_connections SET terminal_at=clock_timestamp()"},
+		{"quarantine", "UPDATE session_workspace_leases SET status='quarantined', version=version+1, expires_at=NULL, quarantine_reason='authority_superseded', recovery_state='pending'"},
+	} {
+		t.Run(invalidation.name, func(t *testing.T) {
+			harness, admission, key := newAdmission(t)
+			if _, err := harness.pool.Exec(context.Background(), invalidation.statement); err != nil {
+				t.Fatalf("invalidate provider start %s: %v", invalidation.name, err)
+			}
+			if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err == nil {
+				t.Fatal("invalidated provider start was admitted")
+			}
+			lease, err := harness.WorkspaceLease(context.Background(), key)
+			if err != nil || lease.Status == store.WorkspaceLeaseStartReceived {
+				t.Fatalf("invalidated lease = %+v, %v", lease, err)
+			}
+		})
+	}
+}
+
 func TestWorkspaceLeaseChildScopeSurvivesReopen(t *testing.T) {
 	harness := newPostgresWorkspaceLeaseHarness(t)
 	reserve := store.WorkspaceLeaseReserve{
