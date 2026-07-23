@@ -338,6 +338,84 @@ func TestWebSocketSettingsRestartRecoversPendingReservation(t *testing.T) {
 	}
 }
 
+func TestWebSocketSettingsRestartRecoversExpiredDeliveryReservation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "settings-delivery-restart-recovery.db")
+	ledger, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ledger.Close() }()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	client := dialWebSocket(t, server.URL)
+	first := dialWebSocket(t, server.URL)
+
+	writeFrame(t, client, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+	writeAdapterHelloV2(t, first, "adapter-token")
+	_ = readFrame(t, first).(*protocol.HelloAck)
+	publishSettingsCapability(t, first, "capability_before_delivery_restart", 1001, settingsCapabilityPayload("sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000", "balanced"))
+	_ = readFrame(t, client).(*protocol.Event)
+
+	command := &protocol.Command{CommandID: "cmd_settings_delivery_restart", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","model_id":"reasoning"}`)}
+	writeFrame(t, client, command)
+	_ = readFrame(t, first).(*protocol.Command)
+
+	server.Close()
+	_ = first.Close(websocket.StatusNormalClosure, "")
+	_ = client.Close(websocket.StatusNormalClosure, "")
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `UPDATE session_settings_commands
+		SET created_at_ms=CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)-6000,
+		    delivery_deadline_ms=CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)-1000,
+		    updated_at_ms=CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)-500
+		WHERE session_id=? AND cmd_id=?`, "ses_1", command.CommandID); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err = sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events = &settingsWebSocketStore{Store: ledger}
+
+	restarted := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	resumedClient := dialWebSocket(t, restarted.URL)
+	defer resumedClient.Close(websocket.StatusNormalClosure, "")
+	replacement := dialWebSocket(t, restarted.URL)
+	defer replacement.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, resumedClient, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "client-token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1", LastSeq: 1}}})
+	_ = readFrame(t, resumedClient).(*protocol.HelloAck)
+	writeAdapterHelloV2(t, replacement, "adapter-token")
+	_ = readFrame(t, replacement).(*protocol.HelloAck)
+	publishSettingsCapability(t, replacement, "capability_after_delivery_restart", 1002, settingsCapabilityPayload("sha256:5e6c6921513d5a3e3ed9f5fc0a67bb94e55a66f822a76b1ced587d5a908e2761", "reasoning"))
+	if capability := readFrame(t, resumedClient).(*protocol.Event); capability.Type != "session.settings.capabilities" || capability.Seq == nil || *capability.Seq != 2 {
+		t.Fatalf("restart capability fanout = %+v", capability)
+	}
+	terminal := readFrame(t, resumedClient).(*protocol.Event)
+	if terminal.Type != "session.settings.effective" || terminal.Seq == nil || *terminal.Seq != 3 ||
+		!strings.Contains(string(terminal.Payload), `"outcome":"rejected"`) || !strings.Contains(string(terminal.Payload), `"reason_code":"adapter_delivery_failed"`) || strings.Contains(string(terminal.Payload), "writer_lease") {
+		t.Fatalf("delivery recovery terminal = %+v", terminal)
+	}
+	stored, err := events.SettingsCommand(ctx, "ses_1", command.CommandID)
+	if err != nil || stored.Status != store.SettingsCommandRejected || stored.TerminalEventSeq == nil || *stored.TerminalEventSeq != 3 {
+		t.Fatalf("delivery recovery ledger = %+v, %v", stored, err)
+	}
+}
+
 func publishSettingsCapability(t *testing.T, adapter *websocket.Conn, proposalID string, at int64, payload json.RawMessage) {
 	t.Helper()
 	writeFrame(t, adapter, &protocol.Event{Type: "session.settings.capabilities", SessionID: "ses_1", Time: at, ProposalID: proposalID, Payload: payload})

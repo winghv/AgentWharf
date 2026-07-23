@@ -1117,7 +1117,30 @@ func (h *webSocketHandler) commitSettingsCapabilityProposal(ctx context.Context,
 		}
 		recovered := make([]protocol.Event, 0, len(pending))
 		for _, command := range pending {
-			if (command.Status != store.SettingsCommandPending && command.Status != store.SettingsCommandRecoveryPending) || command.Writer == adapter.settingsWriter {
+			if command.Writer == adapter.settingsWriter {
+				continue
+			}
+			if command.Status == store.SettingsCommandDeliveryPending {
+				if command.DeliveryDeadline.After(time.Now()) {
+					continue
+				}
+				rejected, err := ledger.RecoverSettingsCommand(commitCtx, event.SessionID, command.CommandID, command.Writer)
+				if err != nil {
+					return nil, fmt.Errorf("recover expired settings delivery: %w", err)
+				}
+				if rejected.Status != store.SettingsCommandRejected || rejected.TerminalEventSeq == nil {
+					return nil, errors.New("settings delivery recovery returned an invalid command")
+				}
+				reason := "adapter_delivery_failed"
+				payload, err := store.SettingsTerminalEventPayload(rejected, rejected.ReservedCapability, rejected.Status, &reason)
+				if err != nil {
+					return nil, err
+				}
+				terminalSeq := *rejected.TerminalEventSeq
+				recovered = append(recovered, protocol.Event{Type: "session.settings.effective", SessionID: event.SessionID, Seq: &terminalSeq, Time: time.Now().UTC().UnixMilli(), Payload: payload})
+				continue
+			}
+			if command.Status != store.SettingsCommandPending && command.Status != store.SettingsCommandRecoveryPending {
 				continue
 			}
 			if command.Status == store.SettingsCommandPending {
