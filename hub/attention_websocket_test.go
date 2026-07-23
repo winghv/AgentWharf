@@ -243,6 +243,41 @@ func TestWebSocketAttentionResubscribeWaitsForInFlightFanout(t *testing.T) {
 	}
 }
 
+func TestWebSocketAttentionRenewalSurvivesOldExpiryTimer(t *testing.T) {
+	ctx := context.Background()
+	events, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "attention-renewal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	if _, err := events.Append(ctx, "ses_one", []store.PendingEvent{{Type: "session.state", Time: time.Now().UTC(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	principal := auth.Principal{Subject: "user_1", Scopes: []auth.Scope{auth.Attention("grant_1")}}
+	authorizer := &mutableAttentionSocketAuth{principal: principal, grant: auth.AttentionGrant{Subject: "user_1", SessionIDs: []string{"ses_one"}, MaxSessions: 1, ExpiresAt: time.Now().Add(60 * time.Millisecond)}}
+	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: authorizer, EventStore: events})
+	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: events})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	conn := dialWebSocket(t, server.URL)
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, conn, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "attention-token"})
+	_ = readFrame(t, conn).(*protocol.HelloAck)
+	writeFrame(t, conn, &protocol.AttentionSubscribe{RequestID: "attn_old_expiry"})
+	_ = readFrame(t, conn).(*protocol.AttentionSummaryFrame)
+	time.Sleep(20 * time.Millisecond)
+	authorizer.setGrant(auth.AttentionGrant{Subject: "user_1", SessionIDs: []string{"ses_one"}, MaxSessions: 1, ExpiresAt: time.Now().Add(time.Minute)})
+	writeFrame(t, conn, &protocol.AttentionSubscribe{RequestID: "attn_renewed"})
+	if snapshot := readFrame(t, conn).(*protocol.AttentionSummaryFrame); snapshot.RequestID != "attn_renewed" {
+		t.Fatalf("renewed snapshot = %+v", snapshot)
+	}
+	time.Sleep(80 * time.Millisecond)
+	writeFrame(t, conn, &protocol.Ping{Nonce: "renewal-survived"})
+	if pong := readFrame(t, conn).(*protocol.Pong); pong.Nonce != "renewal-survived" {
+		t.Fatalf("old expiry timer closed renewed subscription: %+v", pong)
+	}
+}
+
 func TestWebSocketAttentionActivityRefreshDeliversLedgerOnlyUpdate(t *testing.T) {
 	ctx := context.Background()
 	events := newAttentionActivityStore(store.SessionAttentionSummary{

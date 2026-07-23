@@ -179,11 +179,12 @@ type webSocketHandler struct {
 	activityDispatcher                *ActivityDispatcher
 	activityDispatcherErr             error
 
-	mu                     sync.Mutex
-	subscribers            map[string]map[*clientConnection]struct{}
-	adapters               map[string]*adapterConnection
-	attentionSubscribers   map[string]map[*clientConnection]struct{}
-	attentionSubscriptions map[*clientConnection]attentionSubscription
+	mu                      sync.Mutex
+	subscribers             map[string]map[*clientConnection]struct{}
+	adapters                map[string]*adapterConnection
+	attentionSubscribers    map[string]map[*clientConnection]struct{}
+	attentionSubscriptions  map[*clientConnection]attentionSubscription
+	nextAttentionGeneration uint64
 
 	commandMu                 sync.Mutex
 	pendingCommands           map[string][]queuedCommand
@@ -209,6 +210,7 @@ type attentionSubscription struct {
 	principal   auth.Principal
 	expiryTimer *time.Timer
 	sent        map[string]protocol.AttentionSummary
+	generation  uint64
 }
 
 // attentionActivitySink reuses the single, bounded Store activity scan for
@@ -940,7 +942,8 @@ func (h *webSocketHandler) handleAttentionSubscribe(ctx context.Context, peer *c
 	defer peer.attentionMu.Unlock()
 	h.mu.Lock()
 	h.removeAttentionSubscriptionLocked(peer)
-	subscription := attentionSubscription{requestID: request.RequestID, sessionIDs: append([]string(nil), fresh.SessionIDs...), grant: copyAttentionGrant(fresh), principal: accepted.Principal, sent: attentionSummaryIndex(frame.Summaries)}
+	h.nextAttentionGeneration++
+	subscription := attentionSubscription{requestID: request.RequestID, sessionIDs: append([]string(nil), fresh.SessionIDs...), grant: copyAttentionGrant(fresh), principal: accepted.Principal, sent: attentionSummaryIndex(frame.Summaries), generation: h.nextAttentionGeneration}
 	h.attentionSubscriptions[peer] = subscription
 	for _, sessionID := range subscription.sessionIDs {
 		if h.attentionSubscribers[sessionID] == nil {
@@ -954,13 +957,19 @@ func (h *webSocketHandler) handleAttentionSubscribe(ctx context.Context, peer *c
 		h.unregisterClient(peer)
 		return auth.ErrUnauthorized
 	}
+	generation := subscription.generation
 	timer := time.AfterFunc(delay, func() {
 		peer.attentionMu.Lock()
 		defer peer.attentionMu.Unlock()
 		h.mu.Lock()
-		h.removeAttentionSubscriptionLocked(peer)
+		current, found := h.attentionSubscriptions[peer]
+		if found && current.generation == generation {
+			h.removeAttentionSubscriptionLocked(peer)
+		}
 		h.mu.Unlock()
-		_ = peer.close(websocket.StatusPolicyViolation, "attention authorization expired")
+		if found && current.generation == generation {
+			_ = peer.close(websocket.StatusPolicyViolation, "attention authorization expired")
+		}
 	})
 	h.mu.Lock()
 	current, found := h.attentionSubscriptions[peer]
