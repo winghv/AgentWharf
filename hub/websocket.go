@@ -1259,6 +1259,14 @@ func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter 
 }
 
 func (h *webSocketHandler) finalizeSettingsEffective(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	return h.withSessionPublication(ctx, event.SessionID, func() error {
+		return h.finalizeSettingsEffectiveLocked(ctx, adapter, event, proposalID)
+	})
+}
+
+// finalizeSettingsEffectiveLocked keeps the Store terminal CAS and its live
+// fanout in the session publication order used by every other durable event.
+func (h *webSocketHandler) finalizeSettingsEffectiveLocked(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
 	ledger, ok := h.events.(store.SettingsCommandStore)
 	if !ok || adapter == nil || adapter.protocolVersion != protocol.ProtocolVersionV2 {
 		return errors.New("settings command store is not configured")
