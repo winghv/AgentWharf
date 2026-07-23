@@ -209,6 +209,7 @@ type attentionSubscription struct {
 	principal   auth.Principal
 	expiryTimer *time.Timer
 	sent        map[string]protocol.AttentionSummary
+	fanoutMu    *sync.Mutex
 }
 
 // attentionActivitySink reuses the single, bounded Store activity scan for
@@ -938,7 +939,7 @@ func (h *webSocketHandler) handleAttentionSubscribe(ctx context.Context, peer *c
 	frame := attentionSummaryFrame(request.RequestID, "snapshot", summaries, fresh.SessionIDs)
 	h.mu.Lock()
 	h.removeAttentionSubscriptionLocked(peer)
-	subscription := attentionSubscription{requestID: request.RequestID, sessionIDs: append([]string(nil), fresh.SessionIDs...), grant: copyAttentionGrant(fresh), principal: accepted.Principal, sent: attentionSummaryIndex(frame.Summaries)}
+	subscription := attentionSubscription{requestID: request.RequestID, sessionIDs: append([]string(nil), fresh.SessionIDs...), grant: copyAttentionGrant(fresh), principal: accepted.Principal, sent: attentionSummaryIndex(frame.Summaries), fanoutMu: &sync.Mutex{}}
 	h.attentionSubscriptions[peer] = subscription
 	for _, sessionID := range subscription.sessionIDs {
 		if h.attentionSubscribers[sessionID] == nil {
@@ -2710,63 +2711,70 @@ func (h *webSocketHandler) broadcastAttentionUpdate(ctx context.Context, session
 	}
 	h.mu.Unlock()
 	for _, peer := range targets {
-		h.mu.Lock()
-		subscription, found := h.attentionSubscriptions[peer]
-		h.mu.Unlock()
-		if !found {
-			continue
+		h.broadcastAttentionUpdateToPeer(ctx, pageStore, peer, sessionID)
+	}
+}
+
+func (h *webSocketHandler) broadcastAttentionUpdateToPeer(ctx context.Context, pageStore store.AttentionSummaryStore, peer *clientConnection, sessionID string) {
+	h.mu.Lock()
+	subscription, found := h.attentionSubscriptions[peer]
+	h.mu.Unlock()
+	if !found || subscription.fanoutMu == nil {
+		return
+	}
+	subscription.fanoutMu.Lock()
+	defer subscription.fanoutMu.Unlock()
+
+	principal := attentionPrincipalFor(peer, h)
+	if principal.Subject == "" {
+		h.unregisterClient(peer)
+		_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
+		return
+	}
+	grant, err := h.handshake.AuthorizeAttention(ctx, principal)
+	if err != nil || !sameAttentionGrant(subscription.grant, grant) {
+		h.unregisterClient(peer)
+		_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
+		return
+	}
+	summaries, err := pageStore.AttentionSnapshot(ctx, []string{sessionID})
+	if err != nil {
+		return
+	}
+	fresh, err := h.handshake.AuthorizeAttention(ctx, principal)
+	if err != nil || !sameAttentionGrant(fresh, grant) {
+		h.unregisterClient(peer)
+		_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
+		return
+	}
+	frame := attentionSummaryFrame(subscription.requestID, "update", summaries, subscription.sessionIDs)
+	if attentionFrameUnchanged(frame, subscription.sent) {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+	err = peer.writeFrame(writeCtx, frame)
+	cancel()
+	if err != nil {
+		h.unregisterClient(peer)
+		return
+	}
+	h.mu.Lock()
+	current, found := h.attentionSubscriptions[peer]
+	if found && current.requestID == subscription.requestID && sameSessionIDs(current.sessionIDs, subscription.sessionIDs) && sameAttentionGrant(current.grant, subscription.grant) {
+		if current.sent == nil {
+			current.sent = make(map[string]protocol.AttentionSummary)
 		}
-		principal := attentionPrincipalFor(peer, h)
-		if principal.Subject == "" {
-			h.unregisterClient(peer)
-			_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
-			continue
+		for sessionID, summary := range attentionSummaryIndex(frame.Summaries) {
+			current.sent[sessionID] = summary
 		}
-		grant, err := h.handshake.AuthorizeAttention(ctx, principal)
-		if err != nil || !sameAttentionGrant(subscription.grant, grant) {
-			h.unregisterClient(peer)
-			_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
-			continue
-		}
-		summaries, err := pageStore.AttentionSnapshot(ctx, []string{sessionID})
-		if err != nil {
-			continue
-		}
-		fresh, err := h.handshake.AuthorizeAttention(ctx, principal)
-		if err != nil || !sameAttentionGrant(fresh, grant) {
-			h.unregisterClient(peer)
-			_ = peer.close(websocket.StatusPolicyViolation, "attention authorization lost")
-			continue
-		}
-		frame := attentionSummaryFrame(subscription.requestID, "update", summaries, subscription.sessionIDs)
-		if attentionFrameUnchanged(frame, subscription.sent) {
-			continue
-		}
-		writeCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
-		err = peer.writeFrame(writeCtx, frame)
-		cancel()
-		if err != nil {
-			h.unregisterClient(peer)
-			continue
-		}
-		h.mu.Lock()
-		current, found := h.attentionSubscriptions[peer]
-		if found && current.requestID == subscription.requestID && sameSessionIDs(current.sessionIDs, subscription.sessionIDs) && sameAttentionGrant(current.grant, subscription.grant) {
-			if current.sent == nil {
-				current.sent = make(map[string]protocol.AttentionSummary)
-			}
-			for sessionID, summary := range attentionSummaryIndex(frame.Summaries) {
-				current.sent[sessionID] = summary
-			}
-			h.attentionSubscriptions[peer] = current
-		}
-		h.mu.Unlock()
-		for _, summary := range summaries {
-			if summary.SessionID == sessionID && summary.TerminalOutcome != nil {
-				h.mu.Lock()
-				h.removeAttentionMembershipLocked(peer, sessionID)
-				h.mu.Unlock()
-			}
+		h.attentionSubscriptions[peer] = current
+	}
+	h.mu.Unlock()
+	for _, summary := range summaries {
+		if summary.SessionID == sessionID && summary.TerminalOutcome != nil {
+			h.mu.Lock()
+			h.removeAttentionMembershipLocked(peer, sessionID)
+			h.mu.Unlock()
 		}
 	}
 }

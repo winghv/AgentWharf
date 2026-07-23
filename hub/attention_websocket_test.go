@@ -145,6 +145,60 @@ func TestWebSocketAttentionExpiryChangeClosesMembership(t *testing.T) {
 	}
 }
 
+func TestWebSocketAttentionConcurrentFanoutDeduplicatesWithoutRace(t *testing.T) {
+	ctx := context.Background()
+	events, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "attention-concurrent-fanout.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	if _, err := events.Append(ctx, "ses_one", []store.PendingEvent{{Type: "session.state", Time: time.Now().UTC(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	principal := auth.Principal{Subject: "user_1", Scopes: []auth.Scope{auth.Attention("grant_1")}}
+	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: attentionSocketAuth{principal: principal, grant: auth.AttentionGrant{Subject: "user_1", SessionIDs: []string{"ses_one"}, MaxSessions: 1, ExpiresAt: time.Now().Add(time.Minute)}}, EventStore: events})
+	handler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: events})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	conn := dialWebSocket(t, server.URL)
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, conn, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleClient, Token: "attention-token"})
+	_ = readFrame(t, conn).(*protocol.HelloAck)
+	writeFrame(t, conn, &protocol.AttentionSubscribe{RequestID: "attn_concurrent"})
+	_ = readFrame(t, conn).(*protocol.AttentionSummaryFrame)
+	if _, err := events.Append(ctx, "ses_one", []store.PendingEvent{{Type: "session.state", Time: time.Now().UTC(), Payload: []byte(`{"state":"busy"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	const fanouts = 32
+	start := make(chan struct{})
+	errCh := make(chan error, fanouts)
+	var wait sync.WaitGroup
+	for range fanouts {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			errCh <- handler.EmitEphemeralEvent(ctx, protocol.Event{Type: "agent.activity", SessionID: "ses_one", Time: time.Now().UTC().UnixMilli(), Payload: []byte(`{}`)})
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent attention fanout: %v", err)
+		}
+	}
+	update := readFrame(t, conn).(*protocol.AttentionSummaryFrame)
+	if update.Kind != "update" || len(update.Summaries) != 1 || update.Summaries[0].LatestSeq != 2 {
+		t.Fatalf("concurrent attention update = %+v", update)
+	}
+	if frame, err := readFrameWithin(conn, 50*time.Millisecond); err == nil {
+		t.Fatalf("duplicate concurrent attention update = %+v", frame)
+	}
+}
+
 func TestWebSocketAttentionActivityRefreshDeliversLedgerOnlyUpdate(t *testing.T) {
 	ctx := context.Background()
 	events := newAttentionActivityStore(store.SessionAttentionSummary{
