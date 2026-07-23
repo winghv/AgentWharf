@@ -186,6 +186,128 @@ func TestGroupSupervisorOwnsWorkerLifecycle(t *testing.T) {
 	}
 }
 
+func TestGroupSupervisorRecoversOnlyVerifiedCurrentTuple(t *testing.T) {
+	leases := &recordingWorkspaceLeaseReserver{}
+	verifier := &recordingRecoveryVerifier{}
+	worker := &fakeGroupWorker{}
+	group, err := NewGroupSupervisor(GroupSupervisorConfig{
+		MaxWorkers: 2,
+		Leases:     leases,
+		Recovery:   verifier,
+		NewWorker:  func(SessionWorkerConfig) (SessionWorkerRunner, error) { return worker, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewGroupSupervisor() error = %v", err)
+	}
+	if err := group.Recover(context.Background(), validGroupWorkerRecovery("worker_1", "ses_1", 1)); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if group.WorkerCount() != 1 || leases.reserveCount() != 0 || verifier.calls != 1 {
+		t.Fatalf("recovery membership/reserve/verify = %d/%d/%d, want 1/0/1", group.WorkerCount(), leases.reserveCount(), verifier.calls)
+	}
+	if err := group.Run(context.Background(), "ses_1"); err != nil {
+		t.Fatalf("Run(recovered) error = %v", err)
+	}
+	if worker.runs != 1 || verifier.calls != 2 {
+		t.Fatalf("recovered run/verify = %d/%d, want 1/2", worker.runs, verifier.calls)
+	}
+}
+
+func TestGroupSupervisorFailsClosedForRecoveryLossAndQueuedRevocation(t *testing.T) {
+	leases := &recordingWorkspaceLeaseReserver{}
+	verifier := &recordingRecoveryVerifier{}
+	worker := &fakeGroupWorker{}
+	group, err := NewGroupSupervisor(GroupSupervisorConfig{
+		MaxWorkers: 2,
+		Leases:     leases,
+		Recovery:   verifier,
+		NewWorker:  func(SessionWorkerConfig) (SessionWorkerRunner, error) { return worker, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewGroupSupervisor() error = %v", err)
+	}
+	if err := group.Recover(context.Background(), validGroupWorkerRecovery("worker_1", "ses_1", 1)); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	verifier.err = errors.New("revoked after recovery")
+	if err := group.Run(context.Background(), "ses_1"); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("Run(revoked queued recovery) error = %v, want ErrRecoveryAuthorityLost", err)
+	}
+	if worker.runs != 0 || leases.reserveCount() != 0 {
+		t.Fatalf("queued authority loss ran/reserved provider: runs=%d reserves=%d", worker.runs, leases.reserveCount())
+	}
+	missing, err := NewGroupSupervisor(GroupSupervisorConfig{
+		MaxWorkers: 1, Leases: leases, NewWorker: func(SessionWorkerConfig) (SessionWorkerRunner, error) { return &fakeGroupWorker{}, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewGroupSupervisor(missing recovery verifier) error = %v", err)
+	}
+	if err := missing.Recover(context.Background(), validGroupWorkerRecovery("worker_2", "ses_2", 2)); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("Recover(without verifier) error = %v, want ErrRecoveryAuthorityLost", err)
+	}
+}
+
+func TestGroupSupervisorRecoveryDeniesSecondWorkerWithoutActivation(t *testing.T) {
+	leases := &recordingWorkspaceLeaseReserver{}
+	verifier := &recordingRecoveryVerifier{}
+	created := 0
+	group, err := NewGroupSupervisor(GroupSupervisorConfig{
+		MaxWorkers: 2,
+		Leases:     leases,
+		Recovery:   verifier,
+		NewWorker: func(SessionWorkerConfig) (SessionWorkerRunner, error) {
+			created++
+			return &fakeGroupWorker{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewGroupSupervisor() error = %v", err)
+	}
+	if err := group.Recover(context.Background(), validGroupWorkerRecovery("worker_1", "ses_1", 1)); err != nil {
+		t.Fatalf("Recover(first) error = %v", err)
+	}
+	if err := group.Recover(context.Background(), validGroupWorkerRecovery("worker_2", "ses_2", 2)); !errors.Is(err, ErrMultiWorkerDisabled) {
+		t.Fatalf("Recover(second) error = %v, want ErrMultiWorkerDisabled", err)
+	}
+	if group.WorkerCount() != 1 || verifier.calls != 1 || created != 1 || leases.reserveCount() != 0 {
+		t.Fatalf("second recovery retained/verified/created/reserved=%d/%d/%d/%d, want 1/1/1/0", group.WorkerCount(), verifier.calls, created, leases.reserveCount())
+	}
+}
+
+func TestGroupSupervisorRejectsInvalidRecoveryTupleBeforeVerifier(t *testing.T) {
+	for _, mutate := range []func(*GroupWorkerRecovery){
+		func(recovery *GroupWorkerRecovery) { recovery.Tuple.ConnectionEpoch++ },
+		func(recovery *GroupWorkerRecovery) { recovery.Tuple.CredentialGeneration++ },
+		func(recovery *GroupWorkerRecovery) { recovery.Tuple.LeaseID = "other" },
+		func(recovery *GroupWorkerRecovery) { recovery.Tuple.ExpiresAt = time.Now().Add(-time.Second) },
+		func(recovery *GroupWorkerRecovery) { recovery.Tuple.Revoked = true },
+		func(recovery *GroupWorkerRecovery) { recovery.Tuple.Terminal = true },
+		func(recovery *GroupWorkerRecovery) { recovery.Tuple.Quarantined = true },
+	} {
+		leases := &recordingWorkspaceLeaseReserver{}
+		verifier := &recordingRecoveryVerifier{}
+		created := 0
+		group, err := NewGroupSupervisor(GroupSupervisorConfig{
+			MaxWorkers: 1, Leases: leases, Recovery: verifier,
+			NewWorker: func(SessionWorkerConfig) (SessionWorkerRunner, error) {
+				created++
+				return &fakeGroupWorker{}, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewGroupSupervisor() error = %v", err)
+		}
+		recovery := validGroupWorkerRecovery("worker_1", "ses_1", 1)
+		mutate(&recovery)
+		if err := group.Recover(context.Background(), recovery); !errors.Is(err, ErrRecoveryAuthorityLost) {
+			t.Fatalf("Recover(invalid tuple) error = %v, want ErrRecoveryAuthorityLost", err)
+		}
+		if verifier.calls != 0 || created != 0 || leases.reserveCount() != 0 || group.WorkerCount() != 0 {
+			t.Fatalf("invalid recovery verified/created/reserved/retained=%d/%d/%d/%d, want 0/0/0/0", verifier.calls, created, leases.reserveCount(), group.WorkerCount())
+		}
+	}
+}
+
 type fakeGroupWorker struct{ runs, stops int }
 
 func (w *fakeGroupWorker) Run(context.Context) error {
@@ -230,6 +352,16 @@ func (failingMultiWorkerGate) AllowMultiWorker(context.Context) error {
 	return errors.New("T42F/T42H receipts unavailable")
 }
 
+type recordingRecoveryVerifier struct {
+	calls int
+	err   error
+}
+
+func (v *recordingRecoveryVerifier) VerifyRecovery(_ context.Context, _ RecoveryTuple) error {
+	v.calls++
+	return v.err
+}
+
 func validGroupWorkerAdmission(workerID, sessionID string, keyByte byte) GroupWorkerAdmission {
 	var key store.WorkspaceLeaseKey
 	key[0] = keyByte
@@ -246,6 +378,17 @@ func validGroupWorkerAdmission(workerID, sessionID string, keyByte byte) GroupWo
 				WorkerID: workerID, SessionID: sessionID, ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_" + workerID,
 			},
 			ExpiresAt: time.Now().Add(time.Minute),
+		},
+	}
+}
+
+func validGroupWorkerRecovery(workerID, sessionID string, keyByte byte) GroupWorkerRecovery {
+	admission := validGroupWorkerAdmission(workerID, sessionID, keyByte)
+	return GroupWorkerRecovery{
+		Admission: admission,
+		Tuple: RecoveryTuple{
+			SessionID: sessionID, WorkerID: workerID, ConnectionEpoch: 1, CredentialGeneration: 1,
+			WorkspaceKey: admission.Lease.Key, LeaseID: admission.Lease.Owner.LeaseID, ExpiresAt: admission.Lease.ExpiresAt,
 		},
 	}
 }

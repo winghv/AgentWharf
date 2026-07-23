@@ -18,6 +18,7 @@ var (
 	ErrSessionWorkerExists          = errors.New("session worker already exists")
 	ErrSessionWorkerNotFound        = errors.New("session worker not found")
 	ErrWorkspaceWriterExists        = errors.New("workspace already has a writer")
+	ErrRecoveryAuthorityLost        = errors.New("recovery authority is unavailable")
 )
 
 // SessionWorkerRunner retains only the process lifecycle needed by this pre-activation
@@ -38,10 +39,29 @@ type MultiWorkerActivation interface {
 	AllowMultiWorker(context.Context) error
 }
 
+type RecoveryTuple struct {
+	SessionID            string
+	WorkerID             string
+	WorkspaceKey         store.WorkspaceLeaseKey
+	ConnectionEpoch      int64
+	CredentialGeneration int64
+	LeaseID              string
+	ExpiresAt            time.Time
+	Revoked              bool
+	Terminal             bool
+	Quarantined          bool
+}
+
+// RecoveryVerifier receives only the current non-secret authority tuple.
+type RecoveryVerifier interface {
+	VerifyRecovery(context.Context, RecoveryTuple) error
+}
+
 type GroupSupervisorConfig struct {
 	MaxWorkers int
 	Leases     workspaceLeaseReserver
 	Activation MultiWorkerActivation
+	Recovery   RecoveryVerifier
 	NewWorker  func(SessionWorkerConfig) (SessionWorkerRunner, error)
 }
 
@@ -55,16 +75,29 @@ type GroupWorkerAdmission struct {
 	Lease     store.WorkspaceLeaseReserve
 }
 
+// GroupWorkerRecovery keeps ephemeral process setup separate from the tuple
+// that a trusted lifecycle validates against durable authority.
+type GroupWorkerRecovery struct {
+	Admission GroupWorkerAdmission
+	Tuple     RecoveryTuple
+}
+
+type supervisedWorker struct {
+	worker   SessionWorkerRunner
+	recovery *RecoveryTuple
+}
+
 // GroupSupervisor owns bounded in-process membership. Durable lease release
 // remains exclusively with the fixed-entry cleanup path after quiescence.
 type GroupSupervisor struct {
 	maxWorkers int
 	leases     workspaceLeaseReserver
 	activation MultiWorkerActivation
+	recovery   RecoveryVerifier
 	newWorker  func(SessionWorkerConfig) (SessionWorkerRunner, error)
 
 	mu          sync.Mutex
-	bySession   map[string]SessionWorkerRunner
+	bySession   map[string]supervisedWorker
 	byWorkspace map[store.WorkspaceLeaseKey]string
 }
 
@@ -81,8 +114,9 @@ func NewGroupSupervisor(cfg GroupSupervisorConfig) (*GroupSupervisor, error) {
 		maxWorkers:  cfg.MaxWorkers,
 		leases:      cfg.Leases,
 		activation:  cfg.Activation,
+		recovery:    cfg.Recovery,
 		newWorker:   cfg.NewWorker,
-		bySession:   make(map[string]SessionWorkerRunner),
+		bySession:   make(map[string]supervisedWorker),
 		byWorkspace: make(map[store.WorkspaceLeaseKey]string),
 	}, nil
 }
@@ -129,25 +163,74 @@ func (s *GroupSupervisor) Admit(ctx context.Context, admission GroupWorkerAdmiss
 	if worker == nil {
 		return fmt.Errorf("construct session worker: %w", ErrInvalidGroupWorkerAdmission)
 	}
-	s.bySession[admission.SessionID] = worker
+	s.bySession[admission.SessionID] = supervisedWorker{worker: worker}
 	s.byWorkspace[admission.Lease.Key] = admission.SessionID
 	return nil
 }
 
+// Recover reconstructs membership only after trusted live authority verifies
+// the durable tuple. It deliberately does not reserve or release a workspace.
+func (s *GroupSupervisor) Recover(ctx context.Context, recovery GroupWorkerRecovery) error {
+	if s == nil || s.recovery == nil || validateGroupWorkerRecovery(recovery) != nil {
+		return ErrRecoveryAuthorityLost
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.bySession[recovery.Admission.SessionID]; exists {
+		return ErrSessionWorkerExists
+	}
+	if _, exists := s.byWorkspace[recovery.Admission.Lease.Key]; exists {
+		return ErrWorkspaceWriterExists
+	}
+	if len(s.bySession) >= s.maxWorkers {
+		return ErrGroupCapacity
+	}
+	if len(s.bySession) > 0 {
+		if s.activation == nil {
+			return ErrMultiWorkerDisabled
+		}
+		if err := s.activation.AllowMultiWorker(ctx); err != nil {
+			return fmt.Errorf("%w: %v", ErrMultiWorkerDisabled, err)
+		}
+	}
+	if err := s.recovery.VerifyRecovery(ctx, recovery.Tuple); err != nil {
+		return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
+	}
+	worker, err := s.newWorker(recovery.Admission.Worker)
+	if err != nil || worker == nil {
+		return ErrRecoveryAuthorityLost
+	}
+	tuple := recovery.Tuple
+	s.bySession[recovery.Admission.SessionID] = supervisedWorker{worker: worker, recovery: &tuple}
+	s.byWorkspace[recovery.Admission.Lease.Key] = recovery.Admission.SessionID
+	return nil
+}
+
 func (s *GroupSupervisor) Run(ctx context.Context, sessionID string) error {
-	worker, err := s.worker(sessionID)
+	member, err := s.worker(sessionID)
 	if err != nil {
 		return err
 	}
-	return worker.Run(ctx)
+	if member.recovery != nil {
+		if s.recovery == nil {
+			return ErrRecoveryAuthorityLost
+		}
+		if err := s.recovery.VerifyRecovery(ctx, *member.recovery); err != nil {
+			return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
+		}
+	}
+	return member.worker.Run(ctx)
 }
 
 func (s *GroupSupervisor) Stop(ctx context.Context, sessionID string) error {
-	worker, err := s.worker(sessionID)
+	member, err := s.worker(sessionID)
 	if err != nil {
 		return err
 	}
-	return worker.Stop(ctx)
+	return member.worker.Stop(ctx)
 }
 
 func (s *GroupSupervisor) WorkerCount() int {
@@ -159,15 +242,15 @@ func (s *GroupSupervisor) WorkerCount() int {
 	return len(s.bySession)
 }
 
-func (s *GroupSupervisor) worker(sessionID string) (SessionWorkerRunner, error) {
+func (s *GroupSupervisor) worker(sessionID string) (supervisedWorker, error) {
 	if s == nil || sessionID == "" {
-		return nil, ErrSessionWorkerNotFound
+		return supervisedWorker{}, ErrSessionWorkerNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	worker, ok := s.bySession[sessionID]
 	if !ok {
-		return nil, ErrSessionWorkerNotFound
+		return supervisedWorker{}, ErrSessionWorkerNotFound
 	}
 	return worker, nil
 }
@@ -184,6 +267,24 @@ func validateGroupWorkerAdmission(admission GroupWorkerAdmission) error {
 	}
 	if admission.Lease.ExpiresAt.IsZero() || !admission.Lease.ExpiresAt.After(time.Now()) || isZeroWorkspaceLeaseKey(admission.Lease.Key) {
 		return ErrInvalidGroupWorkerAdmission
+	}
+	return nil
+}
+
+func validateGroupWorkerRecovery(recovery GroupWorkerRecovery) error {
+	if validateGroupWorkerAdmission(recovery.Admission) != nil {
+		return ErrRecoveryAuthorityLost
+	}
+	tuple := recovery.Tuple
+	if tuple.SessionID != recovery.Admission.SessionID ||
+		tuple.WorkerID != recovery.Admission.WorkerID ||
+		tuple.WorkspaceKey != recovery.Admission.Lease.Key ||
+		tuple.ConnectionEpoch != recovery.Admission.Lease.Owner.ConnectionEpoch ||
+		tuple.CredentialGeneration != recovery.Admission.Lease.Owner.CredentialGeneration ||
+		tuple.LeaseID != recovery.Admission.Lease.Owner.LeaseID ||
+		tuple.ExpiresAt.IsZero() || !tuple.ExpiresAt.After(time.Now()) ||
+		tuple.Revoked || tuple.Terminal || tuple.Quarantined {
+		return ErrRecoveryAuthorityLost
 	}
 	return nil
 }
