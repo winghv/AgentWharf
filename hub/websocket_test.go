@@ -272,11 +272,12 @@ func TestWebSocketSettingsReplacementRecoversPendingReservation(t *testing.T) {
 
 func TestWebSocketSettingsRestartRecoversPendingReservation(t *testing.T) {
 	ctx := context.Background()
-	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "settings-restart-recovery.db"))
+	path := filepath.Join(t.TempDir(), "settings-restart-recovery.db")
+	ledger, err := sqlite.Open(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ledger.Close()
+	defer func() { _ = ledger.Close() }()
 	events := &settingsWebSocketStore{Store: ledger}
 	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
@@ -304,6 +305,14 @@ func TestWebSocketSettingsRestartRecoversPendingReservation(t *testing.T) {
 	server.Close()
 	_ = first.Close(websocket.StatusNormalClosure, "")
 	_ = client.Close(websocket.StatusNormalClosure, "")
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err = sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events = &settingsWebSocketStore{Store: ledger}
 
 	restarted := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
 	resumedClient := dialWebSocket(t, restarted.URL)
