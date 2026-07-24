@@ -294,12 +294,12 @@ func (w *SessionWorker) DeliverCommand(ctx context.Context, command SessionWorke
 	if command.CommandID == "" {
 		return CommandRoutingReceipt{}, fmt.Errorf("%w: command ID is required", ErrInvalidDurableReceipt)
 	}
+	if command.SessionID != "" && command.SessionID != w.sessionID {
+		return CommandRoutingReceipt{}, ErrSessionCredentialMismatch
+	}
 	if w.credential != nil {
 		if err := w.credential.validate(w.sessionID, time.Now()); err != nil {
 			return CommandRoutingReceipt{}, err
-		}
-		if command.SessionID != "" && command.SessionID != w.sessionID {
-			return CommandRoutingReceipt{}, ErrSessionCredentialMismatch
 		}
 	}
 	if !supportedSessionWorkerCommand(command.Type) {
