@@ -99,6 +99,7 @@ type SessionWorker struct {
 	provider          *ProcessSupervisor
 	receipts          SessionWorkerDurableReceipts
 	credential        *SessionCredential
+	rotation          *CredentialRotation
 	ownership         ProcessTreeOwnership
 	lease             QuiescenceLease
 	ownerObservations *sync.WaitGroup
@@ -254,9 +255,16 @@ func newSessionWorker(cfg SessionWorkerConfig, runner processRunner) (*SessionWo
 	if err != nil {
 		return nil, err
 	}
+	var rotation *CredentialRotation
+	if cfg.Credential != nil {
+		rotation, err = NewCredentialRotation(cfg.SessionID, cfg.Credential, 1)
+		if err != nil {
+			return nil, err
+		}
+	}
 	worker := &SessionWorker{
 		sessionID: cfg.SessionID, provider: provider, receipts: cfg.DurableReceipts,
-		credential: cfg.Credential, ownership: cfg.ProcessOwnership, lease: cfg.QuiescenceLease,
+		credential: cfg.Credential, rotation: rotation, ownership: cfg.ProcessOwnership, lease: cfg.QuiescenceLease,
 		ownerObservations: &ownerObservations,
 	}
 	if cfg.ProcessOwnership != nil {
@@ -272,6 +280,79 @@ func (w *SessionWorker) SessionID() string {
 		return ""
 	}
 	return w.sessionID
+}
+
+func (w *SessionWorker) PrepareCredentialRotation(rotationID string, credential *SessionCredential) error {
+	if w == nil || w.rotation == nil {
+		return ErrCredentialRotationUnavailable
+	}
+	return w.rotation.Prepare(rotationID, credential)
+}
+
+func (w *SessionWorker) AcknowledgeCredentialPossession(rotationID string, acceptedEpoch int64) (CredentialRotationReceipt, error) {
+	if w == nil || w.rotation == nil {
+		return CredentialRotationReceipt{}, ErrCredentialRotationUnavailable
+	}
+	return w.rotation.PossessionAck(rotationID, acceptedEpoch)
+}
+
+func (w *SessionWorker) ActivateCredentialRotation(receipt CredentialRotationReceipt) error {
+	if w == nil || w.rotation == nil {
+		return ErrCredentialRotationUnavailable
+	}
+	return w.rotation.Activate(receipt)
+}
+
+func (w *SessionWorker) RetryCredentialActivation(rotationID string) (CredentialRotationReceipt, error) {
+	if w == nil || w.rotation == nil {
+		return CredentialRotationReceipt{}, ErrCredentialRotationUnavailable
+	}
+	return w.rotation.RetryActivation(rotationID)
+}
+
+func (w *SessionWorker) ReconnectCredential(epoch, generation int64) error {
+	if w == nil || w.rotation == nil {
+		return ErrCredentialRotationUnavailable
+	}
+	return w.rotation.Reconnect(epoch, generation)
+}
+
+func (w *SessionWorker) CredentialRecoveryPermit() (CredentialRecoveryPermit, error) {
+	if w == nil || w.rotation == nil {
+		return CredentialRecoveryPermit{}, ErrCredentialRotationUnavailable
+	}
+	return w.rotation.RecoveryPermit()
+}
+
+func (w *SessionWorker) MarkCredentialAuthorityLost() {
+	if w != nil && w.rotation != nil {
+		w.rotation.MarkAuthorityLost()
+	}
+}
+
+func (w *SessionWorker) RevokeCredential() {
+	if w != nil && w.rotation != nil {
+		w.rotation.Revoke()
+	}
+}
+
+func (w *SessionWorker) TerminalCredential() {
+	if w != nil && w.rotation != nil {
+		w.rotation.Terminal()
+	}
+}
+
+func (w *SessionWorker) validateActiveCredential() error {
+	if w == nil {
+		return ErrSessionCredentialRequired
+	}
+	if w.rotation != nil {
+		return w.rotation.Authorize(time.Now())
+	}
+	if w.credential == nil {
+		return ErrSessionCredentialRequired
+	}
+	return w.credential.validate(w.sessionID, time.Now())
 }
 
 func (w *SessionWorker) Events() <-chan ProcessEvent {
@@ -402,11 +483,13 @@ func (w *SessionWorker) forwardEvents() {
 // durable receipt path. A missing credential is deny-by-default for routed
 // work; legacy callers that use DeliverCommand directly retain T42C behavior.
 func (w *SessionWorker) RouteCommand(ctx context.Context, command SessionWorkerCommand, apply func(context.Context) error) (CommandRoutingReceipt, error) {
-	if w == nil || w.credential == nil {
+	if w == nil || (w.credential == nil && w.rotation == nil) {
 		return CommandRoutingReceipt{}, ErrSessionCredentialRequired
 	}
-	if err := w.credential.validate(w.sessionID, time.Now()); err != nil {
-		return CommandRoutingReceipt{}, err
+	if w.credential != nil || w.rotation != nil {
+		if err := w.validateActiveCredential(); err != nil {
+			return CommandRoutingReceipt{}, err
+		}
 	}
 	if command.SessionID != "" && command.SessionID != w.sessionID {
 		return CommandRoutingReceipt{}, ErrSessionCredentialMismatch
@@ -428,8 +511,8 @@ func (w *SessionWorker) DeliverCommand(ctx context.Context, command SessionWorke
 	if command.SessionID != "" && command.SessionID != w.sessionID {
 		return CommandRoutingReceipt{}, ErrSessionCredentialMismatch
 	}
-	if w.credential != nil {
-		if err := w.credential.validate(w.sessionID, time.Now()); err != nil {
+	if w.credential != nil || w.rotation != nil {
+		if err := w.validateActiveCredential(); err != nil {
 			return CommandRoutingReceipt{}, err
 		}
 	}
@@ -455,6 +538,11 @@ func (w *SessionWorker) DeliverCommand(ctx context.Context, command SessionWorke
 	if operation.OperationID == "" || operation.Version < 1 || operation.Status != LedgerOperationPending {
 		return CommandRoutingReceipt{}, fmt.Errorf("%w: ledger operation receipt", ErrInvalidDurableReceipt)
 	}
+	if w.credential != nil || w.rotation != nil {
+		if err := w.validateActiveCredential(); err != nil {
+			return CommandRoutingReceipt{}, err
+		}
+	}
 
 	if err := apply(ctx); err != nil {
 		return routing, w.finalizeCommandUnknown(command, operation, err)
@@ -475,8 +563,8 @@ func (w *SessionWorker) ProposeEvent(ctx context.Context, proposalID string, pub
 	if proposalID == "" {
 		return EventProposalReceipt{}, fmt.Errorf("%w: proposal ID is required", ErrInvalidDurableReceipt)
 	}
-	if w.credential != nil {
-		if err := w.credential.validate(w.sessionID, time.Now()); err != nil {
+	if w.credential != nil || w.rotation != nil {
+		if err := w.validateActiveCredential(); err != nil {
 			return EventProposalReceipt{}, err
 		}
 	}
@@ -536,6 +624,7 @@ type ownedProcessStartAdmission struct {
 	delegate    ProcessStartAdmission
 	onConfirmed func()
 }
+
 func (a *ownedProcessStartAdmission) PrepareProcessStart(ctx context.Context, attempt int) error {
 	if a == nil || a.owner == nil {
 		return ErrRecoveryAuthorityLost
