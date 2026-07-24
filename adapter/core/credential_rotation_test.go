@@ -213,6 +213,67 @@ func TestCredentialRotationRejectsAuthorityLostRecoveryAndForgedIdempotentReceip
 	}
 }
 
+func TestCredentialRotationRejectsExpiredPendingActiveAndPriorLineages(t *testing.T) {
+	rotation, err := NewCredentialRotation("ses_rotation_expiry_lifecycle", rotationCredential(t, "ses_rotation_expiry_lifecycle", 1), 1)
+	if err != nil {
+		t.Fatalf("NewCredentialRotation() error = %v", err)
+	}
+	pending := rotationCredential(t, "ses_rotation_expiry_lifecycle", 2)
+	if err := rotation.Prepare("rot_expired", pending); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	pending.metadata.ExpiresAt = time.Now().Add(-time.Second)
+	if _, err := rotation.PossessionAck("rot_expired", 1); !errors.Is(err, ErrSessionCredentialExpired) {
+		t.Fatalf("expired pending PossessionAck() error = %v, want expired", err)
+	}
+	if err := rotation.Activate(CredentialRotationReceipt{
+		RotationID: "rot_expired", SessionID: "ses_rotation_expiry_lifecycle", Epoch: 1,
+		Generation: 2, Status: CredentialRotationPending,
+	}); !errors.Is(err, ErrSessionCredentialExpired) {
+		t.Fatalf("expired pending Activate() error = %v, want expired", err)
+	}
+
+	activeRotation, err := NewCredentialRotation("ses_rotation_active_expiry", rotationCredential(t, "ses_rotation_active_expiry", 1), 1)
+	if err != nil {
+		t.Fatalf("active NewCredentialRotation() error = %v", err)
+	}
+	activePending := rotationCredential(t, "ses_rotation_active_expiry", 2)
+	if err := activeRotation.Prepare("rot_active_expiry", activePending); err != nil {
+		t.Fatalf("active Prepare() error = %v", err)
+	}
+	activeReceipt, err := activeRotation.PossessionAck("rot_active_expiry", 1)
+	if err != nil {
+		t.Fatalf("active PossessionAck() error = %v", err)
+	}
+	if err := activeRotation.Activate(activeReceipt); err != nil {
+		t.Fatalf("active Activate() error = %v", err)
+	}
+	activeRotation.active.metadata.ExpiresAt = time.Now().Add(-time.Second)
+	if _, err := activeRotation.ActiveReceipt(); !errors.Is(err, ErrSessionCredentialExpired) {
+		t.Fatalf("expired active ActiveReceipt() error = %v, want expired", err)
+	}
+
+	priorRotation, err := NewCredentialRotation("ses_rotation_prior_expiry", rotationCredential(t, "ses_rotation_prior_expiry", 1), 1)
+	if err != nil {
+		t.Fatalf("prior NewCredentialRotation() error = %v", err)
+	}
+	priorPending := rotationCredential(t, "ses_rotation_prior_expiry", 2)
+	if err := priorRotation.Prepare("rot_prior_expiry", priorPending); err != nil {
+		t.Fatalf("prior Prepare() error = %v", err)
+	}
+	priorReceipt, err := priorRotation.PossessionAck("rot_prior_expiry", 1)
+	if err != nil {
+		t.Fatalf("prior PossessionAck() error = %v", err)
+	}
+	if err := priorRotation.Activate(priorReceipt); err != nil {
+		t.Fatalf("prior Activate() error = %v", err)
+	}
+	priorRotation.prior.metadata.ExpiresAt = time.Now().Add(-time.Second)
+	if _, err := priorRotation.RecoveryPermit(); !errors.Is(err, ErrSessionCredentialExpired) {
+		t.Fatalf("expired prior RecoveryPermit() error = %v, want expired", err)
+	}
+}
+
 type authorityLossAfterPrepareGate struct {
 	worker    *SessionWorker
 	finalized []CommandOutcome

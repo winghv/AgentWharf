@@ -117,7 +117,7 @@ func (r *CredentialRotation) PossessionAck(rotationID string, acceptedEpoch int6
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := r.authorityLocked(); err != nil {
+	if err := r.authorizeLocked(time.Now()); err != nil {
 		return CredentialRotationReceipt{}, err
 	}
 	if r.pending == nil || r.pending.id != rotationID {
@@ -125,6 +125,9 @@ func (r *CredentialRotation) PossessionAck(rotationID string, acceptedEpoch int6
 	}
 	if acceptedEpoch != r.epoch {
 		return CredentialRotationReceipt{}, ErrCredentialRotationStale
+	}
+	if err := validCredentialLocked(r.pending.credential, time.Now()); err != nil {
+		return CredentialRotationReceipt{}, err
 	}
 	metadata, _ := r.pending.credential.Metadata()
 	return CredentialRotationReceipt{RotationID: rotationID, SessionID: r.sessionID, Epoch: r.epoch, Generation: metadata.Generation, Status: CredentialRotationPending}, nil
@@ -136,7 +139,7 @@ func (r *CredentialRotation) Activate(receipt CredentialRotationReceipt) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := r.authorityLocked(); err != nil {
+	if err := r.authorizeLocked(time.Now()); err != nil {
 		return err
 	}
 	if receipt.RotationID != "" && r.activeRotationID == receipt.RotationID && receipt.Status == CredentialRotationActive {
@@ -151,6 +154,9 @@ func (r *CredentialRotation) Activate(receipt CredentialRotationReceipt) error {
 	}
 	if r.pending == nil || receipt.RotationID != r.pending.id || receipt.SessionID != r.sessionID || receipt.Epoch != r.epoch || receipt.Status != CredentialRotationPending {
 		return ErrCredentialRotationStale
+	}
+	if err := validCredentialLocked(r.pending.credential, time.Now()); err != nil {
+		return err
 	}
 	metadata, _ := r.pending.credential.Metadata()
 	if metadata.Generation != receipt.Generation {
@@ -170,7 +176,7 @@ func (r *CredentialRotation) RetryActivation(rotationID string) (CredentialRotat
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := r.authorityLocked(); err != nil {
+	if err := r.authorizeLocked(time.Now()); err != nil {
 		return CredentialRotationReceipt{}, err
 	}
 	if r.activeRotationID != rotationID || r.active == nil {
@@ -186,14 +192,8 @@ func (r *CredentialRotation) Reconnect(epoch, generation int64) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.revoked || r.terminal {
-		return ErrCredentialTerminal
-	}
-	if r.authorityLost {
-		return ErrCredentialAuthorityLost
-	}
-	if r.active == nil {
-		return ErrCredentialRecoveryRequired
+	if err := r.authorizeLocked(time.Now()); err != nil {
+		return err
 	}
 	metadata, _ := r.active.Metadata()
 	if generation != metadata.Generation || epoch <= r.epoch {
@@ -210,7 +210,7 @@ func (r *CredentialRotation) ActiveReceipt() (CredentialRotationReceipt, error) 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := r.authorityLocked(); err != nil {
+	if err := r.authorizeLocked(time.Now()); err != nil {
 		return CredentialRotationReceipt{}, err
 	}
 	metadata, _ := r.active.Metadata()
@@ -223,11 +223,14 @@ func (r *CredentialRotation) RecoveryPermit() (CredentialRecoveryPermit, error) 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := r.authorityLocked(); err != nil {
+	if err := r.authorizeLocked(time.Now()); err != nil {
 		return CredentialRecoveryPermit{}, err
 	}
 	if r.prior == nil || time.Now().After(r.priorRecoveryUntil) {
 		return CredentialRecoveryPermit{}, ErrCredentialRecoveryRequired
+	}
+	if err := validCredentialLocked(r.prior, time.Now()); err != nil {
+		return CredentialRecoveryPermit{}, err
 	}
 	metadata, _ := r.prior.Metadata()
 	return CredentialRecoveryPermit{SessionID: r.sessionID, Epoch: r.epoch, Generation: metadata.Generation}, nil
@@ -252,6 +255,20 @@ func (r *CredentialRotation) authorizeLocked(now time.Time) error {
 	metadata, _ := r.active.Metadata()
 	if !metadata.ExpiresAt.After(now) {
 		r.authorityLost = true
+		return ErrSessionCredentialExpired
+	}
+	return nil
+}
+
+func validCredentialLocked(credential *SessionCredential, now time.Time) error {
+	if credential == nil {
+		return ErrCredentialRecoveryRequired
+	}
+	metadata, err := credential.Metadata()
+	if err != nil {
+		return err
+	}
+	if !metadata.ExpiresAt.After(now) {
 		return ErrSessionCredentialExpired
 	}
 	return nil
