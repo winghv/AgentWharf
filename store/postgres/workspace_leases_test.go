@@ -125,6 +125,28 @@ func TestProviderStartAdmissionContract(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects an expired reservation during re-admission", func(t *testing.T) {
+		harness, admission, key := newAdmission(t)
+		if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err != nil {
+			t.Fatalf("RecordProviderStartAdmission() = %v", err)
+		}
+		if _, err := harness.pool.Exec(context.Background(), "UPDATE session_workspace_leases SET reservation_expires_at=clock_timestamp() - interval '1 second'"); err != nil {
+			t.Fatalf("expire reservation: %v", err)
+		}
+		admission.ReAdmission = true
+		called := false
+		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+			called = true
+			return nil
+		}); err == nil || called {
+			t.Fatalf("expired reservation re-admission err=%v, callback=%t", err, called)
+		}
+		lease, err := harness.WorkspaceLease(context.Background(), key)
+		if err != nil || lease.Status != store.WorkspaceLeaseStartReceived {
+			t.Fatalf("expired reservation lease = %+v, %v", lease, err)
+		}
+	})
+
 	t.Run("callback failure leaves the lease reserved", func(t *testing.T) {
 		harness, admission, key := newAdmission(t)
 		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
