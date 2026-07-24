@@ -173,3 +173,89 @@ func TestCredentialRotationPriorGenerationIsRecoveryOnlyAndWorkerLocal(t *testin
 		t.Fatalf("terminal second Worker affected first Worker: %v", err)
 	}
 }
+
+func TestCredentialRotationRejectsAuthorityLostRecoveryAndForgedIdempotentReceipt(t *testing.T) {
+	rotation, err := NewCredentialRotation("ses_rotation_receipts", rotationCredential(t, "ses_rotation_receipts", 1), 1)
+	if err != nil {
+		t.Fatalf("NewCredentialRotation() error = %v", err)
+	}
+	if err := rotation.Prepare("rot_2", rotationCredential(t, "ses_rotation_receipts", 2)); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	receipt, err := rotation.PossessionAck("rot_2", 1)
+	if err != nil {
+		t.Fatalf("PossessionAck() error = %v", err)
+	}
+	if err := rotation.Activate(receipt); err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	active, err := rotation.RetryActivation("rot_2")
+	if err != nil {
+		t.Fatalf("RetryActivation() error = %v", err)
+	}
+	forged := active
+	forged.SessionID = "ses_other"
+	if err := rotation.Activate(forged); !errors.Is(err, ErrCredentialRotationStale) {
+		t.Fatalf("forged idempotent receipt error = %v, want stale", err)
+	}
+	rotation.MarkAuthorityLost()
+	if _, err := rotation.RetryActivation("rot_2"); !errors.Is(err, ErrCredentialAuthorityLost) {
+		t.Fatalf("authority-lost retry error = %v, want authority lost", err)
+	}
+	if _, err := rotation.RecoveryPermit(); !errors.Is(err, ErrCredentialAuthorityLost) {
+		t.Fatalf("authority-lost recovery permit error = %v, want authority lost", err)
+	}
+}
+
+type authorityLossAfterPrepareGate struct {
+	worker    *SessionWorker
+	finalized []CommandOutcome
+}
+
+func (g *authorityLossAfterPrepareGate) PrepareProviderStart(context.Context, string, int) error {
+	return nil
+}
+
+func (g *authorityLossAfterPrepareGate) ConfirmProviderStarted(context.Context, string, int) error {
+	return nil
+}
+
+func (g *authorityLossAfterPrepareGate) PrepareCommand(context.Context, string, SessionWorkerCommand) (CommandRoutingReceipt, LedgerOperationReceipt, error) {
+	g.worker.MarkCredentialAuthorityLost()
+	return CommandRoutingReceipt{CommandID: "cmd_authority_lost", Status: CommandRoutingAccepted}, LedgerOperationReceipt{
+		OperationID: "op_authority_lost", Version: 1, Status: LedgerOperationPending,
+	}, nil
+}
+
+func (g *authorityLossAfterPrepareGate) FinalizeCommand(_ context.Context, _ string, _ SessionWorkerCommand, _ LedgerOperationReceipt, outcome CommandOutcome) error {
+	g.finalized = append(g.finalized, outcome)
+	return nil
+}
+
+func (g *authorityLossAfterPrepareGate) CommitEventProposal(context.Context, string, string) (EventProposalReceipt, error) {
+	return EventProposalReceipt{}, nil
+}
+
+func TestSessionWorkerFinalizesPendingCommandWhenAuthorityIsLostAfterPrepare(t *testing.T) {
+	worker, err := newSessionWorker(SessionWorkerConfig{
+		SessionID:  "ses_authority_lost_after_prepare",
+		Credential: rotationCredential(t, "ses_authority_lost_after_prepare", 1),
+		Provider:   ProcessConfig{Command: ProcessCommand{Path: "provider"}},
+	}, newFakeProcessRunner())
+	if err != nil {
+		t.Fatalf("newSessionWorker() error = %v", err)
+	}
+	gate := &authorityLossAfterPrepareGate{worker: worker}
+	worker.receipts = gate
+	var applied atomic.Int32
+	_, err = worker.DeliverCommand(context.Background(), SessionWorkerCommand{CommandID: "cmd_authority_lost", Type: "session.send"}, func(context.Context) error {
+		applied.Add(1)
+		return nil
+	})
+	if !errors.Is(err, ErrUnsafeCommandReplay) || applied.Load() != 0 {
+		t.Fatalf("DeliverCommand() = %v, applied=%d; want outcome_unknown without side effect", err, applied.Load())
+	}
+	if len(gate.finalized) != 1 || gate.finalized[0] != CommandOutcomeOutcomeUnknown {
+		t.Fatalf("finalized outcomes = %+v, want one outcome_unknown", gate.finalized)
+	}
+}

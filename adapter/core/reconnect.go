@@ -136,11 +136,18 @@ func (r *CredentialRotation) Activate(receipt CredentialRotationReceipt) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.activeRotationID == receipt.RotationID && receipt.Status == CredentialRotationActive {
-		return nil
-	}
 	if err := r.authorityLocked(); err != nil {
 		return err
+	}
+	if r.activeRotationID == receipt.RotationID && receipt.Status == CredentialRotationActive {
+		if r.active == nil || receipt.SessionID != r.sessionID || receipt.Epoch != r.epoch {
+			return ErrCredentialRotationStale
+		}
+		metadata, _ := r.active.Metadata()
+		if receipt.Generation != metadata.Generation {
+			return ErrCredentialRotationStale
+		}
+		return nil
 	}
 	if r.pending == nil || receipt.RotationID != r.pending.id || receipt.SessionID != r.sessionID || receipt.Epoch != r.epoch || receipt.Status != CredentialRotationPending {
 		return ErrCredentialRotationStale
@@ -163,6 +170,9 @@ func (r *CredentialRotation) RetryActivation(rotationID string) (CredentialRotat
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.authorityLocked(); err != nil {
+		return CredentialRotationReceipt{}, err
+	}
 	if r.activeRotationID != rotationID || r.active == nil {
 		return CredentialRotationReceipt{}, ErrCredentialRotationStale
 	}
@@ -210,8 +220,8 @@ func (r *CredentialRotation) RecoveryPermit() (CredentialRecoveryPermit, error) 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.revoked || r.terminal {
-		return CredentialRecoveryPermit{}, ErrCredentialTerminal
+	if err := r.authorityLocked(); err != nil {
+		return CredentialRecoveryPermit{}, err
 	}
 	if r.prior == nil || time.Now().After(r.priorRecoveryUntil) {
 		return CredentialRecoveryPermit{}, ErrCredentialRecoveryRequired
@@ -238,6 +248,26 @@ func (r *CredentialRotation) Authorize(now time.Time) error {
 		return ErrSessionCredentialExpired
 	}
 	return nil
+}
+
+func (r *CredentialRotation) withAuthorized(fn func() error) error {
+	if r == nil || fn == nil {
+		return ErrCredentialRotationUnavailable
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.authorityLocked(); err != nil {
+		return err
+	}
+	if r.active == nil {
+		return ErrCredentialRecoveryRequired
+	}
+	metadata, _ := r.active.Metadata()
+	if !metadata.ExpiresAt.After(time.Now()) {
+		r.authorityLost = true
+		return ErrSessionCredentialExpired
+	}
+	return fn()
 }
 
 func (r *CredentialRotation) MarkAuthorityLost() {

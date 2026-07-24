@@ -538,17 +538,26 @@ func (w *SessionWorker) DeliverCommand(ctx context.Context, command SessionWorke
 	if operation.OperationID == "" || operation.Version < 1 || operation.Status != LedgerOperationPending {
 		return CommandRoutingReceipt{}, fmt.Errorf("%w: ledger operation receipt", ErrInvalidDurableReceipt)
 	}
-	if w.credential != nil || w.rotation != nil {
-		if err := w.validateActiveCredential(); err != nil {
-			return CommandRoutingReceipt{}, err
+	execute := func() error {
+		if err := apply(ctx); err != nil {
+			return w.finalizeCommandUnknown(command, operation, err)
 		}
+		if err := w.receipts.FinalizeCommand(ctx, w.sessionID, command, operation, CommandOutcomeCompleted); err != nil {
+			return w.finalizeCommandUnknown(command, operation, err)
+		}
+		return nil
 	}
-
-	if err := apply(ctx); err != nil {
-		return routing, w.finalizeCommandUnknown(command, operation, err)
+	if w.rotation != nil {
+		if err := w.rotation.withAuthorized(execute); err != nil {
+			if isCredentialFenceError(err) {
+				return routing, w.finalizeCommandUnknown(command, operation, err)
+			}
+			return routing, err
+		}
+		return routing, nil
 	}
-	if err := w.receipts.FinalizeCommand(ctx, w.sessionID, command, operation, CommandOutcomeCompleted); err != nil {
-		return routing, w.finalizeCommandUnknown(command, operation, err)
+	if err := execute(); err != nil {
+		return routing, err
 	}
 	return routing, nil
 }
@@ -574,17 +583,37 @@ func (w *SessionWorker) ProposeEvent(ctx context.Context, proposalID string, pub
 
 	w.proposalMu.Lock()
 	defer w.proposalMu.Unlock()
-	receipt, err := w.receipts.CommitEventProposal(ctx, w.sessionID, proposalID)
-	if err != nil {
-		return EventProposalReceipt{}, fmt.Errorf("commit durable event proposal: %w", err)
+	var receipt EventProposalReceipt
+	commitAndPublish := func() error {
+		var err error
+		receipt, err = w.receipts.CommitEventProposal(ctx, w.sessionID, proposalID)
+		if err != nil {
+			return fmt.Errorf("commit durable event proposal: %w", err)
+		}
+		if receipt.ProposalID != proposalID || receipt.Seq < 1 || receipt.Status != EventProposalAccepted {
+			return fmt.Errorf("%w: event proposal receipt", ErrInvalidDurableReceipt)
+		}
+		if err := publish(receipt.Seq); err != nil {
+			return fmt.Errorf("publish committed event sequence %d: %w", receipt.Seq, err)
+		}
+		return nil
 	}
-	if receipt.ProposalID != proposalID || receipt.Seq < 1 || receipt.Status != EventProposalAccepted {
-		return EventProposalReceipt{}, fmt.Errorf("%w: event proposal receipt", ErrInvalidDurableReceipt)
+	if w.rotation != nil {
+		if err := w.rotation.withAuthorized(commitAndPublish); err != nil {
+			return receipt, err
+		}
+		return receipt, nil
 	}
-	if err := publish(receipt.Seq); err != nil {
-		return receipt, fmt.Errorf("publish committed event sequence %d: %w", receipt.Seq, err)
+	if err := commitAndPublish(); err != nil {
+		return receipt, err
 	}
 	return receipt, nil
+}
+
+func isCredentialFenceError(err error) bool {
+	return errors.Is(err, ErrCredentialAuthorityLost) || errors.Is(err, ErrCredentialTerminal) ||
+		errors.Is(err, ErrSessionCredentialExpired) || errors.Is(err, ErrCredentialRotationUnavailable) ||
+		errors.Is(err, ErrCredentialRecoveryRequired)
 }
 
 func (w *SessionWorker) finalizeCommandUnknown(command SessionWorkerCommand, operation LedgerOperationReceipt, cause error) error {
