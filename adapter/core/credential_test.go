@@ -53,7 +53,7 @@ func TestSessionCredentialRejectsInvalidAndExpiredMetadata(t *testing.T) {
 
 func TestSessionCredentialCannotBeSerializedOrLogged(t *testing.T) {
 	credential := testSessionCredential(t, "ses_credential_redact")
-	for _, rendered := range []string{fmt.Sprint(credential), fmt.Sprintf("%v", credential), fmt.Sprintf("%+v", credential), fmt.Sprintf("%#v", credential)} {
+	for _, rendered := range []string{fmt.Sprint(credential), fmt.Sprintf("%v", credential), fmt.Sprintf("%+v", credential), fmt.Sprintf("%#v", credential), fmt.Sprintf("%v", *credential), fmt.Sprintf("%+v", *credential), fmt.Sprintf("%#v", *credential)} {
 		if strings.Contains(rendered, "bearer-ses_credential_redact") || strings.Contains(rendered, "target_attach") {
 			t.Fatalf("credential rendering leaked secret or lineage: %q", rendered)
 		}

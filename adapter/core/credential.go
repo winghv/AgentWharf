@@ -71,25 +71,25 @@ func (c *SessionCredential) validate(sessionID string, now time.Time) error {
 	return nil
 }
 
-func (c *SessionCredential) String() string {
+func (c SessionCredential) String() string {
 	return "[session credential redacted]"
 }
 
-func (c *SessionCredential) GoString() string {
+func (c SessionCredential) GoString() string {
 	return c.String()
 }
 
-func (c *SessionCredential) MarshalJSON() ([]byte, error) {
+func (c SessionCredential) MarshalJSON() ([]byte, error) {
 	return nil, ErrSessionCredentialNotSerializable
 }
 
-func (c *SessionCredential) MarshalText() ([]byte, error) {
+func (c SessionCredential) MarshalText() ([]byte, error) {
 	return nil, ErrSessionCredentialNotSerializable
 }
 
-func (c *SessionCredential) Format(state fmt.State, verb rune) {
+func (c SessionCredential) Format(state fmt.State, verb rune) {
 	_, _ = state.Write([]byte(c.String()))
 }
 
-var _ json.Marshaler = (*SessionCredential)(nil)
-var _ fmt.Formatter = (*SessionCredential)(nil)
+var _ json.Marshaler = SessionCredential{}
+var _ fmt.Formatter = SessionCredential{}
