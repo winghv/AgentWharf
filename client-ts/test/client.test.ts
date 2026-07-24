@@ -61,6 +61,54 @@ test('connect sends client hello with the current replay cursor', async () => {
   client.close()
 })
 
+test('requests typed reverse history pages and validates cursors', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'view-token', sessions: [{ sessionId: 'ses_1' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 1, sessions: [] })
+  await connected
+
+  const pagePromise = client.historyPage('ses_1', { beforeSeq: 8, limit: 2, requestId: 'history_1' })
+  assert.deepEqual(sockets.last().sentFrames()[1], {
+    frame: 'history.page', request_id: 'history_1', session_id: 'ses_1', before_seq: 8, limit: 2,
+  })
+  sockets.last().receive({
+    frame: 'history.page', request_id: 'history_1', session_id: 'ses_1',
+    events: [
+      { frame: 'event', type: 'session.message', session_id: 'ses_1', seq: 5, time: 5, payload: {} },
+      { frame: 'event', type: 'session.message', session_id: 'ses_1', seq: 7, time: 7, payload: {} },
+    ], latest_seq: 7, next_before_seq: 5, retention_state: 'complete',
+  })
+  const page = await pagePromise
+  assert.equal(page.events.length, 2)
+  assert.equal(page.next_before_seq, 5)
+  client.close()
+})
+
+test('cancels pending history pages on abort and reconnect close', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'view-token', sessions: [{ sessionId: 'ses_1' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 1, sessions: [] })
+  await connected
+  const controller = new AbortController()
+  const aborted = client.historyPage('ses_1', { signal: controller.signal })
+  controller.abort()
+  await assert.rejects(aborted, /aborted/)
+  const closed = client.historyPage('ses_1')
+  sockets.last().serverClose()
+  await assert.rejects(closed, /websocket closed before history\.page/)
+  client.close()
+})
+
 test('rejects capabilities on a v1 acknowledgement', async () => {
   const sockets = new FakeSocketFactory()
   const client = new AgentWharfClient({

@@ -92,6 +92,24 @@ export interface ErrorFrame {
   fatal?: boolean
 }
 
+export interface HistoryPageRequestFrame {
+  frame: 'history.page'
+  request_id: string
+  session_id: string
+  before_seq?: number
+  limit: number
+}
+
+export interface HistoryPageResponseFrame {
+  frame: 'history.page'
+  request_id: string
+  session_id: string
+  events: AgentWharfEvent[]
+  latest_seq: number
+  next_before_seq: number | null
+  retention_state: string
+}
+
 export type AgentWharfFrame =
   | HelloFrame
   | HelloAckFrame
@@ -101,6 +119,8 @@ export type AgentWharfFrame =
   | PingFrame
   | PongFrame
   | ErrorFrame
+  | HistoryPageRequestFrame
+  | HistoryPageResponseFrame
 
 export interface WebSocketLike {
   onopen: ((event: Event) => void) | null
@@ -136,12 +156,26 @@ export interface SendCommandOptions {
   commandId?: string
 }
 
+export interface HistoryPageOptions {
+  beforeSeq?: number
+  limit?: number
+  requestId?: string
+  signal?: AbortSignal
+}
+
 type EventHandler = (event: AgentWharfEvent) => void
 type ErrorHandler = (error: Error | ErrorFrame) => void
 
 interface PendingCommand {
   resolve: (ack: CommandAckFrame) => void
   reject: (error: Error) => void
+}
+
+interface PendingHistoryPage {
+  resolve: (page: HistoryPageResponseFrame) => void
+  reject: (error: Error) => void
+  signal?: AbortSignal
+  abort: () => void
 }
 
 export function encodeFrame(frame: AgentWharfFrame): string {
@@ -159,6 +193,7 @@ export function decodeFrame(data: string): AgentWharfFrame {
     case 'ping':
     case 'pong':
     case 'error':
+    case 'history.page':
       return decoded as AgentWharfFrame
     default:
       throw new Error(`unknown frame: ${String(decoded.frame)}`)
@@ -173,6 +208,7 @@ export class AgentWharfClient {
   private readonly eventHandlers = new Set<EventHandler>()
   private readonly errorHandlers = new Set<ErrorHandler>()
   private readonly pendingCommands = new Map<string, PendingCommand>()
+  private readonly pendingHistoryPages = new Map<string, PendingHistoryPage>()
 
   private socket: WebSocketLike | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -205,6 +241,7 @@ export class AgentWharfClient {
       this.reconnectTimer = null
     }
     this.rejectPendingCommands(new Error('client closed'))
+    this.rejectPendingHistoryPages(new Error('client closed'))
     this.socket?.close()
     this.socket = null
   }
@@ -272,6 +309,45 @@ export class AgentWharfClient {
     return ack
   }
 
+  historyPage(sessionId: string, options: HistoryPageOptions = {}): Promise<HistoryPageResponseFrame> {
+    if (!this.cursors.has(sessionId)) {
+      return Promise.reject(new Error('session is not subscribed'))
+    }
+    const socket = this.socket
+    if (socket === null) {
+      return Promise.reject(new Error('client is not connected'))
+    }
+    const limit = options.limit ?? 100
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      return Promise.reject(new Error('history page limit must be in 1..100'))
+    }
+    if (options.beforeSeq !== undefined && (!Number.isInteger(options.beforeSeq) || options.beforeSeq < 1)) {
+      return Promise.reject(new Error('history page beforeSeq must be positive'))
+    }
+    if (options.signal?.aborted) {
+      return Promise.reject(new Error('history page request aborted'))
+    }
+    const requestId = options.requestId ?? `history_${Date.now()}_${this.nextCommandNumber++}`
+    const request: HistoryPageRequestFrame = {
+      frame: 'history.page', request_id: requestId, session_id: sessionId, limit,
+    }
+    if (options.beforeSeq !== undefined) request.before_seq = options.beforeSeq
+    return new Promise<HistoryPageResponseFrame>((resolve, reject) => {
+      const abort = () => {
+        if (this.pendingHistoryPages.delete(requestId)) reject(new Error('history page request aborted'))
+      }
+      this.pendingHistoryPages.set(requestId, { resolve, reject, signal: options.signal, abort })
+      options.signal?.addEventListener('abort', abort, { once: true })
+      try {
+        socket.send(encodeFrame(request))
+      } catch (error) {
+        this.pendingHistoryPages.delete(requestId)
+        options.signal?.removeEventListener('abort', abort)
+        reject(normalizeError(error))
+      }
+    })
+  }
+
   private openSocket(): Promise<HelloAckFrame> {
     const socket = this.webSocketFactory(this.options.url)
     this.socket = socket
@@ -325,6 +401,7 @@ export class AgentWharfClient {
           reject(new Error('websocket closed before hello.ack'))
         }
         this.rejectPendingCommands(new Error('websocket closed before command.ack'))
+        this.rejectPendingHistoryPages(new Error('websocket closed before history.page'))
         if (!this.closedByClient) {
           this.scheduleReconnect()
         }
@@ -345,6 +422,9 @@ export class AgentWharfClient {
         return
       case 'error':
         this.emitError(frame)
+        return
+      case 'history.page':
+        if ('events' in frame) this.resolveHistoryPage(frame)
         return
       case 'pong':
       case 'hello':
@@ -382,6 +462,27 @@ export class AgentWharfClient {
     this.pendingCommands.clear()
   }
 
+  private rejectPendingHistoryPages(error: Error): void {
+    for (const [requestId, pending] of this.pendingHistoryPages) {
+      pending.signal?.removeEventListener('abort', pending.abort)
+      pending.reject(error)
+      this.pendingHistoryPages.delete(requestId)
+    }
+  }
+
+  private resolveHistoryPage(page: HistoryPageResponseFrame): void {
+    const pending = this.pendingHistoryPages.get(page.request_id)
+    if (pending === undefined) return
+    this.pendingHistoryPages.delete(page.request_id)
+    pending.signal?.removeEventListener('abort', pending.abort)
+    try {
+      validateHistoryPage(page)
+      pending.resolve(page)
+    } catch (error) {
+      pending.reject(normalizeError(error))
+    }
+  }
+
   private helloFrame(): HelloFrame {
     return {
       frame: 'hello',
@@ -414,6 +515,24 @@ export class AgentWharfClient {
     for (const handler of this.errorHandlers) {
       handler(error)
     }
+  }
+}
+
+function validateHistoryPage(page: HistoryPageResponseFrame): void {
+  if (page.frame !== 'history.page' || page.request_id === '' || page.session_id === '' || !Array.isArray(page.events)) {
+    throw new Error('invalid history.page response')
+  }
+  if (!Number.isInteger(page.latest_seq) || page.latest_seq < 0 ||
+    (page.next_before_seq !== null && (!Number.isInteger(page.next_before_seq) || page.next_before_seq < 1))) {
+    throw new Error('invalid history.page cursor')
+  }
+  let previous = 0
+  for (const event of page.events) {
+    if (event.frame !== 'event' || event.session_id !== page.session_id || !Number.isInteger(event.seq) ||
+      (event.seq as number) <= previous || (event.seq as number) > page.latest_seq) {
+      throw new Error('invalid history.page event')
+    }
+    previous = event.seq as number
   }
 }
 
