@@ -2784,6 +2784,7 @@ func (s *Store) WithProviderStartAdmission(ctx context.Context, request store.Pr
 	}
 	rows, err := tx.Query(ctx, `SELECT workspace_key, version, worker_id, status FROM session_workspace_leases
 WHERE session_id=$1 AND connection_epoch=$2 AND credential_generation=$3 AND lease_id=$4 AND status IN ('reserved', 'start_received')
+  AND (child_scope_expires_at IS NULL OR child_scope_expires_at > clock_timestamp())
 FOR UPDATE`, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID)
 	if err != nil {
 		return store.WorkspaceLease{}, fmt.Errorf("lock provider workspace lease: %w", err)

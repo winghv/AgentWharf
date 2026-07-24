@@ -436,9 +436,13 @@ func TestGroupSupervisorStoreLifecycleRejectsSQLiteReplacementBeforeProviderStar
 	admission.Lease.Owner.CredentialGeneration = receipt.CredentialGeneration
 	admission.Lease.Owner.LeaseID = receipt.WriterLeaseID
 	admission.Lease.ExpiresAt = receipt.ExpiresAt
-	authority, err := NewRecoveryAuthority(receipt, lifecycle)
+	handle, err := NewRecoveryStartHandle("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
 	if err != nil {
-		t.Fatalf("NewRecoveryAuthority() error = %v", err)
+		t.Fatalf("NewRecoveryStartHandle() error = %v", err)
+	}
+	authority, err := NewRecoveryAuthorityWithStartHandle(receipt, lifecycle, handle)
+	if err != nil {
+		t.Fatalf("NewRecoveryAuthorityWithStartHandle() error = %v", err)
 	}
 	worker := &fakeGroupWorker{}
 	group, err := NewGroupSupervisor(GroupSupervisorConfig{
@@ -449,7 +453,7 @@ func TestGroupSupervisorStoreLifecycleRejectsSQLiteReplacementBeforeProviderStar
 	if err != nil {
 		t.Fatalf("NewGroupSupervisor() error = %v", err)
 	}
-	if err := group.Recover(ctx, GroupWorkerRecovery{Admission: admission, Authority: authority}); err != nil {
+	if err := group.Recover(ctx, GroupWorkerRecovery{Admission: admission, Authority: authority, StartHandle: handle}); err != nil {
 		t.Fatalf("Recover() error = %v", err)
 	}
 	if _, err := authorityStore.AcceptAdapterHello(ctx, "ses_sqlite_recovery", store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: "lease_sqlite_replaced"}); err != nil {
@@ -583,6 +587,7 @@ func TestGroupSupervisorRecoveryFencesMismatchedOpaqueStartHandle(t *testing.T) 
 		t.Fatalf("NewRecoveryAuthorityWithStartHandle() = %v", err)
 	}
 	recovery.Authority = authority
+	recovery.StartHandle = RecoveryStartHandle{}
 	if err := group.Recover(context.Background(), recovery); !errors.Is(err, ErrRecoveryAuthorityLost) {
 		t.Fatalf("Recover() mismatched opaque start handle = %v, want authority loss", err)
 	}
@@ -742,13 +747,18 @@ func validGroupWorkerRecoveryWithStore(workerID, sessionID string, keyByte byte)
 	if err != nil {
 		panic(err)
 	}
-	authority, err := NewRecoveryAuthority(receipt, lifecycle)
+	handle, err := NewRecoveryStartHandle("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+	if err != nil {
+		panic(err)
+	}
+	authority, err := NewRecoveryAuthorityWithStartHandle(receipt, lifecycle, handle)
 	if err != nil {
 		panic(err)
 	}
 	return GroupWorkerRecovery{
-		Admission: admission,
-		Authority: authority,
+		Admission:   admission,
+		Authority:   authority,
+		StartHandle: handle,
 	}, authorityStore
 }
 

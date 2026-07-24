@@ -252,12 +252,21 @@ func TestProviderStartFramesAreStrictAndReferenceOnly(t *testing.T) {
 		`{"frame":"provider.start.prepare","attempt":1,"lease_id":"forbidden"}`,
 		`{"frame":"provider.start.started","attempt":1,"provider":"forbidden"}`,
 		`{"frame":"provider.start.ack","attempt":1,"status":"admitted","provider":"forbidden"}`,
-		`{"frame":"provider.start.ack","attempt":1,"status":"admitted"}`,
 		`{"frame":"provider.start.ack","attempt":1,"status":"rejected","recovery_handle":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}`,
 		`{"frame":"provider.start.ack","attempt":0,"status":"unknown"}`,
 	} {
 		if _, err := Decode([]byte(raw)); err == nil {
 			t.Fatalf("Decode(%s) accepted non-minimal provider-start frame", raw)
+		}
+	}
+	for _, raw := range []string{
+		`{"frame":"provider.start"}`,
+		`{"frame":"provider.start.prepare"}`,
+		`{"frame":"provider.start.started"}`,
+		`{"frame":"provider.start.ack","status":"admitted"}`,
+	} {
+		if _, err := Decode([]byte(raw)); err != nil {
+			t.Fatalf("Decode(%s) rejected v2 compatibility frame: %v", raw, err)
 		}
 	}
 }

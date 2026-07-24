@@ -191,18 +191,14 @@ func (h RecoveryStartHandle) matches(other RecoveryStartHandle) bool { return h.
 
 func NewRecoveryAuthority(receipt store.ConnectionAuthorityReceipt, lifecycle *ConnectionAuthorityLifecycle) (RecoveryAuthority, error) {
 	authority := RecoveryAuthority{receipt: receipt, lifecycle: lifecycle}
-	if err := validateRecoveryAuthority(authority); err != nil {
-		return RecoveryAuthority{}, err
-	}
-	return authority, nil
+	return authority, ErrRecoveryAuthorityLost
 }
 
 func NewRecoveryAuthorityWithStartHandle(receipt store.ConnectionAuthorityReceipt, lifecycle *ConnectionAuthorityLifecycle, handle RecoveryStartHandle) (RecoveryAuthority, error) {
-	authority, err := NewRecoveryAuthority(receipt, lifecycle)
-	if err != nil || !validRecoveryStartHandle(handle.value) {
+	authority := RecoveryAuthority{receipt: receipt, lifecycle: lifecycle, startHandle: handle}
+	if err := validateRecoveryAuthority(authority); err != nil {
 		return RecoveryAuthority{}, ErrRecoveryAuthorityLost
 	}
-	authority.startHandle = handle
 	return authority, nil
 }
 
@@ -521,7 +517,7 @@ func validateGroupWorkerRecovery(recovery GroupWorkerRecovery) error {
 }
 
 func validateRecoveryAuthority(authority RecoveryAuthority) error {
-	if authority.lifecycle == nil || authority.lifecycle.authorityStore == nil {
+	if authority.lifecycle == nil || authority.lifecycle.authorityStore == nil || !validRecoveryStartHandle(authority.startHandle.value) {
 		return ErrRecoveryAuthorityLost
 	}
 	return validateConnectionAuthorityReceipt(authority.receipt)
