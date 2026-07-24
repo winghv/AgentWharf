@@ -186,6 +186,50 @@ func TestWebSocketV2ProviderStartUsesStoreLinearizedAdmission(t *testing.T) {
 	}
 }
 
+func TestWebSocketV2ProviderStartAcceptsLegacyEmptyFirstChild(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "provider-start-legacy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	receipt := readFrame(t, adapter).(*protocol.HelloAck).ConnectionAuthority
+	if receipt == nil {
+		t.Fatal("v2 adapter receipt missing")
+	}
+	var key store.WorkspaceLeaseKey
+	key[0] = 43
+	if _, err := events.ReserveWorkspaceLease(ctx, store.WorkspaceLeaseReserve{Key: key, Owner: store.WorkspaceLeaseOwner{WorkerID: "worker_start_legacy", SessionID: receipt.SessionID, ConnectionEpoch: receipt.ConnectionEpoch, CredentialGeneration: receipt.CredentialGeneration, LeaseID: receipt.WriterLeaseID}, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatalf("ReserveWorkspaceLease() = %v", err)
+	}
+
+	writeFrame(t, adapter, &protocol.ProviderStart{})
+	if prepare, ok := readFrame(t, adapter).(*protocol.ProviderStartPrepare); !ok || prepare.Attempt != 0 {
+		t.Fatalf("legacy provider start prepare = %#v", prepare)
+	}
+	writeFrame(t, adapter, &protocol.ProviderStartStarted{})
+	if ack, ok := readFrame(t, adapter).(*protocol.ProviderStartAck); !ok || ack.Attempt != 0 || ack.Status != protocol.ProviderStartAdmitted || ack.RecoveryHandle != "" {
+		t.Fatalf("legacy provider start ack = %#v", ack)
+	}
+	lease, err := events.WorkspaceLease(ctx, key)
+	if err != nil || lease.Status != store.WorkspaceLeaseStartReceived {
+		t.Fatalf("legacy workspace start receipt = %+v, %v", lease, err)
+	}
+
+	writeFrame(t, adapter, &protocol.ProviderStart{})
+	if ack, ok := readFrame(t, adapter).(*protocol.ProviderStartAck); !ok || ack.Attempt != 0 || ack.Status != protocol.ProviderStartRejected || ack.RecoveryHandle != "" {
+		t.Fatalf("duplicate legacy provider start ack = %#v", ack)
+	}
+}
+
 func TestWebSocketSettingsRoutesCapabilityReserveDeliveryAndTerminalResult(t *testing.T) {
 	ctx := context.Background()
 	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "settings.db"))

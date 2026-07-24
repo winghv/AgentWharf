@@ -1869,21 +1869,36 @@ func (h *webSocketHandler) handleSettingsChange(ctx context.Context, conn *manag
 }
 
 func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *adapterConnection, request *protocol.ProviderStart) error {
-	if adapter == nil || request == nil || request.Attempt < 1 || h.events == nil {
+	if adapter == nil || request == nil || h.events == nil {
 		return errAdapterAuthorityLost
 	}
-	if request.Attempt != adapter.providerStartAttempt+1 {
-		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartRejected})
+	legacy := request.Attempt == 0
+	attempt := request.Attempt
+	if legacy {
+		attempt = 1
+	}
+	ack := func(status protocol.ProviderStartStatus, handle string) *protocol.ProviderStartAck {
+		if legacy {
+			return &protocol.ProviderStartAck{Status: status}
+		}
+		return &protocol.ProviderStartAck{Attempt: attempt, Status: status, RecoveryHandle: handle}
+	}
+	if attempt != adapter.providerStartAttempt+1 {
+		return adapter.writeFrame(ctx, ack(protocol.ProviderStartRejected, ""))
 	}
 	admissions, ok := h.events.(store.ProviderStartAdmissionStore)
 	if !ok {
-		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartRejected})
+		return adapter.writeFrame(ctx, ack(protocol.ProviderStartRejected, ""))
 	}
 	err := withAdapterAuthorityBudget(ctx, func(admissionCtx context.Context) error {
 		_, err := admissions.WithProviderStartAdmission(admissionCtx, store.ProviderStartAdmission{
-			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter, ReAdmission: request.Attempt > 1,
+			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter, ReAdmission: attempt > 1,
 		}, func(startCtx context.Context) error {
-			if err := adapter.writeFrame(startCtx, &protocol.ProviderStartPrepare{Attempt: request.Attempt}); err != nil {
+			prepare := &protocol.ProviderStartPrepare{Attempt: attempt}
+			if legacy {
+				prepare.Attempt = 0
+			}
+			if err := adapter.writeFrame(startCtx, prepare); err != nil {
 				return fmt.Errorf("send provider start prepare: %w", err)
 			}
 			frame, err := readProtocolFrame(startCtx, adapter.conn)
@@ -1899,14 +1914,14 @@ func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *ada
 		return err
 	})
 	if err != nil {
-		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartRejected})
+		return adapter.writeFrame(ctx, ack(protocol.ProviderStartRejected, ""))
 	}
 	handle, err := newRecoveryStartHandle()
 	if err != nil {
-		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartRejected})
+		return adapter.writeFrame(ctx, ack(protocol.ProviderStartRejected, ""))
 	}
-	adapter.providerStartAttempt = request.Attempt
-	return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartAdmitted, RecoveryHandle: handle})
+	adapter.providerStartAttempt = attempt
+	return adapter.writeFrame(ctx, ack(protocol.ProviderStartAdmitted, handle))
 }
 
 func newRecoveryStartHandle() (string, error) {

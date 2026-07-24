@@ -48,13 +48,17 @@ SET status = 'canceled', queue_reason = NULL, expires_at = NULL,
 }
 
 func TestProviderStartAdmissionContract(t *testing.T) {
-	newAdmission := func(t *testing.T) (*postgresWorkspaceLeaseHarness, store.ProviderStartAdmission, store.WorkspaceLeaseKey) {
+	newAdmission := func(t *testing.T, scopes ...*store.WorkspaceLeaseChildScope) (*postgresWorkspaceLeaseHarness, store.ProviderStartAdmission, store.WorkspaceLeaseKey) {
 		t.Helper()
 		harness := newPostgresWorkspaceLeaseHarness(t)
 		var key store.WorkspaceLeaseKey
 		key[0] = 73
 		owner := store.WorkspaceLeaseOwner{WorkerID: "worker_provider_start", SessionID: "ses_workspace", ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_provider_start"}
-		if _, err := harness.ReserveWorkspaceLease(context.Background(), store.WorkspaceLeaseReserve{Key: key, Owner: owner, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		var scope *store.WorkspaceLeaseChildScope
+		if len(scopes) > 0 {
+			scope = scopes[0]
+		}
+		if _, err := harness.ReserveWorkspaceLease(context.Background(), store.WorkspaceLeaseReserve{Key: key, ChildScope: scope, Owner: owner, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 			t.Fatalf("ReserveWorkspaceLease() = %v", err)
 		}
 		var fence int64
@@ -95,6 +99,29 @@ func TestProviderStartAdmissionContract(t *testing.T) {
 		})
 		if err != nil || !called || lease.Key != key || lease.Status != store.WorkspaceLeaseStartReceived {
 			t.Fatalf("explicit provider restart = %+v, called=%t, err=%v", lease, called, err)
+		}
+	})
+
+	t.Run("rejects an expired child scope during re-admission", func(t *testing.T) {
+		scope := &store.WorkspaceLeaseChildScope{ParentKey: store.WorkspaceLeaseKey{72}, CapabilityDigest: [32]byte{73}, ExpiresAt: time.Now().Add(time.Minute)}
+		harness, admission, key := newAdmission(t, scope)
+		if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err != nil {
+			t.Fatalf("RecordProviderStartAdmission() = %v", err)
+		}
+		if _, err := harness.pool.Exec(context.Background(), "UPDATE session_workspace_leases SET child_scope_expires_at=clock_timestamp() - interval '1 second'"); err != nil {
+			t.Fatalf("expire child scope: %v", err)
+		}
+		admission.ReAdmission = true
+		called := false
+		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+			called = true
+			return nil
+		}); err == nil || called {
+			t.Fatalf("expired child scope re-admission err=%v, callback=%t", err, called)
+		}
+		lease, err := harness.WorkspaceLease(context.Background(), key)
+		if err != nil || lease.Status != store.WorkspaceLeaseStartReceived {
+			t.Fatalf("expired child scope lease = %+v, %v", lease, err)
 		}
 	})
 
