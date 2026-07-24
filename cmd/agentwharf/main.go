@@ -137,9 +137,13 @@ type machineTaskClaimExchangeRequest struct {
 type machineTaskClaimExchangeResponse struct {
 	Data struct {
 		SessionID    string `json:"session_id"`
+		Provider     string `json:"provider"`
 		HubWSURL     string `json:"hub_ws_url"`
 		AdapterToken string `json:"adapter_token"`
 		ExpiresAt    string `json:"expires_at"`
+		Session      struct {
+			Provider string `json:"provider"`
+		} `json:"session"`
 	} `json:"data"`
 }
 
@@ -196,24 +200,41 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 	if err := decodeCloudAPIJSON(body, &handoff); err != nil || handoff.Data.SessionID == "" || handoff.Data.HubWSURL == "" || handoff.Data.AdapterToken == "" || handoff.Data.ExpiresAt == "" {
 		return errors.New("claim unavailable")
 	}
+	provider := strings.TrimSpace(handoff.Data.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(handoff.Data.Session.Provider)
+	}
+	if provider == "" || strings.ContainsAny(provider, " \t\r\n") {
+		return errors.New("claim unavailable")
+	}
 	expiresAt, err := time.Parse(time.RFC3339, handoff.Data.ExpiresAt)
 	if err != nil || !expiresAt.After(time.Now().UTC()) {
 		return errors.New("claim unavailable")
 	}
+	agent := provider
+	if provider == "claude-code" {
+		agent = "claude"
+	}
 	cfg := wrapConfig{
 		HubURL:          handoff.Data.HubWSURL,
 		SessionID:       handoff.Data.SessionID,
-		Agent:           "claude",
-		Provider:        defaultProvider,
+		Agent:           agent,
+		Provider:        provider,
 		AdapterToken:    handoff.Data.AdapterToken,
 		Format:          "acp",
-		ProviderCommand: defaultProviderCommand("claude"),
+		ProviderCommand: defaultProviderCommand(agent),
 		ProtocolVersion: protocol.ProtocolVersion,
 	}
-	if _, err := runWrap(ctx, cfg, strings.NewReader(""), stderr); err != nil {
-		return err
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := runWrap(ctx, cfg, strings.NewReader(""), stderr); err == nil {
+			return nil
+		} else if strings.Contains(strings.ToLower(err.Error()), "hello ack") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") || strings.Contains(strings.ToLower(err.Error()), "credential") {
+			return errors.New("reclaim required")
+		} else if attempt == 1 {
+			return errors.New("reclaim required")
+		}
 	}
-	return nil
+	return errors.New("reclaim required")
 }
 
 func claimInputIsTTY(input io.Reader) bool {
