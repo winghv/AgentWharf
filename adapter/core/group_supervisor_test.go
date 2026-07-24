@@ -436,13 +436,9 @@ func TestGroupSupervisorStoreLifecycleRejectsSQLiteReplacementBeforeProviderStar
 	admission.Lease.Owner.CredentialGeneration = receipt.CredentialGeneration
 	admission.Lease.Owner.LeaseID = receipt.WriterLeaseID
 	admission.Lease.ExpiresAt = receipt.ExpiresAt
-	handle, err := NewRecoveryStartHandle("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+	authority, err := NewRecoveryAuthority(receipt, lifecycle)
 	if err != nil {
-		t.Fatalf("NewRecoveryStartHandle() error = %v", err)
-	}
-	authority, err := NewRecoveryAuthorityWithStartHandle(receipt, lifecycle, handle)
-	if err != nil {
-		t.Fatalf("NewRecoveryAuthorityWithStartHandle() error = %v", err)
+		t.Fatalf("NewRecoveryAuthority() error = %v", err)
 	}
 	worker := &fakeGroupWorker{}
 	group, err := NewGroupSupervisor(GroupSupervisorConfig{
@@ -453,7 +449,7 @@ func TestGroupSupervisorStoreLifecycleRejectsSQLiteReplacementBeforeProviderStar
 	if err != nil {
 		t.Fatalf("NewGroupSupervisor() error = %v", err)
 	}
-	if err := group.Recover(ctx, GroupWorkerRecovery{Admission: admission, Authority: authority, StartHandle: handle}); err != nil {
+	if err := group.Recover(ctx, GroupWorkerRecovery{Admission: admission, Authority: authority}); err != nil {
 		t.Fatalf("Recover() error = %v", err)
 	}
 	if _, err := authorityStore.AcceptAdapterHello(ctx, "ses_sqlite_recovery", store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: "lease_sqlite_replaced"}); err != nil {
@@ -565,34 +561,6 @@ func TestGroupSupervisorRejectsInvalidRecoveryTupleBeforeVerifier(t *testing.T) 
 		if created != 0 || leases.reserveCount() != 0 || group.WorkerCount() != 0 {
 			t.Fatalf("invalid recovery created/reserved/retained=%d/%d/%d, want 0/0/0", created, leases.reserveCount(), group.WorkerCount())
 		}
-	}
-}
-
-func TestGroupSupervisorRecoveryFencesMismatchedOpaqueStartHandle(t *testing.T) {
-	leases := &recordingWorkspaceLeaseReserver{}
-	group, err := NewGroupSupervisor(GroupSupervisorConfig{
-		MaxWorkers: 1, Leases: leases,
-		NewWorker: func(SessionWorkerConfig) (SessionWorkerRunner, error) { return &fakeGroupWorker{}, nil },
-	})
-	if err != nil {
-		t.Fatalf("NewGroupSupervisor() = %v", err)
-	}
-	recovery := validGroupWorkerRecovery("worker_handle", "ses_handle", 9)
-	handle, err := NewRecoveryStartHandle("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
-	if err != nil {
-		t.Fatalf("NewRecoveryStartHandle() = %v", err)
-	}
-	authority, err := NewRecoveryAuthorityWithStartHandle(recovery.Authority.receipt, recovery.Authority.lifecycle, handle)
-	if err != nil {
-		t.Fatalf("NewRecoveryAuthorityWithStartHandle() = %v", err)
-	}
-	recovery.Authority = authority
-	recovery.StartHandle = RecoveryStartHandle{}
-	if err := group.Recover(context.Background(), recovery); !errors.Is(err, ErrRecoveryAuthorityLost) {
-		t.Fatalf("Recover() mismatched opaque start handle = %v, want authority loss", err)
-	}
-	if got := group.WorkerCount(); got != 0 {
-		t.Fatalf("rejected recovery worker count = %d, want 0", got)
 	}
 }
 
@@ -747,18 +715,13 @@ func validGroupWorkerRecoveryWithStore(workerID, sessionID string, keyByte byte)
 	if err != nil {
 		panic(err)
 	}
-	handle, err := NewRecoveryStartHandle("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
-	if err != nil {
-		panic(err)
-	}
-	authority, err := NewRecoveryAuthorityWithStartHandle(receipt, lifecycle, handle)
+	authority, err := NewRecoveryAuthority(receipt, lifecycle)
 	if err != nil {
 		panic(err)
 	}
 	return GroupWorkerRecovery{
-		Admission:   admission,
-		Authority:   authority,
-		StartHandle: handle,
+		Admission: admission,
+		Authority: authority,
 	}, authorityStore
 }
 

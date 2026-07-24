@@ -52,6 +52,23 @@ type ProcessStartAdmission interface {
 	ConfirmProcessStarted(context.Context, int) error
 }
 
+// RecoveryStartHandle is an opaque reference returned by an admitted child
+// start. It carries no authority and has no accessor; T42B owns any later
+// GroupSupervisor recovery consumption.
+type RecoveryStartHandle struct{ value string }
+
+func NewRecoveryStartHandle(value string) (RecoveryStartHandle, error) {
+	if len(value) < 32 || len(value) > 128 {
+		return RecoveryStartHandle{}, errors.New("invalid recovery start handle")
+	}
+	for _, char := range value {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') {
+			return RecoveryStartHandle{}, errors.New("invalid recovery start handle")
+		}
+	}
+	return RecoveryStartHandle{value: value}, nil
+}
+
 type ProcessEventType string
 
 const (

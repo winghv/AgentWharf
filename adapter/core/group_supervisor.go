@@ -170,34 +170,14 @@ func (l *ConnectionAuthorityLifecycle) validateStore(ctx context.Context, receip
 }
 
 type RecoveryAuthority struct {
-	receipt     store.ConnectionAuthorityReceipt
-	lifecycle   *ConnectionAuthorityLifecycle
-	startHandle RecoveryStartHandle
+	receipt   store.ConnectionAuthorityReceipt
+	lifecycle *ConnectionAuthorityLifecycle
 }
-
-// RecoveryStartHandle is the opaque, non-secret reference returned only by a
-// committed v2 Provider-start admission. It cannot expose or reconstruct a
-// WorkspaceLease key and is compared only inside recovery fencing.
-type RecoveryStartHandle struct{ value string }
-
-func NewRecoveryStartHandle(value string) (RecoveryStartHandle, error) {
-	if !validRecoveryStartHandle(value) {
-		return RecoveryStartHandle{}, ErrRecoveryAuthorityLost
-	}
-	return RecoveryStartHandle{value: value}, nil
-}
-
-func (h RecoveryStartHandle) matches(other RecoveryStartHandle) bool { return h.value == other.value }
 
 func NewRecoveryAuthority(receipt store.ConnectionAuthorityReceipt, lifecycle *ConnectionAuthorityLifecycle) (RecoveryAuthority, error) {
 	authority := RecoveryAuthority{receipt: receipt, lifecycle: lifecycle}
-	return authority, ErrRecoveryAuthorityLost
-}
-
-func NewRecoveryAuthorityWithStartHandle(receipt store.ConnectionAuthorityReceipt, lifecycle *ConnectionAuthorityLifecycle, handle RecoveryStartHandle) (RecoveryAuthority, error) {
-	authority := RecoveryAuthority{receipt: receipt, lifecycle: lifecycle, startHandle: handle}
 	if err := validateRecoveryAuthority(authority); err != nil {
-		return RecoveryAuthority{}, ErrRecoveryAuthorityLost
+		return RecoveryAuthority{}, err
 	}
 	return authority, nil
 }
@@ -245,9 +225,8 @@ type GroupWorkerAdmission struct {
 // GroupWorkerRecovery keeps ephemeral process setup separate from the tuple
 // that a trusted lifecycle validates against durable authority.
 type GroupWorkerRecovery struct {
-	Admission   GroupWorkerAdmission
-	Authority   RecoveryAuthority
-	StartHandle RecoveryStartHandle
+	Admission GroupWorkerAdmission
+	Authority RecoveryAuthority
 }
 
 type supervisedWorker struct {
@@ -490,9 +469,6 @@ func validateGroupWorkerRecovery(recovery GroupWorkerRecovery) error {
 	if err := validateRecoveryAuthority(recovery.Authority); err != nil {
 		return ErrRecoveryAuthorityLost
 	}
-	if !recovery.StartHandle.matches(recovery.Authority.startHandle) {
-		return ErrRecoveryAuthorityLost
-	}
 	tuple := recoveryTuple{
 		SessionID:            recovery.Authority.receipt.SessionID,
 		WorkerID:             recovery.Admission.WorkerID,
@@ -517,7 +493,7 @@ func validateGroupWorkerRecovery(recovery GroupWorkerRecovery) error {
 }
 
 func validateRecoveryAuthority(authority RecoveryAuthority) error {
-	if authority.lifecycle == nil || authority.lifecycle.authorityStore == nil || !validRecoveryStartHandle(authority.startHandle.value) {
+	if authority.lifecycle == nil || authority.lifecycle.authorityStore == nil {
 		return ErrRecoveryAuthorityLost
 	}
 	return validateConnectionAuthorityReceipt(authority.receipt)
@@ -543,16 +519,4 @@ func sameConnectionAuthority(left, right store.ConnectionAuthorityReceipt) bool 
 func isZeroWorkspaceLeaseKey(key store.WorkspaceLeaseKey) bool {
 	var zero store.WorkspaceLeaseKey
 	return key == zero
-}
-
-func validRecoveryStartHandle(value string) bool {
-	if len(value) < 32 || len(value) > 128 {
-		return false
-	}
-	for _, char := range value {
-		if (char < 'a' || char > 'z') && (char < '0' || char > '9') {
-			return false
-		}
-	}
-	return true
 }
