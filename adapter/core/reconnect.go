@@ -239,6 +239,10 @@ func (r *CredentialRotation) Authorize(now time.Time) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.authorizeLocked(now)
+}
+
+func (r *CredentialRotation) authorizeLocked(now time.Time) error {
 	if err := r.authorityLocked(); err != nil {
 		return err
 	}
@@ -259,16 +263,8 @@ func (r *CredentialRotation) withAuthorized(fn func() error) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := r.authorityLocked(); err != nil {
+	if err := r.authorizeLocked(time.Now()); err != nil {
 		return err
-	}
-	if r.active == nil {
-		return ErrCredentialRecoveryRequired
-	}
-	metadata, _ := r.active.Metadata()
-	if !metadata.ExpiresAt.After(time.Now()) {
-		r.authorityLost = true
-		return ErrSessionCredentialExpired
 	}
 	return fn()
 }

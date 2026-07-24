@@ -280,3 +280,110 @@ func TestSessionWorkerRunFailsClosedAfterCredentialAuthorityLoss(t *testing.T) {
 		t.Fatalf("Run() error = %v, want authority lost", err)
 	}
 }
+
+type blockingCredentialStartRunner struct {
+	started chan struct{}
+	release chan struct{}
+	handle  *fakeProcessHandle
+	err     error
+}
+
+func (r *blockingCredentialStartRunner) Start(ProcessCommand) (processHandle, error) {
+	close(r.started)
+	<-r.release
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.handle, nil
+}
+
+func TestCredentialRotationStartFenceLinearizesAuthorityLoss(t *testing.T) {
+	runner := &blockingCredentialStartRunner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		handle:  &fakeProcessHandle{pid: 1001, done: make(chan struct{})},
+	}
+	worker, err := newSessionWorker(SessionWorkerConfig{
+		SessionID:  "ses_rotation_start_fence",
+		Credential: rotationCredential(t, "ses_rotation_start_fence", 1),
+		Provider:   ProcessConfig{Command: ProcessCommand{Path: "provider"}},
+	}, runner)
+	if err != nil {
+		t.Fatalf("newSessionWorker() error = %v", err)
+	}
+	admission, ok := worker.provider.cfg.StartAdmission.(*credentialRotationStartAdmission)
+	if !ok {
+		t.Fatalf("start admission type = %T, want credential rotation fence", worker.provider.cfg.StartAdmission)
+	}
+	if err := admission.PrepareProcessStart(context.Background(), 1); err != nil {
+		t.Fatalf("PrepareProcessStart() error = %v", err)
+	}
+	startDone := make(chan error, 1)
+	go func() {
+		_, startErr := worker.provider.runner.Start(ProcessCommand{Path: "provider"})
+		startDone <- startErr
+	}()
+	<-runner.started
+	authorityDone := make(chan struct{})
+	go func() {
+		worker.MarkCredentialAuthorityLost()
+		close(authorityDone)
+	}()
+	select {
+	case <-authorityDone:
+		t.Fatal("authority loss completed before Provider-start fence released")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(runner.release)
+	if startErr := <-startDone; startErr != nil {
+		t.Fatalf("runner.Start() error = %v", startErr)
+	}
+	if err := admission.ConfirmProcessStarted(context.Background(), 1); err != nil {
+		t.Fatalf("ConfirmProcessStarted() error = %v", err)
+	}
+	select {
+	case <-authorityDone:
+	case <-time.After(time.Second):
+		t.Fatal("authority loss did not complete after Provider-start fence release")
+	}
+}
+
+func TestCredentialRotationStartFenceReleasesOnRunnerFailure(t *testing.T) {
+	runner := &blockingCredentialStartRunner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		err:     errors.New("provider start failed"),
+	}
+	worker, err := newSessionWorker(SessionWorkerConfig{
+		SessionID:  "ses_rotation_start_failure",
+		Credential: rotationCredential(t, "ses_rotation_start_failure", 1),
+		Provider:   ProcessConfig{Command: ProcessCommand{Path: "provider"}},
+	}, runner)
+	if err != nil {
+		t.Fatalf("newSessionWorker() error = %v", err)
+	}
+	admission := worker.provider.cfg.StartAdmission.(*credentialRotationStartAdmission)
+	if err := admission.PrepareProcessStart(context.Background(), 1); err != nil {
+		t.Fatalf("PrepareProcessStart() error = %v", err)
+	}
+	startDone := make(chan error, 1)
+	go func() {
+		_, startErr := worker.provider.runner.Start(ProcessCommand{Path: "provider"})
+		startDone <- startErr
+	}()
+	<-runner.started
+	close(runner.release)
+	if startErr := <-startDone; !errors.Is(startErr, runner.err) {
+		t.Fatalf("runner.Start() error = %v, want %v", startErr, runner.err)
+	}
+	authorityDone := make(chan struct{})
+	go func() {
+		worker.MarkCredentialAuthorityLost()
+		close(authorityDone)
+	}()
+	select {
+	case <-authorityDone:
+	case <-time.After(time.Second):
+		t.Fatal("authority loss remained blocked after failed Provider start")
+	}
+}

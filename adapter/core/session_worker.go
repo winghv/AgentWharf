@@ -258,9 +258,13 @@ func newSessionWorker(cfg SessionWorkerConfig, runner processRunner) (*SessionWo
 		if err != nil {
 			return nil, err
 		}
-		cfg.Provider.StartAdmission = &credentialRotationStartAdmission{
+		rotationAdmission := &credentialRotationStartAdmission{
 			rotation: rotation,
 			delegate: cfg.Provider.StartAdmission,
+		}
+		cfg.Provider.StartAdmission = rotationAdmission
+		if runner != nil {
+			runner = &credentialRotationProcessRunner{delegate: runner, admission: rotationAdmission}
 		}
 	}
 	provider, err := newProcessSupervisor(cfg.Provider, runner)
@@ -661,7 +665,26 @@ type durableReceiptStartAdmission struct {
 type credentialRotationStartAdmission struct {
 	rotation *CredentialRotation
 	delegate ProcessStartAdmission
+	startMu  sync.Mutex
+	started  bool
 }
+
+type credentialRotationProcessRunner struct {
+	delegate  processRunner
+	admission *credentialRotationStartAdmission
+}
+
+func (r *credentialRotationProcessRunner) Start(command ProcessCommand) (processHandle, error) {
+	if r == nil || r.delegate == nil {
+		return nil, ErrInvalidProcessConfig
+	}
+	handle, err := r.delegate.Start(command)
+	if err != nil && r.admission != nil {
+		r.admission.AbortProcessStart()
+	}
+	return handle, err
+}
+
 type ownedProcessStartAdmission struct {
 	owner       ProcessTreeOwnership
 	delegate    ProcessStartAdmission
@@ -672,11 +695,18 @@ func (a *credentialRotationStartAdmission) PrepareProcessStart(ctx context.Conte
 	if a == nil || a.rotation == nil || attempt < 1 {
 		return ErrCredentialAuthorityLost
 	}
-	if err := a.rotation.Authorize(time.Now()); err != nil {
+	a.startMu.Lock()
+	a.rotation.mu.Lock()
+	a.started = true
+	if err := a.rotation.authorizeLocked(time.Now()); err != nil {
+		a.releaseStartFence()
 		return err
 	}
 	if a.delegate != nil {
-		return a.delegate.PrepareProcessStart(ctx, attempt)
+		if err := a.delegate.PrepareProcessStart(ctx, attempt); err != nil {
+			a.releaseStartFence()
+			return err
+		}
 	}
 	return nil
 }
@@ -685,12 +715,31 @@ func (a *credentialRotationStartAdmission) ConfirmProcessStarted(ctx context.Con
 	if a == nil || a.rotation == nil || attempt < 1 {
 		return ErrCredentialAuthorityLost
 	}
-	if a.delegate != nil {
-		if err := a.delegate.ConfirmProcessStarted(ctx, attempt); err != nil {
-			return err
-		}
+	if !a.started {
+		return ErrCredentialAuthorityLost
 	}
-	return a.rotation.Authorize(time.Now())
+	var err error
+	if a.delegate != nil {
+		err = a.delegate.ConfirmProcessStarted(ctx, attempt)
+	}
+	if err == nil {
+		err = a.rotation.authorizeLocked(time.Now())
+	}
+	a.releaseStartFence()
+	return err
+}
+
+func (a *credentialRotationStartAdmission) AbortProcessStart() {
+	if a == nil || a.rotation == nil || !a.started {
+		return
+	}
+	a.releaseStartFence()
+}
+
+func (a *credentialRotationStartAdmission) releaseStartFence() {
+	a.started = false
+	a.rotation.mu.Unlock()
+	a.startMu.Unlock()
 }
 
 func (a *ownedProcessStartAdmission) PrepareProcessStart(ctx context.Context, attempt int) error {
