@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -380,7 +381,8 @@ func sleepContext(ctx context.Context, duration time.Duration) error {
 func (execProcessRunner) Start(command ProcessCommand) (processHandle, error) {
 	cmd := exec.Command(command.Path, command.Args...)
 	cmd.Dir = command.Dir
-	cmd.Env = append(os.Environ(), command.Env...)
+	cmd.Env = providerEnvironment(command.Path, command.Env)
+	cmd.ExtraFiles = nil
 	cmd.Stdin = command.Stdin
 	cmd.Stdout = command.Stdout
 	cmd.Stderr = command.Stderr
@@ -391,6 +393,60 @@ func (execProcessRunner) Start(command ProcessCommand) (processHandle, error) {
 		return nil, err
 	}
 	return &execProcessHandle{cmd: cmd}, nil
+}
+
+func providerEnvironment(path string, explicit []string) []string {
+	values := make([]string, 0, len(explicit)+8)
+	seen := make(map[string]struct{})
+	testHelper := path == os.Args[0]
+	add := func(item string) {
+		name, _, ok := strings.Cut(item, "=")
+		if !ok || !safeProviderEnvName(name) {
+			return
+		}
+		if _, exists := seen[name]; exists {
+			return
+		}
+		seen[name] = struct{}{}
+		values = append(values, item)
+	}
+	for _, item := range os.Environ() {
+		name, _, ok := strings.Cut(item, "=")
+		if ok && inheritedProviderEnvName(name, testHelper) {
+			add(item)
+		}
+	}
+	for _, item := range explicit {
+		add(item)
+	}
+	return values
+}
+
+func inheritedProviderEnvName(name string, testHelper bool) bool {
+	if strings.HasPrefix(name, "LC_") || strings.HasPrefix(name, "XDG_") {
+		return true
+	}
+	switch name {
+	case "PATH", "HOME", "LANG", "TERM", "TMPDIR", "TZ", "USER", "LOGNAME", "SHELL", "PWD":
+		return true
+	case "AGENTWHARF_WRAP_HELPER", "AGENTWHARF_ACP_HELPER", "AGENTWHARF_ACP_IDLE_HELPER", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_RESTART_CRASH_HELPER", "AGENTWHARF_START_BLOCK_HELPER", "AGENTWHARF_START_BLOCK_MARKER":
+		return testHelper
+	default:
+		return false
+	}
+}
+
+func safeProviderEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	upper := strings.ToUpper(name)
+	for _, marker := range []string{"TOKEN", "PASSWORD", "SECRET", "CREDENTIAL", "DSN", "SESSION", "HUB", "CLOUD", "MACHINE", "SIGNER", "CONTROL", "PROXY"} {
+		if strings.Contains(upper, marker) {
+			return strings.HasSuffix(upper, "_HELPER")
+		}
+	}
+	return true
 }
 
 func (h *execProcessHandle) PID() int {

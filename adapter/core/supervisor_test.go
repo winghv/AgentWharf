@@ -250,6 +250,30 @@ func TestProcessSupervisorConnectsProviderStdio(t *testing.T) {
 	}
 }
 
+func TestProcessSupervisorProviderDoesNotInheritAdapterEnvironment(t *testing.T) {
+	t.Setenv("AGENTWHARF_SECRET_CANARY", "adapter-secret-canary")
+	var stdout bytes.Buffer
+	supervisor, err := NewProcessSupervisor(ProcessConfig{
+		Command: ProcessCommand{
+			Path:   os.Args[0],
+			Args:   []string{"-test.run=TestProcessSupervisorHelperProcess"},
+			Env:    []string{"AGENTWHARF_HELPER_PROCESS=env"},
+			Stdout: &stdout,
+		},
+		MaxRestarts: 1,
+		GracePeriod: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewProcessSupervisor() error = %v", err)
+	}
+	if err := supervisor.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "secret=" {
+		t.Fatalf("provider environment = %q, want secret=", got)
+	}
+}
+
 func TestProcessSupervisorKillsProviderAfterGracePeriod(t *testing.T) {
 	t.Parallel()
 
@@ -552,6 +576,9 @@ func runHelperProcess(mode string) {
 		os.Exit(0)
 	case "echo":
 		_, _ = io.Copy(os.Stdout, os.Stdin)
+		os.Exit(0)
+	case "env":
+		_, _ = fmt.Fprintf(os.Stdout, "secret=%s\n", os.Getenv("AGENTWHARF_SECRET_CANARY"))
 		os.Exit(0)
 	case "ignore":
 		signal.Reset(os.Interrupt)
