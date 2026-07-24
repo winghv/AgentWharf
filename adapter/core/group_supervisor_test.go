@@ -600,6 +600,83 @@ func TestGroupSupervisorRecoveryDependenciesRunOutsideSupervisorLock(t *testing.
 	}
 }
 
+func TestGroupSupervisorRecoveryConsumesOpaqueStartHandleAndFencesReplacement(t *testing.T) {
+	t.Parallel()
+
+	source := &fakeRecoveryStartHandleSource{handle: testRecoveryStartHandle(t, "a")}
+	leases := &recordingWorkspaceLeaseReserver{}
+	worker := &recordingSessionWorker{}
+	var gotSource RecoveryStartHandleSource
+	group, err := NewGroupSupervisor(GroupSupervisorConfig{
+		MaxWorkers: 1,
+		Leases:     leases,
+		NewWorker: func(cfg SessionWorkerConfig) (SessionWorkerRunner, error) {
+			gotSource = cfg.RecoveryStartHandleSource
+			if cfg.RecoveryStartHandle == nil || cfg.RecoveryStartHandle.value == "" {
+				t.Fatal("recovered worker did not receive an opaque handle reference")
+			}
+			return worker, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewGroupSupervisor() error = %v", err)
+	}
+	recovery := GroupWorkerRecovery{
+		Admission:         validGroupWorkerAdmission("worker_handle", "ses_handle", 1),
+		StartHandle:       source.handle,
+		StartHandleSource: source,
+	}
+	if err := group.Recover(context.Background(), recovery); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if gotSource != source {
+		t.Fatal("recovered worker lost the opaque handle source")
+	}
+	if err := group.Run(context.Background(), "ses_handle"); err != nil {
+		t.Fatalf("Run(current handle) error = %v", err)
+	}
+	if worker.runCount() != 1 {
+		t.Fatalf("worker Run count after current handle = %d, want 1", worker.runCount())
+	}
+
+	source.setHandle(testRecoveryStartHandle(t, "b"))
+	if err := group.Run(context.Background(), "ses_handle"); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("Run(replaced handle) error = %v, want ErrRecoveryAuthorityLost", err)
+	}
+	if group.WorkerCount() != 0 {
+		t.Fatalf("WorkerCount after replaced handle = %d, want 0", group.WorkerCount())
+	}
+	if worker.runCount() != 1 {
+		t.Fatalf("worker Run count after replaced handle = %d, want 1", worker.runCount())
+	}
+}
+
+type recordingSessionWorker struct {
+	mu    sync.Mutex
+	runs  int
+	stops int
+}
+
+func (w *recordingSessionWorker) Run(context.Context) error {
+	w.mu.Lock()
+	w.runs++
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *recordingSessionWorker) Stop(context.Context) error {
+	w.mu.Lock()
+	w.stops++
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *recordingSessionWorker) runCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.runs
+}
+
 type fakeGroupWorker struct{ runs, stops int }
 
 func (w *fakeGroupWorker) Run(context.Context) error {

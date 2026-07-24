@@ -1087,7 +1087,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 	if startAdmission != nil {
 		processAdmission = startAdmission
 	}
-	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
+	processConfig := core.ProcessConfig{
 		Command: core.ProcessCommand{
 			Path:       cfg.ProviderCommand[0],
 			Args:       cfg.ProviderCommand[1:],
@@ -1097,7 +1097,14 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 			Credential: cfg.ProviderCredential,
 		},
 		StartAdmission: processAdmission,
-	})
+	}
+	if startAdmission != nil {
+		processConfig, err = core.BindRecoveryStartAdmission(processConfig, startAdmission)
+		if err != nil {
+			return err
+		}
+	}
+	supervisor, err := core.NewProcessSupervisor(processConfig)
 	if err != nil {
 		return err
 	}
@@ -1200,7 +1207,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	if startAdmission != nil {
 		processAdmission = startAdmission
 	}
-	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
+	processConfig := core.ProcessConfig{
 		Command: core.ProcessCommand{
 			Path:       cfg.ProviderCommand[0],
 			Args:       cfg.ProviderCommand[1:],
@@ -1210,7 +1217,14 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 			Credential: cfg.ProviderCredential,
 		},
 		StartAdmission: processAdmission,
-	})
+	}
+	if startAdmission != nil {
+		processConfig, err = core.BindRecoveryStartAdmission(processConfig, startAdmission)
+		if err != nil {
+			return err
+		}
+	}
+	supervisor, err := core.NewProcessSupervisor(processConfig)
 	if err != nil {
 		return err
 	}

@@ -225,15 +225,19 @@ type GroupWorkerAdmission struct {
 // GroupWorkerRecovery keeps ephemeral process setup separate from the tuple
 // that a trusted lifecycle validates against durable authority.
 type GroupWorkerRecovery struct {
-	Admission GroupWorkerAdmission
-	Authority RecoveryAuthority
+	Admission         GroupWorkerAdmission
+	Authority         RecoveryAuthority
+	StartHandle       RecoveryStartHandle
+	StartHandleSource RecoveryStartHandleSource
 }
 
 type supervisedWorker struct {
-	worker       SessionWorkerRunner
-	workspaceKey store.WorkspaceLeaseKey
-	recovery     *RecoveryAuthority
-	runMu        *sync.Mutex
+	worker            SessionWorkerRunner
+	workspaceKey      store.WorkspaceLeaseKey
+	recovery          *RecoveryAuthority
+	startHandle       RecoveryStartHandle
+	startHandleSource RecoveryStartHandleSource
+	runMu             *sync.Mutex
 }
 
 // GroupSupervisor owns bounded in-process membership. Durable lease release
@@ -336,10 +340,18 @@ func (s *GroupSupervisor) Recover(ctx context.Context, recovery GroupWorkerRecov
 			return fmt.Errorf("%w: %v", ErrMultiWorkerDisabled, err)
 		}
 	}
-	if err := recovery.Authority.verify(ctx); err != nil {
-		return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
+	if recovery.StartHandleSource == nil {
+		if err := recovery.Authority.verify(ctx); err != nil {
+			return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
+		}
 	}
-	worker, err := s.newWorker(recovery.Admission.Worker)
+	workerConfig := recovery.Admission.Worker
+	if recovery.StartHandleSource != nil {
+		expected := recovery.StartHandle
+		workerConfig.RecoveryStartHandleSource = recovery.StartHandleSource
+		workerConfig.RecoveryStartHandle = &expected
+	}
+	worker, err := s.newWorker(workerConfig)
 	if err != nil || worker == nil {
 		return ErrRecoveryAuthorityLost
 	}
@@ -359,8 +371,15 @@ func (s *GroupSupervisor) Recover(ctx context.Context, recovery GroupWorkerRecov
 			return ErrMultiWorkerDisabled
 		}
 	}
-	authority := recovery.Authority
-	s.bySession[recovery.Admission.SessionID] = supervisedWorker{worker: worker, workspaceKey: recovery.Admission.Lease.Key, recovery: &authority, runMu: &sync.Mutex{}}
+	member := supervisedWorker{worker: worker, workspaceKey: recovery.Admission.Lease.Key, runMu: &sync.Mutex{}}
+	if recovery.StartHandleSource != nil {
+		member.startHandle = recovery.StartHandle
+		member.startHandleSource = recovery.StartHandleSource
+	} else {
+		authority := recovery.Authority
+		member.recovery = &authority
+	}
+	s.bySession[recovery.Admission.SessionID] = member
 	s.byWorkspace[recovery.Admission.Lease.Key] = recovery.Admission.SessionID
 	return nil
 }
@@ -376,6 +395,17 @@ func (s *GroupSupervisor) Run(ctx context.Context, sessionID string) error {
 	}
 	if member.recovery != nil {
 		if err := member.recovery.run(ctx, member.worker.Run); err != nil {
+			s.fenceRecoveredWorker(sessionID, member)
+			return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
+		}
+		return nil
+	}
+	if member.startHandleSource != nil {
+		if err := verifyRecoveryStartHandle(member.startHandleSource, member.startHandle); err != nil {
+			s.fenceRecoveredWorker(sessionID, member)
+			return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
+		}
+		if err := member.worker.Run(ctx); err != nil {
 			s.fenceRecoveredWorker(sessionID, member)
 			return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
 		}
@@ -433,13 +463,14 @@ func (s *GroupSupervisor) worker(sessionID string) (supervisedWorker, error) {
 }
 
 func (s *GroupSupervisor) fenceRecoveredWorker(sessionID string, member supervisedWorker) {
-	if s == nil || member.recovery == nil {
+	if s == nil || (member.recovery == nil && member.startHandleSource == nil) {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, ok := s.bySession[sessionID]
-	if !ok || current.recovery != member.recovery {
+	if !ok || (member.recovery != nil && current.recovery != member.recovery) ||
+		(member.startHandleSource != nil && current.startHandleSource != member.startHandleSource) {
 		return
 	}
 	delete(s.bySession, sessionID)
@@ -466,6 +497,12 @@ func validateGroupWorkerRecovery(recovery GroupWorkerRecovery) error {
 	if validateGroupWorkerAdmission(recovery.Admission) != nil {
 		return ErrRecoveryAuthorityLost
 	}
+	if recovery.StartHandleSource != nil {
+		if recovery.StartHandle.value == "" || verifyRecoveryStartHandle(recovery.StartHandleSource, recovery.StartHandle) != nil {
+			return ErrRecoveryAuthorityLost
+		}
+		return nil
+	}
 	if err := validateRecoveryAuthority(recovery.Authority); err != nil {
 		return ErrRecoveryAuthorityLost
 	}
@@ -487,6 +524,17 @@ func validateGroupWorkerRecovery(recovery GroupWorkerRecovery) error {
 		tuple.LeaseID != recovery.Admission.Lease.Owner.LeaseID ||
 		tuple.AcceptedFence < 1 || tuple.ExpiresAt.IsZero() || !tuple.ExpiresAt.After(time.Now()) ||
 		tuple.Revoked || tuple.Terminal || tuple.Quarantined {
+		return ErrRecoveryAuthorityLost
+	}
+	return nil
+}
+
+func verifyRecoveryStartHandle(source RecoveryStartHandleSource, expected RecoveryStartHandle) error {
+	if source == nil || expected.value == "" {
+		return ErrRecoveryAuthorityLost
+	}
+	current, err := source.RecoveryStartHandle()
+	if err != nil || current.value == "" || current.value != expected.value {
 		return ErrRecoveryAuthorityLost
 	}
 	return nil

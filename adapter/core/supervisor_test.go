@@ -77,6 +77,39 @@ func TestProcessSupervisorReAdmitsEveryChildStartAndFailsClosed(t *testing.T) {
 	}
 }
 
+func TestBindRecoveryStartAdmissionFencesReplacedHandleBeforeRestart(t *testing.T) {
+	t.Parallel()
+
+	source := &fakeRecoveryStartHandleSource{handle: testRecoveryStartHandle(t, "a")}
+	delegate := &recordingProcessStartAdmission{}
+	bound, err := BindRecoveryStartAdmission(ProcessConfig{StartAdmission: delegate}, source)
+	if err != nil {
+		t.Fatalf("BindRecoveryStartAdmission() error = %v", err)
+	}
+	if err := bound.StartAdmission.PrepareProcessStart(context.Background(), 1); err != nil {
+		t.Fatalf("first PrepareProcessStart() error = %v", err)
+	}
+	if err := bound.StartAdmission.ConfirmProcessStarted(context.Background(), 1); err != nil {
+		t.Fatalf("first ConfirmProcessStarted() error = %v", err)
+	}
+
+	source.setHandle(testRecoveryStartHandle(t, "b"))
+	if err := bound.StartAdmission.PrepareProcessStart(context.Background(), 2); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("replaced PrepareProcessStart() error = %v, want ErrRecoveryAuthorityLost", err)
+	}
+	if got := delegate.calls(); !reflect.DeepEqual(got, []string{"prepare:1", "started:1"}) {
+		t.Fatalf("delegate calls after replacement = %v", got)
+	}
+}
+
+func TestBindRecoveryStartAdmissionRequiresStoreBackedDelegate(t *testing.T) {
+	t.Parallel()
+
+	if _, err := BindRecoveryStartAdmission(ProcessConfig{}, &fakeRecoveryStartHandleSource{handle: testRecoveryStartHandle(t, "a")}); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("BindRecoveryStartAdmission() error = %v, want ErrRecoveryAuthorityLost", err)
+	}
+}
+
 func TestProcessSupervisorRestartsKilledProviderChild(t *testing.T) {
 	t.Parallel()
 
@@ -329,6 +362,35 @@ type recordingProcessStartAdmission struct {
 	mu            sync.Mutex
 	rejectAttempt int
 	callsSeen     []string
+}
+
+type fakeRecoveryStartHandleSource struct {
+	mu     sync.Mutex
+	handle RecoveryStartHandle
+}
+
+func (s *fakeRecoveryStartHandleSource) RecoveryStartHandle() (RecoveryStartHandle, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.handle.value == "" {
+		return RecoveryStartHandle{}, ErrRecoveryAuthorityLost
+	}
+	return s.handle, nil
+}
+
+func (s *fakeRecoveryStartHandleSource) setHandle(handle RecoveryStartHandle) {
+	s.mu.Lock()
+	s.handle = handle
+	s.mu.Unlock()
+}
+
+func testRecoveryStartHandle(t *testing.T, prefix string) RecoveryStartHandle {
+	t.Helper()
+	handle, err := NewRecoveryStartHandle(prefix + strings.Repeat("0", 31))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handle
 }
 
 func (a *recordingProcessStartAdmission) PrepareProcessStart(_ context.Context, attempt int) error {
