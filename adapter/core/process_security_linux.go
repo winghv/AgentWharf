@@ -10,7 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"time"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -19,6 +19,24 @@ var (
 	ErrChildConfidentialityUnavailable = errors.New("child confidentiality boundary is unavailable")
 	ErrChildConfidentialityUnproven    = errors.New("child confidentiality boundary is unproven")
 )
+
+const (
+	childProbeArgument = "--agentwharf-child-confidentiality-probe"
+	childProbeEnv      = "AGENTWHARF_CHILD_CONFIDENTIALITY_PROBE"
+	childProbeDenied   = 0
+	childProbeGranted  = 41
+	childProbeMissing  = 42
+	childProbeUnknown  = 43
+)
+
+// The probe runs as the real executable so the access attempt is made by a
+// same-UID child without adding a helper binary or trusting shell diagnostics.
+func init() {
+	if os.Getenv(childProbeEnv) != "1" || len(os.Args) < 2 || os.Args[1] != childProbeArgument {
+		return
+	}
+	os.Exit(runChildConfidentialityProbe(os.Getppid()))
+}
 
 // ChildConfidentialityReport is deliberately evidence-shaped. A true result
 // requires both supervisor state and a same-UID child access probe; callers
@@ -46,8 +64,8 @@ func (r ChildConfidentialityReport) valid() bool {
 
 // ProbeChildConfidentiality checks the actual supervisor confinement and then
 // runs a same-UID child that attempts the credential-bearing proc accesses.
-// Any missing tool, unsupported kernel policy or failed assertion is a hard
-// denial so multi-Worker capability remains absent.
+// Any unsupported, unverifiable or failed assertion is unavailable so callers
+// must keep multi-Worker capability absent.
 func ProbeChildConfidentiality(ctx context.Context) (ChildConfidentialityReport, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -153,34 +171,59 @@ func ptraceRestricted() (bool, error) {
 }
 
 func probeSameUIDProcAccess(ctx context.Context) error {
-	probe := `set -eu
-p=$PPID
-for target in environ mem fd/0; do
-  if [ ! -e "/proc/$p/$target" ]; then
-		exit 42
-	fi
-  if : < "/proc/$p/$target" 2>/dev/null; then
-		exit 41
-	fi
-done
-exit 0
-`
-	commandCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(commandCtx, "/bin/sh", "-c", probe)
-	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cmd := exec.CommandContext(ctx, "/proc/self/exe", childProbeArgument)
+	cmd.Env = []string{childProbeEnv + "=1"}
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Run(); err != nil {
-		if errors.Is(commandCtx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("%w: same-UID proc probe timed out", ErrChildConfidentialityUnavailable)
-		}
 		var execErr *exec.Error
 		if errors.As(err, &execErr) {
 			return fmt.Errorf("%w: same-UID proc probe helper is unavailable: %v", ErrChildConfidentialityUnavailable, err)
 		}
-		return fmt.Errorf("%w: same-UID proc access was not denied: %v", ErrChildConfidentialityUnproven, err)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			return fmt.Errorf("%w: same-UID proc probe failed: %v", ErrChildConfidentialityUnavailable, err)
+		}
+		switch exitErr.ExitCode() {
+		case childProbeDenied:
+			return nil
+		case childProbeGranted:
+			return fmt.Errorf("%w: same-UID proc access was not denied", ErrChildConfidentialityUnproven)
+		case childProbeMissing:
+			return fmt.Errorf("%w: same-UID proc target is missing", ErrChildConfidentialityUnavailable)
+		default:
+			return fmt.Errorf("%w: same-UID proc access probe was unverifiable (exit=%d)", ErrChildConfidentialityUnavailable, exitErr.ExitCode())
+		}
 	}
-	return nil
+	return fmt.Errorf("%w: same-UID proc access probe returned without a denial result", ErrChildConfidentialityUnavailable)
+}
+
+func runChildConfidentialityProbe(parentPID int) int {
+	for _, target := range []string{"environ", "mem", "fd/0"} {
+		file, err := os.Open(fmt.Sprintf("/proc/%d/%s", parentPID, target))
+		if err == nil {
+			_ = file.Close()
+			return childProbeGranted
+		}
+		switch classifyProbeOpenError(err) {
+		case childProbeDenied:
+			continue
+		case childProbeMissing:
+			return childProbeMissing
+		default:
+			return childProbeUnknown
+		}
+	}
+	return childProbeDenied
+}
+
+func classifyProbeOpenError(err error) int {
+	if errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
+		return childProbeDenied
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return childProbeMissing
+	}
+	return childProbeUnknown
 }

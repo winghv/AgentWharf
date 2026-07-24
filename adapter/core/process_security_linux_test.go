@@ -5,6 +5,8 @@ package core
 import (
 	"context"
 	"errors"
+	"os"
+	"syscall"
 	"testing"
 )
 
@@ -40,5 +42,26 @@ func TestChildConfidentialityReportRequiresEveryBoundary(t *testing.T) {
 	report.PidfdGetfdDenied = false
 	if report.valid() {
 		t.Fatal("incomplete child-confidentiality report validated")
+	}
+}
+
+func TestClassifyProbeOpenErrorFailsClosedForUnknownErrno(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "permission denied", err: syscall.EACCES, want: childProbeDenied},
+		{name: "operation not permitted", err: syscall.EPERM, want: childProbeDenied},
+		{name: "missing target", err: os.ErrNotExist, want: childProbeMissing},
+		{name: "too many files", err: syscall.EMFILE, want: childProbeUnknown},
+		{name: "system file error", err: syscall.EIO, want: childProbeUnknown},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyProbeOpenError(test.err); got != test.want {
+				t.Fatalf("classifyProbeOpenError(%v) = %d, want %d", test.err, got, test.want)
+			}
+		})
 	}
 }
