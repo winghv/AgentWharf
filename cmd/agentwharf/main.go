@@ -55,7 +55,10 @@ const (
 	cloudAPIMaxAttempts       = 3
 )
 
-var errUnsafeDefaultToken = errors.New("default local tokens require a loopback listen address")
+var (
+	errUnsafeDefaultToken = errors.New("default local tokens require a loopback listen address")
+	errClaimAuthRejection = errors.New("claim authentication rejected")
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -240,6 +243,9 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 func claimLaunchRequiresReclaim(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, errClaimAuthRejection) || errors.Is(err, core.ErrInvalidHelloAck) {
+		return true
 	}
 	lower := strings.ToLower(err.Error())
 	return strings.Contains(lower, "unauthorized") || strings.Contains(lower, "invalid hello ack") || strings.Contains(lower, "credential")
@@ -806,6 +812,9 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	if err != nil {
 		return cfg, fmt.Errorf("read hello ack: %w", err)
 	}
+	if protocolErr, ok := frame.(*protocol.Error); ok && claimProtocolErrorRequiresReclaim(protocolErr) {
+		return cfg, fmt.Errorf("%w: %s", errClaimAuthRejection, protocolErr.Code)
+	}
 	ack, ok := frame.(*protocol.HelloAck)
 	if !ok {
 		return cfg, fmt.Errorf("read hello ack: got %T", frame)
@@ -841,6 +850,15 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		}
 	}
 	return cfg, nil
+}
+
+func claimProtocolErrorRequiresReclaim(protocolErr *protocol.Error) bool {
+	if protocolErr == nil {
+		return false
+	}
+	code := strings.ToLower(strings.TrimSpace(protocolErr.Code))
+	return protocolErr.Fatal || code == "unauthorized" || code == "invalid_hello" ||
+		strings.Contains(code, "credential") || strings.Contains(code, "expired") || strings.Contains(code, "revoked")
 }
 
 func prepareManagedWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wrapConfig, error) {

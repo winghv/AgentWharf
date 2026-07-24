@@ -148,6 +148,18 @@ func TestClaimLaunchRetryClassifierDistinguishesTransportFailure(t *testing.T) {
 			t.Fatalf("claimLaunchRequiresReclaim(%q) = false", message)
 		}
 	}
+	for _, frame := range []*protocol.Error{
+		{Code: "unauthorized", Fatal: true},
+		{Code: "invalid_hello", Fatal: true},
+		{Code: "credential_expired", Fatal: true},
+	} {
+		if !claimProtocolErrorRequiresReclaim(frame) || !claimLaunchRequiresReclaim(fmt.Errorf("%w: %s", errClaimAuthRejection, frame.Code)) {
+			t.Fatalf("protocol error %q was not classified as terminal reclaim", frame.Code)
+		}
+	}
+	if claimProtocolErrorRequiresReclaim(&protocol.Error{Code: "temporary", Fatal: false}) {
+		t.Fatal("non-fatal protocol error must not force reclaim")
+	}
 }
 
 func TestRunServeRejectsNonLocalDefaultToken(t *testing.T) {
