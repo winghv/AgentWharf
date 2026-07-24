@@ -443,10 +443,19 @@ func safeProviderEnvName(name string) bool {
 	upper := strings.ToUpper(name)
 	for _, marker := range []string{"TOKEN", "PASSWORD", "SECRET", "CREDENTIAL", "DSN", "SESSION", "HUB", "CLOUD", "MACHINE", "SIGNER", "CONTROL", "PROXY"} {
 		if strings.Contains(upper, marker) {
-			return strings.HasSuffix(upper, "_HELPER")
+			return safeProviderHelperEnvName(upper)
 		}
 	}
 	return true
+}
+
+func safeProviderHelperEnvName(name string) bool {
+	switch name {
+	case "AGENTWHARF_WRAP_HELPER", "AGENTWHARF_ACP_HELPER", "AGENTWHARF_ACP_IDLE_HELPER", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_RESTART_CRASH_HELPER", "AGENTWHARF_START_BLOCK_HELPER", "AGENTWHARF_START_BLOCK_MARKER", "AGENTWHARF_HELPER_PROCESS":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *execProcessHandle) PID() int {

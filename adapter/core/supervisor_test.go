@@ -274,6 +274,19 @@ func TestProcessSupervisorProviderDoesNotInheritAdapterEnvironment(t *testing.T)
 	}
 }
 
+func TestSafeProviderEnvNameRejectsArbitrarySensitiveHelpers(t *testing.T) {
+	for _, name := range []string{"MY_SECRET_HELPER", "API_TOKEN_HELPER", "AGENTWHARF_SECRET_HELPER"} {
+		if safeProviderEnvName(name) {
+			t.Fatalf("safeProviderEnvName(%q) = true, want false", name)
+		}
+	}
+	for _, name := range []string{"AGENTWHARF_HELPER_PROCESS", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_START_BLOCK_MARKER"} {
+		if !safeProviderEnvName(name) {
+			t.Fatalf("safeProviderEnvName(%q) = false, want true", name)
+		}
+	}
+}
+
 func TestProcessSupervisorKillsProviderAfterGracePeriod(t *testing.T) {
 	t.Parallel()
 
