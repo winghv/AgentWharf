@@ -193,6 +193,9 @@ func TestCredentialRotationRejectsAuthorityLostRecoveryAndForgedIdempotentReceip
 	if err != nil {
 		t.Fatalf("RetryActivation() error = %v", err)
 	}
+	if err := rotation.Activate(CredentialRotationReceipt{SessionID: "ses_rotation_receipts", Epoch: 1, Generation: 2, Status: CredentialRotationActive}); !errors.Is(err, ErrCredentialRotationStale) {
+		t.Fatalf("empty rotation id error = %v, want stale", err)
+	}
 	forged := active
 	forged.SessionID = "ses_other"
 	if err := rotation.Activate(forged); !errors.Is(err, ErrCredentialRotationStale) {
@@ -204,6 +207,9 @@ func TestCredentialRotationRejectsAuthorityLostRecoveryAndForgedIdempotentReceip
 	}
 	if _, err := rotation.RecoveryPermit(); !errors.Is(err, ErrCredentialAuthorityLost) {
 		t.Fatalf("authority-lost recovery permit error = %v, want authority lost", err)
+	}
+	if err := rotation.Reconnect(2, 2); !errors.Is(err, ErrCredentialAuthorityLost) {
+		t.Fatalf("authority-lost reconnect error = %v, want authority lost", err)
 	}
 }
 
@@ -257,5 +263,20 @@ func TestSessionWorkerFinalizesPendingCommandWhenAuthorityIsLostAfterPrepare(t *
 	}
 	if len(gate.finalized) != 1 || gate.finalized[0] != CommandOutcomeOutcomeUnknown {
 		t.Fatalf("finalized outcomes = %+v, want one outcome_unknown", gate.finalized)
+	}
+}
+
+func TestSessionWorkerRunFailsClosedAfterCredentialAuthorityLoss(t *testing.T) {
+	worker, err := newSessionWorker(SessionWorkerConfig{
+		SessionID:  "ses_run_authority_lost",
+		Credential: rotationCredential(t, "ses_run_authority_lost", 1),
+		Provider:   ProcessConfig{Command: ProcessCommand{Path: "provider"}},
+	}, newFakeProcessRunner())
+	if err != nil {
+		t.Fatalf("newSessionWorker() error = %v", err)
+	}
+	worker.MarkCredentialAuthorityLost()
+	if err := worker.Run(context.Background()); !errors.Is(err, ErrCredentialAuthorityLost) {
+		t.Fatalf("Run() error = %v, want authority lost", err)
 	}
 }

@@ -139,7 +139,7 @@ func (r *CredentialRotation) Activate(receipt CredentialRotationReceipt) error {
 	if err := r.authorityLocked(); err != nil {
 		return err
 	}
-	if r.activeRotationID == receipt.RotationID && receipt.Status == CredentialRotationActive {
+	if receipt.RotationID != "" && r.activeRotationID == receipt.RotationID && receipt.Status == CredentialRotationActive {
 		if r.active == nil || receipt.SessionID != r.sessionID || receipt.Epoch != r.epoch {
 			return ErrCredentialRotationStale
 		}
@@ -188,6 +188,9 @@ func (r *CredentialRotation) Reconnect(epoch, generation int64) error {
 	defer r.mu.Unlock()
 	if r.revoked || r.terminal {
 		return ErrCredentialTerminal
+	}
+	if r.authorityLost {
+		return ErrCredentialAuthorityLost
 	}
 	if r.active == nil {
 		return ErrCredentialRecoveryRequired
