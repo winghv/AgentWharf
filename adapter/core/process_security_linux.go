@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -23,7 +24,7 @@ var (
 const (
 	childProbeArgument = "--agentwharf-child-confidentiality-probe"
 	childProbeEnv      = "AGENTWHARF_CHILD_CONFIDENTIALITY_PROBE"
-	childProbeDenied   = 0
+	childProbeDenied   = 40
 	childProbeGranted  = 41
 	childProbeMissing  = 42
 	childProbeUnknown  = 43
@@ -171,12 +172,17 @@ func ptraceRestricted() (bool, error) {
 }
 
 func probeSameUIDProcAccess(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "/proc/self/exe", childProbeArgument)
+	commandCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(commandCtx, "/proc/self/exe", childProbeArgument)
 	cmd.Env = []string{childProbeEnv + "=1"}
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Run(); err != nil {
+		if errors.Is(commandCtx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("%w: same-UID proc probe timed out", ErrChildConfidentialityUnavailable)
+		}
 		var execErr *exec.Error
 		if errors.As(err, &execErr) {
 			return fmt.Errorf("%w: same-UID proc probe helper is unavailable: %v", ErrChildConfidentialityUnavailable, err)
