@@ -96,6 +96,9 @@ func (r *CredentialRotation) Prepare(rotationID string, credential *SessionCrede
 	if err := r.authorityLocked(); err != nil {
 		return err
 	}
+	if r.pending != nil && !r.pending.credential.metadata.ExpiresAt.After(time.Now()) {
+		r.pending = nil
+	}
 	if r.pending != nil {
 		pendingMetadata, _ := r.pending.credential.Metadata()
 		if r.pending.id == rotationID && sameCredentialMetadata(pendingMetadata, metadata) {

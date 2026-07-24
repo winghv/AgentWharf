@@ -232,6 +232,16 @@ func TestCredentialRotationRejectsExpiredPendingActiveAndPriorLineages(t *testin
 	}); !errors.Is(err, ErrSessionCredentialExpired) {
 		t.Fatalf("expired pending Activate() error = %v, want expired", err)
 	}
+	if err := rotation.Prepare("rot_recovered", rotationCredential(t, "ses_rotation_expiry_lifecycle", 3)); err != nil {
+		t.Fatalf("Prepare() after expired pending error = %v", err)
+	}
+	recoveredReceipt, err := rotation.PossessionAck("rot_recovered", 1)
+	if err != nil {
+		t.Fatalf("recovered pending PossessionAck() error = %v", err)
+	}
+	if err := rotation.Activate(recoveredReceipt); err != nil {
+		t.Fatalf("recovered pending Activate() error = %v", err)
+	}
 
 	activeRotation, err := NewCredentialRotation("ses_rotation_active_expiry", rotationCredential(t, "ses_rotation_active_expiry", 1), 1)
 	if err != nil {
