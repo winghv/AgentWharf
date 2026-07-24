@@ -137,6 +137,19 @@ func TestTaskClaimCodeInputRequiresBoundedNonTTYStdin(t *testing.T) {
 	}
 }
 
+func TestClaimLaunchRetryClassifierDistinguishesTransportFailure(t *testing.T) {
+	t.Parallel()
+
+	if claimLaunchRequiresReclaim(errors.New("read hello ack: websocket EOF")) {
+		t.Fatal("transport hello failure must permit one bounded retry")
+	}
+	for _, message := range []string{"invalid hello ack", "unauthorized adapter", "credential revoked"} {
+		if !claimLaunchRequiresReclaim(errors.New(message)) {
+			t.Fatalf("claimLaunchRequiresReclaim(%q) = false", message)
+		}
+	}
+}
+
 func TestRunServeRejectsNonLocalDefaultToken(t *testing.T) {
 	t.Parallel()
 

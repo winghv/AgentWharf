@@ -228,13 +228,21 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 	for attempt := 0; attempt < 2; attempt++ {
 		if _, err := runWrap(ctx, cfg, strings.NewReader(""), stderr); err == nil {
 			return nil
-		} else if strings.Contains(strings.ToLower(err.Error()), "hello ack") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") || strings.Contains(strings.ToLower(err.Error()), "credential") {
+		} else if claimLaunchRequiresReclaim(err) {
 			return errors.New("reclaim required")
 		} else if attempt == 1 {
 			return errors.New("reclaim required")
 		}
 	}
 	return errors.New("reclaim required")
+}
+
+func claimLaunchRequiresReclaim(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "unauthorized") || strings.Contains(lower, "invalid hello ack") || strings.Contains(lower, "credential")
 }
 
 func claimInputIsTTY(input io.Reader) bool {
