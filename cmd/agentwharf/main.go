@@ -1098,13 +1098,30 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		},
 		StartAdmission: processAdmission,
 	}
+	var supervisor *core.ProcessSupervisor
+	var recoveryGroup *core.GroupSupervisor
 	if startAdmission != nil {
-		processConfig, err = core.BindRecoveryStartAdmission(processConfig, startAdmission)
+		recoveryGroup, err = core.NewGroupSupervisor(core.GroupSupervisorConfig{
+			MaxWorkers:                 1,
+			AllowReferenceOnlyRecovery: true,
+			NewWorker: func(core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
+				if supervisor == nil {
+					return nil, errors.New("provider supervisor is unavailable")
+				}
+				return supervisor, nil
+			},
+		})
 		if err != nil {
 			return err
 		}
 	}
-	supervisor, err := core.NewProcessSupervisor(processConfig)
+	if startAdmission != nil {
+		processConfig, err = recoveryGroup.BindRecoveryStartAdmission(processConfig, startAdmission)
+		if err != nil {
+			return err
+		}
+	}
+	supervisor, err = core.NewProcessSupervisor(processConfig)
 	if err != nil {
 		return err
 	}
@@ -1127,7 +1144,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		return err
 	}
 	if startAdmission != nil {
-		if _, err := composeProviderGroupRecovery(runCtx, cfg, processConfig, supervisor, startAdmission); err != nil {
+		if err := composeProviderGroupRecovery(runCtx, cfg, processConfig, supervisor, recoveryGroup, startAdmission); err != nil {
 			cancel()
 			stopProviderSupervisor(supervisor)
 			return err
@@ -1226,13 +1243,30 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		},
 		StartAdmission: processAdmission,
 	}
+	var supervisor *core.ProcessSupervisor
+	var recoveryGroup *core.GroupSupervisor
 	if startAdmission != nil {
-		processConfig, err = core.BindRecoveryStartAdmission(processConfig, startAdmission)
+		recoveryGroup, err = core.NewGroupSupervisor(core.GroupSupervisorConfig{
+			MaxWorkers:                 1,
+			AllowReferenceOnlyRecovery: true,
+			NewWorker: func(core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
+				if supervisor == nil {
+					return nil, errors.New("provider supervisor is unavailable")
+				}
+				return supervisor, nil
+			},
+		})
 		if err != nil {
 			return err
 		}
 	}
-	supervisor, err := core.NewProcessSupervisor(processConfig)
+	if startAdmission != nil {
+		processConfig, err = recoveryGroup.BindRecoveryStartAdmission(processConfig, startAdmission)
+		if err != nil {
+			return err
+		}
+	}
+	supervisor, err = core.NewProcessSupervisor(processConfig)
 	if err != nil {
 		return err
 	}
@@ -1252,7 +1286,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		return err
 	}
 	if startAdmission != nil {
-		if _, err := composeProviderGroupRecovery(runCtx, cfg, processConfig, supervisor, startAdmission); err != nil {
+		if err := composeProviderGroupRecovery(runCtx, cfg, processConfig, supervisor, recoveryGroup, startAdmission); err != nil {
 			cancel()
 			stopProviderSupervisor(supervisor)
 			return err
@@ -1587,23 +1621,14 @@ func (a *providerStartAdmission) watchLifecycle(ctx context.Context, cancel cont
 // real GroupSupervisor.Recover path. The existing ProcessSupervisor remains
 // the child runner; GroupSupervisor stores only session membership and the
 // opaque reference, while Hub/Store remains the durable authority.
-func composeProviderGroupRecovery(ctx context.Context, cfg wrapConfig, processConfig core.ProcessConfig, supervisor *core.ProcessSupervisor, admission *providerStartAdmission) (*core.GroupSupervisor, error) {
-	if supervisor == nil || admission == nil {
-		return nil, errors.New("provider recovery composition is unavailable")
+
+func composeProviderGroupRecovery(ctx context.Context, cfg wrapConfig, processConfig core.ProcessConfig, supervisor *core.ProcessSupervisor, group *core.GroupSupervisor, admission *providerStartAdmission) error {
+	if supervisor == nil || group == nil || admission == nil {
+		return errors.New("provider recovery composition is unavailable")
 	}
 	handle, err := admission.RecoveryStartHandle()
 	if err != nil {
-		return nil, err
-	}
-	group, err := core.NewGroupSupervisor(core.GroupSupervisorConfig{
-		MaxWorkers:                 1,
-		AllowReferenceOnlyRecovery: true,
-		NewWorker: func(core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
-			return supervisor, nil
-		},
-	})
-	if err != nil {
-		return nil, err
+		return err
 	}
 	recovery := core.GroupWorkerRecovery{
 		Admission: core.GroupWorkerAdmission{
@@ -1618,9 +1643,9 @@ func composeProviderGroupRecovery(ctx context.Context, cfg wrapConfig, processCo
 		StartHandleSource: admission,
 	}
 	if err := group.Recover(ctx, recovery); err != nil {
-		return nil, err
+		return err
 	}
-	return group, nil
+	return nil
 }
 
 func waitForFirstProviderStartAdmission(ctx context.Context, admission *providerStartAdmission, processDone <-chan error) error {

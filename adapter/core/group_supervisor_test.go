@@ -651,6 +651,37 @@ func TestGroupSupervisorRecoveryConsumesOpaqueStartHandleAndFencesReplacement(t 
 	}
 }
 
+func TestGroupSupervisorOwnsRecoveryStartAdmissionFence(t *testing.T) {
+	t.Parallel()
+
+	group, err := NewGroupSupervisor(GroupSupervisorConfig{
+		MaxWorkers:                 1,
+		AllowReferenceOnlyRecovery: true,
+		NewWorker: func(SessionWorkerConfig) (SessionWorkerRunner, error) {
+			return &recordingSessionWorker{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewGroupSupervisor() error = %v", err)
+	}
+	source := &fakeRecoveryStartHandleSource{handle: testRecoveryStartHandle(t, "fence")}
+	delegate := &recordingProcessStartAdmission{}
+	bound, err := group.BindRecoveryStartAdmission(ProcessConfig{StartAdmission: delegate}, source)
+	if err != nil {
+		t.Fatalf("BindRecoveryStartAdmission() error = %v", err)
+	}
+	if err := bound.StartAdmission.PrepareProcessStart(context.Background(), 1); err != nil {
+		t.Fatalf("first PrepareProcessStart() error = %v", err)
+	}
+	if err := bound.StartAdmission.ConfirmProcessStarted(context.Background(), 1); err != nil {
+		t.Fatalf("first ConfirmProcessStarted() error = %v", err)
+	}
+	source.setHandle(testRecoveryStartHandle(t, "changed"))
+	if err := bound.StartAdmission.PrepareProcessStart(context.Background(), 2); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("replaced PrepareProcessStart() error = %v, want ErrRecoveryAuthorityLost", err)
+	}
+}
+
 func TestGroupSupervisorRejectsReferenceHandleWithoutDurableLifecycleFence(t *testing.T) {
 	t.Parallel()
 

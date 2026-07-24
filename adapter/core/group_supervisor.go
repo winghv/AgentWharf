@@ -280,6 +280,17 @@ func NewGroupSupervisor(cfg GroupSupervisorConfig) (*GroupSupervisor, error) {
 	}, nil
 }
 
+// BindRecoveryStartAdmission makes this GroupSupervisor the owner of the
+// opaque lifecycle fence used by every Provider child start. The handle source
+// remains the Hub/Store-backed authority; this method only binds the existing
+// admission delegate and never exposes or derives the handle value.
+func (s *GroupSupervisor) BindRecoveryStartAdmission(provider ProcessConfig, source RecoveryStartHandleSource) (ProcessConfig, error) {
+	if s == nil {
+		return ProcessConfig{}, ErrRecoveryAuthorityLost
+	}
+	return bindRecoveryStartAdmission(provider, source, nil)
+}
+
 // Admit reserves durable writer authority before constructing a Worker. A
 // reservation failure therefore proves that no Provider spawn can follow.
 func (s *GroupSupervisor) Admit(ctx context.Context, admission GroupWorkerAdmission) error {
