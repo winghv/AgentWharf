@@ -228,6 +228,46 @@ func TestMapperMapsACPPermissionRequest(t *testing.T) {
 	}
 }
 
+func TestMapperMapsProviderSettingsCapabilityAndEffectiveResult(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code", Now: func() time.Time {
+		return time.UnixMilli(1700000000456)
+	}})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+	events, err := mapper.MapReader(context.Background(), strings.NewReader(strings.Join([]string{
+		`{"type":"initialize_response","session_id":"acp_ses_1","model":"reasoning","permissionMode":"ask","models":[{"id":"reasoning","label":"Reasoning"},{"id":"balanced","label":"Balanced"}],"permissionModes":[{"id":"workspace","label":"Workspace"},{"id":"ask","label":"Ask first"}],"modelChange":true,"permissionChange":true}`,
+		`{"type":"settings_change_response","cmd_id":"cmd_settings_1","request_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","effective_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outcome":"rejected","effective_model_id":"balanced","effective_permission_mode_id":"ask","reason_code":"provider_rejected"}`,
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("MapReader() error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events = %+v, want state plus settings events", events)
+	}
+	assertEvent(t, events[1], "session.settings.capabilities")
+	capability, err := protocol.DecodeSettingsCapabilityPayload(events[1].Payload)
+	if err != nil {
+		t.Fatalf("capability payload error = %v; payload=%s", err, events[1].Payload)
+	}
+	if capability.EffectiveModelID != "reasoning" || capability.EffectivePermissionModeID != "ask" || capability.ModelChange != "allowed" || capability.PermissionChange != "allowed" {
+		t.Fatalf("capability = %+v", capability)
+	}
+	if capability.Models[0].ID != "balanced" || capability.PermissionModes[0].ID != "ask" {
+		t.Fatalf("capability choices are not canonical: %+v", capability)
+	}
+	assertEvent(t, events[2], "session.settings.effective")
+	effective, err := protocol.DecodeSettingsEffectivePayload(events[2].Payload)
+	if err != nil {
+		t.Fatalf("effective payload error = %v; payload=%s", err, events[2].Payload)
+	}
+	if effective.CommandID != "cmd_settings_1" || effective.Outcome != "rejected" || effective.ReasonCode == nil || *effective.ReasonCode != "provider_rejected" {
+		t.Fatalf("effective = %+v", effective)
+	}
+}
+
 func TestMapperRejectsInvalidConfig(t *testing.T) {
 	t.Parallel()
 

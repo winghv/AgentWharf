@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/winghv/agentwharf/protocol"
@@ -90,11 +93,24 @@ func (m *Mapper) MapLine(line []byte) ([]protocol.Event, error) {
 func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protocol.Event {
 	switch frameName(raw) {
 	case "initialize_response":
-		return []protocol.Event{m.stateEvent("starting", providerSessionID, copyWithout(raw, "type", "method", "session_id"))}
+		events := []protocol.Event{m.stateEvent("starting", providerSessionID, copyWithout(raw, "type", "method", "session_id"))}
+		if event := m.settingsCapabilityEvent(raw); event != nil {
+			events = append(events, *event)
+		}
+		return events
 	case "new_session_response":
-		return []protocol.Event{m.stateEvent("ready", providerSessionID, copyWithout(raw, "type", "method", "session_id"))}
+		events := []protocol.Event{m.stateEvent("ready", providerSessionID, copyWithout(raw, "type", "method", "session_id"))}
+		if event := m.settingsCapabilityEvent(raw); event != nil {
+			events = append(events, *event)
+		}
+		return events
 	case "session/cancel_response", "cancel_response":
 		return []protocol.Event{m.stateEvent("ready", providerSessionID, copyWithout(raw, "type", "method", "session_id"))}
+	case "settings_change_response", "session/settings/change_response", "settings_effective":
+		if event := m.settingsEffectiveEvent(raw); event != nil {
+			return []protocol.Event{*event}
+		}
+		return nil
 	case "session/update":
 		return m.mapSessionUpdate(raw, providerSessionID)
 	case "session/request_permission":
@@ -144,6 +160,16 @@ func (m *Mapper) mapSessionPermissionRequest(raw map[string]any, providerSession
 
 func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []protocol.Event {
 	switch frameName(update) {
+	case "settings_capabilities", "settings_capability_update", "settings/update":
+		if event := m.settingsCapabilityEvent(update); event != nil {
+			return []protocol.Event{*event}
+		}
+		return nil
+	case "settings_change_response", "settings_effective":
+		if event := m.settingsEffectiveEvent(update); event != nil {
+			return []protocol.Event{*event}
+		}
+		return nil
 	case "available_commands_update":
 		payload := copyWithout(update, "type", "subtype", "kind", "sessionUpdate")
 		payload["kind"] = "available_commands_update"
@@ -187,6 +213,171 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 	default:
 		return nil
 	}
+}
+
+func (m *Mapper) settingsCapabilityEvent(raw map[string]any) *protocol.Event {
+	source := raw
+	if params := objectField(raw, "params"); params != nil {
+		source = params
+	}
+	models, modelOK := settingsChoices(source, 32, "models", "available_models", "model_options")
+	permissions, permissionOK := settingsChoices(source, 16, "permission_modes", "permissionModes", "available_permission_modes", "permission_options")
+	if !modelOK || !permissionOK || (!modelOK && !permissionOK) || (len(models) == 0 && len(permissions) == 0) {
+		return nil
+	}
+	effectiveModel := firstString(source, "effective_model_id", "effectiveModelId", "model")
+	effectivePermission := firstString(source, "effective_permission_mode_id", "effectivePermissionModeId", "permission_mode", "permissionMode")
+	if effectiveModel == "" && len(models) > 0 {
+		effectiveModel = models[0].ID
+	}
+	if effectivePermission == "" && len(permissions) > 0 {
+		effectivePermission = permissions[0].ID
+	}
+	modelChange, modelReason := settingsChangeMode(source, len(models), "model_change", "modelChange")
+	permissionChange, permissionReason := settingsChangeMode(source, len(permissions), "permission_change", "permissionChange")
+	payload := protocol.SettingsCapabilityPayload{
+		SchemaVersion:             1,
+		Models:                    models,
+		PermissionModes:           permissions,
+		EffectiveModelID:          effectiveModel,
+		EffectivePermissionModeID: effectivePermission,
+		ModelChange:               modelChange,
+		PermissionChange:          permissionChange,
+		ModelReadOnlyReason:       modelReason,
+		PermissionReadOnlyReason:  permissionReason,
+	}
+	payload.Fingerprint = settingsCapabilityFingerprint(payload)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	if _, err := protocol.DecodeSettingsCapabilityPayload(encoded); err != nil {
+		return nil
+	}
+	return m.rawEvent("session.settings.capabilities", encoded)
+}
+
+func (m *Mapper) settingsEffectiveEvent(raw map[string]any) *protocol.Event {
+	source := raw
+	if params := objectField(raw, "params"); params != nil {
+		source = params
+	}
+	payload := map[string]any{
+		"cmd_id":                       firstString(source, "cmd_id", "command_id", "commandId"),
+		"request_fingerprint":          firstString(source, "request_fingerprint", "requestFingerprint"),
+		"effective_fingerprint":        firstString(source, "effective_fingerprint", "effectiveFingerprint"),
+		"outcome":                      firstString(source, "outcome", "status"),
+		"effective_model_id":           firstString(source, "effective_model_id", "effectiveModelId", "model"),
+		"effective_permission_mode_id": firstString(source, "effective_permission_mode_id", "effectivePermissionModeId", "permission_mode", "permissionMode"),
+		"reason_code":                  firstAny(source, "reason_code", "reasonCode"),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	if _, err := protocol.DecodeSettingsEffectivePayload(encoded); err != nil {
+		return nil
+	}
+	return m.rawEvent("session.settings.effective", encoded)
+}
+
+func (m *Mapper) rawEvent(eventType string, payload json.RawMessage) *protocol.Event {
+	return &protocol.Event{Type: eventType, SessionID: m.sessionID, Time: m.now().UTC().UnixMilli(), Payload: payload}
+}
+
+func settingsChoices(source map[string]any, max int, keys ...string) ([]protocol.SettingsCapabilityChoice, bool) {
+	value := firstAny(source, keys...)
+	if value == nil {
+		return nil, false
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	if len(items) == 0 || len(items) > max {
+		return nil, false
+	}
+	choices := make([]protocol.SettingsCapabilityChoice, 0, len(items))
+	for _, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		id := firstString(object, "id", "value", "name")
+		label := firstString(object, "label", "title", "name", "value")
+		if id == "" || label == "" {
+			return nil, false
+		}
+		choices = append(choices, protocol.SettingsCapabilityChoice{ID: id, Label: label})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].ID < choices[j].ID })
+	for i := 1; i < len(choices); i++ {
+		if choices[i-1].ID == choices[i].ID {
+			return nil, false
+		}
+	}
+	return choices, true
+}
+
+func settingsChangeMode(source map[string]any, choiceCount int, keys ...string) (string, *string) {
+	value := firstAny(source, keys...)
+	allowed := false
+	switch typed := value.(type) {
+	case bool:
+		allowed = typed
+	case string:
+		allowed = typed == "allowed"
+	}
+	if allowed && choiceCount >= 2 {
+		return "allowed", nil
+	}
+	reason := "provider_unsupported"
+	return "read_only", &reason
+}
+
+func settingsCapabilityFingerprint(capability protocol.SettingsCapabilityPayload) string {
+	data := make([]byte, 0, 512)
+	appendString := func(value string) {
+		var length [2]byte
+		binary.BigEndian.PutUint16(length[:], uint16(len(value)))
+		data = append(data, length[:]...)
+		data = append(data, value...)
+	}
+	data = append(data, []byte("agentwharf.settings-capability.v1")...)
+	data = append(data, 0, 1, byte(len(capability.Models)))
+	for _, choice := range capability.Models {
+		appendString(choice.ID)
+		appendString(choice.Label)
+	}
+	data = append(data, byte(len(capability.PermissionModes)))
+	for _, choice := range capability.PermissionModes {
+		appendString(choice.ID)
+		appendString(choice.Label)
+	}
+	appendString(capability.EffectiveModelID)
+	appendString(capability.EffectivePermissionModeID)
+	if capability.ModelChange == "allowed" {
+		data = append(data, 1)
+	} else {
+		data = append(data, 0)
+	}
+	if capability.PermissionChange == "allowed" {
+		data = append(data, 1)
+	} else {
+		data = append(data, 0)
+	}
+	if capability.ModelReadOnlyReason == nil {
+		appendString("")
+	} else {
+		appendString(*capability.ModelReadOnlyReason)
+	}
+	if capability.PermissionReadOnlyReason == nil {
+		appendString("")
+	} else {
+		appendString(*capability.PermissionReadOnlyReason)
+	}
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("sha256:%x", digest[:])
 }
 
 func (m *Mapper) permissionRequestEvent(source map[string]any, requestID string, providerSessionID string) []protocol.Event {
