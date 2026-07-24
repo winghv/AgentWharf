@@ -45,6 +45,16 @@ type workspaceLeaseReserver interface {
 type MultiWorkerActivation interface {
 	AllowMultiWorker(context.Context) error
 }
+type ProcessTreeOwnership interface {
+	PrepareStart(context.Context, int) error
+	AbortStart(context.Context, int) error
+	ObserveStarted(context.Context, ProcessEvent) error
+	Quiesce(context.Context) error
+}
+type QuiescenceLease interface {
+	Release(context.Context) error
+	Quarantine(context.Context) error
+}
 
 type recoveryTuple struct {
 	SessionID            string
@@ -217,6 +227,8 @@ type GroupSupervisorConfig struct {
 	Leases                     workspaceLeaseReserver
 	AllowReferenceOnlyRecovery bool
 	Activation                 MultiWorkerActivation
+	ProcessOwnership           ProcessTreeOwnership
+	QuiescenceLease            QuiescenceLease
 	NewWorker                  func(SessionWorkerConfig) (SessionWorkerRunner, error)
 }
 
@@ -255,6 +267,8 @@ type GroupSupervisor struct {
 	leases     workspaceLeaseReserver
 	activation MultiWorkerActivation
 	newWorker  func(SessionWorkerConfig) (SessionWorkerRunner, error)
+	ownership  ProcessTreeOwnership
+	lease      QuiescenceLease
 
 	mu          sync.Mutex
 	bySession   map[string]supervisedWorker
@@ -275,6 +289,8 @@ func NewGroupSupervisor(cfg GroupSupervisorConfig) (*GroupSupervisor, error) {
 		leases:      cfg.Leases,
 		activation:  cfg.Activation,
 		newWorker:   cfg.NewWorker,
+		ownership:   cfg.ProcessOwnership,
+		lease:       cfg.QuiescenceLease,
 		bySession:   make(map[string]supervisedWorker),
 		byWorkspace: make(map[store.WorkspaceLeaseKey]string),
 	}, nil
@@ -323,10 +339,16 @@ func (s *GroupSupervisor) Admit(ctx context.Context, admission GroupWorkerAdmiss
 			return fmt.Errorf("%w: %v", ErrMultiWorkerDisabled, err)
 		}
 	}
+	if s.leases == nil {
+		return ErrInvalidGroupSupervisorConfig
+	}
 	if _, err := s.leases.ReserveWorkspaceLease(ctx, admission.Lease); err != nil {
 		return fmt.Errorf("reserve workspace writer: %w", err)
 	}
-	worker, err := s.newWorker(admission.Worker)
+	workerConfig := admission.Worker
+	workerConfig.ProcessOwnership = s.ownership
+	workerConfig.QuiescenceLease = s.lease
+	worker, err := s.newWorker(workerConfig)
 	if err != nil {
 		return fmt.Errorf("construct session worker: %w", err)
 	}
@@ -367,6 +389,8 @@ func (s *GroupSupervisor) Recover(ctx context.Context, recovery GroupWorkerRecov
 		return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
 	}
 	workerConfig := recovery.Admission.Worker
+	workerConfig.ProcessOwnership = s.ownership
+	workerConfig.QuiescenceLease = s.lease
 	if recovery.StartHandleSource != nil {
 		expected := recovery.StartHandle
 		workerConfig.RecoveryStartHandleSource = recovery.StartHandleSource

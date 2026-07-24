@@ -95,12 +95,20 @@ type SessionWorkerDurableReceipts interface {
 // lifecycle and its receipt-gated command/event side effects. Hub connection
 // and credential ownership remain outside this boundary.
 type SessionWorker struct {
-	sessionID  string
-	provider   *ProcessSupervisor
-	receipts   SessionWorkerDurableReceipts
-	credential *SessionCredential
-	commandMu  sync.Mutex
-	proposalMu sync.Mutex
+	sessionID         string
+	provider          *ProcessSupervisor
+	receipts          SessionWorkerDurableReceipts
+	credential        *SessionCredential
+	ownership         ProcessTreeOwnership
+	lease             QuiescenceLease
+	ownerObservations *sync.WaitGroup
+	events            chan ProcessEvent
+	ownerErrs         chan error
+	stopMu            sync.Mutex
+	stopped           bool
+	stopErr           error
+	commandMu         sync.Mutex
+	proposalMu        sync.Mutex
 }
 
 type SessionWorkerConfig struct {
@@ -110,6 +118,8 @@ type SessionWorkerConfig struct {
 	RecoveryStartHandle       *RecoveryStartHandle
 	DurableReceipts           SessionWorkerDurableReceipts
 	Credential                *SessionCredential
+	ProcessOwnership          ProcessTreeOwnership
+	QuiescenceLease           QuiescenceLease
 }
 
 // RecoveryStartHandleSource exposes only the current opaque reference. The
@@ -215,6 +225,7 @@ func newSessionWorker(cfg SessionWorkerConfig, runner processRunner) (*SessionWo
 			return nil, err
 		}
 	}
+	var ownerObservations sync.WaitGroup
 	if cfg.RecoveryStartHandleSource != nil {
 		if cfg.Provider.StartAdmission == nil {
 			return nil, ErrRecoveryAuthorityLost
@@ -232,11 +243,28 @@ func newSessionWorker(cfg SessionWorkerConfig, runner processRunner) (*SessionWo
 			delegate:  cfg.Provider.StartAdmission,
 		}
 	}
+	if cfg.ProcessOwnership != nil {
+		cfg.Provider.StartAdmission = &ownedProcessStartAdmission{
+			owner:       cfg.ProcessOwnership,
+			delegate:    cfg.Provider.StartAdmission,
+			onConfirmed: func() { ownerObservations.Add(1) },
+		}
+	}
 	provider, err := newProcessSupervisor(cfg.Provider, runner)
 	if err != nil {
 		return nil, err
 	}
-	return &SessionWorker{sessionID: cfg.SessionID, provider: provider, receipts: cfg.DurableReceipts, credential: cfg.Credential}, nil
+	worker := &SessionWorker{
+		sessionID: cfg.SessionID, provider: provider, receipts: cfg.DurableReceipts,
+		credential: cfg.Credential, ownership: cfg.ProcessOwnership, lease: cfg.QuiescenceLease,
+		ownerObservations: &ownerObservations,
+	}
+	if cfg.ProcessOwnership != nil {
+		worker.events = make(chan ProcessEvent, 128)
+		worker.ownerErrs = make(chan error, 1)
+		go worker.forwardEvents()
+	}
+	return worker, nil
 }
 
 func (w *SessionWorker) SessionID() string {
@@ -250,21 +278,124 @@ func (w *SessionWorker) Events() <-chan ProcessEvent {
 	if w == nil || w.provider == nil {
 		return nil
 	}
-	return w.provider.Events()
+	if w.ownership == nil {
+		return w.provider.Events()
+	}
+	return w.events
 }
 
 func (w *SessionWorker) Run(ctx context.Context) error {
 	if w == nil || w.provider == nil {
 		return ErrInvalidSessionWorkerConfig
 	}
-	return w.provider.Run(ctx)
+	if w.ownership == nil {
+		return w.provider.Run(ctx)
+	}
+	if held, ok := w.lease.(interface{ Held() bool }); ok && !held.Held() {
+		return ErrRecoveryAuthorityLost
+	}
+	w.stopMu.Lock()
+	w.stopped, w.stopErr = false, nil
+	w.stopMu.Unlock()
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.provider.Run(ctx) }()
+	cleanup := func(err error, label string) error {
+		alreadyStopped := w.wasStopped()
+		cleanupErr := w.stopOwned()
+		if alreadyStopped {
+			return err
+		}
+		if cleanupErr != nil && err != nil {
+			return fmt.Errorf("%s: %v; ownership cleanup: %w", label, err, cleanupErr)
+		}
+		if cleanupErr != nil {
+			return fmt.Errorf("ownership cleanup: %w", cleanupErr)
+		}
+		return err
+	}
+	select {
+	case err := <-runDone:
+		return cleanup(err, "provider run")
+	case err := <-w.ownerErrs:
+		return cleanup(err, "ownership event")
+	case <-ctx.Done():
+		return cleanup(ctx.Err(), "worker context")
+	}
 }
-
+func (w *SessionWorker) stopOwned() error {
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return w.stopOnce(stopCtx)
+}
 func (w *SessionWorker) Stop(ctx context.Context) error {
+	if w != nil && w.ownership != nil {
+		return w.stopOnce(ctx)
+	}
+	return w.stopNow(ctx)
+}
+func (w *SessionWorker) wasStopped() bool {
+	w.stopMu.Lock()
+	defer w.stopMu.Unlock()
+	return w.stopped
+}
+func (w *SessionWorker) stopOnce(ctx context.Context) error {
+	w.stopMu.Lock()
+	defer w.stopMu.Unlock()
+	if w.stopped {
+		return w.stopErr
+	}
+	w.stopped = true
+	w.stopErr = w.stopNow(ctx)
+	return w.stopErr
+}
+func (w *SessionWorker) stopNow(ctx context.Context) error {
 	if w == nil || w.provider == nil {
 		return ErrInvalidSessionWorkerConfig
 	}
-	return w.provider.Stop(ctx)
+	if err := w.provider.Stop(ctx); err != nil {
+		w.quarantine()
+		return err
+	}
+	done := make(chan struct{})
+	go func() { w.ownerObservations.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		w.quarantine()
+		return ctx.Err()
+	}
+	if w.ownership != nil {
+		if err := w.ownership.Quiesce(ctx); err != nil {
+			w.quarantine()
+			return err
+		}
+	}
+	if w.lease != nil {
+		if err := w.lease.Release(ctx); err != nil {
+			w.quarantine()
+			return err
+		}
+	}
+	return nil
+}
+func (w *SessionWorker) quarantine() {
+	if w.lease != nil {
+		_ = w.lease.Quarantine(context.Background())
+	}
+}
+func (w *SessionWorker) forwardEvents() {
+	for event := range w.provider.Events() {
+		if w.ownership != nil && event.Type == ProcessEventStarted {
+			if err := w.ownership.ObserveStarted(context.Background(), event); err != nil {
+				select {
+				case w.ownerErrs <- err:
+				default:
+				}
+			}
+			w.ownerObservations.Done()
+		}
+		w.events <- event
+	}
 }
 
 // RouteCommand verifies the private credential binding before entering the
@@ -399,6 +530,41 @@ type durableReceiptStartAdmission struct {
 	sessionID string
 	receipts  SessionWorkerDurableReceipts
 	delegate  ProcessStartAdmission
+}
+type ownedProcessStartAdmission struct {
+	owner       ProcessTreeOwnership
+	delegate    ProcessStartAdmission
+	onConfirmed func()
+}
+func (a *ownedProcessStartAdmission) PrepareProcessStart(ctx context.Context, attempt int) error {
+	if a == nil || a.owner == nil {
+		return ErrRecoveryAuthorityLost
+	}
+	if err := a.owner.PrepareStart(ctx, attempt); err != nil {
+		return err
+	}
+	if a.delegate != nil {
+		if err := a.delegate.PrepareProcessStart(ctx, attempt); err != nil {
+			_ = a.owner.AbortStart(context.Background(), attempt)
+			return err
+		}
+	}
+	return nil
+}
+func (a *ownedProcessStartAdmission) ConfirmProcessStarted(ctx context.Context, attempt int) error {
+	if a == nil || a.owner == nil {
+		return ErrRecoveryAuthorityLost
+	}
+	if a.delegate != nil {
+		if err := a.delegate.ConfirmProcessStarted(ctx, attempt); err != nil {
+			_ = a.owner.AbortStart(context.Background(), attempt)
+			return err
+		}
+	}
+	if a.onConfirmed != nil {
+		a.onConfirmed()
+	}
+	return nil
 }
 
 func (a *durableReceiptStartAdmission) PrepareProcessStart(ctx context.Context, attempt int) error {
