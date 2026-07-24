@@ -37,10 +37,19 @@ type ProcessCommand struct {
 type ProcessCredential struct{ UID, GID uint32 }
 
 type ProcessConfig struct {
-	Command     ProcessCommand
-	MaxRestarts int
-	Backoff     time.Duration
-	GracePeriod time.Duration
+	Command        ProcessCommand
+	MaxRestarts    int
+	Backoff        time.Duration
+	GracePeriod    time.Duration
+	StartAdmission ProcessStartAdmission
+}
+
+// ProcessStartAdmission binds every individual Provider child start to a
+// trusted lifecycle. Prepare runs before exec and confirmation runs as soon
+// as a child exists. It deliberately receives no Provider configuration.
+type ProcessStartAdmission interface {
+	PrepareProcessStart(context.Context, int) error
+	ConfirmProcessStarted(context.Context, int) error
 }
 
 type ProcessEventType string
@@ -130,7 +139,7 @@ func (s *ProcessSupervisor) Run(ctx context.Context) error {
 			return err
 		}
 
-		process, err := s.start(attempt)
+		process, err := s.start(ctx, attempt)
 		if err != nil {
 			return err
 		}
@@ -209,7 +218,12 @@ func (s *ProcessSupervisor) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (s *ProcessSupervisor) start(attempt int) (*runningProcess, error) {
+func (s *ProcessSupervisor) start(ctx context.Context, attempt int) (*runningProcess, error) {
+	if s.cfg.StartAdmission != nil {
+		if err := s.cfg.StartAdmission.PrepareProcessStart(ctx, attempt); err != nil {
+			return nil, fmt.Errorf("prepare provider start admission: %w", err)
+		}
+	}
 	handle, err := s.runner.Start(s.cfg.Command)
 	if err != nil {
 		return nil, fmt.Errorf("start provider process: %w", err)
@@ -228,6 +242,17 @@ func (s *ProcessSupervisor) start(attempt int) (*runningProcess, error) {
 		process.mu.Unlock()
 		close(process.done)
 	}()
+	if s.cfg.StartAdmission != nil {
+		if err := s.cfg.StartAdmission.ConfirmProcessStarted(ctx, attempt); err != nil {
+			stopCtx, cancel := context.WithTimeout(context.Background(), s.cfg.GracePeriod+time.Second)
+			stopErr := s.Stop(stopCtx)
+			cancel()
+			if stopErr != nil {
+				return nil, fmt.Errorf("confirm provider start admission: %w (stop rejected child: %v)", err, stopErr)
+			}
+			return nil, fmt.Errorf("confirm provider start admission: %w", err)
+		}
+	}
 	s.emit(ProcessEvent{Type: ProcessEventStarted, Attempt: attempt, PID: process.pid()})
 	return process, nil
 }

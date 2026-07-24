@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -38,6 +40,40 @@ func TestProcessSupervisorRestartsCrashedProviderUpToLimit(t *testing.T) {
 	}
 	if started[0].Attempt != 1 || started[1].Attempt != 2 || started[2].Attempt != 3 {
 		t.Fatalf("started attempts = %+v", started)
+	}
+}
+
+func TestProcessSupervisorReAdmitsEveryChildStartAndFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeProcessRunner()
+	admission := &recordingProcessStartAdmission{rejectAttempt: 2}
+	supervisor, err := newProcessSupervisor(ProcessConfig{
+		Command:        ProcessCommand{Path: "provider"},
+		MaxRestarts:    2,
+		Backoff:        time.Millisecond,
+		GracePeriod:    20 * time.Millisecond,
+		StartAdmission: admission,
+	}, runner)
+	if err != nil {
+		t.Fatalf("newProcessSupervisor() error = %v", err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- supervisor.Run(context.Background()) }()
+	first := waitEvent(t, supervisor.Events(), ProcessEventStarted)
+	runner.handle(0).finish(errors.New("crashed"))
+	if err := <-runDone; err == nil {
+		t.Fatal("Run() succeeded after re-admission rejection")
+	}
+	if first.Attempt != 1 {
+		t.Fatalf("started attempt = %d, want 1", first.Attempt)
+	}
+	if got := runner.startCount(); got != 1 {
+		t.Fatalf("started child count = %d, want one admitted child", got)
+	}
+	if got := admission.calls(); !reflect.DeepEqual(got, []string{"prepare:1", "started:1", "prepare:2"}) {
+		t.Fatalf("admission calls = %v", got)
 	}
 }
 
@@ -283,6 +319,41 @@ type fakeProcessRunner struct {
 	started []*fakeProcessHandle
 }
 
+func (r *fakeProcessRunner) startCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.started)
+}
+
+type recordingProcessStartAdmission struct {
+	mu            sync.Mutex
+	rejectAttempt int
+	callsSeen     []string
+}
+
+func (a *recordingProcessStartAdmission) PrepareProcessStart(_ context.Context, attempt int) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.callsSeen = append(a.callsSeen, fmt.Sprintf("prepare:%d", attempt))
+	if attempt == a.rejectAttempt {
+		return errors.New("start admission rejected")
+	}
+	return nil
+}
+
+func (a *recordingProcessStartAdmission) ConfirmProcessStarted(_ context.Context, attempt int) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.callsSeen = append(a.callsSeen, fmt.Sprintf("started:%d", attempt))
+	return nil
+}
+
+func (a *recordingProcessStartAdmission) calls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.callsSeen...)
+}
+
 type fakeProcessHandle struct {
 	pid  int
 	done chan struct{}
@@ -345,6 +416,13 @@ func (h *fakeProcessHandle) Kill() error {
 		close(h.done)
 	})
 	return nil
+}
+
+func (h *fakeProcessHandle) finish(err error) {
+	h.mu.Lock()
+	h.err = err
+	h.mu.Unlock()
+	h.once.Do(func() { close(h.done) })
 }
 
 func (h *fakeProcessHandle) counts() (int, int) {

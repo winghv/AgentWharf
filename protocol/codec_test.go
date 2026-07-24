@@ -232,7 +232,13 @@ func TestHelloAckConnectionAuthorityReceiptIsMinimalAndRoundTrips(t *testing.T) 
 }
 
 func TestProviderStartFramesAreStrictAndReferenceOnly(t *testing.T) {
-	for _, frame := range []Frame{&ProviderStart{}, &ProviderStartPrepare{}, &ProviderStartStarted{}, &ProviderStartAck{Status: ProviderStartAdmitted}, &ProviderStartAck{Status: ProviderStartRejected}} {
+	for _, frame := range []Frame{
+		&ProviderStart{Attempt: 1},
+		&ProviderStartPrepare{Attempt: 1},
+		&ProviderStartStarted{Attempt: 1},
+		&ProviderStartAck{Attempt: 1, Status: ProviderStartAdmitted, RecoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"},
+		&ProviderStartAck{Attempt: 1, Status: ProviderStartRejected},
+	} {
 		encoded, err := Encode(frame)
 		if err != nil {
 			t.Fatalf("Encode(%T): %v", frame, err)
@@ -242,11 +248,13 @@ func TestProviderStartFramesAreStrictAndReferenceOnly(t *testing.T) {
 		}
 	}
 	for _, raw := range []string{
-		`{"frame":"provider.start","workspace_key":"forbidden"}`,
-		`{"frame":"provider.start.prepare","lease_id":"forbidden"}`,
-		`{"frame":"provider.start.started","provider":"forbidden"}`,
-		`{"frame":"provider.start.ack","status":"admitted","provider":"forbidden"}`,
-		`{"frame":"provider.start.ack","status":"unknown"}`,
+		`{"frame":"provider.start","attempt":1,"workspace_key":"forbidden"}`,
+		`{"frame":"provider.start.prepare","attempt":1,"lease_id":"forbidden"}`,
+		`{"frame":"provider.start.started","attempt":1,"provider":"forbidden"}`,
+		`{"frame":"provider.start.ack","attempt":1,"status":"admitted","provider":"forbidden"}`,
+		`{"frame":"provider.start.ack","attempt":1,"status":"admitted"}`,
+		`{"frame":"provider.start.ack","attempt":1,"status":"rejected","recovery_handle":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}`,
+		`{"frame":"provider.start.ack","attempt":0,"status":"unknown"}`,
 	} {
 		if _, err := Decode([]byte(raw)); err == nil {
 			t.Fatalf("Decode(%s) accepted non-minimal provider-start frame", raw)

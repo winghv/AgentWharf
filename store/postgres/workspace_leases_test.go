@@ -79,6 +79,25 @@ func TestProviderStartAdmissionContract(t *testing.T) {
 		}
 	})
 
+	t.Run("re-admits only an explicit restarted child", func(t *testing.T) {
+		harness, admission, key := newAdmission(t)
+		if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err != nil {
+			t.Fatalf("RecordProviderStartAdmission() = %v", err)
+		}
+		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error { return nil }); err == nil {
+			t.Fatal("implicit provider restart was admitted")
+		}
+		admission.ReAdmission = true
+		called := false
+		lease, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+			called = true
+			return nil
+		})
+		if err != nil || !called || lease.Key != key || lease.Status != store.WorkspaceLeaseStartReceived {
+			t.Fatalf("explicit provider restart = %+v, called=%t, err=%v", lease, called, err)
+		}
+	})
+
 	t.Run("callback failure leaves the lease reserved", func(t *testing.T) {
 		harness, admission, key := newAdmission(t)
 		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {

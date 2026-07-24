@@ -2782,8 +2782,8 @@ func (s *Store) WithProviderStartAdmission(ctx context.Context, request store.Pr
 	if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
 		return store.WorkspaceLease{}, errors.New("provider start authority lost")
 	}
-	rows, err := tx.Query(ctx, `SELECT workspace_key, version, worker_id FROM session_workspace_leases
-WHERE session_id=$1 AND connection_epoch=$2 AND credential_generation=$3 AND lease_id=$4 AND status='reserved'
+	rows, err := tx.Query(ctx, `SELECT workspace_key, version, worker_id, status FROM session_workspace_leases
+WHERE session_id=$1 AND connection_epoch=$2 AND credential_generation=$3 AND lease_id=$4 AND status IN ('reserved', 'start_received')
 FOR UPDATE`, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID)
 	if err != nil {
 		return store.WorkspaceLease{}, fmt.Errorf("lock provider workspace lease: %w", err)
@@ -2792,11 +2792,15 @@ FOR UPDATE`, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.C
 	var key string
 	var version int64
 	var workerID string
-	if !rows.Next() || rows.Scan(&key, &version, &workerID) != nil || rows.Next() || rows.Err() != nil {
+	var status string
+	if !rows.Next() || rows.Scan(&key, &version, &workerID, &status) != nil || rows.Next() || rows.Err() != nil {
 		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
 	}
 	rows.Close()
 	if rows.Err() != nil {
+		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+	}
+	if status == string(store.WorkspaceLeaseStartReceived) && !request.ReAdmission {
 		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
 	}
 	if callback != nil {
@@ -2804,12 +2808,20 @@ FOR UPDATE`, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.C
 			return store.WorkspaceLease{}, fmt.Errorf("provider start callback: %w", err)
 		}
 	}
-	row, err := db.New(tx).RecordWorkspaceStartReceived(ctx, db.RecordWorkspaceStartReceivedParams{
-		WorkspaceKey: key, ExpectedVersion: version, WorkerID: workerID, SessionID: request.SessionID,
-		ConnectionEpoch: request.Writer.ConnectionEpoch, CredentialGeneration: request.Writer.CredentialGeneration, LeaseID: request.Writer.LeaseID,
-	})
-	if err != nil {
-		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+	var row db.SessionWorkspaceLease
+	if status == string(store.WorkspaceLeaseReserved) {
+		row, err = db.New(tx).RecordWorkspaceStartReceived(ctx, db.RecordWorkspaceStartReceivedParams{
+			WorkspaceKey: key, ExpectedVersion: version, WorkerID: workerID, SessionID: request.SessionID,
+			ConnectionEpoch: request.Writer.ConnectionEpoch, CredentialGeneration: request.Writer.CredentialGeneration, LeaseID: request.Writer.LeaseID,
+		})
+		if err != nil {
+			return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+		}
+	} else {
+		row, err = db.New(tx).WorkspaceLeaseByKey(ctx, key)
+		if err != nil || row.Status != string(store.WorkspaceLeaseStartReceived) {
+			return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+		}
 	}
 	if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
 		return store.WorkspaceLease{}, errors.New("provider start authority lost")

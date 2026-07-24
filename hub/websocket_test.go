@@ -151,28 +151,36 @@ func TestWebSocketV2ProviderStartUsesStoreLinearizedAdmission(t *testing.T) {
 	if _, err := events.ReserveWorkspaceLease(ctx, store.WorkspaceLeaseReserve{Key: key, Owner: store.WorkspaceLeaseOwner{WorkerID: "worker_start", SessionID: receipt.SessionID, ConnectionEpoch: receipt.ConnectionEpoch, CredentialGeneration: receipt.CredentialGeneration, LeaseID: receipt.WriterLeaseID}, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatalf("ReserveWorkspaceLease() = %v", err)
 	}
-	writeFrame(t, adapter, &protocol.ProviderStart{})
-	if _, ok := readFrame(t, adapter).(*protocol.ProviderStartPrepare); !ok {
+	writeFrame(t, adapter, &protocol.ProviderStart{Attempt: 1})
+	if prepare, ok := readFrame(t, adapter).(*protocol.ProviderStartPrepare); !ok || prepare.Attempt != 1 {
 		t.Fatal("provider start did not enter the Store-held prepare phase")
 	}
-	writeFrame(t, adapter, &protocol.ProviderStartStarted{})
-	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Status != protocol.ProviderStartAdmitted {
+	writeFrame(t, adapter, &protocol.ProviderStartStarted{Attempt: 1})
+	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Attempt != 1 || ack.Status != protocol.ProviderStartAdmitted || ack.RecoveryHandle == "" {
 		t.Fatalf("provider start ack = %+v", ack)
 	}
 	lease, err := events.WorkspaceLease(ctx, key)
 	if err != nil || lease.Status != store.WorkspaceLeaseStartReceived {
 		t.Fatalf("workspace start receipt = %+v, %v", lease, err)
 	}
-	writeFrame(t, adapter, &protocol.ProviderStart{})
-	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Status != protocol.ProviderStartRejected {
-		t.Fatalf("duplicate provider start ack = %+v", ack)
+	writeFrame(t, adapter, &protocol.ProviderStart{Attempt: 2})
+	if prepare, ok := readFrame(t, adapter).(*protocol.ProviderStartPrepare); !ok || prepare.Attempt != 2 {
+		t.Fatal("provider restart did not enter the Store-held prepare phase")
+	}
+	writeFrame(t, adapter, &protocol.ProviderStartStarted{Attempt: 2})
+	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Attempt != 2 || ack.Status != protocol.ProviderStartAdmitted || ack.RecoveryHandle == "" {
+		t.Fatalf("provider restart ack = %+v", ack)
+	}
+	writeFrame(t, adapter, &protocol.ProviderStart{Attempt: 2})
+	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Attempt != 2 || ack.Status != protocol.ProviderStartRejected {
+		t.Fatalf("duplicate provider restart ack = %+v", ack)
 	}
 
 	v1 := dialWebSocket(t, server.URL)
 	defer v1.Close(websocket.StatusNormalClosure, "")
 	writeAdapterHelloVersionFor(t, v1, "adapter-token", "ses_1", protocol.ProtocolVersion)
 	_ = readFrame(t, v1).(*protocol.HelloAck)
-	writeFrame(t, v1, &protocol.ProviderStart{})
+	writeFrame(t, v1, &protocol.ProviderStart{Attempt: 1})
 	if _, ok := readFrame(t, v1).(*protocol.Error); !ok {
 		t.Fatal("v1 Adapter start was not rejected")
 	}

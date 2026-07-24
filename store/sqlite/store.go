@@ -2761,11 +2761,12 @@ func (s *Store) WithProviderStartAdmission(ctx context.Context, request store.Pr
 	}
 	var key store.WorkspaceLeaseKey
 	var raw []byte
-	rows, err := tx.QueryContext(ctx, `SELECT workspace_key FROM session_workspace_leases
+	rows, err := tx.QueryContext(ctx, `SELECT workspace_key, status FROM session_workspace_leases
 WHERE session_id=? AND connection_epoch=? AND credential_generation=? AND lease_id=?
-  AND status='reserved' AND expires_at_ns > ?
+  AND status IN ('reserved', 'start_received') AND expires_at_ns > ?
   AND (child_scope_expires_at_ns IS NULL OR child_scope_expires_at_ns > ?)`, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, nowMS*int64(time.Millisecond), nowMS*int64(time.Millisecond))
-	if err != nil || !rows.Next() || rows.Scan(&raw) != nil || rows.Next() || rows.Err() != nil || len(raw) != len(key) {
+	var status string
+	if err != nil || !rows.Next() || rows.Scan(&raw, &status) != nil || rows.Next() || rows.Err() != nil || len(raw) != len(key) {
 		if err != nil {
 			return store.WorkspaceLease{}, fmt.Errorf("find provider start admission: %w", err)
 		}
@@ -2775,21 +2776,26 @@ WHERE session_id=? AND connection_epoch=? AND credential_generation=? AND lease_
 	if err := rows.Close(); err != nil {
 		return store.WorkspaceLease{}, fmt.Errorf("close provider start admission rows: %w", err)
 	}
+	if status == string(store.WorkspaceLeaseStartReceived) && !request.ReAdmission {
+		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+	}
 	if callback != nil {
 		if err := callback(ctx); err != nil {
 			return store.WorkspaceLease{}, fmt.Errorf("provider start callback: %w", err)
 		}
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE session_workspace_leases
+	if status == string(store.WorkspaceLeaseReserved) {
+		result, err := tx.ExecContext(ctx, `UPDATE session_workspace_leases
 SET status='start_received', version=version+1, updated_at_ms=?
 WHERE workspace_key=? AND session_id=? AND connection_epoch=? AND credential_generation=? AND lease_id=?
   AND status='reserved' AND expires_at_ns > ?
   AND (child_scope_expires_at_ns IS NULL OR child_scope_expires_at_ns > ?)`, nowMS, key[:], request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, nowMS*int64(time.Millisecond), nowMS*int64(time.Millisecond))
-	if err != nil {
-		return store.WorkspaceLease{}, fmt.Errorf("record provider start admission: %w", err)
-	}
-	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
-		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+		if err != nil {
+			return store.WorkspaceLease{}, fmt.Errorf("record provider start admission: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+			return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+		}
 	}
 	if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
 		return store.WorkspaceLease{}, errors.New("provider start authority lost")

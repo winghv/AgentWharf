@@ -201,22 +201,29 @@ type ConnectionAuthorityReceipt struct {
 	ExpiresAt            int64  `json:"expires_at"`
 }
 
-// ProviderStart requests the v2 Adapter-only Store-linearized start admission.
-// The Adapter never selects a workspace or authority tuple: the Hub binds this
-// empty request to its authenticated live connection.
-type ProviderStart struct{}
+// ProviderStart requests one v2 Adapter-only Store-linearized child start.
+// Attempt is strictly increasing for the authenticated connection; the Hub
+// binds it to its current authority tuple and never accepts workspace input.
+type ProviderStart struct {
+	Attempt int `json:"attempt"`
+}
 
 func (*ProviderStart) FrameName() FrameName { return FrameProviderStart }
 
 // ProviderStartPrepare is Hub-to-Adapter only. It confirms that the Hub holds
-// the bounded Store transaction; it is not permission to forward work.
-type ProviderStartPrepare struct{}
+// the bounded Store transaction for this exact attempt; it is not permission
+// to forward work.
+type ProviderStartPrepare struct {
+	Attempt int `json:"attempt"`
+}
 
 func (*ProviderStartPrepare) FrameName() FrameName { return FrameProviderStartPrepare }
 
 // ProviderStartStarted confirms that the Adapter crossed the process-start
 // boundary while the Hub's Store admission transaction remains open.
-type ProviderStartStarted struct{}
+type ProviderStartStarted struct {
+	Attempt int `json:"attempt"`
+}
 
 func (*ProviderStartStarted) FrameName() FrameName { return FrameProviderStartStarted }
 
@@ -227,10 +234,14 @@ const (
 	ProviderStartRejected ProviderStartStatus = "rejected"
 )
 
-// ProviderStartAck is deliberately reference-only. It neither reveals the
-// selected workspace nor carries Provider configuration or credentials.
+// ProviderStartAck is deliberately reference-only. RecoveryHandle is an
+// opaque, non-secret fencing reference emitted only after the Store commits
+// admission; it neither reveals the selected workspace nor carries Provider
+// configuration or credentials.
 type ProviderStartAck struct {
-	Status ProviderStartStatus `json:"status"`
+	Attempt        int                 `json:"attempt"`
+	Status         ProviderStartStatus `json:"status"`
+	RecoveryHandle string              `json:"recovery_handle,omitempty"`
 }
 
 func (*ProviderStartAck) FrameName() FrameName { return FrameProviderStartAck }
@@ -599,36 +610,75 @@ func Decode(data []byte) (Frame, error) {
 }
 
 func decodeProviderStart(data []byte) (Frame, error) {
-	if _, err := targetJoinFields(data, FrameProviderStart); err != nil {
+	fields, err := targetJoinFields(data, FrameProviderStart, "attempt")
+	if err != nil {
 		return nil, targetJoinError(FrameProviderStart)
 	}
-	return &ProviderStart{}, nil
+	var out ProviderStart
+	if json.Unmarshal(fields["attempt"], &out.Attempt) != nil || out.Attempt < 1 {
+		return nil, targetJoinError(FrameProviderStart)
+	}
+	return &out, nil
 }
 
 func decodeProviderStartPrepare(data []byte) (Frame, error) {
-	if _, err := targetJoinFields(data, FrameProviderStartPrepare); err != nil {
+	fields, err := targetJoinFields(data, FrameProviderStartPrepare, "attempt")
+	if err != nil {
 		return nil, targetJoinError(FrameProviderStartPrepare)
 	}
-	return &ProviderStartPrepare{}, nil
+	var out ProviderStartPrepare
+	if json.Unmarshal(fields["attempt"], &out.Attempt) != nil || out.Attempt < 1 {
+		return nil, targetJoinError(FrameProviderStartPrepare)
+	}
+	return &out, nil
 }
 
 func decodeProviderStartStarted(data []byte) (Frame, error) {
-	if _, err := targetJoinFields(data, FrameProviderStartStarted); err != nil {
+	fields, err := targetJoinFields(data, FrameProviderStartStarted, "attempt")
+	if err != nil {
 		return nil, targetJoinError(FrameProviderStartStarted)
 	}
-	return &ProviderStartStarted{}, nil
+	var out ProviderStartStarted
+	if json.Unmarshal(fields["attempt"], &out.Attempt) != nil || out.Attempt < 1 {
+		return nil, targetJoinError(FrameProviderStartStarted)
+	}
+	return &out, nil
 }
 
 func decodeProviderStartAck(data []byte) (Frame, error) {
-	fields, err := targetJoinFields(data, FrameProviderStartAck, "status")
+	fields, err := targetJoinFields(data, FrameProviderStartAck, "attempt", "status", "recovery_handle")
+	if err != nil {
+		fields, err = targetJoinFields(data, FrameProviderStartAck, "attempt", "status")
+	}
 	if err != nil {
 		return nil, targetJoinError(FrameProviderStartAck)
 	}
-	var status ProviderStartStatus
-	if json.Unmarshal(fields["status"], &status) != nil || (status != ProviderStartAdmitted && status != ProviderStartRejected) {
+	var out ProviderStartAck
+	if json.Unmarshal(fields["attempt"], &out.Attempt) != nil || out.Attempt < 1 ||
+		json.Unmarshal(fields["status"], &out.Status) != nil || (out.Status != ProviderStartAdmitted && out.Status != ProviderStartRejected) {
 		return nil, targetJoinError(FrameProviderStartAck)
 	}
-	return &ProviderStartAck{Status: status}, nil
+	if raw, ok := fields["recovery_handle"]; ok {
+		if json.Unmarshal(raw, &out.RecoveryHandle) != nil || !validRecoveryHandle(out.RecoveryHandle) {
+			return nil, targetJoinError(FrameProviderStartAck)
+		}
+	}
+	if (out.Status == ProviderStartAdmitted) != (out.RecoveryHandle != "") {
+		return nil, targetJoinError(FrameProviderStartAck)
+	}
+	return &out, nil
+}
+
+func validRecoveryHandle(value string) bool {
+	if len(value) < 32 || len(value) > 128 {
+		return false
+	}
+	for _, char := range value {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeAttentionSubscribe(data []byte) (Frame, error) {

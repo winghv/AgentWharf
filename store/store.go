@@ -395,9 +395,10 @@ type AdapterConnectionAuthorityReceiptStore interface {
 // turn one reserved WorkspaceLease into durable start_received. It intentionally
 // excludes Provider configuration, paths, content, and credentials.
 type ProviderStartAdmission struct {
-	SessionID string
-	Admission AdapterConnectionAdmission
-	Writer    SettingsWriter
+	SessionID   string
+	Admission   AdapterConnectionAdmission
+	Writer      SettingsWriter
+	ReAdmission bool
 }
 
 // ProviderStartAdmissionStore linearizes the final connection and workspace

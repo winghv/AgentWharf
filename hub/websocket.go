@@ -2,6 +2,8 @@ package hub
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -265,17 +267,18 @@ type sessionCredentialActivationPreflight interface {
 }
 
 type adapterConnection struct {
-	conn               *managedConn
-	writeGate          contextWriteGate
-	effectMu           sync.Mutex
-	sessionID          string
-	provider           string
-	protocolVersion    int
-	handler            *webSocketHandler
-	admission          store.AdapterConnectionAdmission
-	credentialEvidence auth.SessionCredentialEvidence
-	settingsWriter     store.SettingsWriter
-	events             *adapterEventBatcher
+	conn                 *managedConn
+	writeGate            contextWriteGate
+	effectMu             sync.Mutex
+	sessionID            string
+	provider             string
+	protocolVersion      int
+	handler              *webSocketHandler
+	admission            store.AdapterConnectionAdmission
+	credentialEvidence   auth.SessionCredentialEvidence
+	settingsWriter       store.SettingsWriter
+	events               *adapterEventBatcher
+	providerStartAttempt int
 }
 
 type queuedCommand struct {
@@ -487,7 +490,7 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *managedConn, acce
 				_ = h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{Code: "unsupported_frame", Message: "provider start is v2 Adapter-only"})
 				continue
 			}
-			if err := h.handleProviderStart(ctx, adapter); err != nil {
+			if err := h.handleProviderStart(ctx, adapter, typed); err != nil {
 				return
 			}
 		case *protocol.CredentialRotationRequest:
@@ -1865,26 +1868,30 @@ func (h *webSocketHandler) handleSettingsChange(ctx context.Context, conn *manag
 	return nil
 }
 
-func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *adapterConnection) error {
-	if adapter == nil || h.events == nil {
+func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *adapterConnection, request *protocol.ProviderStart) error {
+	if adapter == nil || request == nil || request.Attempt < 1 || h.events == nil {
 		return errAdapterAuthorityLost
+	}
+	if request.Attempt != adapter.providerStartAttempt+1 {
+		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartRejected})
 	}
 	admissions, ok := h.events.(store.ProviderStartAdmissionStore)
 	if !ok {
-		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Status: protocol.ProviderStartRejected})
+		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartRejected})
 	}
 	err := withAdapterAuthorityBudget(ctx, func(admissionCtx context.Context) error {
 		_, err := admissions.WithProviderStartAdmission(admissionCtx, store.ProviderStartAdmission{
-			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter,
+			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter, ReAdmission: request.Attempt > 1,
 		}, func(startCtx context.Context) error {
-			if err := adapter.writeFrame(startCtx, &protocol.ProviderStartPrepare{}); err != nil {
+			if err := adapter.writeFrame(startCtx, &protocol.ProviderStartPrepare{Attempt: request.Attempt}); err != nil {
 				return fmt.Errorf("send provider start prepare: %w", err)
 			}
 			frame, err := readProtocolFrame(startCtx, adapter.conn)
 			if err != nil {
 				return fmt.Errorf("read provider start proof: %w", err)
 			}
-			if _, ok := frame.(*protocol.ProviderStartStarted); !ok {
+			started, ok := frame.(*protocol.ProviderStartStarted)
+			if !ok || started.Attempt != request.Attempt {
 				return fmt.Errorf("provider start proof = %T", frame)
 			}
 			return nil
@@ -1892,9 +1899,22 @@ func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *ada
 		return err
 	})
 	if err != nil {
-		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Status: protocol.ProviderStartRejected})
+		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartRejected})
 	}
-	return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Status: protocol.ProviderStartAdmitted})
+	handle, err := newRecoveryStartHandle()
+	if err != nil {
+		return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartRejected})
+	}
+	adapter.providerStartAttempt = request.Attempt
+	return adapter.writeFrame(ctx, &protocol.ProviderStartAck{Attempt: request.Attempt, Status: protocol.ProviderStartAdmitted, RecoveryHandle: handle})
+}
+
+func newRecoveryStartHandle() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
 }
 
 func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter *adapterConnection, ack *protocol.CommandAck) error {

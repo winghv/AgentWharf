@@ -564,6 +564,33 @@ func TestGroupSupervisorRejectsInvalidRecoveryTupleBeforeVerifier(t *testing.T) 
 	}
 }
 
+func TestGroupSupervisorRecoveryFencesMismatchedOpaqueStartHandle(t *testing.T) {
+	leases := &recordingWorkspaceLeaseReserver{}
+	group, err := NewGroupSupervisor(GroupSupervisorConfig{
+		MaxWorkers: 1, Leases: leases,
+		NewWorker: func(SessionWorkerConfig) (SessionWorkerRunner, error) { return &fakeGroupWorker{}, nil },
+	})
+	if err != nil {
+		t.Fatalf("NewGroupSupervisor() = %v", err)
+	}
+	recovery := validGroupWorkerRecovery("worker_handle", "ses_handle", 9)
+	handle, err := NewRecoveryStartHandle("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+	if err != nil {
+		t.Fatalf("NewRecoveryStartHandle() = %v", err)
+	}
+	authority, err := NewRecoveryAuthorityWithStartHandle(recovery.Authority.receipt, recovery.Authority.lifecycle, handle)
+	if err != nil {
+		t.Fatalf("NewRecoveryAuthorityWithStartHandle() = %v", err)
+	}
+	recovery.Authority = authority
+	if err := group.Recover(context.Background(), recovery); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("Recover() mismatched opaque start handle = %v, want authority loss", err)
+	}
+	if got := group.WorkerCount(); got != 0 {
+		t.Fatalf("rejected recovery worker count = %d, want 0", got)
+	}
+}
+
 func TestGroupSupervisorRecoveryDependenciesRunOutsideSupervisorLock(t *testing.T) {
 	leases := &recordingWorkspaceLeaseReserver{}
 	var group *GroupSupervisor

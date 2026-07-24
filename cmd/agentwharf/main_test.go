@@ -1374,12 +1374,19 @@ func TestRunWrapV2ProviderDoesNotStartAfterAdmissionRejection(t *testing.T) {
 		if err != nil {
 			return
 		}
-		if _, ok := frame.(*protocol.ProviderStart); !ok {
+		start, ok := frame.(*protocol.ProviderStart)
+		if !ok || start.Attempt != 1 {
 			t.Errorf("provider start frame = %T", frame)
 			return
 		}
 		startSeen <- struct{}{}
-		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Status: protocol.ProviderStartRejected})
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: start.Attempt}); err != nil {
+			return
+		}
+		if _, err := readFrameFromConn(ctx, conn); err != nil {
+			return
+		}
+		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: start.Attempt, Status: protocol.ProviderStartRejected})
 	}))
 	defer server.Close()
 	_, err := runWrap(ctx, wrapConfig{HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_v2", Provider: "claude-code", AdapterToken: "adapter-token", Format: "jsonstream", ProtocolVersion: protocol.ProtocolVersionV2, ProviderCommand: []string{os.Args[0]}}, nil, io.Discard)
@@ -1416,7 +1423,7 @@ func TestRunWrapV2ProviderStopsAfterFinalAdmissionRejection(t *testing.T) {
 			t.Errorf("provider start request = %T, %v", frame, err)
 			return
 		}
-		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{}); err != nil {
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: 1}); err != nil {
 			return
 		}
 		if frame, err := readFrameFromConn(ctx, conn); err != nil || frame.FrameName() != protocol.FrameProviderStartStarted {
@@ -1435,7 +1442,7 @@ func TestRunWrapV2ProviderStopsAfterFinalAdmissionRejection(t *testing.T) {
 			return
 		}
 		proofSeen <- struct{}{}
-		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Status: protocol.ProviderStartRejected})
+		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: 1, Status: protocol.ProviderStartRejected})
 	}))
 	defer server.Close()
 	_, err := runWrap(ctx, wrapConfig{HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_v2", Provider: "claude-code", AdapterToken: "adapter-token", Format: "jsonstream", ProtocolVersion: protocol.ProtocolVersionV2, ProviderCommand: []string{os.Args[0]}}, nil, io.Discard)
@@ -1452,6 +1459,61 @@ func TestRunWrapV2ProviderStopsAfterFinalAdmissionRejection(t *testing.T) {
 	}
 	content, _ := os.ReadFile(marker)
 	t.Fatalf("started provider was not stopped after final rejection: %q", content)
+}
+
+func TestRunWrapV2ReAdmitsEveryRestartedChild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	t.Setenv("AGENTWHARF_RESTART_CRASH_HELPER", "1")
+	attempts := make(chan int, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		if _, err := readFrameFromConn(ctx, conn); err != nil {
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_v2", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_v2", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_v2", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
+			return
+		}
+		for expected := 1; expected <= 2; expected++ {
+			frame, err := readFrameFromConn(ctx, conn)
+			if err != nil {
+				return
+			}
+			start, ok := frame.(*protocol.ProviderStart)
+			if !ok || start.Attempt != expected {
+				t.Errorf("provider start = %T %+v, want attempt %d", frame, frame, expected)
+				return
+			}
+			if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: expected}); err != nil {
+				return
+			}
+			frame, err = readFrameFromConn(ctx, conn)
+			if started, ok := frame.(*protocol.ProviderStartStarted); err != nil || !ok || started.Attempt != expected {
+				t.Errorf("provider start proof = %T %+v, %v", frame, frame, err)
+				return
+			}
+			attempts <- expected
+			if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: expected, Status: protocol.ProviderStartAdmitted, RecoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	_, _ = runWrap(ctx, wrapConfig{HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_v2", Provider: "claude-code", AdapterToken: "adapter-token", Format: "jsonstream", ProtocolVersion: protocol.ProtocolVersionV2, ProviderCommand: []string{os.Args[0], "-test.run=TestProcessSupervisorHelperProcess"}}, nil, io.Discard)
+	for _, want := range []int{1, 2} {
+		select {
+		case got := <-attempts:
+			if got != want {
+				t.Fatalf("admitted attempt = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for admitted attempt %d", want)
+		}
+	}
 }
 
 func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
@@ -1805,6 +1867,9 @@ func assertSignal(t *testing.T, ch <-chan struct{}, name string) {
 }
 
 func TestMain(m *testing.M) {
+	if os.Getenv("AGENTWHARF_RESTART_CRASH_HELPER") == "1" {
+		os.Exit(2)
+	}
 	if os.Getenv("AGENTWHARF_START_BLOCK_HELPER") == "1" {
 		runWrapStartBlockProviderHelper()
 		return

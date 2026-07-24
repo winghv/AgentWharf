@@ -650,19 +650,6 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 			if ack.ConnectionAuthority == nil {
 				return cfg, errors.New("provider start requires v2 connection authority")
 			}
-			if err := writeCLIProtocolFrame(ctx, conn, &protocol.ProviderStart{}); err != nil {
-				return cfg, fmt.Errorf("request provider start admission: %w", err)
-			}
-			frame, err := readCLIProtocolFrame(ctx, conn)
-			if err != nil {
-				return cfg, fmt.Errorf("read provider start admission: %w", err)
-			}
-			if rejected, ok := frame.(*protocol.ProviderStartAck); ok && rejected.Status == protocol.ProviderStartRejected {
-				return cfg, errors.New("provider start admission rejected")
-			}
-			if _, ok := frame.(*protocol.ProviderStartPrepare); !ok {
-				return cfg, errors.New("provider start preparation rejected")
-			}
 		}
 		return cfg, runWrapProvider(ctx, cfg, conn, masker)
 	}
@@ -1087,6 +1074,19 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 	defer stdinReader.Close()
 	defer stdinWriter.Close()
 	stdoutReader, stdoutWriter := io.Pipe()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var writeMu sync.Mutex
+	writeFrame := func(frame protocol.Frame) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeCLIProtocolFrame(runCtx, conn, frame)
+	}
+	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, conn, writeFrame)
+	var processAdmission core.ProcessStartAdmission
+	if startAdmission != nil {
+		processAdmission = startAdmission
+	}
 	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
 		Command: core.ProcessCommand{
 			Path:       cfg.ProviderCommand[0],
@@ -1096,22 +1096,15 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 			Stderr:     os.Stderr,
 			Credential: cfg.ProviderCredential,
 		},
+		StartAdmission: processAdmission,
 	})
 	if err != nil {
 		return err
 	}
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	processDone := make(chan error, 1)
 	outputDone := make(chan error, 1)
 	commandDone := make(chan error, 1)
-	var writeMu sync.Mutex
-	writeFrame := func(frame protocol.Frame) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		return writeCLIProtocolFrame(runCtx, conn, frame)
-	}
 	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
 	startSupervisor := func() {
 		go func() {
@@ -1121,12 +1114,10 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		}()
 	}
 	startSupervisor()
-	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
-		if err := completeProviderStartAdmission(runCtx, conn, supervisor); err != nil {
-			cancel()
-			stopProviderSupervisor(supervisor)
-			return err
-		}
+	if err := waitForFirstProviderStartAdmission(runCtx, startAdmission, processDone); err != nil {
+		cancel()
+		stopProviderSupervisor(supervisor)
+		return err
 	}
 	go func() {
 		outputDone <- streamProviderOutput(runCtx, cfg, stdoutReader, func(event protocol.Event) error {
@@ -1138,7 +1129,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToProvider(runCtx, conn, stdinWriter, writeFrame, observePong)
+		commandDone <- forwardHubCommandsToProvider(runCtx, conn, stdinWriter, writeFrame, observePong, startAdmission)
 	}()
 
 	var processErr error
@@ -1196,6 +1187,19 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	defer stdinReader.Close()
 	defer stdinWriter.Close()
 	stdoutReader, stdoutWriter := io.Pipe()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var writeMu sync.Mutex
+	writeFrame := func(frame protocol.Frame) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeCLIProtocolFrame(runCtx, conn, frame)
+	}
+	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, conn, writeFrame)
+	var processAdmission core.ProcessStartAdmission
+	if startAdmission != nil {
+		processAdmission = startAdmission
+	}
 	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
 		Command: core.ProcessCommand{
 			Path:       cfg.ProviderCommand[0],
@@ -1205,13 +1209,12 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 			Stderr:     os.Stderr,
 			Credential: cfg.ProviderCredential,
 		},
+		StartAdmission: processAdmission,
 	})
 	if err != nil {
 		return err
 	}
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	processDone := make(chan error, 1)
 	startSupervisor := func() {
 		go func() {
@@ -1221,12 +1224,10 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		}()
 	}
 	startSupervisor()
-	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
-		if err := completeProviderStartAdmission(runCtx, conn, supervisor); err != nil {
-			cancel()
-			stopProviderSupervisor(supervisor)
-			return err
-		}
+	if err := waitForFirstProviderStartAdmission(runCtx, startAdmission, processDone); err != nil {
+		cancel()
+		stopProviderSupervisor(supervisor)
+		return err
 	}
 
 	scanner := bufio.NewScanner(stdoutReader)
@@ -1282,14 +1283,8 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 
 	outputDone := make(chan error, 1)
 	commandDone := make(chan error, 1)
-	var writeMu sync.Mutex
 	var permissionMu sync.Mutex
 	pendingPermissions := make(map[string]acpPendingPermission)
-	writeFrame := func(frame protocol.Frame) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		return writeCLIProtocolFrame(runCtx, conn, frame)
-	}
 	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
 	go func() {
 		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, func(line []byte) {
@@ -1303,7 +1298,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, observePong, providerSessionID, 3, pendingPermissions, &permissionMu)
+		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, observePong, providerSessionID, 3, pendingPermissions, &permissionMu, startAdmission)
 	}()
 
 	processFinished := false
@@ -1353,30 +1348,174 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	}
 }
 
-// completeProviderStartAdmission proves the process crossed its start boundary
-// while the Hub holds the Store transaction. No Hub work is forwarded until
-// the Hub commits that durable start receipt and returns admitted.
-func completeProviderStartAdmission(ctx context.Context, conn *websocket.Conn, supervisor *core.ProcessSupervisor) error {
-	select {
-	case event := <-supervisor.Events():
-		if event.Type != core.ProcessEventStarted {
-			return fmt.Errorf("provider exited before start admission: %s", event.Type)
-		}
-	case <-ctx.Done():
-		return fmt.Errorf("wait provider start: %w", ctx.Err())
+// providerStartAdmission is the Adapter-side, per-child handshake. The first
+// exchange owns the socket reader directly; later exchanges are delivered by
+// the command reader so ProcessSupervisor retries cannot race command routing.
+type providerStartAdmission struct {
+	conn  *websocket.Conn
+	write func(protocol.Frame) error
+
+	mu             sync.Mutex
+	direct         bool
+	recoveryHandle string
+	prepare        chan *protocol.ProviderStartPrepare
+	ack            chan *protocol.ProviderStartAck
+	firstAdmitted  chan struct{}
+	firstAdmitOnce sync.Once
+}
+
+func newProviderStartAdmission(version int, conn *websocket.Conn, write func(protocol.Frame) error) *providerStartAdmission {
+	if version != protocol.ProtocolVersionV2 || conn == nil || write == nil {
+		return nil
 	}
-	if err := writeCLIProtocolFrame(ctx, conn, &protocol.ProviderStartStarted{}); err != nil {
-		return fmt.Errorf("confirm provider start: %w", err)
+	return &providerStartAdmission{
+		conn: conn, write: write, direct: true,
+		prepare: make(chan *protocol.ProviderStartPrepare, 1), ack: make(chan *protocol.ProviderStartAck, 1),
+		firstAdmitted: make(chan struct{}),
 	}
-	frame, err := readCLIProtocolFrame(ctx, conn)
-	if err != nil {
-		return fmt.Errorf("read provider start admission: %w", err)
+}
+
+func (a *providerStartAdmission) PrepareProcessStart(ctx context.Context, attempt int) error {
+	if a == nil || attempt < 1 {
+		return errors.New("provider start admission is unavailable")
 	}
-	ack, ok := frame.(*protocol.ProviderStartAck)
-	if !ok || ack.Status != protocol.ProviderStartAdmitted {
-		return errors.New("provider start admission rejected")
+	a.mu.Lock()
+	direct := a.direct
+	a.mu.Unlock()
+	if err := a.write(&protocol.ProviderStart{Attempt: attempt}); err != nil {
+		return fmt.Errorf("request provider start admission: %w", err)
+	}
+	prepare, err := a.nextPrepare(ctx, direct)
+	if err != nil || prepare.Attempt != attempt {
+		return errors.New("provider start preparation rejected")
 	}
 	return nil
+}
+
+func (a *providerStartAdmission) ConfirmProcessStarted(ctx context.Context, attempt int) error {
+	if a == nil || attempt < 1 {
+		return errors.New("provider start admission is unavailable")
+	}
+	a.mu.Lock()
+	direct := a.direct
+	a.mu.Unlock()
+	if err := a.write(&protocol.ProviderStartStarted{Attempt: attempt}); err != nil {
+		return fmt.Errorf("confirm provider start: %w", err)
+	}
+	ack, err := a.nextAck(ctx, direct)
+	if err != nil || ack.Attempt != attempt || ack.Status != protocol.ProviderStartAdmitted || ack.RecoveryHandle == "" {
+		return errors.New("provider start admission rejected")
+	}
+	a.mu.Lock()
+	a.direct = false
+	a.recoveryHandle = ack.RecoveryHandle
+	a.mu.Unlock()
+	a.firstAdmitOnce.Do(func() { close(a.firstAdmitted) })
+	return nil
+}
+
+func (a *providerStartAdmission) nextPrepare(ctx context.Context, direct bool) (*protocol.ProviderStartPrepare, error) {
+	if direct {
+		frame, err := readCLIProtocolFrame(ctx, a.conn)
+		if err != nil {
+			return nil, err
+		}
+		prepare, ok := frame.(*protocol.ProviderStartPrepare)
+		if !ok {
+			return nil, errors.New("provider start preparation rejected")
+		}
+		return prepare, nil
+	}
+	select {
+	case prepare := <-a.prepare:
+		return prepare, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (a *providerStartAdmission) nextAck(ctx context.Context, direct bool) (*protocol.ProviderStartAck, error) {
+	if direct {
+		frame, err := readCLIProtocolFrame(ctx, a.conn)
+		if err != nil {
+			return nil, err
+		}
+		ack, ok := frame.(*protocol.ProviderStartAck)
+		if !ok {
+			return nil, errors.New("provider start admission rejected")
+		}
+		return ack, nil
+	}
+	select {
+	case ack := <-a.ack:
+		return ack, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (a *providerStartAdmission) deliver(frame protocol.Frame) error {
+	if a == nil {
+		return errors.New("unexpected provider start lifecycle frame")
+	}
+	switch typed := frame.(type) {
+	case *protocol.ProviderStartPrepare:
+		select {
+		case a.prepare <- typed:
+			return nil
+		default:
+			return errors.New("unexpected provider start preparation")
+		}
+	case *protocol.ProviderStartAck:
+		select {
+		case a.ack <- typed:
+			return nil
+		default:
+			return errors.New("unexpected provider start acknowledgement")
+		}
+	default:
+		return errors.New("unexpected provider start lifecycle frame")
+	}
+}
+
+// RecoveryStartHandle returns only the opaque committed-start reference that a
+// later GroupSupervisor recovery fence may compare. It cannot expose a Store
+// key, credential, path, content, or Provider configuration.
+func (a *providerStartAdmission) RecoveryStartHandle() (core.RecoveryStartHandle, error) {
+	if a == nil {
+		return core.RecoveryStartHandle{}, errors.New("provider start admission is unavailable")
+	}
+	a.mu.Lock()
+	handle := a.recoveryHandle
+	a.mu.Unlock()
+	return core.NewRecoveryStartHandle(handle)
+}
+
+func waitForFirstProviderStartAdmission(ctx context.Context, admission *providerStartAdmission, processDone <-chan error) error {
+	if admission == nil {
+		return nil
+	}
+	select {
+	case <-admission.firstAdmitted:
+		return nil
+	default:
+	}
+	select {
+	case <-admission.firstAdmitted:
+		return nil
+	case err := <-processDone:
+		select {
+		case <-admission.firstAdmitted:
+			return nil
+		default:
+		}
+		if err == nil {
+			return errors.New("provider exited before start admission")
+		}
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("wait provider start admission: %w", ctx.Err())
+	}
 }
 
 func stopProviderSupervisor(supervisor *core.ProcessSupervisor) {
@@ -1528,7 +1667,7 @@ func translateWrapLine(cfg wrapConfig, line []byte) ([]protocol.Event, error) {
 	}
 }
 
-func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string)) error {
+func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), startAdmission *providerStartAdmission) error {
 	defer stdin.Close()
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
@@ -1536,6 +1675,10 @@ func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, std
 			return ignoreContextError(err)
 		}
 		switch typed := frame.(type) {
+		case *protocol.ProviderStartPrepare, *protocol.ProviderStartAck:
+			if err := startAdmission.deliver(typed); err != nil {
+				return err
+			}
 		case *protocol.Command:
 			if err := writeProviderCommand(stdin, typed); err != nil {
 				return err
@@ -1600,7 +1743,7 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 	return nil
 }
 
-func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex) error {
+func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex, startAdmission *providerStartAdmission) error {
 	defer stdin.Close()
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
@@ -1608,6 +1751,10 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 			return ignoreContextError(err)
 		}
 		switch typed := frame.(type) {
+		case *protocol.ProviderStartPrepare, *protocol.ProviderStartAck:
+			if err := startAdmission.deliver(typed); err != nil {
+				return err
+			}
 		case *protocol.Command:
 			switch typed.Type {
 			case protocol.CommandSessionSend:

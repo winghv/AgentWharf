@@ -909,8 +909,10 @@ func TestSettingsCommandStoreContract(t *testing.T) {
 		RevokeWriter: func(t *testing.T, current store.SettingsCommandStore, sessionID string) {
 			t.Helper()
 			harness := current.(*sqliteCommandHarness)
-			now := time.Now().UnixMilli()
-			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), `UPDATE session_adapter_connections SET revoked_at_ms=?, updated_at_ms=? WHERE session_id=?`, now, now, sessionID); err != nil {
+			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), `UPDATE session_adapter_connections
+SET revoked_at_ms=CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER),
+    updated_at_ms=CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+WHERE session_id=?`, sessionID); err != nil {
 				t.Fatalf("revoke settings writer: %v", err)
 			}
 		},
@@ -1170,6 +1172,26 @@ func TestProviderStartAdmissionLinearizesLiveConnectionAndWorkspaceLease(t *test
 		}
 	})
 
+	t.Run("re-admits only an explicit restarted child", func(t *testing.T) {
+		harness, admission, key := newAdmission(t)
+		defer harness.Close()
+		if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err != nil {
+			t.Fatalf("RecordProviderStartAdmission() = %v", err)
+		}
+		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error { return nil }); err == nil {
+			t.Fatal("implicit provider restart was admitted")
+		}
+		admission.ReAdmission = true
+		called := false
+		lease, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+			called = true
+			return nil
+		})
+		if err != nil || !called || lease.Key != key || lease.Status != store.WorkspaceLeaseStartReceived {
+			t.Fatalf("explicit provider restart = %+v, called=%t, err=%v", lease, called, err)
+		}
+	})
+
 	t.Run("callback failure leaves the lease reserved", func(t *testing.T) {
 		harness, admission, key := newAdmission(t)
 		defer harness.Close()
@@ -1286,6 +1308,18 @@ func TestProviderStartAdmissionLinearizesLiveConnectionAndWorkspaceLease(t *test
 			lease, err := harness.WorkspaceLease(context.Background(), key)
 			if err != nil || lease.Status == store.WorkspaceLeaseStartReceived {
 				t.Fatalf("invalidated lease = %+v, %v", lease, err)
+			}
+		})
+		t.Run("re-admission "+invalidation.name, func(t *testing.T) {
+			harness, admission, key := newAdmission(t)
+			defer harness.Close()
+			if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err != nil {
+				t.Fatalf("record initial provider start: %v", err)
+			}
+			invalidation.apply(harness, key)
+			admission.ReAdmission = true
+			if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error { return nil }); err == nil {
+				t.Fatalf("%s re-admission was accepted after authority loss", invalidation.name)
 			}
 		})
 	}
