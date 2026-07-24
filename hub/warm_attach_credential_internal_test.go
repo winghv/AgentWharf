@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,6 +165,61 @@ func TestManagedConnRejectsOversizedIngressBeforeDecode(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("managed connection did not reject oversized ingress")
+	}
+}
+
+func TestManagedConnSerializesConcurrentWrites(t *testing.T) {
+	const writes = 8
+	ready := make(chan struct{})
+	start := make(chan struct{})
+	writeResult := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := acceptManagedConn(w, r)
+		if err != nil {
+			writeResult <- err
+			return
+		}
+		defer conn.CloseNow()
+		close(ready)
+		<-start
+
+		results := make(chan error, writes)
+		var group sync.WaitGroup
+		for range writes {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				results <- conn.Write(context.Background(), websocket.MessageText, []byte(`{"frame":"ping","nonce":"serialized"}`))
+			}()
+		}
+		group.Wait()
+		close(results)
+		for err := range results {
+			if err != nil {
+				writeResult <- err
+				return
+			}
+		}
+		writeResult <- nil
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	client, _, err := websocket.Dial(ctx, "ws"+server.URL[len("http"):], nil)
+	if err != nil {
+		t.Fatalf("dial managed connection: %v", err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "")
+	<-ready
+	close(start)
+	for range writes {
+		if _, _, err := client.Read(ctx); err != nil {
+			t.Fatalf("read serialized write: %v", err)
+		}
+	}
+	if err := <-writeResult; err != nil {
+		t.Fatalf("concurrent write: %v", err)
 	}
 }
 

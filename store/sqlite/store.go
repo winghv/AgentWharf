@@ -2784,16 +2784,30 @@ WHERE session_id=? AND connection_epoch=? AND credential_generation=? AND lease_
 			return store.WorkspaceLease{}, fmt.Errorf("provider start callback: %w", err)
 		}
 	}
+	commitNowMS, err := sqliteNowMillis(ctx, tx)
+	if err != nil {
+		return store.WorkspaceLease{}, err
+	}
 	if status == string(store.WorkspaceLeaseReserved) {
 		result, err := tx.ExecContext(ctx, `UPDATE session_workspace_leases
 SET status='start_received', version=version+1, updated_at_ms=?
 WHERE workspace_key=? AND session_id=? AND connection_epoch=? AND credential_generation=? AND lease_id=?
   AND status='reserved' AND expires_at_ns > ?
-  AND (child_scope_expires_at_ns IS NULL OR child_scope_expires_at_ns > ?)`, nowMS, key[:], request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, nowMS*int64(time.Millisecond), nowMS*int64(time.Millisecond))
+	  AND (child_scope_expires_at_ns IS NULL OR child_scope_expires_at_ns > ?)`, commitNowMS, key[:], request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, commitNowMS*int64(time.Millisecond), commitNowMS*int64(time.Millisecond))
 		if err != nil {
 			return store.WorkspaceLease{}, fmt.Errorf("record provider start admission: %w", err)
 		}
 		if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+			return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+		}
+	} else {
+		var leaseCurrent bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM session_workspace_leases
+			WHERE workspace_key=? AND session_id=? AND connection_epoch=? AND credential_generation=? AND lease_id=?
+			  AND status='start_received' AND expires_at_ns > ?
+			  AND (child_scope_expires_at_ns IS NULL OR child_scope_expires_at_ns > ?)
+		)`, key[:], request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, commitNowMS*int64(time.Millisecond), commitNowMS*int64(time.Millisecond)).Scan(&leaseCurrent); err != nil || !leaseCurrent {
 			return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
 		}
 	}

@@ -486,14 +486,14 @@ func TestSettingsCommandStoreContract(t *testing.T) {
 		ExpireOperationDeadline: func(t *testing.T, current store.SettingsCommandStore, sessionID, commandID string) {
 			t.Helper()
 			harness := current.(*postgresCommandHarness)
-			if _, err := harness.pool.Exec(context.Background(), `UPDATE session_settings_commands SET operation_deadline=created_at + interval '1 millisecond' WHERE session_id=$1 AND cmd_id=$2`, sessionID, commandID); err != nil {
+			if _, err := harness.pool.Exec(context.Background(), `UPDATE session_settings_commands SET created_at=created_at - interval '2 milliseconds', delivery_deadline=delivery_deadline - interval '2 milliseconds', operation_deadline=created_at - interval '1 millisecond' WHERE session_id=$1 AND cmd_id=$2`, sessionID, commandID); err != nil {
 				t.Fatalf("expire settings operation deadline: %v", err)
 			}
 		},
 		ExpireFileReferenceDeliveryDeadline: func(t *testing.T, current store.SettingsCommandStore, sessionID, commandID string) {
 			t.Helper()
 			harness := current.(*postgresCommandHarness)
-			if _, err := harness.pool.Exec(context.Background(), `UPDATE session_file_reference_commands SET delivery_deadline=created_at + interval '1 millisecond' WHERE session_id=$1 AND cmd_id=$2`, sessionID, commandID); err != nil {
+			if _, err := harness.pool.Exec(context.Background(), `UPDATE session_file_reference_commands SET created_at=created_at - interval '2 milliseconds', delivery_deadline=created_at - interval '1 millisecond' WHERE session_id=$1 AND cmd_id=$2`, sessionID, commandID); err != nil {
 				t.Fatalf("expire file-reference delivery deadline: %v", err)
 			}
 		},

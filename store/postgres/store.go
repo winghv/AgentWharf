@@ -2810,6 +2810,15 @@ FOR UPDATE`, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.C
 			return store.WorkspaceLease{}, fmt.Errorf("provider start callback: %w", err)
 		}
 	}
+	var leaseCurrent bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+	SELECT 1 FROM session_workspace_leases
+	WHERE workspace_key=$1 AND session_id=$2 AND connection_epoch=$3 AND credential_generation=$4 AND lease_id=$5 AND status=$6
+	  AND reservation_expires_at > clock_timestamp()
+	  AND (child_scope_expires_at IS NULL OR child_scope_expires_at > clock_timestamp())
+)`, key, request.SessionID, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, status).Scan(&leaseCurrent); err != nil || !leaseCurrent {
+		return store.WorkspaceLease{}, errors.New("provider start admission is unavailable")
+	}
 	var row db.SessionWorkspaceLease
 	if status == string(store.WorkspaceLeaseReserved) {
 		row, err = db.New(tx).RecordWorkspaceStartReceived(ctx, db.RecordWorkspaceStartReceivedParams{

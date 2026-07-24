@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
 
 	gws "github.com/gorilla/websocket"
@@ -11,7 +12,10 @@ import (
 
 // managedConn keeps Hub's context-aware surface while exposing a synchronous
 // Pong callback to its only reader.
-type managedConn struct{ raw *gws.Conn }
+type managedConn struct {
+	raw     *gws.Conn
+	writeMu sync.Mutex
+}
 
 const hubWebSocketReadLimit = 64 << 10
 
@@ -32,6 +36,8 @@ func (c *managedConn) Read(ctx context.Context) (int, []byte, error) {
 	return c.raw.ReadMessage()
 }
 func (c *managedConn) Write(ctx context.Context, kind websocket.MessageType, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := c.raw.SetWriteDeadline(deadline); err != nil {
 			return err

@@ -895,14 +895,14 @@ func TestSettingsCommandStoreContract(t *testing.T) {
 		ExpireOperationDeadline: func(t *testing.T, current store.SettingsCommandStore, sessionID, commandID string) {
 			t.Helper()
 			harness := current.(*sqliteCommandHarness)
-			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), `UPDATE session_settings_commands SET operation_deadline_ms=created_at_ms+1 WHERE session_id=? AND cmd_id=?`, sessionID, commandID); err != nil {
+			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), `UPDATE session_settings_commands SET created_at_ms=created_at_ms-2, delivery_deadline_ms=delivery_deadline_ms-2, operation_deadline_ms=created_at_ms-1 WHERE session_id=? AND cmd_id=?`, sessionID, commandID); err != nil {
 				t.Fatalf("expire settings operation deadline: %v", err)
 			}
 		},
 		ExpireFileReferenceDeliveryDeadline: func(t *testing.T, current store.SettingsCommandStore, sessionID, commandID string) {
 			t.Helper()
 			harness := current.(*sqliteCommandHarness)
-			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), `UPDATE session_file_reference_commands SET delivery_deadline_ms=created_at_ms+1 WHERE session_id=? AND cmd_id=?`, sessionID, commandID); err != nil {
+			if _, err := openRawSQLite(t, harness.path).ExecContext(context.Background(), `UPDATE session_file_reference_commands SET created_at_ms=created_at_ms-2, delivery_deadline_ms=created_at_ms-1 WHERE session_id=? AND cmd_id=?`, sessionID, commandID); err != nil {
 				t.Fatalf("expire file-reference delivery deadline: %v", err)
 			}
 		},
@@ -1140,7 +1140,7 @@ func TestWorkspaceLeaseRejectsExpiredStartAndReleasesQuarantine(t *testing.T) {
 }
 
 func TestProviderStartAdmissionLinearizesLiveConnectionAndWorkspaceLease(t *testing.T) {
-	newAdmission := func(t *testing.T) (*sqliteWorkspaceLeaseHarness, store.ProviderStartAdmission, store.WorkspaceLeaseKey) {
+	newAdmission := func(t *testing.T, scopes ...*store.WorkspaceLeaseChildScope) (*sqliteWorkspaceLeaseHarness, store.ProviderStartAdmission, store.WorkspaceLeaseKey) {
 		t.Helper()
 		harness := newSQLiteWorkspaceLeaseHarness(t, filepath.Join(t.TempDir(), "events.db"))
 		connection, err := harness.AcceptAdapterHello(context.Background(), "ses_workspace", store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: "lease_provider_start"})
@@ -1150,7 +1150,11 @@ func TestProviderStartAdmissionLinearizesLiveConnectionAndWorkspaceLease(t *test
 		var key store.WorkspaceLeaseKey
 		key[0] = 91
 		owner := store.WorkspaceLeaseOwner{WorkerID: "worker_provider_start", SessionID: "ses_workspace", ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: "lease_provider_start"}
-		if _, err := harness.ReserveWorkspaceLease(context.Background(), store.WorkspaceLeaseReserve{Key: key, Owner: owner, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		var scope *store.WorkspaceLeaseChildScope
+		if len(scopes) > 0 {
+			scope = scopes[0]
+		}
+		if _, err := harness.ReserveWorkspaceLease(context.Background(), store.WorkspaceLeaseReserve{Key: key, ChildScope: scope, Owner: owner, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 			t.Fatalf("ReserveWorkspaceLease() = %v", err)
 		}
 		fence, err := harness.AllocateAdapterGrantFence(context.Background())
@@ -1191,6 +1195,41 @@ func TestProviderStartAdmissionLinearizesLiveConnectionAndWorkspaceLease(t *test
 			t.Fatalf("explicit provider restart = %+v, called=%t, err=%v", lease, called, err)
 		}
 	})
+
+	for _, expiry := range []struct {
+		name      string
+		scope     *store.WorkspaceLeaseChildScope
+		statement string
+	}{
+		{"reservation", nil, "UPDATE session_workspace_leases SET expires_at_ns=?"},
+		{"child scope", &store.WorkspaceLeaseChildScope{ParentKey: store.WorkspaceLeaseKey{90}, CapabilityDigest: [32]byte{92}, ExpiresAt: time.Now().Add(time.Minute)}, "UPDATE session_workspace_leases SET child_scope_expires_at_ns=?"},
+	} {
+		t.Run("rejects "+expiry.name+" that expires during re-admission callback", func(t *testing.T) {
+			harness, admission, key := newAdmission(t, expiry.scope)
+			defer harness.Close()
+			if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err != nil {
+				t.Fatalf("RecordProviderStartAdmission() = %v", err)
+			}
+			db := openRawSQLite(t, harness.path)
+			defer db.Close()
+			if _, err := db.ExecContext(context.Background(), expiry.statement, time.Now().Add(20*time.Millisecond).UnixNano()); err != nil {
+				t.Fatalf("set callback expiry: %v", err)
+			}
+			admission.ReAdmission = true
+			called := false
+			if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+				called = true
+				time.Sleep(50 * time.Millisecond)
+				return nil
+			}); err == nil || !called {
+				t.Fatalf("expired %s re-admission err=%v, callback=%t", expiry.name, err, called)
+			}
+			lease, err := harness.WorkspaceLease(context.Background(), key)
+			if err != nil || lease.Status != store.WorkspaceLeaseStartReceived {
+				t.Fatalf("expired %s lease = %+v, %v", expiry.name, lease, err)
+			}
+		})
+	}
 
 	t.Run("callback failure leaves the lease reserved", func(t *testing.T) {
 		harness, admission, key := newAdmission(t)

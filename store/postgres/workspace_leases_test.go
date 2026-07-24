@@ -147,6 +147,38 @@ func TestProviderStartAdmissionContract(t *testing.T) {
 		}
 	})
 
+	for _, expiry := range []struct {
+		name      string
+		scope     *store.WorkspaceLeaseChildScope
+		statement string
+	}{
+		{"reservation", nil, "UPDATE session_workspace_leases SET reservation_expires_at=clock_timestamp() + interval '20 milliseconds'"},
+		{"child scope", &store.WorkspaceLeaseChildScope{ParentKey: store.WorkspaceLeaseKey{72}, CapabilityDigest: [32]byte{74}, ExpiresAt: time.Now().Add(time.Minute)}, "UPDATE session_workspace_leases SET child_scope_expires_at=clock_timestamp() + interval '20 milliseconds'"},
+	} {
+		t.Run("rejects "+expiry.name+" that expires during re-admission callback", func(t *testing.T) {
+			harness, admission, key := newAdmission(t, expiry.scope)
+			if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err != nil {
+				t.Fatalf("RecordProviderStartAdmission() = %v", err)
+			}
+			if _, err := harness.pool.Exec(context.Background(), expiry.statement); err != nil {
+				t.Fatalf("set callback expiry: %v", err)
+			}
+			admission.ReAdmission = true
+			called := false
+			if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+				called = true
+				time.Sleep(50 * time.Millisecond)
+				return nil
+			}); err == nil || !called {
+				t.Fatalf("expired %s re-admission err=%v, callback=%t", expiry.name, err, called)
+			}
+			lease, err := harness.WorkspaceLease(context.Background(), key)
+			if err != nil || lease.Status != store.WorkspaceLeaseStartReceived {
+				t.Fatalf("expired %s lease = %+v, %v", expiry.name, lease, err)
+			}
+		})
+	}
+
 	t.Run("callback failure leaves the lease reserved", func(t *testing.T) {
 		harness, admission, key := newAdmission(t)
 		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
