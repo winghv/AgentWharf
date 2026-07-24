@@ -1438,6 +1438,10 @@ func (a *providerStartAdmission) ConfirmProcessStarted(ctx context.Context, atte
 		return errors.New("provider start admission rejected")
 	}
 	a.mu.Lock()
+	if a.invalidated {
+		a.mu.Unlock()
+		return errors.New("provider start authority is unavailable")
+	}
 	a.direct = false
 	a.recoveryHandle = ack.RecoveryHandle
 	a.mu.Unlock()
@@ -1569,7 +1573,7 @@ func (a *providerStartAdmission) watchLifecycle(ctx context.Context, cancel cont
 				pingCtx, pingCancel := context.WithTimeout(ctx, 100*time.Millisecond)
 				err := a.conn.Ping(pingCtx)
 				pingCancel()
-				if err != nil && websocket.CloseStatus(err) != -1 {
+				if err != nil && (websocket.CloseStatus(err) != -1 || errors.Is(err, net.ErrClosed)) {
 					a.invalidate()
 					cancel()
 					return

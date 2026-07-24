@@ -1576,6 +1576,44 @@ func TestProviderStartAdmissionInvalidationClearsRecoveryReference(t *testing.T)
 	}
 }
 
+func TestProviderStartAdmissionWatcherInvalidatesClosedSocket(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverConn := make(chan *websocket.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		serverConn <- conn
+		<-ctx.Done()
+	}))
+	defer server.Close()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	admission := &providerStartAdmission{conn: conn, recoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}
+	watchCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	admission.watchLifecycle(watchCtx, stop)
+	select {
+	case peer := <-serverConn:
+		_ = peer.Close(websocket.StatusPolicyViolation, "authority revoked")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for server connection")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := admission.RecoveryStartHandle(); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("closed Hub socket did not invalidate recovery reference")
+}
+
 func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
