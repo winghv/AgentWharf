@@ -156,9 +156,12 @@ func probeSameUIDProcAccess(ctx context.Context) error {
 	probe := `set -eu
 p=$PPID
 for target in environ mem fd/0; do
-  if dd if="/proc/$p/$target" of=/dev/null bs=1 count=1 status=none 2>/dev/null; then
-    exit 41
-  fi
+  if [ ! -e "/proc/$p/$target" ]; then
+		exit 42
+	fi
+  if : < "/proc/$p/$target" 2>/dev/null; then
+		exit 41
+	fi
 done
 exit 0
 `
@@ -172,6 +175,10 @@ exit 0
 	if err := cmd.Run(); err != nil {
 		if errors.Is(commandCtx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("%w: same-UID proc probe timed out", ErrChildConfidentialityUnavailable)
+		}
+		var execErr *exec.Error
+		if errors.As(err, &execErr) {
+			return fmt.Errorf("%w: same-UID proc probe helper is unavailable: %v", ErrChildConfidentialityUnavailable, err)
 		}
 		return fmt.Errorf("%w: same-UID proc access was not denied: %v", ErrChildConfidentialityUnproven, err)
 	}
