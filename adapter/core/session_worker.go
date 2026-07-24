@@ -73,6 +73,9 @@ const (
 type SessionWorkerCommand struct {
 	CommandID string
 	Type      string
+	// SessionID is an optional trusted routing assertion. Provider-controlled
+	// values are never used to select a Worker and must match the bound Worker.
+	SessionID string
 }
 
 // SessionWorkerDurableReceipts is the narrow Adapter-side seam to the
@@ -95,6 +98,7 @@ type SessionWorker struct {
 	sessionID  string
 	provider   *ProcessSupervisor
 	receipts   SessionWorkerDurableReceipts
+	credential *SessionCredential
 	commandMu  sync.Mutex
 	proposalMu sync.Mutex
 }
@@ -105,6 +109,7 @@ type SessionWorkerConfig struct {
 	RecoveryStartHandleSource RecoveryStartHandleSource
 	RecoveryStartHandle       *RecoveryStartHandle
 	DurableReceipts           SessionWorkerDurableReceipts
+	Credential                *SessionCredential
 }
 
 // RecoveryStartHandleSource exposes only the current opaque reference. The
@@ -205,6 +210,11 @@ func newSessionWorker(cfg SessionWorkerConfig, runner processRunner) (*SessionWo
 	if cfg.SessionID == "" {
 		return nil, ErrInvalidSessionWorkerConfig
 	}
+	if cfg.Credential != nil {
+		if err := cfg.Credential.validate(cfg.SessionID, time.Now()); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.RecoveryStartHandleSource != nil {
 		if cfg.Provider.StartAdmission == nil {
 			return nil, ErrRecoveryAuthorityLost
@@ -226,7 +236,7 @@ func newSessionWorker(cfg SessionWorkerConfig, runner processRunner) (*SessionWo
 	if err != nil {
 		return nil, err
 	}
-	return &SessionWorker{sessionID: cfg.SessionID, provider: provider, receipts: cfg.DurableReceipts}, nil
+	return &SessionWorker{sessionID: cfg.SessionID, provider: provider, receipts: cfg.DurableReceipts, credential: cfg.Credential}, nil
 }
 
 func (w *SessionWorker) SessionID() string {
@@ -257,6 +267,23 @@ func (w *SessionWorker) Stop(ctx context.Context) error {
 	return w.provider.Stop(ctx)
 }
 
+// RouteCommand verifies the private credential binding before entering the
+// durable receipt path. A missing credential is deny-by-default for routed
+// work; legacy callers that use DeliverCommand directly retain T42C behavior.
+func (w *SessionWorker) RouteCommand(ctx context.Context, command SessionWorkerCommand, apply func(context.Context) error) (CommandRoutingReceipt, error) {
+	if w == nil || w.credential == nil {
+		return CommandRoutingReceipt{}, ErrSessionCredentialRequired
+	}
+	if err := w.credential.validate(w.sessionID, time.Now()); err != nil {
+		return CommandRoutingReceipt{}, err
+	}
+	if command.SessionID != "" && command.SessionID != w.sessionID {
+		return CommandRoutingReceipt{}, ErrSessionCredentialMismatch
+	}
+	command.SessionID = w.sessionID
+	return w.DeliverCommand(ctx, command, apply)
+}
+
 // DeliverCommand waits for both the routing acknowledgement and durable
 // ledger operation receipt before invoking the Provider side effect. Any
 // ambiguous result is finalized as outcome_unknown and is never replayed.
@@ -266,6 +293,14 @@ func (w *SessionWorker) DeliverCommand(ctx context.Context, command SessionWorke
 	}
 	if command.CommandID == "" {
 		return CommandRoutingReceipt{}, fmt.Errorf("%w: command ID is required", ErrInvalidDurableReceipt)
+	}
+	if w.credential != nil {
+		if err := w.credential.validate(w.sessionID, time.Now()); err != nil {
+			return CommandRoutingReceipt{}, err
+		}
+		if command.SessionID != "" && command.SessionID != w.sessionID {
+			return CommandRoutingReceipt{}, ErrSessionCredentialMismatch
+		}
 	}
 	if !supportedSessionWorkerCommand(command.Type) {
 		return CommandRoutingReceipt{}, ErrUnsupportedSessionWorkerCommand
@@ -308,6 +343,11 @@ func (w *SessionWorker) ProposeEvent(ctx context.Context, proposalID string, pub
 	}
 	if proposalID == "" {
 		return EventProposalReceipt{}, fmt.Errorf("%w: proposal ID is required", ErrInvalidDurableReceipt)
+	}
+	if w.credential != nil {
+		if err := w.credential.validate(w.sessionID, time.Now()); err != nil {
+			return EventProposalReceipt{}, err
+		}
 	}
 	if ctx == nil {
 		ctx = context.Background()
