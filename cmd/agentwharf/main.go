@@ -1126,6 +1126,14 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		stopProviderSupervisor(supervisor)
 		return err
 	}
+	if startAdmission != nil {
+		if _, err := composeProviderGroupRecovery(runCtx, cfg, processConfig, supervisor, startAdmission); err != nil {
+			cancel()
+			stopProviderSupervisor(supervisor)
+			return err
+		}
+		startAdmission.watchLifecycle(runCtx, cancel)
+	}
 	go func() {
 		outputDone <- streamProviderOutput(runCtx, cfg, stdoutReader, func(event protocol.Event) error {
 			masked, err := maskEvent(masker, event)
@@ -1242,6 +1250,14 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		cancel()
 		stopProviderSupervisor(supervisor)
 		return err
+	}
+	if startAdmission != nil {
+		if _, err := composeProviderGroupRecovery(runCtx, cfg, processConfig, supervisor, startAdmission); err != nil {
+			cancel()
+			stopProviderSupervisor(supervisor)
+			return err
+		}
+		startAdmission.watchLifecycle(runCtx, cancel)
 	}
 
 	scanner := bufio.NewScanner(stdoutReader)
@@ -1376,6 +1392,7 @@ type providerStartAdmission struct {
 	ack            chan *protocol.ProviderStartAck
 	firstAdmitted  chan struct{}
 	firstAdmitOnce sync.Once
+	invalidated    bool
 }
 
 func newProviderStartAdmission(version int, conn *websocket.Conn, write func(protocol.Frame) error) *providerStartAdmission {
@@ -1500,9 +1517,106 @@ func (a *providerStartAdmission) RecoveryStartHandle() (core.RecoveryStartHandle
 		return core.RecoveryStartHandle{}, errors.New("provider start admission is unavailable")
 	}
 	a.mu.Lock()
+	if a.invalidated {
+		a.mu.Unlock()
+		return core.RecoveryStartHandle{}, errors.New("provider start authority is unavailable")
+	}
 	handle := a.recoveryHandle
 	a.mu.Unlock()
 	return core.NewRecoveryStartHandle(handle)
+}
+
+// VerifyRecoveryStart turns the Hub's Store-backed connection lifecycle into
+// the local recovery fence. Hub closes this socket when replacement,
+// revocation, terminalization, expiry or quarantine invalidates the durable
+// tuple; no bearer or Store key is carried into the Adapter.
+func (a *providerStartAdmission) VerifyRecoveryStart(ctx context.Context) error {
+	if a == nil || a.conn == nil {
+		return errors.New("provider start authority is unavailable")
+	}
+	if _, err := a.RecoveryStartHandle(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *providerStartAdmission) invalidate() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.invalidated = true
+	a.recoveryHandle = ""
+	a.mu.Unlock()
+}
+
+func (a *providerStartAdmission) watchLifecycle(ctx context.Context, cancel context.CancelFunc) {
+	if a == nil || cancel == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := a.VerifyRecoveryStart(ctx); err != nil {
+					cancel()
+					return
+				}
+				pingCtx, pingCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+				err := a.conn.Ping(pingCtx)
+				pingCancel()
+				if err != nil && websocket.CloseStatus(err) != -1 {
+					a.invalidate()
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+}
+
+// composeProviderGroupRecovery is the production composition point for the
+// real GroupSupervisor.Recover path. The existing ProcessSupervisor remains
+// the child runner; GroupSupervisor stores only session membership and the
+// opaque reference, while Hub/Store remains the durable authority.
+func composeProviderGroupRecovery(ctx context.Context, cfg wrapConfig, processConfig core.ProcessConfig, supervisor *core.ProcessSupervisor, admission *providerStartAdmission) (*core.GroupSupervisor, error) {
+	if supervisor == nil || admission == nil {
+		return nil, errors.New("provider recovery composition is unavailable")
+	}
+	handle, err := admission.RecoveryStartHandle()
+	if err != nil {
+		return nil, err
+	}
+	group, err := core.NewGroupSupervisor(core.GroupSupervisorConfig{
+		MaxWorkers:                 1,
+		AllowReferenceOnlyRecovery: true,
+		NewWorker: func(core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
+			return supervisor, nil
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	recovery := core.GroupWorkerRecovery{
+		Admission: core.GroupWorkerAdmission{
+			WorkerID:  cfg.SessionID,
+			SessionID: cfg.SessionID,
+			Worker: core.SessionWorkerConfig{
+				SessionID: cfg.SessionID,
+				Provider:  processConfig,
+			},
+		},
+		StartHandle:       handle,
+		StartHandleSource: admission,
+	}
+	if err := group.Recover(ctx, recovery); err != nil {
+		return nil, err
+	}
+	return group, nil
 }
 
 func waitForFirstProviderStartAdmission(ctx context.Context, admission *providerStartAdmission, processDone <-chan error) error {

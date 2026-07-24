@@ -21,6 +21,13 @@ var (
 	ErrRecoveryAuthorityLost        = errors.New("recovery authority is unavailable")
 )
 
+// RecoveryStartAuthority is the lifecycle fence paired with a reference-only
+// start handle. The production Adapter implementation is backed by Hub/Store
+// authority; a handle alone is never durable authority.
+type RecoveryStartAuthority interface {
+	VerifyRecoveryStart(context.Context) error
+}
+
 // SessionWorkerRunner retains only the process lifecycle needed by this pre-activation
 // foundation. Credential delivery, command routing and cleanup are owned by
 // their dedicated tasks.
@@ -206,10 +213,11 @@ func (a RecoveryAuthority) run(ctx context.Context, run func(context.Context) er
 }
 
 type GroupSupervisorConfig struct {
-	MaxWorkers int
-	Leases     workspaceLeaseReserver
-	Activation MultiWorkerActivation
-	NewWorker  func(SessionWorkerConfig) (SessionWorkerRunner, error)
+	MaxWorkers                 int
+	Leases                     workspaceLeaseReserver
+	AllowReferenceOnlyRecovery bool
+	Activation                 MultiWorkerActivation
+	NewWorker                  func(SessionWorkerConfig) (SessionWorkerRunner, error)
 }
 
 // GroupWorkerAdmission contains the Store-derived opaque workspace tuple for
@@ -254,7 +262,7 @@ type GroupSupervisor struct {
 }
 
 func NewGroupSupervisor(cfg GroupSupervisorConfig) (*GroupSupervisor, error) {
-	if cfg.MaxWorkers < 1 || cfg.Leases == nil {
+	if cfg.MaxWorkers < 1 || (cfg.Leases == nil && !cfg.AllowReferenceOnlyRecovery) {
 		return nil, ErrInvalidGroupSupervisorConfig
 	}
 	if cfg.NewWorker == nil {
@@ -344,6 +352,8 @@ func (s *GroupSupervisor) Recover(ctx context.Context, recovery GroupWorkerRecov
 		if err := recovery.Authority.verify(ctx); err != nil {
 			return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
 		}
+	} else if err := verifyRecoveryStartAuthority(ctx, recovery.StartHandleSource); err != nil {
+		return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
 	}
 	workerConfig := recovery.Admission.Worker
 	if recovery.StartHandleSource != nil {
@@ -401,6 +411,10 @@ func (s *GroupSupervisor) Run(ctx context.Context, sessionID string) error {
 		return nil
 	}
 	if member.startHandleSource != nil {
+		if err := verifyRecoveryStartAuthority(ctx, member.startHandleSource); err != nil {
+			s.fenceRecoveredWorker(sessionID, member)
+			return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
+		}
 		if err := verifyRecoveryStartHandle(member.startHandleSource, member.startHandle); err != nil {
 			s.fenceRecoveredWorker(sessionID, member)
 			return fmt.Errorf("%w: %v", ErrRecoveryAuthorityLost, err)
@@ -494,14 +508,17 @@ func validateGroupWorkerAdmission(admission GroupWorkerAdmission) error {
 }
 
 func validateGroupWorkerRecovery(recovery GroupWorkerRecovery) error {
-	if validateGroupWorkerAdmission(recovery.Admission) != nil {
-		return ErrRecoveryAuthorityLost
-	}
 	if recovery.StartHandleSource != nil {
+		if recovery.Admission.WorkerID == "" || recovery.Admission.SessionID == "" || recovery.Admission.Worker.SessionID != recovery.Admission.SessionID {
+			return ErrRecoveryAuthorityLost
+		}
 		if recovery.StartHandle.value == "" || verifyRecoveryStartHandle(recovery.StartHandleSource, recovery.StartHandle) != nil {
 			return ErrRecoveryAuthorityLost
 		}
 		return nil
+	}
+	if validateGroupWorkerAdmission(recovery.Admission) != nil {
+		return ErrRecoveryAuthorityLost
 	}
 	if err := validateRecoveryAuthority(recovery.Authority); err != nil {
 		return ErrRecoveryAuthorityLost
@@ -538,6 +555,14 @@ func verifyRecoveryStartHandle(source RecoveryStartHandleSource, expected Recove
 		return ErrRecoveryAuthorityLost
 	}
 	return nil
+}
+
+func verifyRecoveryStartAuthority(ctx context.Context, source RecoveryStartHandleSource) error {
+	authority, ok := source.(RecoveryStartAuthority)
+	if !ok || authority == nil {
+		return ErrRecoveryAuthorityLost
+	}
+	return authority.VerifyRecoveryStart(ctx)
 }
 
 func validateRecoveryAuthority(authority RecoveryAuthority) error {

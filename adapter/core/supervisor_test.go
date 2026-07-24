@@ -378,6 +378,11 @@ func (s *fakeRecoveryStartHandleSource) RecoveryStartHandle() (RecoveryStartHand
 	return s.handle, nil
 }
 
+func (s *fakeRecoveryStartHandleSource) VerifyRecoveryStart(context.Context) error {
+	_, err := s.RecoveryStartHandle()
+	return err
+}
+
 func (s *fakeRecoveryStartHandleSource) setHandle(handle RecoveryStartHandle) {
 	s.mu.Lock()
 	s.handle = handle

@@ -651,6 +651,44 @@ func TestGroupSupervisorRecoveryConsumesOpaqueStartHandleAndFencesReplacement(t 
 	}
 }
 
+func TestGroupSupervisorRejectsReferenceHandleWithoutDurableLifecycleFence(t *testing.T) {
+	t.Parallel()
+
+	group, err := NewGroupSupervisor(GroupSupervisorConfig{
+		MaxWorkers: 1,
+		Leases:     &recordingWorkspaceLeaseReserver{},
+		NewWorker: func(SessionWorkerConfig) (SessionWorkerRunner, error) {
+			return &recordingSessionWorker{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewGroupSupervisor() error = %v", err)
+	}
+	source := &handleOnlyRecoverySource{handle: testRecoveryStartHandle(t, "authority")}
+	recovery := GroupWorkerRecovery{
+		Admission:         validGroupWorkerAdmission("worker_unfenced", "ses_unfenced", 1),
+		StartHandle:       source.handle,
+		StartHandleSource: source,
+	}
+	if err := group.Recover(context.Background(), recovery); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("Recover(unfenced handle) error = %v, want ErrRecoveryAuthorityLost", err)
+	}
+	if group.WorkerCount() != 0 {
+		t.Fatalf("WorkerCount after unfenced recovery = %d, want 0", group.WorkerCount())
+	}
+}
+
+type handleOnlyRecoverySource struct {
+	handle RecoveryStartHandle
+}
+
+func (s *handleOnlyRecoverySource) RecoveryStartHandle() (RecoveryStartHandle, error) {
+	if s == nil || s.handle.value == "" {
+		return RecoveryStartHandle{}, ErrRecoveryAuthorityLost
+	}
+	return s.handle, nil
+}
+
 type recordingSessionWorker struct {
 	mu    sync.Mutex
 	runs  int
