@@ -1516,6 +1516,52 @@ func TestRunWrapV2ReAdmitsEveryRestartedChild(t *testing.T) {
 	}
 }
 
+func TestProviderStartAdmissionRetainsOpaqueRecoveryHandle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		frame, err := readFrameFromConn(ctx, conn)
+		start, ok := frame.(*protocol.ProviderStart)
+		if err != nil || !ok || start.Attempt != 1 {
+			t.Errorf("provider start = %T %+v, %v", frame, frame, err)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: start.Attempt}); err != nil {
+			return
+		}
+		frame, err = readFrameFromConn(ctx, conn)
+		started, ok := frame.(*protocol.ProviderStartStarted)
+		if err != nil || !ok || started.Attempt != start.Attempt {
+			t.Errorf("provider started = %T %+v, %v", frame, frame, err)
+			return
+		}
+		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: start.Attempt, Status: protocol.ProviderStartAdmitted, RecoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"})
+	}))
+	defer server.Close()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	admission := newProviderStartAdmission(protocol.ProtocolVersionV2, conn, func(frame protocol.Frame) error {
+		return writeFrameToConn(ctx, conn, frame)
+	})
+	if err := admission.PrepareProcessStart(ctx, 1); err != nil {
+		t.Fatalf("PrepareProcessStart() = %v", err)
+	}
+	if err := admission.ConfirmProcessStarted(ctx, 1); err != nil {
+		t.Fatalf("ConfirmProcessStarted() = %v", err)
+	}
+	if _, err := admission.RecoveryStartHandle(); err != nil {
+		t.Fatalf("RecoveryStartHandle() = %v", err)
+	}
+}
+
 func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
