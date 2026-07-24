@@ -121,11 +121,112 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 			return runMachineLogout(stdout)
 		}
 		return errors.New("usage: wharf machine unlink")
+	case "task":
+		return runTaskCommand(ctx, args[1:], stdin, stdout, stderr)
 	case "attention-backfill":
 		return runAttentionBackfill(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+type machineTaskClaimExchangeRequest struct {
+	ClaimCode string `json:"claim_code"`
+}
+
+type machineTaskClaimExchangeResponse struct {
+	Data struct {
+		SessionID    string `json:"session_id"`
+		HubWSURL     string `json:"hub_ws_url"`
+		AdapterToken string `json:"adapter_token"`
+		ExpiresAt    string `json:"expires_at"`
+	} `json:"data"`
+}
+
+func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if len(args) < 2 || args[0] != "claim" {
+		return errors.New("usage: wharf task claim <claim_id> --code-stdin")
+	}
+	claimID := strings.TrimSpace(args[1])
+	if claimID == "" || strings.ContainsAny(claimID, "/\\") {
+		return errors.New("claim unavailable")
+	}
+	codeStdin := false
+	for _, arg := range args[2:] {
+		if arg == "--code-stdin" {
+			codeStdin = true
+			continue
+		}
+		return errors.New("usage: wharf task claim <claim_id> --code-stdin")
+	}
+	if !codeStdin || claimInputIsTTY(stdin) {
+		return errors.New("claim code input unavailable")
+	}
+	code, err := readClaimCode(stdin)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for index := range code {
+			code[index] = 0
+		}
+	}()
+	credential, err := loadMachineCredential()
+	if err != nil {
+		return errors.New("claim unavailable")
+	}
+	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machine-task-claims/"+url.PathEscape(claimID)+"/exchange")
+	if err != nil {
+		return errors.New("claim unavailable")
+	}
+	status, body, err := postCloudAPIJSON(ctx, &http.Client{Timeout: 30 * time.Second}, endpoint, credential.MachineToken, machineTaskClaimExchangeRequest{ClaimCode: string(code)})
+	if err != nil || status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return errors.New("claim unavailable")
+	}
+	var handoff machineTaskClaimExchangeResponse
+	if err := decodeCloudAPIJSON(body, &handoff); err != nil || handoff.Data.SessionID == "" || handoff.Data.HubWSURL == "" || handoff.Data.AdapterToken == "" || handoff.Data.ExpiresAt == "" {
+		return errors.New("claim unavailable")
+	}
+	expiresAt, err := time.Parse(time.RFC3339, handoff.Data.ExpiresAt)
+	if err != nil || !expiresAt.After(time.Now().UTC()) {
+		return errors.New("claim unavailable")
+	}
+	cfg := wrapConfig{
+		HubURL:          handoff.Data.HubWSURL,
+		SessionID:       handoff.Data.SessionID,
+		Agent:           "claude",
+		Provider:        defaultProvider,
+		AdapterToken:    handoff.Data.AdapterToken,
+		Format:          "acp",
+		ProviderCommand: defaultProviderCommand("claude"),
+		ProtocolVersion: protocol.ProtocolVersion,
+	}
+	if _, err := runWrap(ctx, cfg, strings.NewReader(""), stderr); err != nil {
+		return err
+	}
+	return nil
+}
+
+func claimInputIsTTY(input io.Reader) bool {
+	file, ok := input.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func readClaimCode(input io.Reader) ([]byte, error) {
+	line, err := bufio.NewReader(io.LimitReader(input, 257)).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, errors.New("claim code input unavailable")
+	}
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	if line == "" || len(line) > 256 || strings.ContainsAny(line, "\r\n") {
+		return nil, errors.New("claim code input unavailable")
+	}
+	return []byte(line), nil
 }
 
 func runAttentionBackfill(ctx context.Context, args []string, stdout, stderr io.Writer) error {

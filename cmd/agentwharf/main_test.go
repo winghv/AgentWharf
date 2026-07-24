@@ -122,6 +122,21 @@ func TestACPFileReferenceFailsClosedOnDigestAndSymlink(t *testing.T) {
 	}
 }
 
+func TestTaskClaimCodeInputRequiresBoundedNonTTYStdin(t *testing.T) {
+	t.Parallel()
+
+	code, err := readClaimCode(strings.NewReader("claim-code-1\n"))
+	if err != nil || string(code) != "claim-code-1" {
+		t.Fatalf("readClaimCode() = %q, %v", string(code), err)
+	}
+	if _, err := readClaimCode(strings.NewReader(strings.Repeat("x", 257))); err == nil {
+		t.Fatal("oversized claim code unexpectedly accepted")
+	}
+	if err := runTaskCommand(context.Background(), []string{"claim", "claim_1"}, strings.NewReader("code\n"), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("runTaskCommand without --code-stdin = %v", err)
+	}
+}
+
 func TestRunServeRejectsNonLocalDefaultToken(t *testing.T) {
 	t.Parallel()
 
