@@ -1151,6 +1151,11 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		}
 		startAdmission.watchLifecycle(runCtx, cancel)
 	}
+	if err := publishRunControlCapability(runCtx, conn, cfg, writeFrame); err != nil {
+		cancel()
+		stopProviderSupervisor(supervisor)
+		return err
+	}
 	go func() {
 		outputDone <- streamProviderOutput(runCtx, cfg, stdoutReader, func(event protocol.Event) error {
 			masked, err := maskEvent(masker, event)
@@ -1161,7 +1166,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToProvider(runCtx, conn, stdinWriter, writeFrame, observePong, startAdmission)
+		commandDone <- forwardHubCommandsToProvider(runCtx, conn, stdinWriter, writeFrame, observePong, startAdmission, supervisor, cfg)
 	}()
 
 	var processErr error
@@ -1293,6 +1298,11 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		}
 		startAdmission.watchLifecycle(runCtx, cancel)
 	}
+	if err := publishRunControlCapability(runCtx, conn, cfg, writeFrame); err != nil {
+		cancel()
+		stopProviderSupervisor(supervisor)
+		return err
+	}
 
 	scanner := bufio.NewScanner(stdoutReader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -1362,7 +1372,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, observePong, providerSessionID, 3, pendingPermissions, &permissionMu, startAdmission)
+		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, observePong, providerSessionID, 3, pendingPermissions, &permissionMu, startAdmission, supervisor, cfg)
 	}()
 
 	processFinished := false
@@ -1708,6 +1718,92 @@ func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wr
 	return nil
 }
 
+func publishRunControlCapability(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, writeFrame func(protocol.Frame) error) error {
+	if cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
+		return nil
+	}
+	proposalID, err := randomToken()
+	if err != nil {
+		return fmt.Errorf("generate run-control capability proposal: %w", err)
+	}
+	payload, err := json.Marshal(protocol.RunControlCapabilityPayload{
+		SchemaVersion: 1, InterruptSupported: true, StopSupported: true,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal run-control capability: %w", err)
+	}
+	return writeFrame(&protocol.Event{
+		Type: "session.run.capabilities", SessionID: cfg.SessionID,
+		Time: time.Now().UTC().UnixMilli(), Payload: payload, ProposalID: proposalID,
+	})
+}
+
+func handleProviderRunControl(ctx context.Context, command *protocol.Command, supervisor *core.ProcessSupervisor, writeFrame func(protocol.Frame) error, cfg wrapConfig, stop bool) error {
+	if command == nil || supervisor == nil {
+		return errors.New("run-control provider is unavailable")
+	}
+	operation := "interrupt"
+	completionState := "ready"
+	if stop {
+		operation = "stop"
+		completionState = "ended"
+	}
+	var operationErr error
+	if stop {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		operationErr = supervisor.Stop(stopCtx)
+		cancel()
+	} else {
+		operationErr = supervisor.Interrupt(ctx)
+	}
+	return acknowledgeRunControl(ctx, command, writeFrame, cfg, operation, completionState, operationErr)
+}
+
+func acknowledgeRunControl(ctx context.Context, command *protocol.Command, writeFrame func(protocol.Frame) error, cfg wrapConfig, operation, completionState string, operationErr error) error {
+	if command == nil || writeFrame == nil {
+		return errors.New("run-control acknowledgement is unavailable")
+	}
+	if err := writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted}); err != nil {
+		return fmt.Errorf("ack run-control command %s: %w", command.CommandID, err)
+	}
+	outcome := "completed"
+	var completion *string
+	var reason *string
+	if operationErr == nil {
+		completion = &completionState
+	} else if errors.Is(operationErr, context.DeadlineExceeded) {
+		outcome = "timeout"
+		code := "run_control_timeout"
+		reason = &code
+	} else if operation == "stop" {
+		outcome = "outcome_unknown"
+		code := "adapter_cleanup_uncertain"
+		reason = &code
+	} else {
+		outcome = "rejected"
+		code := "provider_rejected"
+		reason = &code
+	}
+	proposalID, err := randomToken()
+	if err != nil {
+		return fmt.Errorf("generate run-control outcome proposal: %w", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"cmd_id": command.CommandID, "operation": operation, "outcome": outcome,
+		"completion_state": completion, "reason_code": reason,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal run-control outcome: %w", err)
+	}
+	if err := writeFrame(&protocol.Event{
+		Type: "session.run.outcome", SessionID: cfg.SessionID,
+		Time: time.Now().UTC().UnixMilli(), Payload: payload, ProposalID: proposalID,
+	}); err != nil {
+		return fmt.Errorf("publish run-control outcome %s: %w", command.CommandID, err)
+	}
+	return nil
+}
+
 func eventMaskerFromSecretDir(dir string) (*core.EventMasker, error) {
 	if dir == "" {
 		return core.NewEventMasker(nil), nil
@@ -1824,7 +1920,7 @@ func translateWrapLine(cfg wrapConfig, line []byte) ([]protocol.Event, error) {
 	}
 }
 
-func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), startAdmission *providerStartAdmission) error {
+func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, cfg wrapConfig) error {
 	defer stdin.Close()
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
@@ -1837,15 +1933,15 @@ func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, std
 				return err
 			}
 		case *protocol.Command:
+			if typed.Type == protocol.CommandSessionInterrupt || typed.Type == protocol.CommandSessionStop {
+				return handleProviderRunControl(ctx, typed, supervisor, writeFrame, cfg, typed.Type == protocol.CommandSessionStop)
+			}
 			if err := writeProviderCommand(stdin, typed); err != nil {
 				return err
 			}
 			ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
 			if err := writeFrame(&ack); err != nil {
 				return fmt.Errorf("ack provider command %s: %w", typed.CommandID, err)
-			}
-			if typed.Type == protocol.CommandSessionStop {
-				return nil
 			}
 		case *protocol.Ping:
 			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
@@ -1900,7 +1996,7 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 	return nil
 }
 
-func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex, startAdmission *providerStartAdmission) error {
+func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex, startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, cfg wrapConfig) error {
 	defer stdin.Close()
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
@@ -1914,6 +2010,14 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 			}
 		case *protocol.Command:
 			switch typed.Type {
+			case protocol.CommandSessionInterrupt:
+				if err := writeACPRequest(stdin, nextID, "session/cancel", map[string]any{"sessionId": providerSessionID}); err != nil {
+					return fmt.Errorf("write acp provider interrupt %s: %w", typed.CommandID, err)
+				}
+				nextID++
+				if err := acknowledgeRunControl(ctx, typed, writeFrame, cfg, "interrupt", "ready", nil); err != nil {
+					return err
+				}
 			case protocol.CommandSessionSend:
 				prompt, err := acpPromptFromSessionSend(typed.Payload)
 				if err != nil {
@@ -1951,9 +2055,8 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 					return fmt.Errorf("ack acp permission response %s: %w", typed.CommandID, err)
 				}
 			case protocol.CommandSessionStop:
-				ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
-				if err := writeFrame(&ack); err != nil {
-					return fmt.Errorf("ack acp provider stop %s: %w", typed.CommandID, err)
+				if err := handleProviderRunControl(ctx, typed, supervisor, writeFrame, cfg, true); err != nil {
+					return err
 				}
 				return nil
 			default:

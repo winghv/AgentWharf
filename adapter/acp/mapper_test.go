@@ -167,6 +167,26 @@ func TestMapperSupportsLiveACPCamelCaseSessionUpdate(t *testing.T) {
 	}
 }
 
+func TestMapperMapsACPCancelResponseToReadyState(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code"})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+	events, err := mapper.MapLine([]byte(`{"type":"session/cancel_response","session_id":"acp_ses_1","stopReason":"cancelled"}`))
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) != 1 || events[0].Type != "session.state" {
+		t.Fatalf("cancel response events = %+v, want one session.state", events)
+	}
+	payload := payloadMap(t, events[0])
+	if payload["state"] != "ready" || payload["provider_session_id"] != "acp_ses_1" {
+		t.Fatalf("cancel response payload = %+v", payload)
+	}
+}
+
 func TestMapperMapsACPPermissionRequest(t *testing.T) {
 	t.Parallel()
 

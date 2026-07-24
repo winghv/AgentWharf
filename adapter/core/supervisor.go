@@ -235,6 +235,33 @@ func (s *ProcessSupervisor) Stop(ctx context.Context) error {
 	return nil
 }
 
+// Interrupt cancels the current Provider turn without changing supervisor
+// lifecycle state. The process remains available for subsequent work and no
+// stopped event or lease cleanup is emitted.
+func (s *ProcessSupervisor) Interrupt(ctx context.Context) error {
+	if s == nil {
+		return ErrInvalidProcessConfig
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	s.mu.Lock()
+	process := s.current
+	s.mu.Unlock()
+	if process == nil {
+		return errors.New("provider process is not running")
+	}
+	if err := process.handle.Interrupt(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("interrupt provider turn: %w", err)
+	}
+	return nil
+}
+
 func (s *ProcessSupervisor) start(ctx context.Context, attempt int) (*runningProcess, error) {
 	if s.cfg.StartAdmission != nil {
 		if err := s.cfg.StartAdmission.PrepareProcessStart(ctx, attempt); err != nil {

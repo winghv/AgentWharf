@@ -185,6 +185,41 @@ func TestProcessSupervisorStopsProviderWithInterrupt(t *testing.T) {
 	}
 }
 
+func TestProcessSupervisorInterruptsCurrentTurnWithoutStoppingProvider(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeProcessRunner()
+	supervisor, err := newProcessSupervisor(ProcessConfig{
+		Command:     ProcessCommand{Path: "provider"},
+		MaxRestarts: 1,
+		Backoff:     time.Millisecond,
+		GracePeriod: 20 * time.Millisecond,
+	}, runner)
+	if err != nil {
+		t.Fatalf("newProcessSupervisor() error = %v", err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- supervisor.Run(context.Background()) }()
+	_ = waitEvent(t, supervisor.Events(), ProcessEventStarted)
+
+	if err := supervisor.Interrupt(context.Background()); err != nil {
+		t.Fatalf("Interrupt() error = %v", err)
+	}
+	interrupts, kills := runner.handle(0).counts()
+	if interrupts != 1 || kills != 0 {
+		t.Fatalf("signals after interrupt = interrupt:%d kill:%d, want 1/0", interrupts, kills)
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run() completed after interrupt: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	runner.handle(0).finish(nil)
+	if err := <-runDone; err != nil {
+		t.Fatalf("Run() error after provider completion = %v", err)
+	}
+}
+
 func TestProcessSupervisorConnectsProviderStdio(t *testing.T) {
 	t.Parallel()
 

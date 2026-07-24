@@ -1370,7 +1370,7 @@ func TestRunWrapV2ProviderDoesNotStartAfterAdmissionRejection(t *testing.T) {
 		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_v2", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_v2", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_v2", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
 			return
 		}
-		frame, err = readFrameFromConn(ctx, conn)
+		frame, err = readProviderStartFrame(ctx, conn)
 		if err != nil {
 			return
 		}
@@ -1419,7 +1419,7 @@ func TestRunWrapV2ProviderStopsAfterFinalAdmissionRejection(t *testing.T) {
 		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_v2", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_v2", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_v2", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
 			return
 		}
-		if frame, err := readFrameFromConn(ctx, conn); err != nil || frame.FrameName() != protocol.FrameProviderStart {
+		if frame, err := readProviderStartFrame(ctx, conn); err != nil || frame.FrameName() != protocol.FrameProviderStart {
 			t.Errorf("provider start request = %T, %v", frame, err)
 			return
 		}
@@ -1479,7 +1479,7 @@ func TestRunWrapV2ReAdmitsEveryRestartedChild(t *testing.T) {
 			return
 		}
 		for expected := 1; expected <= 2; expected++ {
-			frame, err := readFrameFromConn(ctx, conn)
+			frame, err := readProviderStartFrame(ctx, conn)
 			if err != nil {
 				return
 			}
@@ -1516,6 +1516,45 @@ func TestRunWrapV2ReAdmitsEveryRestartedChild(t *testing.T) {
 	}
 }
 
+func TestRunControlCapabilityAndOutcomeProposalsAreCanonical(t *testing.T) {
+	t.Parallel()
+
+	cfg := wrapConfig{ProtocolVersion: protocol.ProtocolVersionV2, SessionID: "ses_run_control"}
+	frames := make([]protocol.Frame, 0, 3)
+	write := func(frame protocol.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	}
+	if err := publishRunControlCapability(context.Background(), nil, cfg, write); err != nil {
+		t.Fatalf("publishRunControlCapability() error = %v", err)
+	}
+	command := &protocol.Command{CommandID: "cmd_run_control_1", Type: protocol.CommandSessionInterrupt, SessionID: cfg.SessionID}
+	if err := acknowledgeRunControl(context.Background(), command, write, cfg, "interrupt", "ready", nil); err != nil {
+		t.Fatalf("acknowledgeRunControl() error = %v", err)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("proposal frames = %d, want 3", len(frames))
+	}
+	capability, ok := frames[0].(*protocol.Event)
+	if !ok || capability.Type != "session.run.capabilities" || capability.ProposalID == "" {
+		t.Fatalf("capability frame = %#v", frames[0])
+	}
+	if _, err := protocol.DecodeRunControlCapabilityPayload(capability.Payload); err != nil {
+		t.Fatalf("capability payload decode error = %v", err)
+	}
+	outcome, ok := frames[2].(*protocol.Event)
+	if !ok || outcome.Type != "session.run.outcome" || outcome.ProposalID == "" {
+		t.Fatalf("outcome frame = %#v", frames[2])
+	}
+	decoded, err := protocol.DecodeRunControlOutcomePayload(outcome.Payload)
+	if err != nil {
+		t.Fatalf("outcome payload decode error = %v; payload=%s", err, outcome.Payload)
+	}
+	if decoded.CommandID != command.CommandID || decoded.Operation != "interrupt" || decoded.Outcome != "completed" || decoded.CompletionState == nil || *decoded.CompletionState != "ready" {
+		t.Fatalf("decoded outcome = %+v", decoded)
+	}
+}
+
 func TestProviderStartAdmissionRetainsOpaqueRecoveryHandle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -1525,7 +1564,7 @@ func TestProviderStartAdmissionRetainsOpaqueRecoveryHandle(t *testing.T) {
 			return
 		}
 		defer conn.Close(websocket.StatusNormalClosure, "")
-		frame, err := readFrameFromConn(ctx, conn)
+		frame, err := readProviderStartFrame(ctx, conn)
 		start, ok := frame.(*protocol.ProviderStart)
 		if err != nil || !ok || start.Attempt != 1 {
 			t.Errorf("provider start = %T %+v, %v", frame, frame, err)
@@ -1952,6 +1991,19 @@ func readFrameFromConn(ctx context.Context, conn *websocket.Conn) (protocol.Fram
 		return nil, fmt.Errorf("decode frame %s: %w", string(data), err)
 	}
 	return frame, nil
+}
+
+func readProviderStartFrame(ctx context.Context, conn *websocket.Conn) (protocol.Frame, error) {
+	for {
+		frame, err := readFrameFromConn(ctx, conn)
+		if err != nil {
+			return nil, err
+		}
+		if event, ok := frame.(*protocol.Event); ok && event.Type == "session.run.capabilities" {
+			continue
+		}
+		return frame, nil
+	}
 }
 
 func assertSignal(t *testing.T, ch <-chan struct{}, name string) {

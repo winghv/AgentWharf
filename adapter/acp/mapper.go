@@ -93,6 +93,8 @@ func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protoc
 		return []protocol.Event{m.stateEvent("starting", providerSessionID, copyWithout(raw, "type", "method", "session_id"))}
 	case "new_session_response":
 		return []protocol.Event{m.stateEvent("ready", providerSessionID, copyWithout(raw, "type", "method", "session_id"))}
+	case "session/cancel_response", "cancel_response":
+		return []protocol.Event{m.stateEvent("ready", providerSessionID, copyWithout(raw, "type", "method", "session_id"))}
 	case "session/update":
 		return m.mapSessionUpdate(raw, providerSessionID)
 	case "session/request_permission":
