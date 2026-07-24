@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -24,6 +26,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/winghv/agentwharf/adapter/acp"
@@ -2218,29 +2221,125 @@ func readACPResponse(ctx context.Context, scanner *bufio.Scanner, id int64) (map
 }
 
 func acpPromptFromSessionSend(payload []byte) ([]map[string]any, error) {
+	return acpPromptFromSessionSendAtRoot(payload, ".")
+}
+
+func acpPromptFromSessionSendAtRoot(payload []byte, rootPath string) ([]map[string]any, error) {
+	filePayload, err := protocol.DecodeFileReferenceSendPayload(payload)
+	if err != nil {
+		return nil, fmt.Errorf("invalid session.send payload: %w", err)
+	}
 	var decoded struct {
-		Content []struct {
-			Kind string `json:"kind"`
-			Text string `json:"text"`
-		} `json:"content"`
+		Content []json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		return nil, fmt.Errorf("invalid session.send payload: %w", err)
 	}
 	prompt := make([]map[string]any, 0, len(decoded.Content))
-	for _, part := range decoded.Content {
-		if part.Kind != "text" || part.Text == "" {
-			continue
+	if !filePayload.HasReferences {
+		for _, raw := range decoded.Content {
+			var part struct {
+				Kind string `json:"kind"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(raw, &part); err != nil {
+				return nil, fmt.Errorf("invalid session.send content: %w", err)
+			}
+			if part.Kind != "text" || part.Text == "" {
+				continue
+			}
+			prompt = append(prompt, map[string]any{"type": "text", "text": part.Text})
 		}
-		prompt = append(prompt, map[string]any{
-			"type": "text",
-			"text": part.Text,
-		})
+	} else {
+		root, err := os.OpenRoot(rootPath)
+		if err != nil {
+			return nil, errors.New("file reference workspace unavailable")
+		}
+		defer root.Close()
+		for index, raw := range decoded.Content {
+			var part map[string]any
+			if err := json.Unmarshal(raw, &part); err != nil {
+				return nil, fmt.Errorf("invalid file-reference content %d", index)
+			}
+			kind := stringFieldFromAny(part["kind"])
+			if kind == "text" {
+				text := stringFieldFromAny(part["text"])
+				if text == "" {
+					return nil, fmt.Errorf("invalid file-reference text %d", index)
+				}
+				prompt = append(prompt, map[string]any{"type": "text", "text": text})
+				continue
+			}
+			if kind != "file_reference" {
+				return nil, fmt.Errorf("unsupported session content %d", index)
+			}
+			content, err := readACPFileReference(root, part)
+			if err != nil {
+				return nil, fmt.Errorf("file reference %d rejected: %w", index, err)
+			}
+			prompt = append(prompt, content)
+		}
 	}
 	if len(prompt) == 0 {
 		return nil, errors.New("session.send payload has no text content")
 	}
 	return prompt, nil
+}
+
+func readACPFileReference(root *os.Root, part map[string]any) (map[string]any, error) {
+	if len(part) != 7 {
+		return nil, errors.New("invalid file-reference fields")
+	}
+	path := stringFieldFromAny(part["path"])
+	disposition := stringFieldFromAny(part["disposition"])
+	digest := stringFieldFromAny(part["content_digest"])
+	mediaType := stringFieldFromAny(part["media_type"])
+	declaredBytes, ok := part["bytes"].(float64)
+	if !ok || declaredBytes < 0 || declaredBytes > 10*1024*1024 || declaredBytes != float64(int64(declaredBytes)) {
+		return nil, errors.New("invalid file-reference size")
+	}
+	if disposition != "file" && disposition != "image" || path == "" || strings.HasPrefix(path, "/") || strings.Contains(path, "\\") || strings.Contains(path, "..") || strings.Contains(path, "\x00") {
+		return nil, errors.New("unsafe file-reference path")
+	}
+	if !strings.HasPrefix(digest, "sha256:") || len(digest) != len("sha256:")+64 {
+		return nil, errors.New("invalid file-reference digest")
+	}
+	if disposition == "image" && !allowedACPImageType(mediaType) {
+		return nil, errors.New("unsupported image type")
+	}
+	file, err := root.Open(path)
+	if err != nil {
+		return nil, errors.New("reference unavailable")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(declaredBytes) {
+		return nil, errors.New("reference changed")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, int64(declaredBytes)+1))
+	if err != nil || int64(len(data)) != int64(declaredBytes) {
+		return nil, errors.New("reference read failed")
+	}
+	digestSum := sha256.Sum256(data)
+	if fmt.Sprintf("sha256:%x", digestSum[:]) != digest {
+		return nil, errors.New("reference digest mismatch")
+	}
+	if disposition == "image" {
+		return map[string]any{"type": "image", "data": base64.StdEncoding.EncodeToString(data), "mimeType": mediaType}, nil
+	}
+	if !utf8.Valid(data) {
+		return nil, errors.New("non-text file requires image disposition")
+	}
+	return map[string]any{"type": "text", "text": string(data)}, nil
+}
+
+func allowedACPImageType(mediaType string) bool {
+	switch mediaType {
+	case "image/png", "image/jpeg", "image/webp", "image/gif":
+		return true
+	default:
+		return false
+	}
 }
 
 func stringFieldFromAny(value any) string {

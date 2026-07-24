@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,6 +83,42 @@ func TestServeStartsLocalHubWithSQLiteAndStaticAuth(t *testing.T) {
 	if got := ack.Sessions[0]; got.SessionID != "ses_local" || got.Provider != "claude-code" ||
 		got.State != "ready" || got.LatestSeq != 0 || got.ReplayFrom != 1 {
 		t.Fatalf("session summary = %+v", got)
+	}
+}
+
+func TestACPFileReferenceReadsBoundedWorkspaceContent(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	content := []byte("package main\n")
+	if err := os.WriteFile(filepath.Join(root, "main.go"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(content)
+	payload := fmt.Sprintf(`{"content":[{"kind":"text","text":"review"},{"kind":"file_reference","disposition":"file","path":"main.go","version":"v1","content_digest":"sha256:%x","bytes":%d,"media_type":"text/plain"}],"capability_fingerprint":"sha256:%064d"}`, digest, len(content), 1)
+	prompt, err := acpPromptFromSessionSendAtRoot([]byte(payload), root)
+	if err != nil {
+		t.Fatalf("acpPromptFromSessionSendAtRoot() error = %v", err)
+	}
+	if len(prompt) != 2 || prompt[1]["type"] != "text" || prompt[1]["text"] != string(content) {
+		t.Fatalf("prompt = %+v", prompt)
+	}
+}
+
+func TestACPFileReferenceFailsClosedOnDigestAndSymlink(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"content":[{"kind":"file_reference","disposition":"file","path":"link.txt","version":"v1","content_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","bytes":7,"media_type":"text/plain"}],"capability_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	if _, err := acpPromptFromSessionSendAtRoot([]byte(payload), root); err == nil {
+		t.Fatal("symlink/digest reference unexpectedly accepted")
 	}
 }
 
