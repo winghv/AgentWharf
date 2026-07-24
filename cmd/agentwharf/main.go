@@ -159,10 +159,19 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		}
 		return errors.New("usage: wharf task claim <claim_id> --code-stdin")
 	}
-	if !codeStdin || claimInputIsTTY(stdin) {
+	if codeStdin && claimInputIsTTY(stdin) {
 		return errors.New("claim code input unavailable")
 	}
-	code, err := readClaimCode(stdin)
+	var code []byte
+	var err error
+	if codeStdin {
+		code, err = readClaimCode(stdin)
+	} else {
+		if !claimInputIsTTY(stdin) {
+			return errors.New("claim code input unavailable")
+		}
+		code, err = readClaimCodeTTY(stdin, stderr)
+	}
 	if err != nil {
 		return err
 	}
@@ -227,6 +236,37 @@ func readClaimCode(input io.Reader) ([]byte, error) {
 		return nil, errors.New("claim code input unavailable")
 	}
 	return []byte(line), nil
+}
+
+func readClaimCodeTTY(input io.Reader, prompt io.Writer) ([]byte, error) {
+	file, ok := input.(*os.File)
+	if !ok || !claimInputIsTTY(input) {
+		return nil, errors.New("claim code input unavailable")
+	}
+	if err := setTerminalEcho(file, false); err != nil {
+		return nil, errors.New("claim code input unavailable")
+	}
+	defer func() { _ = setTerminalEcho(file, true) }()
+	if prompt != nil {
+		_, _ = fmt.Fprint(prompt, "Claim code: ")
+	}
+	code, err := readClaimCode(file)
+	if prompt != nil {
+		_, _ = fmt.Fprintln(prompt)
+	}
+	return code, err
+}
+
+func setTerminalEcho(file *os.File, enabled bool) error {
+	argument := "-echo"
+	if enabled {
+		argument = "echo"
+	}
+	command := exec.Command("stty", argument)
+	command.Stdin = file
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	return command.Run()
 }
 
 func runAttentionBackfill(ctx context.Context, args []string, stdout, stderr io.Writer) error {
