@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStartFixedEntryHealthRequiresRegularMarker(t *testing.T) {
@@ -20,12 +21,16 @@ func TestStartFixedEntryHealthTouchesExistingMarker(t *testing.T) {
 	if err := os.WriteFile(marker, nil, 0o600); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
+	before := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(marker, before, before); err != nil {
+		t.Fatalf("backdate marker: %v", err)
+	}
 	stop, err := StartFixedEntryHealth(context.Background(), marker)
 	if err != nil {
 		t.Fatalf("StartFixedEntryHealth() error = %v", err)
 	}
 	defer stop()
-	if info, err := os.Stat(marker); err != nil || !info.Mode().IsRegular() {
+	if info, err := os.Stat(marker); err != nil || !info.Mode().IsRegular() || !info.ModTime().After(before) {
 		t.Fatalf("marker = %v, %v", info, err)
 	}
 }
