@@ -65,3 +65,10 @@ func TestClassifyProbeOpenErrorFailsClosedForUnknownErrno(t *testing.T) {
 		})
 	}
 }
+
+func TestChildConfidentialityReportStringDoesNotCarrySecrets(t *testing.T) {
+	report := ChildConfidentialityReport{DumpableZero: true, CoreLimitZero: true, NoNewPrivileges: true}
+	if report.valid() {
+		t.Fatal("partial child report unexpectedly validated")
+	}
+}
