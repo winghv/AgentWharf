@@ -782,9 +782,6 @@ func (s *Store) AcknowledgeSettingsCommandDelivery(ctx context.Context, sessionI
 	if err != nil {
 		return store.SettingsCommand{}, err
 	}
-	if err != nil {
-		return store.SettingsCommand{}, err
-	}
 	if err := tx.Commit(); err != nil {
 		return store.SettingsCommand{}, fmt.Errorf("commit settings delivery acknowledgement: %w", err)
 	}
