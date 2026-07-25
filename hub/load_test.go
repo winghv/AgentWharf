@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -469,6 +472,52 @@ func TestCoreCoverageHistoryValidationPolicies(t *testing.T) {
 	request.BeforeSeq = &before
 	if handler.validHistoryPage(page, request) {
 		t.Fatal("history event at or after before_seq accepted")
+	}
+}
+
+func TestObservabilityHandlerRestrictsDiagnostics(t *testing.T) {
+	fallback := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	handler := NewObservabilityHandler("diagnostic-token", fallback)
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "192.0.2.10:1234"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("remote metrics status = %d, want 404", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	request.Header.Set("Authorization", "Bearer diagnostic-token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "agentwharf_hub_info") || strings.Contains(response.Body.String(), "diagnostic-token") {
+		t.Fatalf("authorized metrics response = %d %q", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/debug/pprof/", nil)
+	request.RemoteAddr = "[::1]:1234"
+	request.Header.Set("Authorization", "Bearer diagnostic-token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "profile") {
+		t.Fatalf("authorized pprof response = %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	request.Header.Set("Authorization", "Bearer diagnostic-token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST metrics status = %d, want 405", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/ws", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("fallback status = %d, want 204", response.Code)
 	}
 }
 

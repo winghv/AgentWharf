@@ -2673,8 +2673,9 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 		Authenticator: authenticator,
 		EventStore:    sessionStore,
 	})
+	webSocketHandler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: sessionStore, SessionCredentialIssuer: issuer, SessionCredentialLifecycle: issuer})
 	server := &http.Server{
-		Handler:           hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: sessionStore, SessionCredentialIssuer: issuer, SessionCredentialLifecycle: issuer}),
+		Handler:           hub.NewObservabilityHandler(cfg.ControlToken, webSocketHandler),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
