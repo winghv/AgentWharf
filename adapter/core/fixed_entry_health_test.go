@@ -15,6 +15,22 @@ func TestStartFixedEntryHealthRequiresRegularMarker(t *testing.T) {
 	}
 }
 
+func TestStartFixedEntryHealthRejectsSymlinkMarker(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	marker := filepath.Join(dir, "health")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := os.Symlink(target, marker); err != nil {
+		t.Fatalf("symlink marker: %v", err)
+	}
+	if _, err := StartFixedEntryHealth(context.Background(), marker); err == nil {
+		t.Fatal("StartFixedEntryHealth() error = nil, want symlink rejection")
+	}
+}
+
 func TestStartFixedEntryHealthTouchesExistingMarker(t *testing.T) {
 	t.Parallel()
 	marker := filepath.Join(t.TempDir(), "health")
