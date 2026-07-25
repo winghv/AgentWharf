@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   AgentWharfClient,
+  AgentWharfAttentionClient,
   decodeFrame,
   encodeFrame,
   type AgentWharfEvent,
@@ -452,6 +453,66 @@ test('serializes bounded file references without content transport or path fallb
   await assert.rejects(client.sendMessageWithReferences('ses_files', [
     { kind: 'file_reference', disposition: 'file', path: 'ok.txt', version: 'v1', contentDigest: `sha256:${'d'.repeat(64)}`, bytes: 10 * 1024 * 1024 + 1 },
   ], { capabilityFingerprint }), /file-reference message part/)
+  client.close()
+})
+
+test('keeps attention summaries bounded, resumable and command-free', async () => {
+  const sockets = new FakeSocketFactory()
+  let requestNumber = 0
+  const client = new AgentWharfAttentionClient({
+    url: 'ws://hub.local/ws', token: 'attention-token', webSocketFactory: sockets.factory, reconnect: false,
+    requestIdFactory: () => `attn_${++requestNumber}`,
+  })
+  const updates: string[] = []
+  client.onSummary((frame) => updates.push(`${frame.kind}/${frame.subscription_state}`))
+  const connected = client.connect()
+  sockets.last().open()
+  assert.deepEqual(sockets.last().sentFrames()[0], {
+    frame: 'hello', protocol_version: 2, role: 'client', token: 'attention-token', subscriptions: [],
+  })
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, sessions: [] })
+  await Promise.resolve()
+  assert.deepEqual(sockets.last().sentFrames()[1], { frame: 'attention.subscribe', request_id: 'attn_1' })
+  sockets.last().receive({
+    frame: 'attention.summary', request_id: 'attn_1', kind: 'snapshot', subscription_state: 'complete',
+    summaries: [{
+      session_id: 'ses_attention', latest_seq: 7, state: 'working', summary_version: 3, summary_state: 'complete',
+      blocker: { kind: 'queued', reason: 'capacity', expires_at: 123, blocking_session_id: 'ses_attention' },
+    }],
+  })
+  const snapshot = await connected
+  assert.equal(snapshot.summaries.length, 1)
+  assert.equal(client.summary('ses_attention')?.summaryVersion, 3)
+  assert.equal(client.summary('ses_attention')?.blocker?.kind, 'queued')
+  assert.equal('sendMessage' in client, false)
+
+  const refreshed = client.refresh()
+  assert.deepEqual(sockets.last().sentFrames()[2], { frame: 'attention.subscribe', request_id: 'attn_2' })
+  sockets.last().receive({
+    frame: 'attention.summary', request_id: 'attn_2', kind: 'update', subscription_state: 'incomplete',
+    summaries: [{
+      session_id: 'ses_attention', latest_seq: 8, state: 'working', summary_version: 4, summary_state: 'incomplete',
+      blocker: { kind: 'outcome_unknown', operation: 'start' },
+    }],
+  })
+  await refreshed
+  assert.equal(client.summary('ses_attention')?.latestSeq, 8)
+  assert.equal(client.currentSubscriptionState(), 'incomplete')
+  sockets.last().receive({
+    frame: 'attention.summary', request_id: 'live', kind: 'update', subscription_state: 'complete',
+    summaries: [{ session_id: 'ses_attention', latest_seq: 7, state: 'working', summary_version: 3, summary_state: 'complete' }],
+  })
+  assert.equal(client.summary('ses_attention')?.summaryVersion, 4)
+  assert.deepEqual(updates, ['snapshot/complete', 'update/incomplete', 'update/complete'])
+
+  const switched = client.switchIdentity('attention-token-2')
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, sessions: [] })
+  await Promise.resolve()
+  assert.equal(sockets.last().sentFrames()[0].token, 'attention-token-2')
+  sockets.last().receive({ frame: 'attention.summary', request_id: 'attn_3', kind: 'snapshot', subscription_state: 'complete', summaries: [] })
+  await switched
+  assert.equal(client.summaries().length, 0)
   client.close()
 })
 

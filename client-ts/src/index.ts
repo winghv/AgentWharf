@@ -176,6 +176,72 @@ export interface RunControlOutcomeUpdate {
   seq?: number
 }
 
+export interface AttentionPermission {
+  id: string
+  status: 'pending'
+}
+
+export interface AttentionBlocker {
+  kind: 'queued' | 'reauthorization_required' | 'new_run_required' | 'outcome_unknown'
+  reason?: string
+  expiresAt?: number
+  blockingSessionId?: string
+  operation?: string
+}
+
+export interface AttentionSummary {
+  sessionId: string
+  latestSeq: number
+  state: string
+  permission?: AttentionPermission
+  terminalOutcome?: string
+  latestChangeSeq?: number
+  blocker?: AttentionBlocker
+  summaryVersion: number
+  summaryState: 'complete' | 'incomplete'
+}
+
+export interface AttentionSubscribeFrame {
+  frame: 'attention.subscribe'
+  request_id: string
+}
+
+export interface AttentionSummaryFrame {
+  frame: 'attention.summary'
+  request_id: string
+  kind: 'snapshot' | 'update'
+  subscription_state: 'complete' | 'incomplete'
+  summaries: AttentionSummaryWire[]
+}
+
+interface AttentionSummaryWire {
+  session_id: string
+  latest_seq: number
+  state: string
+  permission?: { id: string; status: 'pending' }
+  terminal_outcome?: string
+  latest_change_seq?: number
+  blocker?: {
+    kind: AttentionBlocker['kind']
+    reason?: string
+    expires_at?: number
+    blocking_session_id?: string
+    operation?: string
+  }
+  summary_version: number
+  summary_state: 'complete' | 'incomplete'
+}
+
+export interface AttentionClientOptions {
+  url: string
+  token: string
+  webSocketFactory?: WebSocketFactory
+  reconnect?: false | Partial<ReconnectConfig>
+  requestIdFactory?: () => string
+}
+
+export type AttentionSummaryHandler = (summary: AttentionSummaryFrame) => void
+
 export interface AgentWharfEvent {
   frame: 'event'
   type: string
@@ -246,6 +312,8 @@ export type AgentWharfFrame =
   | ErrorFrame
   | HistoryPageRequestFrame
   | HistoryPageResponseFrame
+  | AttentionSubscribeFrame
+  | AttentionSummaryFrame
 
 export interface WebSocketLike {
   onopen: ((event: Event) => void) | null
@@ -338,6 +406,8 @@ export function decodeFrame(data: string): AgentWharfFrame {
     case 'pong':
     case 'error':
     case 'history.page':
+    case 'attention.subscribe':
+    case 'attention.summary':
       return decoded as AgentWharfFrame
     default:
       throw new Error(`unknown frame: ${String(decoded.frame)}`)
@@ -726,6 +796,8 @@ export class AgentWharfClient {
       case 'hello':
       case 'hello.ack':
       case 'command':
+      case 'attention.subscribe':
+      case 'attention.summary':
         return
     }
   }
@@ -910,6 +982,193 @@ export class AgentWharfClient {
   }
 }
 
+/**
+ * Attention-only client. It deliberately has no command, attach, history or
+ * credential APIs; membership and summaries come solely from the Auth grant.
+ */
+export class AgentWharfAttentionClient {
+  private readonly webSocketFactory: WebSocketFactory
+  private readonly reconnect: ReconnectConfig | null
+  private readonly requestIdFactory: () => string
+  private readonly summaryHandlers = new Set<AttentionSummaryHandler>()
+  private readonly summariesBySession = new Map<string, AttentionSummary>()
+  private readonly pendingRefresh = new Map<string, { resolve: (frame: AttentionSummaryFrame) => void; reject: (error: Error) => void }>()
+  private token: string
+  private socket: WebSocketLike | null = null
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private reconnectDelayMs: number
+  private closedByClient = false
+  private handshakeReady = false
+  private subscriptionState: 'complete' | 'incomplete' = 'incomplete'
+  private nextRequestNumber = 1
+
+  constructor(private readonly options: AttentionClientOptions) {
+    if (options.token.trim() === '') throw new Error('attention token is required')
+    this.token = options.token
+    this.webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory
+    this.reconnect = normalizeReconnect(options.reconnect)
+    this.reconnectDelayMs = this.reconnect?.initialDelayMs ?? 0
+    this.requestIdFactory = options.requestIdFactory ?? (() => `attention_${Date.now()}_${this.nextRequestNumber++}`)
+  }
+
+  connect(): Promise<AttentionSummaryFrame> {
+    this.closedByClient = false
+    this.handshakeReady = false
+    return this.openSocket().then(() => this.refresh())
+  }
+
+  resume(): Promise<AttentionSummaryFrame> {
+    this.closedByClient = false
+    if (this.socket !== null && this.handshakeReady) return this.refresh()
+    this.handshakeReady = false
+    return this.openSocket().then(() => this.refresh())
+  }
+
+  switchIdentity(token: string): Promise<AttentionSummaryFrame> {
+    if (typeof token !== 'string' || token.trim() === '') return Promise.reject(new Error('attention token is required'))
+    this.token = token
+    this.summariesBySession.clear()
+    this.subscriptionState = 'incomplete'
+    this.close()
+    return this.connect()
+  }
+
+  close(): void {
+    this.closedByClient = true
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.rejectPending(new Error('attention client closed'))
+    this.handshakeReady = false
+    this.socket?.close()
+    this.socket = null
+  }
+
+  onSummary(handler: AttentionSummaryHandler): () => void {
+    this.summaryHandlers.add(handler)
+    return () => this.summaryHandlers.delete(handler)
+  }
+
+  summary(sessionId: string): AttentionSummary | undefined {
+    const summary = this.summariesBySession.get(sessionId)
+    return summary === undefined ? undefined : cloneAttentionSummary(summary)
+  }
+
+  summaries(): AttentionSummary[] {
+    return [...this.summariesBySession.values()].map(cloneAttentionSummary)
+  }
+
+  currentSubscriptionState(): 'complete' | 'incomplete' {
+    return this.subscriptionState
+  }
+
+  refresh(): Promise<AttentionSummaryFrame> {
+    const socket = this.socket
+    if (socket === null || !this.handshakeReady) return Promise.reject(new Error('attention client is not connected'))
+    const requestId = this.requestIdFactory()
+    if (!isSettingsIdentifier(requestId) || this.pendingRefresh.has(requestId)) return Promise.reject(new Error('attention request id is invalid or pending'))
+    const frame: AttentionSubscribeFrame = { frame: 'attention.subscribe', request_id: requestId }
+    return new Promise<AttentionSummaryFrame>((resolve, reject) => {
+      this.pendingRefresh.set(requestId, { resolve, reject })
+      try {
+        socket.send(encodeFrame(frame))
+      } catch (error) {
+        this.pendingRefresh.delete(requestId)
+        reject(normalizeError(error))
+      }
+    })
+  }
+
+  private openSocket(): Promise<void> {
+    const socket = this.webSocketFactory(this.options.url)
+    this.socket = socket
+    return new Promise<void>((resolve, reject) => {
+      let handshakeComplete = false
+      socket.onopen = () => {
+        socket.send(encodeFrame({
+          frame: 'hello', protocol_version: 2, role: 'client', token: this.token, subscriptions: [],
+        } satisfies HelloFrame))
+      }
+      socket.onmessage = (event) => {
+        try {
+          const frame = decodeFrame(event.data)
+          if (frame.frame === 'hello.ack') {
+            validateHelloAck(frame, 2)
+            handshakeComplete = true
+            this.handshakeReady = true
+            this.reconnectDelayMs = this.reconnect?.initialDelayMs ?? 0
+            resolve()
+            return
+          }
+          if (frame.frame === 'attention.summary') {
+            validateAttentionSummaryFrame(frame)
+            this.applyAttentionSummary(frame)
+            const pending = this.pendingRefresh.get(frame.request_id)
+            if (pending !== undefined) {
+              this.pendingRefresh.delete(frame.request_id)
+              pending.resolve(frame)
+            }
+            for (const handler of this.summaryHandlers) handler(frame)
+            return
+          }
+          if (frame.frame === 'ping') {
+            socket.send(encodeFrame({ frame: 'pong', nonce: frame.nonce }))
+          }
+        } catch (error) {
+          const normalized = normalizeError(error)
+          if (!handshakeComplete) {
+            if (this.socket === socket) this.socket = null
+            reject(normalized)
+            socket.close()
+          } else {
+            this.rejectPending(normalized)
+            socket.close()
+          }
+        }
+      }
+      socket.onerror = () => {
+        const error = new Error('websocket error')
+        if (!handshakeComplete) reject(error)
+      }
+      socket.onclose = () => {
+        if (this.socket !== socket) return
+        this.socket = null
+        this.handshakeReady = false
+        if (!handshakeComplete) reject(new Error('websocket closed before hello.ack'))
+        this.rejectPending(new Error('attention websocket closed'))
+        if (!this.closedByClient) this.scheduleReconnect()
+      }
+    })
+  }
+
+  private applyAttentionSummary(frame: AttentionSummaryFrame): void {
+    if (frame.kind === 'snapshot') this.summariesBySession.clear()
+    this.subscriptionState = frame.subscription_state
+    for (const wire of frame.summaries) {
+      const summary = attentionSummaryFromWire(wire)
+      const previous = this.summariesBySession.get(summary.sessionId)
+      if (previous !== undefined && (summary.latestSeq < previous.latestSeq || summary.summaryVersion < previous.summaryVersion)) continue
+      this.summariesBySession.set(summary.sessionId, summary)
+    }
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pendingRefresh.values()) pending.reject(error)
+    this.pendingRefresh.clear()
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnect === null || this.reconnectTimer !== null) return
+    const delay = this.reconnectDelayMs
+    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, this.reconnect.maxDelayMs)
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.openSocket().then(() => this.refresh()).catch(() => this.scheduleReconnect())
+    }, delay)
+  }
+}
+
 function asJsonObject(value: JsonValue): { [key: string]: JsonValue } | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as { [key: string]: JsonValue } : null
 }
@@ -975,6 +1234,76 @@ function isFileReferenceMediaType(value: string | undefined): boolean {
 
 function utf8ByteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength
+}
+
+function validateAttentionSummaryFrame(frame: AttentionSummaryFrame): void {
+  if (!isSettingsIdentifier(frame.request_id) || (frame.kind !== 'snapshot' && frame.kind !== 'update') ||
+    (frame.subscription_state !== 'complete' && frame.subscription_state !== 'incomplete') ||
+    !Array.isArray(frame.summaries) || frame.summaries.length > 64) {
+    throw new Error('invalid attention summary')
+  }
+  const seen = new Set<string>()
+  for (const summary of frame.summaries) {
+    if (!isSettingsIdentifier(summary.session_id) || seen.has(summary.session_id) ||
+      !Number.isInteger(summary.latest_seq) || summary.latest_seq < 0 || typeof summary.state !== 'string' || summary.state.length === 0 ||
+      !Number.isInteger(summary.summary_version) || summary.summary_version < 0 ||
+      (summary.summary_state !== 'complete' && summary.summary_state !== 'incomplete')) {
+      throw new Error('invalid attention summary')
+    }
+    seen.add(summary.session_id)
+    if (summary.permission !== undefined && (summary.permission.status !== 'pending' || !isSettingsIdentifier(summary.permission.id))) {
+      throw new Error('invalid attention summary permission')
+    }
+    if (summary.terminal_outcome !== undefined && typeof summary.terminal_outcome !== 'string') {
+      throw new Error('invalid attention summary terminal outcome')
+    }
+    if (summary.latest_change_seq !== undefined && (!Number.isInteger(summary.latest_change_seq) || summary.latest_change_seq < 0)) {
+      throw new Error('invalid attention summary change sequence')
+    }
+    const blocker = summary.blocker
+    if (blocker === undefined) continue
+    if (!['queued', 'reauthorization_required', 'new_run_required', 'outcome_unknown'].includes(blocker.kind)) {
+      throw new Error('invalid attention summary blocker')
+    }
+    if (blocker.reason !== undefined && typeof blocker.reason !== 'string') throw new Error('invalid attention summary blocker reason')
+    if (blocker.expires_at !== undefined && (!Number.isInteger(blocker.expires_at) || blocker.expires_at < 0)) throw new Error('invalid attention summary blocker expiry')
+    if (blocker.blocking_session_id !== undefined && !isSettingsIdentifier(blocker.blocking_session_id)) throw new Error('invalid attention summary blocker session')
+    if (blocker.operation !== undefined && typeof blocker.operation !== 'string') throw new Error('invalid attention summary blocker operation')
+    if (blocker.kind !== 'queued' && (blocker.reason !== undefined || blocker.expires_at !== undefined || blocker.blocking_session_id !== undefined)) {
+      throw new Error('invalid attention summary blocker fields')
+    }
+    if (blocker.kind !== 'outcome_unknown' && blocker.operation !== undefined) throw new Error('invalid attention summary blocker operation')
+  }
+}
+
+function attentionSummaryFromWire(wire: AttentionSummaryWire): AttentionSummary {
+  return {
+    sessionId: wire.session_id,
+    latestSeq: wire.latest_seq,
+    state: wire.state,
+    ...(wire.permission === undefined ? {} : { permission: { ...wire.permission } }),
+    ...(wire.terminal_outcome === undefined ? {} : { terminalOutcome: wire.terminal_outcome }),
+    ...(wire.latest_change_seq === undefined ? {} : { latestChangeSeq: wire.latest_change_seq }),
+    ...(wire.blocker === undefined ? {} : {
+      blocker: {
+        kind: wire.blocker.kind,
+        ...(wire.blocker.reason === undefined ? {} : { reason: wire.blocker.reason }),
+        ...(wire.blocker.expires_at === undefined ? {} : { expiresAt: wire.blocker.expires_at }),
+        ...(wire.blocker.blocking_session_id === undefined ? {} : { blockingSessionId: wire.blocker.blocking_session_id }),
+        ...(wire.blocker.operation === undefined ? {} : { operation: wire.blocker.operation }),
+      },
+    }),
+    summaryVersion: wire.summary_version,
+    summaryState: wire.summary_state,
+  }
+}
+
+function cloneAttentionSummary(summary: AttentionSummary): AttentionSummary {
+  return {
+    ...summary,
+    ...(summary.permission === undefined ? {} : { permission: { ...summary.permission } }),
+    ...(summary.blocker === undefined ? {} : { blocker: { ...summary.blocker } }),
+  }
 }
 
 function decodeSettingsCapability(value: JsonValue): SettingsCapability {
