@@ -777,6 +777,13 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	if err := validateProviderCommand(cfg); err != nil {
 		return cfg, err
 	}
+	metrics := core.NewAdapterMetrics()
+	diagnostics := startWrapDiagnostics(ctx, cfg, metrics)
+	if diagnostics != nil {
+		defer diagnostics.Close()
+	}
+	metrics.SetWorkerCounts(1, 0, 0)
+	defer metrics.SetWorkerCounts(0, 0, 0)
 	if cfg.Managed {
 		cfg, err = prepareManagedWrapSession(ctx, cfg, pairOutput)
 		if err != nil {
@@ -833,7 +840,7 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 				return cfg, errors.New("provider start requires v2 connection authority")
 			}
 		}
-		return cfg, runWrapProvider(ctx, cfg, conn, masker)
+		return cfg, runWrapProvider(ctx, cfg, conn, masker, metrics)
 	}
 
 	events, err := translateWrapInput(ctx, cfg, stdin)
@@ -848,8 +855,32 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		if err := writeCLIProtocolFrame(ctx, conn, &event); err != nil {
 			return cfg, fmt.Errorf("send event %s: %w", event.Type, err)
 		}
+		metrics.IncMaskedEvent()
 	}
 	return cfg, nil
+}
+
+func startWrapDiagnostics(ctx context.Context, cfg wrapConfig, metrics *core.AdapterMetrics) *core.AdapterDiagnosticsServer {
+	if cfg.HealthMarker == "" || cfg.ProviderCredential == nil || cfg.ProviderCredential.UID == 0 || cfg.ProviderCredential.UID == uint32(os.Geteuid()) {
+		return nil
+	}
+	markerInfo, err := os.Lstat(cfg.HealthMarker)
+	if err != nil || !markerInfo.Mode().IsRegular() || markerInfo.Mode().Perm() != 0o600 {
+		return nil
+	}
+	root := filepath.Dir(cfg.HealthMarker)
+	socketPath := filepath.Join(root, "diagnostics.sock")
+	server, err := core.StartAdapterDiagnosticsWithConfig(ctx, core.AdapterDiagnosticsConfig{
+		SocketPath:  socketPath,
+		RootPath:    root,
+		Metrics:     metrics,
+		OperatorUID: uint32(os.Geteuid()),
+		ProviderUID: cfg.ProviderCredential.UID,
+	})
+	if err != nil {
+		return nil
+	}
+	return server
 }
 
 func claimProtocolErrorRequiresReclaim(protocolErr *protocol.Error) bool {
@@ -1248,14 +1279,14 @@ func sameCloudAPIURL(left string, right string) bool {
 	return strings.TrimRight(strings.TrimSpace(left), "/") == strings.TrimRight(strings.TrimSpace(right), "/")
 }
 
-func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker) error {
+func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
 	stopHealth, err := core.StartFixedEntryHealth(ctx, cfg.HealthMarker)
 	if err != nil {
 		return err
 	}
 	defer stopHealth()
 	if cfg.Format == "acp" {
-		return runWrapACPProvider(ctx, cfg, conn, masker)
+		return runWrapACPProvider(ctx, cfg, conn, masker, metrics)
 	}
 
 	stdinReader, stdinWriter, err := os.Pipe()
@@ -1295,10 +1326,11 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		recoveryGroup, err = core.NewGroupSupervisor(core.GroupSupervisorConfig{
 			MaxWorkers:                 1,
 			AllowReferenceOnlyRecovery: true,
-			NewWorker: func(core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
+			NewWorker: func(workerCfg core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
 				if supervisor == nil {
 					return nil, errors.New("provider supervisor is unavailable")
 				}
+				workerCfg.Metrics = metrics
 				return supervisor, nil
 			},
 		})
@@ -1329,6 +1361,8 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		}()
 	}
 	startSupervisor()
+	metrics.SetWorkerCounts(1, 1, 0)
+	defer metrics.SetWorkerCounts(0, 0, 0)
 	if err := waitForFirstProviderStartAdmission(runCtx, startAdmission, processDone); err != nil {
 		cancel()
 		stopProviderSupervisor(supervisor)
@@ -1407,7 +1441,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 	}
 }
 
-func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker) error {
+func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
 	stdinReader, stdinWriter, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("create provider stdin pipe: %w", err)
@@ -1445,10 +1479,11 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		recoveryGroup, err = core.NewGroupSupervisor(core.GroupSupervisorConfig{
 			MaxWorkers:                 1,
 			AllowReferenceOnlyRecovery: true,
-			NewWorker: func(core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
+			NewWorker: func(workerCfg core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
 				if supervisor == nil {
 					return nil, errors.New("provider supervisor is unavailable")
 				}
+				workerCfg.Metrics = metrics
 				return supervisor, nil
 			},
 		})
@@ -1476,6 +1511,8 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		}()
 	}
 	startSupervisor()
+	metrics.SetWorkerCounts(1, 1, 0)
+	defer metrics.SetWorkerCounts(0, 0, 0)
 	if err := waitForFirstProviderStartAdmission(runCtx, startAdmission, processDone); err != nil {
 		cancel()
 		stopProviderSupervisor(supervisor)
@@ -2657,14 +2694,6 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 		_ = eventStore.Close()
 		return nil, fmt.Errorf("listen %s: %w", cfg.Addr, err)
 	}
-	metrics := core.NewAdapterMetrics()
-	diagnosticsPath := adapterDiagnosticsSocketPath(cfg.DBPath)
-	diagnostics, err := core.StartAdapterDiagnostics(ctx, diagnosticsPath, metrics)
-	if err != nil {
-		_ = listener.Close()
-		_ = eventStore.Close()
-		return nil, err
-	}
 
 	baseAuthenticator := static.New([]static.Token{
 		{
@@ -2691,12 +2720,11 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 	}
 
 	running := &runningServe{
-		server:      server,
-		store:       eventStore,
-		diagnostics: diagnostics,
-		done:        make(chan error, 1),
-		addr:        listener.Addr().String(),
-		wsURL:       "ws://" + listener.Addr().String(),
+		server: server,
+		store:  eventStore,
+		done:   make(chan error, 1),
+		addr:   listener.Addr().String(),
+		wsURL:  "ws://" + listener.Addr().String(),
 	}
 
 	go func() {
@@ -2712,20 +2740,9 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
-		_ = diagnostics.Close()
 	}()
 
 	return running, nil
-}
-
-func adapterDiagnosticsSocketPath(dbPath string) string {
-	preferred := filepath.Join(filepath.Dir(dbPath), "adapter-state", "diagnostics.sock")
-	if len(preferred) <= 100 {
-		return preferred
-	}
-	digest := sha256.Sum256([]byte(dbPath))
-	shortDirectory := filepath.Join(os.TempDir(), "agentwharf-"+hex.EncodeToString(digest[:6]))
-	return filepath.Join(shortDirectory, "diagnostics.sock")
 }
 
 func newLocalSessionCredentialIssuer(cfg serveConfig) (*auth.LocalSessionCredentialIssuer, error) {
@@ -2762,7 +2779,10 @@ func newLocalSessionCredentialIssuer(cfg serveConfig) (*auth.LocalSessionCredent
 func (r *runningServe) wait() error {
 	r.waitOnce.Do(func() {
 		serveErr := <-r.done
-		diagnosticsErr := r.diagnostics.Close()
+		var diagnosticsErr error
+		if r.diagnostics != nil {
+			diagnosticsErr = r.diagnostics.Close()
+		}
 		closeErr := r.store.Close()
 		if serveErr != nil {
 			r.waitErr = serveErr

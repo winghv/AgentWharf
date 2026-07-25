@@ -158,6 +158,32 @@ func (h *adapterObservabilityHandler) servePprof(w http.ResponseWriter, path str
 			return
 		}
 		if handler := pprof.Handler(name); handler != nil {
+			if raw, present := r.URL.Query()["seconds"]; present {
+				if len(raw) != 1 {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				seconds, err := boundedProfileSeconds(r)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if h.profileSlot != nil {
+					select {
+					case h.profileSlot <- struct{}{}:
+						defer func() { <-h.profileSlot }()
+					default:
+						w.WriteHeader(http.StatusTooManyRequests)
+						return
+					}
+				}
+				query := r.URL.Query()
+				query.Set("seconds", strconv.Itoa(seconds))
+				r2 := r.Clone(r.Context())
+				r2.URL.RawQuery = query.Encode()
+				handler.ServeHTTP(w, r2)
+				return
+			}
 			handler.ServeHTTP(w, r)
 			return
 		}
@@ -241,42 +267,55 @@ type AdapterDiagnosticsServer struct {
 	server *http.Server
 	ln     *peerUnixListener
 	path   string
+	cancel context.CancelFunc
 	once   sync.Once
 }
 
+type AdapterDiagnosticsConfig struct {
+	SocketPath  string
+	RootPath    string
+	Metrics     *AdapterMetrics
+	OperatorUID uint32
+	ProviderUID uint32
+}
+
 func StartAdapterDiagnostics(ctx context.Context, socketPath string, metrics *AdapterMetrics) (*AdapterDiagnosticsServer, error) {
-	if socketPath == "" {
-		return nil, errors.New("diagnostic socket path is required")
+	return nil, errors.New("fixed-entry diagnostics configuration is required")
+}
+
+func StartAdapterDiagnosticsWithConfig(ctx context.Context, cfg AdapterDiagnosticsConfig) (*AdapterDiagnosticsServer, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	directory := filepath.Dir(socketPath)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return nil, fmt.Errorf("create diagnostic socket directory: %w", err)
+	if cfg.SocketPath == "" || cfg.RootPath == "" || cfg.OperatorUID == cfg.ProviderUID {
+		return nil, errors.New("diagnostic identity and paths are required")
 	}
-	if err := os.Chmod(directory, 0o700); err != nil {
-		return nil, fmt.Errorf("protect diagnostic socket directory: %w", err)
+	if filepath.Dir(filepath.Clean(cfg.SocketPath)) != filepath.Clean(cfg.RootPath) {
+		return nil, errors.New("diagnostic socket must be directly under its fixed-entry root")
 	}
-	if info, err := os.Lstat(socketPath); err == nil {
-		if info.Mode()&os.ModeSocket != os.ModeSocket || info.Mode().Perm()&0o077 != 0 || info.Sys() == nil {
-			return nil, errors.New("diagnostic socket path is unsafe")
-		}
-		if err := os.Remove(socketPath); err != nil {
-			return nil, fmt.Errorf("remove stale diagnostic socket: %w", err)
-		}
+	rootInfo, err := os.Lstat(cfg.RootPath)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode().Perm() != 0o700 {
+		return nil, errors.New("diagnostic fixed-entry root is unavailable")
+	}
+	if _, err := os.Lstat(cfg.SocketPath); err == nil {
+		// A stale or foreign entry is evidence that the fixed-entry proof is lost.
+		return nil, errors.New("diagnostic socket path is occupied")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect diagnostic socket: %w", err)
 	}
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: cfg.SocketPath, Net: "unix"})
 	if err != nil {
 		return nil, fmt.Errorf("listen on diagnostic socket: %w", err)
 	}
-	if err := os.Chmod(socketPath, 0o600); err != nil {
+	if err := os.Chmod(cfg.SocketPath, 0o600); err != nil {
 		_ = listener.Close()
-		_ = os.Remove(socketPath)
+		_ = os.Remove(cfg.SocketPath)
 		return nil, fmt.Errorf("protect diagnostic socket: %w", err)
 	}
-	peer := &peerUnixListener{listener: listener, operatorUID: uint32(os.Geteuid()), slots: make(chan struct{}, 2)}
-	handler := &adapterObservabilityHandler{metrics: metrics, unixPeer: true, profileSlot: make(chan struct{}, 1)}
+	peer := &peerUnixListener{listener: listener, operatorUID: cfg.OperatorUID, slots: make(chan struct{}, 2)}
+	handler := &adapterObservabilityHandler{metrics: cfg.Metrics, unixPeer: true, profileSlot: make(chan struct{}, 1)}
 	budget := &diagnosticBudget{}
+	serverCtx, cancel := context.WithCancel(ctx)
 	server := &http.Server{
 		Handler:        handler,
 		MaxHeaderBytes: 8 << 10,
@@ -285,8 +324,9 @@ func StartAdapterDiagnostics(ctx context.Context, socketPath string, metrics *Ad
 		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 			return context.WithValue(ctx, diagnosticBudgetKey{}, budget)
 		},
+		BaseContext: func(net.Listener) context.Context { return serverCtx },
 	}
-	result := &AdapterDiagnosticsServer{server: server, ln: peer, path: socketPath}
+	result := &AdapterDiagnosticsServer{server: server, ln: peer, path: cfg.SocketPath, cancel: cancel}
 	go func() {
 		if ctx != nil {
 			<-ctx.Done()
@@ -310,12 +350,23 @@ func (s *AdapterDiagnosticsServer) Close() error {
 	}
 	var err error
 	s.once.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
 		_ = s.ln.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		err = s.server.Shutdown(ctx)
-		if removeErr := os.Remove(s.path); err == nil && !errors.Is(removeErr, os.ErrNotExist) {
-			err = removeErr
+		if err != nil && (errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection")) {
+			err = nil
+		}
+		if closeErr := s.server.Close(); err == nil && closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+			err = closeErr
+		}
+		if removeErr := os.Remove(s.path); !errors.Is(removeErr, os.ErrNotExist) {
+			if err == nil {
+				err = removeErr
+			}
 		}
 	})
 	return err

@@ -102,6 +102,7 @@ type SessionWorker struct {
 	rotation          *CredentialRotation
 	ownership         ProcessTreeOwnership
 	lease             QuiescenceLease
+	metrics           *AdapterMetrics
 	ownerObservations *sync.WaitGroup
 	events            chan ProcessEvent
 	ownerErrs         chan error
@@ -121,6 +122,7 @@ type SessionWorkerConfig struct {
 	Credential                *SessionCredential
 	ProcessOwnership          ProcessTreeOwnership
 	QuiescenceLease           QuiescenceLease
+	Metrics                   *AdapterMetrics
 }
 
 // RecoveryStartHandleSource exposes only the current opaque reference. The
@@ -274,6 +276,7 @@ func newSessionWorker(cfg SessionWorkerConfig, runner processRunner) (*SessionWo
 	worker := &SessionWorker{
 		sessionID: cfg.SessionID, provider: provider, receipts: cfg.DurableReceipts,
 		credential: cfg.Credential, rotation: rotation, ownership: cfg.ProcessOwnership, lease: cfg.QuiescenceLease,
+		metrics:           cfg.Metrics,
 		ownerObservations: &ownerObservations,
 	}
 	if cfg.ProcessOwnership != nil {
@@ -282,6 +285,12 @@ func newSessionWorker(cfg SessionWorkerConfig, runner processRunner) (*SessionWo
 		go worker.forwardEvents()
 	}
 	return worker, nil
+}
+
+func (w *SessionWorker) recordReceiptFailure() {
+	if w != nil && w.metrics != nil {
+		w.metrics.IncReceiptFailure()
+	}
 }
 
 func (w *SessionWorker) SessionID() string {
@@ -541,6 +550,7 @@ func (w *SessionWorker) DeliverCommand(ctx context.Context, command SessionWorke
 	defer w.commandMu.Unlock()
 	routing, operation, err := w.receipts.PrepareCommand(ctx, w.sessionID, command)
 	if err != nil {
+		w.recordReceiptFailure()
 		return CommandRoutingReceipt{}, fmt.Errorf("prepare durable command: %w", err)
 	}
 	if routing.CommandID != command.CommandID || !validCommandRoutingStatus(routing.Status) {
@@ -557,6 +567,7 @@ func (w *SessionWorker) DeliverCommand(ctx context.Context, command SessionWorke
 			return w.finalizeCommandUnknown(command, operation, err)
 		}
 		if err := w.receipts.FinalizeCommand(ctx, w.sessionID, command, operation, CommandOutcomeCompleted); err != nil {
+			w.recordReceiptFailure()
 			return w.finalizeCommandUnknown(command, operation, err)
 		}
 		return nil
@@ -602,6 +613,7 @@ func (w *SessionWorker) ProposeEvent(ctx context.Context, proposalID string, pub
 		var err error
 		receipt, err = w.receipts.CommitEventProposal(ctx, w.sessionID, proposalID)
 		if err != nil {
+			w.recordReceiptFailure()
 			return fmt.Errorf("commit durable event proposal: %w", err)
 		}
 		if receipt.ProposalID != proposalID || receipt.Seq < 1 || receipt.Status != EventProposalAccepted {

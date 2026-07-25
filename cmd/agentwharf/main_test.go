@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -20,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/winghv/agentwharf/adapter/core"
 	"github.com/winghv/agentwharf/auth"
 	"github.com/winghv/agentwharf/auth/static"
 	"github.com/winghv/agentwharf/protocol"
@@ -64,29 +64,7 @@ func TestServeStartsLocalHubWithSQLiteAndStaticAuth(t *testing.T) {
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("stat sqlite db: %v", err)
 	}
-	diagnosticsPath := running.diagnostics.Path()
-	info, err := os.Stat(diagnosticsPath)
-	if err != nil {
-		t.Fatalf("stat diagnostics socket: %v", err)
-	}
-	if info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 {
-		t.Fatalf("diagnostics socket mode = %v", info.Mode())
-	}
-	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, "unix", diagnosticsPath)
-	}}
-	diagnosticsClient := &http.Client{Transport: transport}
-	metricsResponse, err := diagnosticsClient.Get("http://localhost/metrics")
-	if err != nil {
-		t.Fatalf("diagnostics metrics request: %v", err)
-	}
-	defer metricsResponse.Body.Close()
-	if metricsResponse.StatusCode != http.StatusOK {
-		t.Fatalf("diagnostics metrics status = %d", metricsResponse.StatusCode)
-	}
-	metricsResponse.Body.Close()
-	metricsResponse, err = http.Get("http://" + running.addr + "/adapter/metrics")
+	metricsResponse, err := http.Get("http://" + running.addr + "/adapter/metrics")
 	if err != nil {
 		t.Fatalf("public adapter metrics request: %v", err)
 	}
@@ -115,12 +93,36 @@ func TestServeStartsLocalHubWithSQLiteAndStaticAuth(t *testing.T) {
 		got.State != "ready" || got.LatestSeq != 0 || got.ReplayFrom != 1 {
 		t.Fatalf("session summary = %+v", got)
 	}
-	cancel()
-	if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("serve shutdown error = %v", err)
+}
+
+func TestStartWrapDiagnosticsRequiresFixedEntryProviderProof(t *testing.T) {
+	if server := startWrapDiagnostics(context.Background(), wrapConfig{}, core.NewAdapterMetrics()); server != nil {
+		t.Fatal("diagnostics enabled without fixed-entry proof")
 	}
-	if _, err := os.Stat(diagnosticsPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("diagnostics socket cleanup error = %v", err)
+	root, err := os.MkdirTemp("/tmp", "aw-wrap-diag-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	marker := filepath.Join(root, "health")
+	if err := os.WriteFile(marker, []byte("healthy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	providerUID := uint32(os.Geteuid()) + 1
+	cfg := wrapConfig{
+		HealthMarker:       marker,
+		ProviderCredential: &core.ProcessCredential{UID: providerUID, GID: providerUID},
+	}
+	server := startWrapDiagnostics(context.Background(), cfg, core.NewAdapterMetrics())
+	if server == nil {
+		t.Fatal("diagnostics proof was not accepted")
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("close diagnostics: %v", err)
+	}
+	cfg.ProviderCredential.UID = uint32(os.Geteuid())
+	if server := startWrapDiagnostics(context.Background(), cfg, core.NewAdapterMetrics()); server != nil {
+		t.Fatal("diagnostics enabled for same-UID provider")
 	}
 }
 

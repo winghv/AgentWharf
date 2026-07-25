@@ -104,6 +104,26 @@ func TestAdapterObservabilityPprofRoutesAndNilMetrics(t *testing.T) {
 			t.Fatalf("profile seconds %q status = %d", seconds, response.Code)
 		}
 	}
+	for _, path := range []string{"/debug/pprof/heap?seconds=0", "/debug/pprof/heap?seconds=31", "/debug/pprof/heap?seconds=86400"} {
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1"+path, nil)
+		request.RemoteAddr = "127.0.0.1:1000"
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("named profile %s status = %d", path, response.Code)
+		}
+	}
+	for _, path := range []string{"/debug/pprof/heap?seconds=1", "/debug/pprof/profile?seconds=1"} {
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1"+path, nil)
+		request.RemoteAddr = "127.0.0.1:1000"
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("bounded profile %s status = %d", path, response.Code)
+		}
+	}
 	limitedWriter := &diagnosticResponseWriter{ResponseWriter: httptest.NewRecorder(), written: 16 << 20}
 	if _, err := limitedWriter.Write([]byte("x")); !errors.Is(err, http.ErrAbortHandler) {
 		t.Fatalf("response limit error = %v", err)
@@ -120,9 +140,16 @@ func TestStartAdapterDiagnosticsUsesBoundedUnixSocket(t *testing.T) {
 	}
 	defer os.RemoveAll(directory)
 	socketPath := filepath.Join(directory, "diagnostics.sock")
+	providerUID := uint32(os.Geteuid()) + 1
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	server, err := StartAdapterDiagnostics(ctx, socketPath, NewAdapterMetrics())
+	server, err := StartAdapterDiagnosticsWithConfig(ctx, AdapterDiagnosticsConfig{
+		SocketPath:  socketPath,
+		RootPath:    directory,
+		Metrics:     NewAdapterMetrics(),
+		OperatorUID: uint32(os.Geteuid()),
+		ProviderUID: providerUID,
+	})
 	if err != nil {
 		t.Fatalf("StartAdapterDiagnostics() error = %v", err)
 	}
@@ -189,8 +216,53 @@ func TestStartAdapterDiagnosticsUsesBoundedUnixSocket(t *testing.T) {
 	if err := os.WriteFile(unsafePath, []byte("not a socket"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := StartAdapterDiagnostics(context.Background(), unsafePath, nil); err == nil {
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), AdapterDiagnosticsConfig{
+		SocketPath:  unsafePath,
+		RootPath:    unsafeDirectory,
+		OperatorUID: uint32(os.Geteuid()),
+		ProviderUID: providerUID,
+	}); err == nil {
 		t.Fatal("regular file diagnostics path unexpectedly accepted")
+	}
+}
+
+func TestStartAdapterDiagnosticsRejectsUnprovenRootAndSocket(t *testing.T) {
+	uid := uint32(os.Geteuid())
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), AdapterDiagnosticsConfig{OperatorUID: uid, ProviderUID: uid + 1}); err == nil {
+		t.Fatal("missing diagnostics paths unexpectedly accepted")
+	}
+	root, err := os.MkdirTemp("/tmp", "aw-diag-invalid-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	socket := filepath.Join(root, "diagnostics.sock")
+	base := AdapterDiagnosticsConfig{SocketPath: socket, RootPath: root, OperatorUID: uid, ProviderUID: uid + 1}
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), AdapterDiagnosticsConfig{SocketPath: socket, RootPath: root, OperatorUID: uid, ProviderUID: uid}); err == nil {
+		t.Fatal("same-UID operator/provider unexpectedly accepted")
+	}
+	for _, cfg := range []AdapterDiagnosticsConfig{
+		{SocketPath: socket, RootPath: filepath.Dir(root), OperatorUID: uid, ProviderUID: uid + 1},
+		{SocketPath: socket, RootPath: filepath.Join(root, "missing"), OperatorUID: uid, ProviderUID: uid + 1},
+	} {
+		if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), cfg); err == nil {
+			t.Fatalf("invalid diagnostics config unexpectedly accepted: %+v", cfg)
+		}
+	}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), base); err == nil {
+		t.Fatal("world-readable diagnostics root unexpectedly accepted")
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socket, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), base); err == nil {
+		t.Fatal("occupied diagnostics socket unexpectedly reused")
 	}
 }
 
@@ -243,6 +315,17 @@ func TestAdapterCredentialAndReceiptBoundaries(t *testing.T) {
 	if err := credential.validate("other", time.Now()); !errors.Is(err, ErrSessionCredentialMismatch) {
 		t.Fatalf("credential mismatch = %v", err)
 	}
+}
+
+func TestSessionWorkerReceiptFailureMetricIsProcessBounded(t *testing.T) {
+	metrics := NewAdapterMetrics()
+	worker := &SessionWorker{metrics: metrics}
+	worker.recordReceiptFailure()
+	if got := metrics.Snapshot().ReceiptFailures; got != 1 {
+		t.Fatalf("receipt failures = %d", got)
+	}
+	var nilWorker *SessionWorker
+	nilWorker.recordReceiptFailure()
 }
 
 func TestAdapterRotationAndWorkerWrappersFailClosed(t *testing.T) {
