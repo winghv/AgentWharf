@@ -41,6 +41,23 @@ export interface AttachStateUpdate {
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 export type JsonObject = { [key: string]: JsonValue }
 
+export interface FileReferencePart {
+  kind: 'file_reference'
+  disposition: 'file' | 'image'
+  path: string
+  version: string
+  contentDigest: string
+  bytes: number
+  mediaType?: string
+}
+
+export interface TextMessagePart {
+  kind: 'text'
+  text: string
+}
+
+export type MessagePart = TextMessagePart | FileReferencePart
+
 export interface Subscription {
   session_id: string
   last_seq: number
@@ -265,6 +282,10 @@ export interface SendCommandOptions {
   commandId?: string
 }
 
+export interface SendMessageWithReferencesOptions extends SendCommandOptions {
+  capabilityFingerprint: string
+}
+
 export interface AttachCommandOptions extends SendCommandOptions {}
 
 export interface SettingsChangeOptions extends SendCommandOptions {
@@ -474,6 +495,19 @@ export class AgentWharfClient {
     options: SendCommandOptions = {},
   ): Promise<CommandAckFrame> {
     return this.sendCommand('session.send', sessionId, { content }, options)
+  }
+
+  sendMessageWithReferences(
+    sessionId: string,
+    content: MessagePart[],
+    options: SendMessageWithReferencesOptions,
+  ): Promise<CommandAckFrame> {
+    try {
+      const payload = encodeFileReferenceMessage(content, options.capabilityFingerprint)
+      return this.sendCommand('session.send', sessionId, payload, options)
+    } catch (error) {
+      return Promise.reject(normalizeError(error))
+    }
   }
 
   respondPermission(
@@ -891,6 +925,56 @@ function isSettingsFingerprint(value: string): boolean {
 
 function isSettingsIdentifier(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(value)
+}
+
+function encodeFileReferenceMessage(content: MessagePart[], capabilityFingerprint: string): JsonObject {
+  if (!isSettingsFingerprint(capabilityFingerprint) || content.length === 0 || content.length > 32) {
+    throw new Error('file-reference capability or content is invalid')
+  }
+  let references = 0
+  const encoded = content.map<JsonObject>((part) => {
+    if (part.kind === 'text') {
+      if (typeof part.text !== 'string') throw new Error('text message part is invalid')
+      return { kind: 'text', text: part.text } as JsonObject
+    }
+    if (part.kind !== 'file_reference' || !isFileReferencePath(part.path) || !isFileReferenceVersion(part.version) ||
+      (part.disposition !== 'file' && part.disposition !== 'image') || !isFileReferenceFingerprint(part.contentDigest) ||
+      !Number.isInteger(part.bytes) || part.bytes < 0 || part.bytes > 10 * 1024 * 1024 || !isFileReferenceMediaType(part.mediaType)) {
+      throw new Error('file-reference message part is invalid')
+    }
+    references += 1
+    if (references > 8) throw new Error('too many file references')
+    return {
+      kind: 'file_reference', disposition: part.disposition, path: part.path, version: part.version,
+      content_digest: part.contentDigest, bytes: part.bytes, media_type: part.mediaType ?? null,
+    } as JsonObject
+  })
+  if (references === 0) throw new Error('at least one file reference is required')
+  const payload: JsonObject = { content: encoded, capability_fingerprint: capabilityFingerprint }
+  if (utf8ByteLength(JSON.stringify(payload)) > 8192) throw new Error('file-reference message is too large')
+  return payload
+}
+
+function isFileReferencePath(value: string): boolean {
+  if (value.length < 1 || value.length > 1024 || value.startsWith('/') || value.includes('\\') || value.includes('\u0000')) return false
+  const parts = value.split('/')
+  return parts.length <= 32 && parts.every((part) => part.length > 0 && part !== '.' && part !== '..')
+}
+
+function isFileReferenceVersion(value: string): boolean {
+  return value.length >= 1 && value.length <= 256 && !value.includes('\u0000')
+}
+
+function isFileReferenceFingerprint(value: string): boolean {
+  return isSettingsFingerprint(value)
+}
+
+function isFileReferenceMediaType(value: string | undefined): boolean {
+  return value === undefined || (value.length >= 1 && value.length <= 127 && /^[\x20-\x7e]+$/.test(value))
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength
 }
 
 function decodeSettingsCapability(value: JsonValue): SettingsCapability {

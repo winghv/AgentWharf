@@ -415,6 +415,46 @@ test('keeps interrupt and stop routing acks distinct from durable run-control ou
   client.close()
 })
 
+test('serializes bounded file references without content transport or path fallback', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_files' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, sessions: [] })
+  await connected
+
+  const capabilityFingerprint = `sha256:${'c'.repeat(64)}`
+  const command = client.sendMessageWithReferences('ses_files', [
+    { kind: 'text', text: 'Review this' },
+    {
+      kind: 'file_reference', disposition: 'file', path: 'src/app.ts', version: 'v1',
+      contentDigest: `sha256:${'d'.repeat(64)}`, bytes: 123, mediaType: 'text/plain',
+    },
+  ], { capabilityFingerprint, commandId: 'file_cmd_1' })
+  assert.deepEqual(sockets.last().sentFrames()[1], {
+    frame: 'command', cmd_id: 'file_cmd_1', type: 'session.send', session_id: 'ses_files',
+    payload: {
+      content: [
+        { kind: 'text', text: 'Review this' },
+        { kind: 'file_reference', disposition: 'file', path: 'src/app.ts', version: 'v1', content_digest: `sha256:${'d'.repeat(64)}`, bytes: 123, media_type: 'text/plain' },
+      ], capability_fingerprint: capabilityFingerprint,
+    },
+  })
+  assert.equal(JSON.stringify(sockets.last().sentFrames()[1]).includes('base64'), false)
+  sockets.last().receive({ frame: 'command.ack', cmd_id: 'file_cmd_1', status: 'accepted', reason: '' })
+  assert.equal((await command).status, 'accepted')
+  await assert.rejects(client.sendMessageWithReferences('ses_files', [
+    { kind: 'file_reference', disposition: 'file', path: '../secret', version: 'v1', contentDigest: `sha256:${'d'.repeat(64)}`, bytes: 1 },
+  ], { capabilityFingerprint }), /file-reference message part/)
+  await assert.rejects(client.sendMessageWithReferences('ses_files', [
+    { kind: 'file_reference', disposition: 'file', path: 'ok.txt', version: 'v1', contentDigest: `sha256:${'d'.repeat(64)}`, bytes: 10 * 1024 * 1024 + 1 },
+  ], { capabilityFingerprint }), /file-reference message part/)
+  client.close()
+})
+
 class FakeSocketFactory {
   readonly all: FakeSocket[] = []
 
