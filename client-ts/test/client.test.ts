@@ -252,6 +252,74 @@ test('emits events and resolves matching command acknowledgements', async () => 
   client.close()
 })
 
+test('submits an opaque attach grant and keeps routing separate from execution state', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_target' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 1, sessions: [] })
+  await connected
+
+  const stateUpdates: string[] = []
+  client.onDeliveryState((state) => stateUpdates.push(`${state.routing}/${state.adapter}/${state.provider}`))
+  const attach = client.attach('ses_target', 'opaque.grant', { commandId: 'attach_1' })
+  assert.deepEqual(sockets.last().sentFrames()[1], {
+    frame: 'command', cmd_id: 'attach_1', type: 'session.attach', session_id: 'ses_target', payload: { grant: 'opaque.grant' },
+  })
+  sockets.last().receive({ frame: 'command.ack', cmd_id: 'attach_1', status: 'accepted', reason: '' })
+  assert.equal((await attach).status, 'accepted')
+  assert.deepEqual(client.deliveryState('attach_1'), {
+    commandId: 'attach_1', sessionId: 'ses_target', type: 'session.attach',
+    routing: 'accepted', adapter: 'pending', provider: 'pending',
+  })
+
+  sockets.last().receive({
+    frame: 'event', type: 'session.attach', session_id: 'ses_target', seq: 2, time: 2,
+    payload: { cmd_id: 'attach_1', delivery_state: 'received', outcome: 'completed' },
+  })
+  assert.equal(client.deliveryState('attach_1')?.adapter, 'received')
+  assert.equal(client.deliveryState('attach_1')?.provider, 'completed')
+  assert.deepEqual(stateUpdates, ['pending/pending/pending', 'accepted/pending/pending', 'accepted/received/completed'])
+
+  sockets.last().receive({
+    frame: 'event', type: 'session.attach', session_id: 'ses_other', seq: 99, time: 99,
+    payload: { cmd_id: 'attach_1', delivery_state: 'outcome_unknown', outcome: 'outcome_unknown' },
+  })
+  assert.equal(client.deliveryState('attach_1')?.provider, 'completed')
+  client.close()
+})
+
+test('resume reuses durable cursors and marks an in-flight command outcome unknown', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_1' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 1, sessions: [] })
+  await connected
+  sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_1', seq: 7, time: 7, payload: {} })
+
+  const command = client.sendMessage('ses_1', [{ kind: 'text', text: 'retry?' }], { commandId: 'cmd_uncertain' })
+  sockets.last().serverClose()
+  await assert.rejects(command, /websocket closed before command\.ack/)
+  assert.equal(client.deliveryState('cmd_uncertain')?.provider, 'outcome_unknown')
+
+  const resumed = client.resume()
+  sockets.last().open()
+  assert.deepEqual(sockets.last().sentFrames()[0], {
+    frame: 'hello', protocol_version: 1, role: 'client', token: 'control-token',
+    subscriptions: [{ session_id: 'ses_1', last_seq: 7 }],
+  })
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 1, sessions: [] })
+  await resumed
+  client.close()
+})
+
 class FakeSocketFactory {
   readonly all: FakeSocket[] = []
 

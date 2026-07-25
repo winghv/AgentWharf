@@ -3,8 +3,40 @@ export const PROTOCOL_VERSION = 1
 export type ProtocolVersion = 1 | 2
 
 export type Role = 'client' | 'adapter'
-export type CommandType = 'session.send' | 'permission.respond' | 'session.interrupt' | 'session.stop'
+export type CommandType = 'session.send' | 'permission.respond' | 'session.interrupt' | 'session.stop' | 'session.attach'
 export type AckStatus = 'accepted' | 'rejected' | 'duplicate'
+
+/**
+ * Routing, Adapter receipt, and Provider completion are separate authorities.
+ * A routing acknowledgement alone never advances the latter two states.
+ */
+export type CommandRoutingState = 'pending' | 'accepted' | 'rejected' | 'duplicate' | 'outcome_unknown'
+export type AdapterDeliveryState = 'not_sent' | 'pending' | 'received' | 'outcome_unknown'
+export type ProviderCompletionState = 'not_started' | 'pending' | 'completed' | 'rejected' | 'timeout' | 'unsupported' | 'outcome_unknown'
+
+export interface CommandDeliveryState {
+  commandId: string
+  sessionId: string
+  type: CommandType
+  routing: CommandRoutingState
+  adapter: AdapterDeliveryState
+  provider: ProviderCompletionState
+  updatedSeq?: number
+}
+
+export type AttachState = 'join_pending' | 'queued' | 'start_received' | 'reauthorization_required' | 'canceled'
+export type AttachOperation = 'credential_handoff' | 'start' | 'command'
+
+export interface AttachStateUpdate {
+  sessionId: string
+  attachId?: string
+  status: AttachState
+  deliveryState: AdapterDeliveryState
+  operation?: AttachOperation
+  blocker?: string
+  version?: number
+  updatedSeq?: number
+}
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 export type JsonObject = { [key: string]: JsonValue }
@@ -156,6 +188,8 @@ export interface SendCommandOptions {
   commandId?: string
 }
 
+export interface AttachCommandOptions extends SendCommandOptions {}
+
 export interface HistoryPageOptions {
   beforeSeq?: number
   limit?: number
@@ -165,10 +199,12 @@ export interface HistoryPageOptions {
 
 type EventHandler = (event: AgentWharfEvent) => void
 type ErrorHandler = (error: Error | ErrorFrame) => void
+type DeliveryStateHandler = (state: CommandDeliveryState) => void
 
 interface PendingCommand {
   resolve: (ack: CommandAckFrame) => void
   reject: (error: Error) => void
+  state: CommandDeliveryState
 }
 
 interface PendingHistoryPage {
@@ -207,6 +243,8 @@ export class AgentWharfClient {
   private readonly cursors = new Map<string, number>()
   private readonly eventHandlers = new Set<EventHandler>()
   private readonly errorHandlers = new Set<ErrorHandler>()
+  private readonly deliveryStateHandlers = new Set<DeliveryStateHandler>()
+  private readonly deliveryStates = new Map<string, CommandDeliveryState>()
   private readonly pendingCommands = new Map<string, PendingCommand>()
   private readonly pendingHistoryPages = new Map<string, PendingHistoryPage>()
 
@@ -215,6 +253,8 @@ export class AgentWharfClient {
   private reconnectDelayMs: number
   private closedByClient = false
   private nextCommandNumber = 1
+  private lastHelloAck: HelloAckFrame | null = null
+  private handshakeReady = false
 
   constructor(private readonly options: AgentWharfClientOptions) {
     if (options.sessions.length === 0) {
@@ -231,6 +271,17 @@ export class AgentWharfClient {
 
   connect(): Promise<HelloAckFrame> {
     this.closedByClient = false
+    this.handshakeReady = false
+    return this.openSocket()
+  }
+
+  /** Re-open the subscription using the latest durable event cursors. */
+  resume(): Promise<HelloAckFrame> {
+    this.closedByClient = false
+    if (this.socket !== null && this.handshakeReady && this.lastHelloAck !== null) {
+      return Promise.resolve(this.lastHelloAck)
+    }
+    this.handshakeReady = false
     return this.openSocket()
   }
 
@@ -242,6 +293,7 @@ export class AgentWharfClient {
     }
     this.rejectPendingCommands(new Error('client closed'))
     this.rejectPendingHistoryPages(new Error('client closed'))
+    this.handshakeReady = false
     this.socket?.close()
     this.socket = null
   }
@@ -254,6 +306,25 @@ export class AgentWharfClient {
   onError(handler: ErrorHandler): () => void {
     this.errorHandlers.add(handler)
     return () => this.errorHandlers.delete(handler)
+  }
+
+  onDeliveryState(handler: DeliveryStateHandler): () => void {
+    this.deliveryStateHandlers.add(handler)
+    return () => this.deliveryStateHandlers.delete(handler)
+  }
+
+  /** Compatibility alias for callers that use the command-delivery wording. */
+  onCommandDelivery(handler: DeliveryStateHandler): () => void {
+    return this.onDeliveryState(handler)
+  }
+
+  deliveryState(commandId: string): CommandDeliveryState | undefined {
+    const state = this.deliveryStates.get(commandId)
+    return state === undefined ? undefined : { ...state }
+  }
+
+  commandDeliveryState(commandId: string): CommandDeliveryState | undefined {
+    return this.deliveryState(commandId)
   }
 
   lastSeq(sessionId: string): number {
@@ -284,6 +355,17 @@ export class AgentWharfClient {
     return this.sendCommand('session.stop', sessionId, {}, options)
   }
 
+  /**
+   * Submit the opaque, in-memory warm-attach grant. The grant is kept in the
+   * command payload only; the SDK never decodes, stores, or logs it.
+   */
+  attach(sessionId: string, grant: string, options: AttachCommandOptions = {}): Promise<CommandAckFrame> {
+    if (typeof grant !== 'string' || grant.trim() === '') {
+      return Promise.reject(new Error('attach grant is required'))
+    }
+    return this.sendCommand('session.attach', sessionId, { grant }, options)
+  }
+
   sendCommand(
     type: CommandType,
     sessionId: string,
@@ -295,6 +377,12 @@ export class AgentWharfClient {
       return Promise.reject(new Error('client is not connected'))
     }
     const commandId = options.commandId ?? this.commandIdFactory()
+    if (typeof commandId !== 'string' || commandId.trim() === '') {
+      return Promise.reject(new Error('command id is required'))
+    }
+    if (this.pendingCommands.has(commandId)) {
+      return Promise.reject(new Error(`command ${commandId} is already pending`))
+    }
     const command: CommandFrame = {
       frame: 'command',
       cmd_id: commandId,
@@ -302,10 +390,25 @@ export class AgentWharfClient {
       session_id: sessionId,
       payload,
     }
+    const state: CommandDeliveryState = {
+      commandId,
+      sessionId,
+      type,
+      routing: 'pending',
+      adapter: 'pending',
+      provider: 'pending',
+    }
+    this.setDeliveryState(state)
     const ack = new Promise<CommandAckFrame>((resolve, reject) => {
-      this.pendingCommands.set(commandId, { resolve, reject })
+      this.pendingCommands.set(commandId, { resolve, reject, state })
     })
-    socket.send(encodeFrame(command))
+    try {
+      socket.send(encodeFrame(command))
+    } catch (error) {
+      this.pendingCommands.delete(commandId)
+      this.setDeliveryState({ ...state, routing: 'outcome_unknown', adapter: 'outcome_unknown', provider: 'outcome_unknown' })
+      return Promise.reject(normalizeError(error))
+    }
     return ack
   }
 
@@ -365,6 +468,8 @@ export class AgentWharfClient {
           if (frame.frame === 'hello.ack') {
             const ack = validateHelloAck(frame)
             handshakeComplete = true
+            this.handshakeReady = true
+            this.lastHelloAck = ack
             this.reconnectDelayMs = this.reconnect?.initialDelayMs ?? 0
             resolve(ack)
             return
@@ -397,6 +502,7 @@ export class AgentWharfClient {
           return
         }
         this.socket = null
+        this.handshakeReady = false
         if (!handshakeComplete) {
           reject(new Error('websocket closed before hello.ack'))
         }
@@ -435,6 +541,7 @@ export class AgentWharfClient {
   }
 
   private handleEvent(event: AgentWharfEvent): void {
+    this.updateDeliveryFromEvent(event)
     if (typeof event.seq === 'number') {
       const current = this.cursors.get(event.session_id) ?? 0
       if (event.seq > current) {
@@ -452,11 +559,29 @@ export class AgentWharfClient {
       return
     }
     this.pendingCommands.delete(ack.cmd_id)
+    const state = this.deliveryStates.get(ack.cmd_id) ?? pending.state
+    if (ack.status === 'accepted') {
+      this.setDeliveryState({ ...state, routing: 'accepted' })
+    } else if (ack.status === 'rejected') {
+      this.setDeliveryState({ ...state, routing: 'rejected', adapter: 'not_sent', provider: 'not_started' })
+    } else {
+      // A duplicate proves only that Hub has seen this command before. The
+      // original Adapter/Provider outcome still requires durable evidence.
+      this.setDeliveryState({ ...state, routing: 'duplicate', adapter: 'outcome_unknown', provider: 'outcome_unknown' })
+    }
     pending.resolve(ack)
   }
 
   private rejectPendingCommands(error: Error): void {
     for (const pending of this.pendingCommands.values()) {
+      const state = this.deliveryStates.get(pending.state.commandId) ?? pending.state
+      this.setDeliveryState({
+        ...state,
+        routing: 'outcome_unknown',
+        adapter: state.adapter === 'received' ? state.adapter : 'outcome_unknown',
+        provider: state.provider === 'completed' || state.provider === 'rejected' || state.provider === 'timeout' || state.provider === 'unsupported'
+          ? state.provider : 'outcome_unknown',
+      })
       pending.reject(error)
     }
     this.pendingCommands.clear()
@@ -516,6 +641,53 @@ export class AgentWharfClient {
       handler(error)
     }
   }
+
+  private setDeliveryState(state: CommandDeliveryState): void {
+    const previous = this.deliveryStates.get(state.commandId)
+    if (previous !== undefined && previous.updatedSeq !== undefined && state.updatedSeq !== undefined && state.updatedSeq < previous.updatedSeq) {
+      return
+    }
+    this.deliveryStates.set(state.commandId, state)
+    for (const handler of this.deliveryStateHandlers) {
+      handler({ ...state })
+    }
+  }
+
+  private updateDeliveryFromEvent(event: AgentWharfEvent): void {
+    const payload = asJsonObject(event.payload)
+    if (payload === null) return
+    const commandId = stringField(payload, 'cmd_id') ?? stringField(payload, 'command_id')
+    if (commandId === undefined) return
+    const state = this.deliveryStates.get(commandId)
+    if (state === undefined || event.session_id !== state.sessionId) return
+    const next = { ...state, updatedSeq: event.seq ?? state.updatedSeq }
+    const deliveryState = stringField(payload, 'delivery_state')
+    const status = stringField(payload, 'status')
+    const outcome = stringField(payload, 'outcome')
+    if (deliveryState === 'received') next.adapter = 'received'
+    if (deliveryState === 'outcome_unknown') next.adapter = 'outcome_unknown'
+    if (status === 'received') next.adapter = 'received'
+    if (status === 'outcome_unknown') next.adapter = 'outcome_unknown'
+    switch (outcome) {
+      case 'completed': next.provider = 'completed'; break
+      case 'rejected': next.provider = 'rejected'; break
+      case 'timeout': next.provider = 'timeout'; break
+      case 'unsupported': next.provider = 'unsupported'; break
+      case 'outcome_unknown': next.provider = 'outcome_unknown'; break
+    }
+    if (next.adapter !== state.adapter || next.provider !== state.provider || next.updatedSeq !== state.updatedSeq) {
+      this.setDeliveryState(next)
+    }
+  }
+}
+
+function asJsonObject(value: JsonValue): { [key: string]: JsonValue } | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as { [key: string]: JsonValue } : null
+}
+
+function stringField(value: { [key: string]: JsonValue }, key: string): string | undefined {
+  const field = value[key]
+  return typeof field === 'string' ? field : undefined
 }
 
 function validateHistoryPage(page: HistoryPageResponseFrame): void {
