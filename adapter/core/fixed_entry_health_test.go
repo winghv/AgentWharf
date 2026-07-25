@@ -30,7 +30,7 @@ func TestStartFixedEntryHealthTouchesExistingMarker(t *testing.T) {
 		t.Fatalf("StartFixedEntryHealth() error = %v", err)
 	}
 	defer stop()
-	if info, err := os.Stat(marker); err != nil || !info.Mode().IsRegular() || !info.ModTime().After(before) {
+	if info, err := os.Stat(marker); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || !info.ModTime().After(before) {
 		t.Fatalf("marker = %v, %v", info, err)
 	}
 }
