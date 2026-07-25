@@ -1212,14 +1212,17 @@ func TestProviderStartAdmissionLinearizesLiveConnectionAndWorkspaceLease(t *test
 			}
 			db := openRawSQLite(t, harness.path)
 			defer db.Close()
-			if _, err := db.ExecContext(context.Background(), expiry.statement, time.Now().Add(20*time.Millisecond).UnixNano()); err != nil {
+			expiresAt := time.Now().Add(2 * time.Second)
+			if _, err := db.ExecContext(context.Background(), expiry.statement, expiresAt.UnixNano()); err != nil {
 				t.Fatalf("set callback expiry: %v", err)
 			}
 			admission.ReAdmission = true
 			called := false
 			if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
 				called = true
-				time.Sleep(50 * time.Millisecond)
+				if wait := time.Until(expiresAt) + 20*time.Millisecond; wait > 0 {
+					time.Sleep(wait)
+				}
 				return nil
 			}); err == nil || !called {
 				t.Fatalf("expired %s re-admission err=%v, callback=%t", expiry.name, err, called)
