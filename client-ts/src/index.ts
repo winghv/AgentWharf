@@ -3,7 +3,7 @@ export const PROTOCOL_VERSION = 1
 export type ProtocolVersion = 1 | 2
 
 export type Role = 'client' | 'adapter'
-export type CommandType = 'session.send' | 'permission.respond' | 'session.interrupt' | 'session.stop' | 'session.attach'
+export type CommandType = 'session.send' | 'permission.respond' | 'session.interrupt' | 'session.stop' | 'session.attach' | 'session.settings.change'
 export type AckStatus = 'accepted' | 'rejected' | 'duplicate'
 
 /**
@@ -81,6 +81,53 @@ export interface HelloAckFrame {
 
 export interface HelloCapabilities {
   history_page?: { max_limit: number }
+  settings?: {
+    schema_version: number
+    max_pending_changes: number
+    provider_response_timeout_seconds: number
+  }
+}
+
+export interface SettingsCapabilityChoice {
+  id: string
+  label: string
+}
+
+export interface SettingsCapability {
+  schemaVersion: number
+  fingerprint: string
+  models: SettingsCapabilityChoice[]
+  permissionModes: SettingsCapabilityChoice[]
+  effectiveModelId: string
+  effectivePermissionModeId: string
+  modelChange: 'allowed' | 'read_only'
+  permissionChange: 'allowed' | 'read_only'
+  modelReadOnlyReason?: string
+  permissionReadOnlyReason?: string
+}
+
+export type SettingsChangeOutcome = 'applied' | 'rejected' | 'timeout' | 'unsupported' | 'stale_capability' | 'outcome_unknown' | 'mismatched_effective'
+
+export interface SettingsEffective {
+  commandId: string
+  requestFingerprint: string
+  effectiveFingerprint: string
+  outcome: SettingsChangeOutcome
+  effectiveModelId: string
+  effectivePermissionModeId: string
+  reasonCode?: string
+}
+
+export interface SettingsCapabilityUpdate {
+  sessionId: string
+  capability: SettingsCapability
+  seq?: number
+}
+
+export interface SettingsEffectiveUpdate {
+  sessionId: string
+  effective: SettingsEffective
+  seq?: number
 }
 
 export interface AgentWharfEvent {
@@ -190,6 +237,12 @@ export interface SendCommandOptions {
 
 export interface AttachCommandOptions extends SendCommandOptions {}
 
+export interface SettingsChangeOptions extends SendCommandOptions {
+  capabilityFingerprint: string
+  modelId?: string
+  permissionModeId?: string
+}
+
 export interface HistoryPageOptions {
   beforeSeq?: number
   limit?: number
@@ -200,6 +253,8 @@ export interface HistoryPageOptions {
 type EventHandler = (event: AgentWharfEvent) => void
 type ErrorHandler = (error: Error | ErrorFrame) => void
 type DeliveryStateHandler = (state: CommandDeliveryState) => void
+type SettingsCapabilityHandler = (update: SettingsCapabilityUpdate) => void
+type SettingsEffectiveHandler = (update: SettingsEffectiveUpdate) => void
 
 interface PendingCommand {
   resolve: (ack: CommandAckFrame) => void
@@ -244,6 +299,10 @@ export class AgentWharfClient {
   private readonly eventHandlers = new Set<EventHandler>()
   private readonly errorHandlers = new Set<ErrorHandler>()
   private readonly deliveryStateHandlers = new Set<DeliveryStateHandler>()
+  private readonly settingsCapabilityHandlers = new Set<SettingsCapabilityHandler>()
+  private readonly settingsEffectiveHandlers = new Set<SettingsEffectiveHandler>()
+  private readonly settingsCapabilities = new Map<string, SettingsCapabilityUpdate>()
+  private readonly settingsEffectives = new Map<string, SettingsEffectiveUpdate>()
   private readonly deliveryStates = new Map<string, CommandDeliveryState>()
   private readonly pendingCommands = new Map<string, PendingCommand>()
   private readonly pendingHistoryPages = new Map<string, PendingHistoryPage>()
@@ -318,6 +377,26 @@ export class AgentWharfClient {
     return this.onDeliveryState(handler)
   }
 
+  onSettingsCapability(handler: SettingsCapabilityHandler): () => void {
+    this.settingsCapabilityHandlers.add(handler)
+    return () => this.settingsCapabilityHandlers.delete(handler)
+  }
+
+  onSettingsEffective(handler: SettingsEffectiveHandler): () => void {
+    this.settingsEffectiveHandlers.add(handler)
+    return () => this.settingsEffectiveHandlers.delete(handler)
+  }
+
+  settingsCapability(sessionId: string): SettingsCapabilityUpdate | undefined {
+    const update = this.settingsCapabilities.get(sessionId)
+    return update === undefined ? undefined : cloneSettingsCapabilityUpdate(update)
+  }
+
+  settingsEffective(commandId: string): SettingsEffectiveUpdate | undefined {
+    const update = this.settingsEffectives.get(commandId)
+    return update === undefined ? undefined : cloneSettingsEffectiveUpdate(update)
+  }
+
   deliveryState(commandId: string): CommandDeliveryState | undefined {
     const state = this.deliveryStates.get(commandId)
     return state === undefined ? undefined : { ...state }
@@ -364,6 +443,25 @@ export class AgentWharfClient {
       return Promise.reject(new Error('attach grant is required'))
     }
     return this.sendCommand('session.attach', sessionId, { grant }, options)
+  }
+
+  changeSettings(sessionId: string, options: SettingsChangeOptions): Promise<CommandAckFrame> {
+    if (!isSettingsFingerprint(options.capabilityFingerprint)) {
+      return Promise.reject(new Error('settings capability fingerprint is required'))
+    }
+    if (options.modelId === undefined && options.permissionModeId === undefined) {
+      return Promise.reject(new Error('settings change requires a requested value'))
+    }
+    if (options.modelId !== undefined && !isSettingsIdentifier(options.modelId)) {
+      return Promise.reject(new Error('settings model id is invalid'))
+    }
+    if (options.permissionModeId !== undefined && !isSettingsIdentifier(options.permissionModeId)) {
+      return Promise.reject(new Error('settings permission mode id is invalid'))
+    }
+    const payload: JsonObject = { capability_fingerprint: options.capabilityFingerprint }
+    if (options.modelId !== undefined) payload.model_id = options.modelId
+    if (options.permissionModeId !== undefined) payload.permission_mode_id = options.permissionModeId
+    return this.sendCommand('session.settings.change', sessionId, payload, options)
   }
 
   sendCommand(
@@ -541,6 +639,7 @@ export class AgentWharfClient {
   }
 
   private handleEvent(event: AgentWharfEvent): void {
+    this.updateSettingsFromEvent(event)
     this.updateDeliveryFromEvent(event)
     if (typeof event.seq === 'number') {
       const current = this.cursors.get(event.session_id) ?? 0
@@ -679,6 +778,26 @@ export class AgentWharfClient {
       this.setDeliveryState(next)
     }
   }
+
+  private updateSettingsFromEvent(event: AgentWharfEvent): void {
+    if (event.type === 'session.settings.capabilities') {
+      const capability = decodeSettingsCapability(event.payload)
+      const previous = this.settingsCapabilities.get(event.session_id)
+      if (previous?.seq !== undefined && event.seq !== undefined && event.seq < previous.seq) return
+      const update: SettingsCapabilityUpdate = { sessionId: event.session_id, capability, seq: event.seq }
+      this.settingsCapabilities.set(event.session_id, update)
+      for (const handler of this.settingsCapabilityHandlers) handler(cloneSettingsCapabilityUpdate(update))
+      return
+    }
+    if (event.type === 'session.settings.effective') {
+      const effective = decodeSettingsEffective(event.payload)
+      const previous = this.settingsEffectives.get(effective.commandId)
+      if (previous?.seq !== undefined && event.seq !== undefined && event.seq < previous.seq) return
+      const update: SettingsEffectiveUpdate = { sessionId: event.session_id, effective, seq: event.seq }
+      this.settingsEffectives.set(effective.commandId, update)
+      for (const handler of this.settingsEffectiveHandlers) handler(cloneSettingsEffectiveUpdate(update))
+    }
+  }
 }
 
 function asJsonObject(value: JsonValue): { [key: string]: JsonValue } | null {
@@ -688,6 +807,103 @@ function asJsonObject(value: JsonValue): { [key: string]: JsonValue } | null {
 function stringField(value: { [key: string]: JsonValue }, key: string): string | undefined {
   const field = value[key]
   return typeof field === 'string' ? field : undefined
+}
+
+function isSettingsFingerprint(value: string): boolean {
+  return /^sha256:[0-9a-f]{64}$/.test(value)
+}
+
+function isSettingsIdentifier(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(value)
+}
+
+function decodeSettingsCapability(value: JsonValue): SettingsCapability {
+  const object = asJsonObject(value)
+  if (object === null || typeof object.schema_version !== 'number' || !Number.isInteger(object.schema_version) || typeof object.fingerprint !== 'string' ||
+    !isSettingsFingerprint(object.fingerprint) || !Array.isArray(object.models) || !Array.isArray(object.permission_modes) ||
+    typeof object.effective_model_id !== 'string' || typeof object.effective_permission_mode_id !== 'string' ||
+    (object.model_change !== 'allowed' && object.model_change !== 'read_only') ||
+    (object.permission_change !== 'allowed' && object.permission_change !== 'read_only')) {
+    throw new Error('invalid settings capability event')
+  }
+  const models = decodeSettingsChoices(object.models)
+  const permissionModes = decodeSettingsChoices(object.permission_modes)
+  if (!isSettingsIdentifier(object.effective_model_id) || !isSettingsIdentifier(object.effective_permission_mode_id) ||
+    !models.some((choice) => choice.id === object.effective_model_id) ||
+    !permissionModes.some((choice) => choice.id === object.effective_permission_mode_id)) {
+    throw new Error('invalid settings capability event')
+  }
+  const modelReadOnlyReason = optionalSettingsReason(object.model_read_only_reason)
+  const permissionReadOnlyReason = optionalSettingsReason(object.permission_read_only_reason)
+  if (object.model_change === 'read_only' && modelReadOnlyReason === undefined ||
+    object.model_change === 'allowed' && modelReadOnlyReason !== undefined ||
+    object.permission_change === 'read_only' && permissionReadOnlyReason === undefined ||
+    object.permission_change === 'allowed' && permissionReadOnlyReason !== undefined) {
+    throw new Error('invalid settings capability event')
+  }
+  return {
+    schemaVersion: object.schema_version,
+    fingerprint: object.fingerprint,
+    models,
+    permissionModes,
+    effectiveModelId: object.effective_model_id,
+    effectivePermissionModeId: object.effective_permission_mode_id,
+    modelChange: object.model_change,
+    permissionChange: object.permission_change,
+    ...(modelReadOnlyReason === undefined ? {} : { modelReadOnlyReason }),
+    ...(permissionReadOnlyReason === undefined ? {} : { permissionReadOnlyReason }),
+  }
+}
+
+function decodeSettingsChoices(value: JsonValue[]): SettingsCapabilityChoice[] {
+  if (value.length < 1 || value.length > 32) throw new Error('invalid settings capability choices')
+  return value.map((entry) => {
+    const object = asJsonObject(entry)
+    if (object === null || typeof object.id !== 'string' || typeof object.label !== 'string' ||
+      !isSettingsIdentifier(object.id) || object.label.length === 0 || object.label.length > 128) {
+      throw new Error('invalid settings capability choices')
+    }
+    return { id: object.id, label: object.label }
+  })
+}
+
+function optionalSettingsReason(value: JsonValue | undefined): string | undefined {
+  if (value === undefined || value === null) return undefined
+  return typeof value === 'string' && isSettingsIdentifier(value) ? value : (() => { throw new Error('invalid settings capability reason') })()
+}
+
+function decodeSettingsEffective(value: JsonValue): SettingsEffective {
+  const object = asJsonObject(value)
+  const outcome = object?.outcome
+  if (object === null || typeof object.cmd_id !== 'string' || !isSettingsIdentifier(object.cmd_id) ||
+    typeof object.request_fingerprint !== 'string' || !isSettingsFingerprint(object.request_fingerprint) ||
+    typeof object.effective_fingerprint !== 'string' || !isSettingsFingerprint(object.effective_fingerprint) ||
+    typeof outcome !== 'string' || !['applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective'].includes(outcome) ||
+    typeof object.effective_model_id !== 'string' || !isSettingsIdentifier(object.effective_model_id) ||
+    typeof object.effective_permission_mode_id !== 'string' || !isSettingsIdentifier(object.effective_permission_mode_id)) {
+    throw new Error('invalid settings effective event')
+  }
+  const reasonCode = object.reason_code === undefined || object.reason_code === null ? undefined : object.reason_code
+  if (reasonCode !== undefined && (typeof reasonCode !== 'string' || !isSettingsIdentifier(reasonCode))) {
+    throw new Error('invalid settings effective event')
+  }
+  return {
+    commandId: object.cmd_id,
+    requestFingerprint: object.request_fingerprint,
+    effectiveFingerprint: object.effective_fingerprint,
+    outcome: outcome as SettingsChangeOutcome,
+    effectiveModelId: object.effective_model_id,
+    effectivePermissionModeId: object.effective_permission_mode_id,
+    ...(reasonCode === undefined ? {} : { reasonCode }),
+  }
+}
+
+function cloneSettingsCapabilityUpdate(update: SettingsCapabilityUpdate): SettingsCapabilityUpdate {
+  return { sessionId: update.sessionId, seq: update.seq, capability: { ...update.capability, models: update.capability.models.map((choice) => ({ ...choice })), permissionModes: update.capability.permissionModes.map((choice) => ({ ...choice })) } }
+}
+
+function cloneSettingsEffectiveUpdate(update: SettingsEffectiveUpdate): SettingsEffectiveUpdate {
+  return { sessionId: update.sessionId, seq: update.seq, effective: { ...update.effective } }
 }
 
 function validateHistoryPage(page: HistoryPageResponseFrame): void {

@@ -320,6 +320,57 @@ test('resume reuses durable cursors and marks an in-flight command outcome unkno
   client.close()
 })
 
+test('routes settings changes and keeps durable capability/effective events separate from ack', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_settings' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 1, sessions: [] })
+  await connected
+
+  const capabilities: string[] = []
+  const effectives: string[] = []
+  client.onSettingsCapability((update) => capabilities.push(update.capability.effectiveModelId))
+  client.onSettingsEffective((update) => effectives.push(update.effective.outcome))
+  const command = client.changeSettings('ses_settings', {
+    commandId: 'settings_1', capabilityFingerprint: `sha256:${'a'.repeat(64)}`, modelId: 'reasoning',
+  })
+  assert.deepEqual(sockets.last().sentFrames()[1], {
+    frame: 'command', cmd_id: 'settings_1', type: 'session.settings.change', session_id: 'ses_settings',
+    payload: { capability_fingerprint: `sha256:${'a'.repeat(64)}`, model_id: 'reasoning' },
+  })
+  sockets.last().receive({ frame: 'command.ack', cmd_id: 'settings_1', status: 'accepted', reason: '' })
+  assert.equal((await command).status, 'accepted')
+  assert.equal(client.deliveryState('settings_1')?.provider, 'pending')
+
+  const fingerprint = `sha256:${'b'.repeat(64)}`
+  sockets.last().receive({
+    frame: 'event', type: 'session.settings.capabilities', session_id: 'ses_settings', seq: 3, time: 3,
+    payload: {
+      schema_version: 1, fingerprint, models: [{ id: 'balanced', label: 'Balanced' }, { id: 'reasoning', label: 'Reasoning' }],
+      permission_modes: [{ id: 'ask', label: 'Ask first' }], effective_model_id: 'reasoning', effective_permission_mode_id: 'ask',
+      model_change: 'allowed', permission_change: 'read_only', model_read_only_reason: null, permission_read_only_reason: 'policy',
+    },
+  })
+  sockets.last().receive({
+    frame: 'event', type: 'session.settings.effective', session_id: 'ses_settings', seq: 4, time: 4,
+    payload: {
+      cmd_id: 'settings_1', request_fingerprint: `sha256:${'a'.repeat(64)}`, effective_fingerprint: fingerprint,
+      outcome: 'applied', effective_model_id: 'reasoning', effective_permission_mode_id: 'ask', reason_code: null,
+    },
+  })
+  assert.deepEqual(capabilities, ['reasoning'])
+  assert.deepEqual(effectives, ['applied'])
+  assert.equal(client.settingsCapability('ses_settings')?.capability.fingerprint, fingerprint)
+  assert.equal(client.settingsEffective('settings_1')?.effective.outcome, 'applied')
+  assert.equal(client.deliveryState('settings_1')?.provider, 'pending')
+  await assert.rejects(client.changeSettings('ses_settings', { capabilityFingerprint: 'bad', modelId: 'reasoning' }), /fingerprint/)
+  client.close()
+})
+
 class FakeSocketFactory {
   readonly all: FakeSocket[] = []
 
