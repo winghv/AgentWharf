@@ -1,29 +1,61 @@
 package core
 
 import (
+	"context"
 	"crypto/subtle"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // NewAdapterObservabilityHandler is intended for a host-owned diagnostic
 // listener. It deliberately keeps the Provider-facing listener as next and
 // exposes no diagnostic route to a sandbox or remote caller.
 func NewAdapterObservabilityHandler(token string, metrics *AdapterMetrics, next http.Handler) http.Handler {
-	return &adapterObservabilityHandler{token: token, metrics: metrics, next: next}
+	return NewAdapterObservabilityHandlerAt(token, metrics, "", next)
+}
+
+// NewAdapterObservabilityHandlerAt mounts the Adapter diagnostic surface on a
+// dedicated path prefix when Hub and Adapter share one host listener.
+func NewAdapterObservabilityHandlerAt(token string, metrics *AdapterMetrics, prefix string, next http.Handler) http.Handler {
+	prefix = strings.TrimSuffix("/"+strings.Trim(prefix, "/"), "/")
+	if prefix == "/" {
+		prefix = ""
+	}
+	return &adapterObservabilityHandler{token: token, metrics: metrics, prefix: prefix, next: next}
 }
 
 type adapterObservabilityHandler struct {
-	token   string
-	metrics *AdapterMetrics
-	next    http.Handler
+	token       string
+	metrics     *AdapterMetrics
+	prefix      string
+	next        http.Handler
+	unixPeer    bool
+	profileSlot chan struct{}
 }
 
 func (h *adapterObservabilityHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r != nil && (r.URL.Path == "/metrics" || strings.HasPrefix(r.URL.Path, "/debug/pprof")) {
-		if !h.authorized(r) {
+	path := h.diagnosticPath(r)
+	if path == "/metrics" || strings.HasPrefix(path, "/debug/pprof") {
+		if h.unixPeer {
+			if err := validateDiagnosticRequest(r); err != nil {
+				http.Error(w, "", http.StatusRequestEntityTooLarge)
+				return
+			}
+			budget, _ := r.Context().Value(diagnosticBudgetKey{}).(*diagnosticBudget)
+			if budget != nil && !budget.allow() {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+		} else if !h.authorized(r) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -31,12 +63,12 @@ func (h *adapterObservabilityHandler) ServeHTTP(w http.ResponseWriter, r *http.R
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if r.URL.Path == "/metrics" {
+		if path == "/metrics" {
 			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-			_, _ = w.Write([]byte(h.metricsSnapshot().Prometheus()))
+			_, _ = (&diagnosticResponseWriter{ResponseWriter: w}).Write([]byte(h.metricsSnapshot().Prometheus()))
 			return
 		}
-		h.servePprof(w, r)
+		h.servePprof(&diagnosticResponseWriter{ResponseWriter: w}, path, r)
 		return
 	}
 	if h.next == nil {
@@ -44,6 +76,22 @@ func (h *adapterObservabilityHandler) ServeHTTP(w http.ResponseWriter, r *http.R
 		return
 	}
 	h.next.ServeHTTP(w, r)
+}
+
+func (h *adapterObservabilityHandler) diagnosticPath(r *http.Request) string {
+	if h == nil || r == nil || r.URL == nil {
+		return ""
+	}
+	if h.prefix == "" {
+		return r.URL.Path
+	}
+	if r.URL.Path == h.prefix {
+		return "/"
+	}
+	if !strings.HasPrefix(r.URL.Path, h.prefix+"/") {
+		return ""
+	}
+	return strings.TrimPrefix(r.URL.Path, h.prefix)
 }
 
 func (h *adapterObservabilityHandler) authorized(r *http.Request) bool {
@@ -70,19 +118,39 @@ func (h *adapterObservabilityHandler) metricsSnapshot() AdapterMetricSnapshot {
 	return h.metrics.Snapshot()
 }
 
-func (h *adapterObservabilityHandler) servePprof(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/debug/pprof")
+func (h *adapterObservabilityHandler) servePprof(w http.ResponseWriter, path string, r *http.Request) {
+	path = strings.TrimPrefix(path, "/debug/pprof")
 	switch path {
 	case "", "/", "/index.html":
 		pprof.Index(w, r)
 	case "/cmdline":
 		pprof.Cmdline(w, r)
-	case "/profile":
-		pprof.Profile(w, r)
+	case "/profile", "/trace":
+		seconds, err := boundedProfileSeconds(r)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if h.profileSlot != nil {
+			select {
+			case h.profileSlot <- struct{}{}:
+				defer func() { <-h.profileSlot }()
+			default:
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+		}
+		query := r.URL.Query()
+		query.Set("seconds", strconv.Itoa(seconds))
+		r2 := r.Clone(r.Context())
+		r2.URL.RawQuery = query.Encode()
+		if path == "/profile" {
+			pprof.Profile(w, r2)
+		} else {
+			pprof.Trace(w, r2)
+		}
 	case "/symbol":
 		pprof.Symbol(w, r)
-	case "/trace":
-		pprof.Trace(w, r)
 	default:
 		name := strings.Trim(path, "/")
 		if name == "" || strings.Contains(name, "/") {
@@ -95,4 +163,219 @@ func (h *adapterObservabilityHandler) servePprof(w http.ResponseWriter, r *http.
 		}
 		http.NotFound(w, r)
 	}
+}
+
+func validateDiagnosticRequest(r *http.Request) error {
+	if r == nil || r.Body == nil {
+		return nil
+	}
+	if r.ContentLength > 0 || len(r.TransferEncoding) > 0 {
+		return errors.New("diagnostic request body is forbidden")
+	}
+	return nil
+}
+
+func boundedProfileSeconds(r *http.Request) (int, error) {
+	seconds := 30
+	if raw := r.URL.Query().Get("seconds"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > 30 {
+			return 0, errors.New("profile seconds out of range")
+		}
+		seconds = value
+	}
+	return seconds, nil
+}
+
+type diagnosticResponseWriter struct {
+	http.ResponseWriter
+	written int64
+}
+
+func (w *diagnosticResponseWriter) Write(p []byte) (int, error) {
+	const maxResponseBytes = 16 << 20
+	if w.written >= maxResponseBytes {
+		return 0, http.ErrAbortHandler
+	}
+	remaining := maxResponseBytes - w.written
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.written += int64(n)
+	if n < len(p) {
+		return n, http.ErrAbortHandler
+	}
+	if int64(len(p)) < remaining {
+		return n, err
+	}
+	return n, http.ErrAbortHandler
+}
+
+type diagnosticBudget struct {
+	mu       sync.Mutex
+	started  time.Time
+	requests int
+}
+
+func (b *diagnosticBudget) allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	if b.started.IsZero() || now.Sub(b.started) >= time.Minute {
+		b.started = now
+		b.requests = 0
+	}
+	if b.requests >= 4 {
+		return false
+	}
+	b.requests++
+	return true
+}
+
+type diagnosticBudgetKey struct{}
+
+// AdapterDiagnosticsServer is a fixed-entry-owned Unix diagnostic listener.
+// It never falls back to TCP or loopback when the socket cannot be proven.
+type AdapterDiagnosticsServer struct {
+	server *http.Server
+	ln     *peerUnixListener
+	path   string
+	once   sync.Once
+}
+
+func StartAdapterDiagnostics(ctx context.Context, socketPath string, metrics *AdapterMetrics) (*AdapterDiagnosticsServer, error) {
+	if socketPath == "" {
+		return nil, errors.New("diagnostic socket path is required")
+	}
+	directory := filepath.Dir(socketPath)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return nil, fmt.Errorf("create diagnostic socket directory: %w", err)
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		return nil, fmt.Errorf("protect diagnostic socket directory: %w", err)
+	}
+	if info, err := os.Lstat(socketPath); err == nil {
+		if info.Mode()&os.ModeSocket != os.ModeSocket || info.Mode().Perm()&0o077 != 0 || info.Sys() == nil {
+			return nil, errors.New("diagnostic socket path is unsafe")
+		}
+		if err := os.Remove(socketPath); err != nil {
+			return nil, fmt.Errorf("remove stale diagnostic socket: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect diagnostic socket: %w", err)
+	}
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		return nil, fmt.Errorf("listen on diagnostic socket: %w", err)
+	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+		return nil, fmt.Errorf("protect diagnostic socket: %w", err)
+	}
+	peer := &peerUnixListener{listener: listener, operatorUID: uint32(os.Geteuid()), slots: make(chan struct{}, 2)}
+	handler := &adapterObservabilityHandler{metrics: metrics, unixPeer: true, profileSlot: make(chan struct{}, 1)}
+	budget := &diagnosticBudget{}
+	server := &http.Server{
+		Handler:        handler,
+		MaxHeaderBytes: 8 << 10,
+		ReadTimeout:    35 * time.Second,
+		WriteTimeout:   35 * time.Second,
+		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+			return context.WithValue(ctx, diagnosticBudgetKey{}, budget)
+		},
+	}
+	result := &AdapterDiagnosticsServer{server: server, ln: peer, path: socketPath}
+	go func() {
+		if ctx != nil {
+			<-ctx.Done()
+			result.Close()
+		}
+	}()
+	go func() { _ = server.Serve(peer) }()
+	return result, nil
+}
+
+func (s *AdapterDiagnosticsServer) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
+
+func (s *AdapterDiagnosticsServer) Close() error {
+	if s == nil {
+		return nil
+	}
+	var err error
+	s.once.Do(func() {
+		_ = s.ln.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err = s.server.Shutdown(ctx)
+		if removeErr := os.Remove(s.path); err == nil && !errors.Is(removeErr, os.ErrNotExist) {
+			err = removeErr
+		}
+	})
+	return err
+}
+
+type peerUnixListener struct {
+	listener    *net.UnixListener
+	operatorUID uint32
+	slots       chan struct{}
+}
+
+func (l *peerUnixListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.listener.AcceptUnix()
+		if err != nil {
+			return nil, err
+		}
+		uid, err := unixPeerUID(conn)
+		if err != nil || uid != l.operatorUID {
+			_ = conn.Close()
+			continue
+		}
+		select {
+		case l.slots <- struct{}{}:
+			return &limitedUnixConn{UnixConn: conn, release: func() { <-l.slots }}, nil
+		default:
+			_ = conn.Close()
+		}
+	}
+}
+
+func (l *peerUnixListener) Close() error   { return l.listener.Close() }
+func (l *peerUnixListener) Addr() net.Addr { return l.listener.Addr() }
+
+type limitedUnixConn struct {
+	*net.UnixConn
+	release func()
+	once    sync.Once
+}
+
+func (c *limitedUnixConn) Close() error {
+	err := c.UnixConn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
+func unixPeerUID(conn *net.UnixConn) (uint32, error) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var controlErr error
+	var uid uint32
+	if err := raw.Control(func(fd uintptr) {
+		uid, controlErr = peerUID(int(fd))
+	}); err != nil {
+		return 0, err
+	}
+	if controlErr != nil {
+		return 0, controlErr
+	}
+	return uid, nil
 }

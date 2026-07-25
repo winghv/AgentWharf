@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +93,133 @@ func TestAdapterObservabilityPprofRoutesAndNilMetrics(t *testing.T) {
 		if response.Code != http.StatusOK && response.Code != http.StatusNotFound {
 			t.Fatalf("pprof %s status = %d", path, response.Code)
 		}
+	}
+	for _, seconds := range []string{"0", "31", "not-a-number"} {
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/debug/pprof/profile?seconds="+seconds, nil)
+		request.RemoteAddr = "127.0.0.1:1000"
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("profile seconds %q status = %d", seconds, response.Code)
+		}
+	}
+	limitedWriter := &diagnosticResponseWriter{ResponseWriter: httptest.NewRecorder(), written: 16 << 20}
+	if _, err := limitedWriter.Write([]byte("x")); !errors.Is(err, http.ErrAbortHandler) {
+		t.Fatalf("response limit error = %v", err)
+	}
+}
+
+func TestStartAdapterDiagnosticsUsesBoundedUnixSocket(t *testing.T) {
+	if _, err := StartAdapterDiagnostics(context.Background(), "", nil); err == nil {
+		t.Fatal("empty diagnostics socket path unexpectedly accepted")
+	}
+	directory, err := os.MkdirTemp("/tmp", "aw-diag-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socketPath := filepath.Join(directory, "diagnostics.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server, err := StartAdapterDiagnostics(ctx, socketPath, NewAdapterMetrics())
+	if err != nil {
+		t.Fatalf("StartAdapterDiagnostics() error = %v", err)
+	}
+	if server.Path() != socketPath || server.ln.Addr() == nil {
+		t.Fatalf("diagnostics listener identity = path %q addr %v", server.Path(), server.ln.Addr())
+	}
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		if _, err := os.Stat(socketPath); err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	info, err := os.Stat(socketPath)
+	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o600 {
+		t.Fatalf("diagnostic socket = %v, %v", info, err)
+	}
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "unix", socketPath)
+	}}
+	client := &http.Client{Transport: transport}
+	for requestNumber := 1; requestNumber <= 4; requestNumber++ {
+		response, err := client.Get("http://localhost/metrics")
+		if err != nil {
+			t.Fatalf("metrics request %d: %v", requestNumber, err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("metrics request %d status = %d", requestNumber, response.StatusCode)
+		}
+	}
+	response, err := client.Get("http://localhost/metrics")
+	if err != nil {
+		t.Fatalf("rate-limited metrics request: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited metrics status = %d", response.StatusCode)
+	}
+	bodyRequest, err := http.NewRequest(http.MethodPost, "http://localhost/metrics", strings.NewReader("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.Do(bodyRequest)
+	if err != nil {
+		t.Fatalf("body request: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("body request status = %d", response.StatusCode)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("diagnostics close: %v", err)
+	}
+	if _, err := os.Stat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket cleanup error = %v", err)
+	}
+	unsafeDirectory, err := os.MkdirTemp("/tmp", "aw-diag-unsafe-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(unsafeDirectory)
+	unsafePath := filepath.Join(unsafeDirectory, "diagnostics.sock")
+	if err := os.WriteFile(unsafePath, []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartAdapterDiagnostics(context.Background(), unsafePath, nil); err == nil {
+		t.Fatal("regular file diagnostics path unexpectedly accepted")
+	}
+}
+
+func TestAdapterObservabilityHandlerSupportsDedicatedPrefix(t *testing.T) {
+	handler := NewAdapterObservabilityHandlerAt("token", NewAdapterMetrics(), "/adapter", http.NotFoundHandler())
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/adapter/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1000"
+	request.Header.Set("Authorization", "Bearer token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "agentwharf_adapter_workers") {
+		t.Fatalf("prefixed metrics response = %d %q", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1000"
+	request.Header.Set("Authorization", "Bearer token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("unprefixed metrics status = %d", response.Code)
+	}
+	rootHandler := NewAdapterObservabilityHandlerAt("token", NewAdapterMetrics(), "/", nil)
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1000"
+	request.Header.Set("Authorization", "Bearer token")
+	response = httptest.NewRecorder()
+	rootHandler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("root-prefix metrics status = %d", response.Code)
 	}
 }
 

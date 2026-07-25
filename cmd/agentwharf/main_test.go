@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -63,6 +64,36 @@ func TestServeStartsLocalHubWithSQLiteAndStaticAuth(t *testing.T) {
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("stat sqlite db: %v", err)
 	}
+	diagnosticsPath := running.diagnostics.Path()
+	info, err := os.Stat(diagnosticsPath)
+	if err != nil {
+		t.Fatalf("stat diagnostics socket: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("diagnostics socket mode = %v", info.Mode())
+	}
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "unix", diagnosticsPath)
+	}}
+	diagnosticsClient := &http.Client{Transport: transport}
+	metricsResponse, err := diagnosticsClient.Get("http://localhost/metrics")
+	if err != nil {
+		t.Fatalf("diagnostics metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	if metricsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("diagnostics metrics status = %d", metricsResponse.StatusCode)
+	}
+	metricsResponse.Body.Close()
+	metricsResponse, err = http.Get("http://" + running.addr + "/adapter/metrics")
+	if err != nil {
+		t.Fatalf("public adapter metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	if metricsResponse.StatusCode == http.StatusOK {
+		t.Fatalf("public adapter metrics unexpectedly reachable")
+	}
 
 	conn, _, err := websocket.Dial(ctx, running.wsURL, nil)
 	if err != nil {
@@ -83,6 +114,13 @@ func TestServeStartsLocalHubWithSQLiteAndStaticAuth(t *testing.T) {
 	if got := ack.Sessions[0]; got.SessionID != "ses_local" || got.Provider != "claude-code" ||
 		got.State != "ready" || got.LatestSeq != 0 || got.ReplayFrom != 1 {
 		t.Fatalf("session summary = %+v", got)
+	}
+	cancel()
+	if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("serve shutdown error = %v", err)
+	}
+	if _, err := os.Stat(diagnosticsPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("diagnostics socket cleanup error = %v", err)
 	}
 }
 

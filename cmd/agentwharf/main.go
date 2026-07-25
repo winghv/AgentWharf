@@ -2625,11 +2625,14 @@ func readCLIProtocolFrame(ctx context.Context, conn *websocket.Conn) (protocol.F
 }
 
 type runningServe struct {
-	server *http.Server
-	store  interface{ Close() error }
-	done   chan error
-	addr   string
-	wsURL  string
+	server      *http.Server
+	store       interface{ Close() error }
+	diagnostics *core.AdapterDiagnosticsServer
+	done        chan error
+	addr        string
+	wsURL       string
+	waitOnce    sync.Once
+	waitErr     error
 }
 
 func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
@@ -2653,6 +2656,14 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 	if err != nil {
 		_ = eventStore.Close()
 		return nil, fmt.Errorf("listen %s: %w", cfg.Addr, err)
+	}
+	metrics := core.NewAdapterMetrics()
+	diagnosticsPath := adapterDiagnosticsSocketPath(cfg.DBPath)
+	diagnostics, err := core.StartAdapterDiagnostics(ctx, diagnosticsPath, metrics)
+	if err != nil {
+		_ = listener.Close()
+		_ = eventStore.Close()
+		return nil, err
 	}
 
 	baseAuthenticator := static.New([]static.Token{
@@ -2680,11 +2691,12 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 	}
 
 	running := &runningServe{
-		server: server,
-		store:  eventStore,
-		done:   make(chan error, 1),
-		addr:   listener.Addr().String(),
-		wsURL:  "ws://" + listener.Addr().String(),
+		server:      server,
+		store:       eventStore,
+		diagnostics: diagnostics,
+		done:        make(chan error, 1),
+		addr:        listener.Addr().String(),
+		wsURL:       "ws://" + listener.Addr().String(),
 	}
 
 	go func() {
@@ -2700,9 +2712,20 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
+		_ = diagnostics.Close()
 	}()
 
 	return running, nil
+}
+
+func adapterDiagnosticsSocketPath(dbPath string) string {
+	preferred := filepath.Join(filepath.Dir(dbPath), "adapter-state", "diagnostics.sock")
+	if len(preferred) <= 100 {
+		return preferred
+	}
+	digest := sha256.Sum256([]byte(dbPath))
+	shortDirectory := filepath.Join(os.TempDir(), "agentwharf-"+hex.EncodeToString(digest[:6]))
+	return filepath.Join(shortDirectory, "diagnostics.sock")
 }
 
 func newLocalSessionCredentialIssuer(cfg serveConfig) (*auth.LocalSessionCredentialIssuer, error) {
@@ -2737,15 +2760,19 @@ func newLocalSessionCredentialIssuer(cfg serveConfig) (*auth.LocalSessionCredent
 }
 
 func (r *runningServe) wait() error {
-	serveErr := <-r.done
-	closeErr := r.store.Close()
-	if serveErr != nil {
-		return serveErr
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close sqlite store: %w", closeErr)
-	}
-	return nil
+	r.waitOnce.Do(func() {
+		serveErr := <-r.done
+		diagnosticsErr := r.diagnostics.Close()
+		closeErr := r.store.Close()
+		if serveErr != nil {
+			r.waitErr = serveErr
+		} else if closeErr != nil {
+			r.waitErr = fmt.Errorf("close sqlite store: %w", closeErr)
+		} else if diagnosticsErr != nil {
+			r.waitErr = fmt.Errorf("close adapter diagnostics: %w", diagnosticsErr)
+		}
+	})
+	return r.waitErr
 }
 
 type localSessionAuthenticator struct {
