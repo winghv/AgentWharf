@@ -50,6 +50,8 @@ type Principal struct {
 	Subject        string
 	Scopes         []Scope
 	AdmissionClaim *SessionAdmissionClaim
+	attentionGrant *AttentionGrant
+	attentionScope Scope
 }
 
 type Authenticator interface {
@@ -65,6 +67,28 @@ type AttentionGrant struct {
 	SessionIDs  []string
 	MaxSessions int
 	ExpiresAt   time.Time
+}
+
+// BindAttentionGrant lets a trusted Auth implementation attach the verified,
+// platform-neutral grant represented by an attention scope. The Hub can read a
+// defensive copy only through AttentionGrantFromPrincipal.
+func BindAttentionGrant(principal Principal, grant AttentionGrant) Principal {
+	copy := grant
+	copy.SessionIDs = append([]string(nil), grant.SessionIDs...)
+	principal.attentionGrant = &copy
+	if len(principal.Scopes) == 1 {
+		principal.attentionScope = principal.Scopes[0]
+	}
+	return principal
+}
+
+func AttentionGrantFromPrincipal(principal Principal) (AttentionGrant, bool) {
+	if principal.attentionGrant == nil || len(principal.Scopes) != 1 || principal.Scopes[0] != principal.attentionScope {
+		return AttentionGrant{}, false
+	}
+	grant := *principal.attentionGrant
+	grant.SessionIDs = append([]string(nil), grant.SessionIDs...)
+	return grant, true
 }
 
 // AttentionAuthorizer is deliberately separate from ordinary scope checks so
