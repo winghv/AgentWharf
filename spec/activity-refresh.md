@@ -8,8 +8,9 @@ only to recover delivery of an already Store-committed, provider-neutral
 ActivitySink summary when the Control Plane has made its own projection fail
 closed.
 
-The request has no fields. In particular, it carries no Task, Run, VM, tenant,
-provider, bearer, credential, content, grant, or command semantics. The Hub
+The request has no fields. In particular, it carries no platform workload,
+infrastructure, tenancy, provider, bearer, credential, content, grant, or
+command semantics. The Hub
 does not learn why the Control Plane requested a refresh and the Control Plane
 does not read Hub Store tables.
 
