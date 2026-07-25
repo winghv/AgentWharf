@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 export type ProtocolVersion = 1 | 2
 
@@ -130,6 +130,35 @@ export interface SettingsEffectiveUpdate {
   seq?: number
 }
 
+export type RunControlOperation = 'interrupt' | 'stop'
+export type RunControlOutcome = 'completed' | 'rejected' | 'timeout' | 'unsupported' | 'outcome_unknown'
+
+export interface RunControlCapability {
+  schemaVersion: 1
+  interruptSupported: boolean
+  stopSupported: boolean
+}
+
+export interface RunControlOutcomeState {
+  commandId: string
+  operation: RunControlOperation
+  outcome: RunControlOutcome
+  completionState?: 'ready' | 'ended'
+  reasonCode?: string
+}
+
+export interface RunControlCapabilityUpdate {
+  sessionId: string
+  capability: RunControlCapability
+  seq?: number
+}
+
+export interface RunControlOutcomeUpdate {
+  sessionId: string
+  outcome: RunControlOutcomeState
+  seq?: number
+}
+
 export interface AgentWharfEvent {
   frame: 'event'
   type: string
@@ -226,6 +255,7 @@ export interface AgentWharfClientOptions {
   url: string
   token: string
   sessions: ClientSubscription[]
+  protocolVersion?: ProtocolVersion
   webSocketFactory?: WebSocketFactory
   reconnect?: false | Partial<ReconnectConfig>
   commandIdFactory?: () => string
@@ -255,6 +285,8 @@ type ErrorHandler = (error: Error | ErrorFrame) => void
 type DeliveryStateHandler = (state: CommandDeliveryState) => void
 type SettingsCapabilityHandler = (update: SettingsCapabilityUpdate) => void
 type SettingsEffectiveHandler = (update: SettingsEffectiveUpdate) => void
+type RunControlCapabilityHandler = (update: RunControlCapabilityUpdate) => void
+type RunControlOutcomeHandler = (update: RunControlOutcomeUpdate) => void
 
 interface PendingCommand {
   resolve: (ack: CommandAckFrame) => void
@@ -293,6 +325,7 @@ export function decodeFrame(data: string): AgentWharfFrame {
 
 export class AgentWharfClient {
   private readonly webSocketFactory: WebSocketFactory
+  private readonly protocolVersion: ProtocolVersion
   private readonly reconnect: ReconnectConfig | null
   private readonly commandIdFactory: () => string
   private readonly cursors = new Map<string, number>()
@@ -303,6 +336,10 @@ export class AgentWharfClient {
   private readonly settingsEffectiveHandlers = new Set<SettingsEffectiveHandler>()
   private readonly settingsCapabilities = new Map<string, SettingsCapabilityUpdate>()
   private readonly settingsEffectives = new Map<string, SettingsEffectiveUpdate>()
+  private readonly runControlCapabilityHandlers = new Set<RunControlCapabilityHandler>()
+  private readonly runControlOutcomeHandlers = new Set<RunControlOutcomeHandler>()
+  private readonly runControlCapabilities = new Map<string, RunControlCapabilityUpdate>()
+  private readonly runControlOutcomes = new Map<string, RunControlOutcomeUpdate>()
   private readonly deliveryStates = new Map<string, CommandDeliveryState>()
   private readonly pendingCommands = new Map<string, PendingCommand>()
   private readonly pendingHistoryPages = new Map<string, PendingHistoryPage>()
@@ -320,6 +357,7 @@ export class AgentWharfClient {
       throw new Error('at least one session subscription is required')
     }
     this.webSocketFactory = options.webSocketFactory ?? defaultWebSocketFactory
+    this.protocolVersion = options.protocolVersion ?? PROTOCOL_VERSION
     this.reconnect = normalizeReconnect(options.reconnect)
     this.reconnectDelayMs = this.reconnect?.initialDelayMs ?? 0
     this.commandIdFactory = options.commandIdFactory ?? (() => `cmd_${Date.now()}_${this.nextCommandNumber++}`)
@@ -395,6 +433,26 @@ export class AgentWharfClient {
   settingsEffective(commandId: string): SettingsEffectiveUpdate | undefined {
     const update = this.settingsEffectives.get(commandId)
     return update === undefined ? undefined : cloneSettingsEffectiveUpdate(update)
+  }
+
+  onRunControlCapability(handler: RunControlCapabilityHandler): () => void {
+    this.runControlCapabilityHandlers.add(handler)
+    return () => this.runControlCapabilityHandlers.delete(handler)
+  }
+
+  onRunControlOutcome(handler: RunControlOutcomeHandler): () => void {
+    this.runControlOutcomeHandlers.add(handler)
+    return () => this.runControlOutcomeHandlers.delete(handler)
+  }
+
+  runControlCapability(sessionId: string): RunControlCapabilityUpdate | undefined {
+    const update = this.runControlCapabilities.get(sessionId)
+    return update === undefined ? undefined : { sessionId: update.sessionId, seq: update.seq, capability: { ...update.capability } }
+  }
+
+  runControlOutcome(commandId: string): RunControlOutcomeUpdate | undefined {
+    const update = this.runControlOutcomes.get(commandId)
+    return update === undefined ? undefined : { sessionId: update.sessionId, seq: update.seq, outcome: { ...update.outcome } }
   }
 
   deliveryState(commandId: string): CommandDeliveryState | undefined {
@@ -564,7 +622,7 @@ export class AgentWharfClient {
         try {
           const frame = decodeFrame(event.data)
           if (frame.frame === 'hello.ack') {
-            const ack = validateHelloAck(frame)
+            const ack = validateHelloAck(frame, this.protocolVersion)
             handshakeComplete = true
             this.handshakeReady = true
             this.lastHelloAck = ack
@@ -710,7 +768,7 @@ export class AgentWharfClient {
   private helloFrame(): HelloFrame {
     return {
       frame: 'hello',
-      protocol_version: PROTOCOL_VERSION,
+      protocol_version: this.protocolVersion,
       role: 'client',
       token: this.options.token,
       subscriptions: this.options.sessions.map((session) => ({
@@ -796,6 +854,24 @@ export class AgentWharfClient {
       const update: SettingsEffectiveUpdate = { sessionId: event.session_id, effective, seq: event.seq }
       this.settingsEffectives.set(effective.commandId, update)
       for (const handler of this.settingsEffectiveHandlers) handler(cloneSettingsEffectiveUpdate(update))
+      return
+    }
+    if (event.type === 'session.run.capabilities') {
+      const capability = decodeRunControlCapability(event.payload)
+      const previous = this.runControlCapabilities.get(event.session_id)
+      if (previous?.seq !== undefined && event.seq !== undefined && event.seq < previous.seq) return
+      const update: RunControlCapabilityUpdate = { sessionId: event.session_id, capability, seq: event.seq }
+      this.runControlCapabilities.set(event.session_id, update)
+      for (const handler of this.runControlCapabilityHandlers) handler({ sessionId: update.sessionId, seq: update.seq, capability: { ...update.capability } })
+      return
+    }
+    if (event.type === 'session.run.outcome') {
+      const outcome = decodeRunControlOutcome(event.payload)
+      const previous = this.runControlOutcomes.get(outcome.commandId)
+      if (previous?.seq !== undefined && event.seq !== undefined && event.seq < previous.seq) return
+      const update: RunControlOutcomeUpdate = { sessionId: event.session_id, outcome, seq: event.seq }
+      this.runControlOutcomes.set(outcome.commandId, update)
+      for (const handler of this.runControlOutcomeHandlers) handler({ sessionId: update.sessionId, seq: update.seq, outcome: { ...update.outcome } })
     }
   }
 }
@@ -898,6 +974,46 @@ function decodeSettingsEffective(value: JsonValue): SettingsEffective {
   }
 }
 
+function decodeRunControlCapability(value: JsonValue): RunControlCapability {
+  const object = asJsonObject(value)
+  if (object === null || object.schema_version !== 1 || typeof object.interrupt_supported !== 'boolean' || typeof object.stop_supported !== 'boolean') {
+    throw new Error('invalid run-control capability event')
+  }
+  return { schemaVersion: 1, interruptSupported: object.interrupt_supported, stopSupported: object.stop_supported }
+}
+
+function decodeRunControlOutcome(value: JsonValue): RunControlOutcomeState {
+  const object = asJsonObject(value)
+  const operation = object?.operation
+  const outcome = object?.outcome
+  if (object === null || typeof object.cmd_id !== 'string' || !isSettingsIdentifier(object.cmd_id) ||
+    (operation !== 'interrupt' && operation !== 'stop') ||
+    (outcome !== 'completed' && outcome !== 'rejected' && outcome !== 'timeout' && outcome !== 'unsupported' && outcome !== 'outcome_unknown')) {
+    throw new Error('invalid run-control outcome event')
+  }
+  const completionState = object.completion_state === null || object.completion_state === undefined ? undefined : object.completion_state
+  const reasonCode = object.reason_code === null || object.reason_code === undefined ? undefined : object.reason_code
+  if (completionState !== undefined && completionState !== 'ready' && completionState !== 'ended') {
+    throw new Error('invalid run-control outcome event')
+  }
+  if (reasonCode !== undefined && (typeof reasonCode !== 'string' || !isSettingsIdentifier(reasonCode))) {
+    throw new Error('invalid run-control outcome event')
+  }
+  if (outcome === 'completed' && (completionState !== (operation === 'stop' ? 'ended' : 'ready') || reasonCode !== undefined)) {
+    throw new Error('invalid run-control outcome event')
+  }
+  if (outcome !== 'completed' && completionState !== undefined) {
+    throw new Error('invalid run-control outcome event')
+  }
+  return {
+    commandId: object.cmd_id,
+    operation,
+    outcome,
+    ...(completionState === undefined ? {} : { completionState }),
+    ...(reasonCode === undefined ? {} : { reasonCode }),
+  }
+}
+
 function cloneSettingsCapabilityUpdate(update: SettingsCapabilityUpdate): SettingsCapabilityUpdate {
   return { sessionId: update.sessionId, seq: update.seq, capability: { ...update.capability, models: update.capability.models.map((choice) => ({ ...choice })), permissionModes: update.capability.permissionModes.map((choice) => ({ ...choice })) } }
 }
@@ -948,8 +1064,8 @@ function normalizeError(error: unknown): Error {
   return new Error(String(error))
 }
 
-function validateHelloAck(frame: HelloAckFrame): HelloAckFrame {
-  if ((frame.protocol_version !== 1 && frame.protocol_version !== 2) || frame.protocol_version > PROTOCOL_VERSION) {
+function validateHelloAck(frame: HelloAckFrame, requestedVersion: ProtocolVersion): HelloAckFrame {
+  if ((frame.protocol_version !== 1 && frame.protocol_version !== 2) || frame.protocol_version > requestedVersion) {
     throw new Error(`unsupported hello.ack protocol version: ${String(frame.protocol_version)}`)
   }
   if (frame.protocol_version === 1 && frame.capabilities !== undefined) {

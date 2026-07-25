@@ -13,7 +13,7 @@ import {
 test('encodes and decodes protocol frames', () => {
   const hello: HelloFrame = {
     frame: 'hello',
-    protocol_version: 1,
+    protocol_version: 2,
     role: 'client',
     token: 'control-token',
     subscriptions: [{ session_id: 'ses_1', last_seq: 7 }],
@@ -41,7 +41,7 @@ test('connect sends client hello with the current replay cursor', async () => {
 
   assert.deepEqual(socket.sentFrames()[0], {
     frame: 'hello',
-    protocol_version: 1,
+    protocol_version: 2,
     role: 'client',
     token: 'control-token',
     subscriptions: [{ session_id: 'ses_1', last_seq: 4 }],
@@ -312,7 +312,7 @@ test('resume reuses durable cursors and marks an in-flight command outcome unkno
   const resumed = client.resume()
   sockets.last().open()
   assert.deepEqual(sockets.last().sentFrames()[0], {
-    frame: 'hello', protocol_version: 1, role: 'client', token: 'control-token',
+    frame: 'hello', protocol_version: 2, role: 'client', token: 'control-token',
     subscriptions: [{ session_id: 'ses_1', last_seq: 7 }],
   })
   sockets.last().receive({ frame: 'hello.ack', protocol_version: 1, sessions: [] })
@@ -368,6 +368,50 @@ test('routes settings changes and keeps durable capability/effective events sepa
   assert.equal(client.settingsEffective('settings_1')?.effective.outcome, 'applied')
   assert.equal(client.deliveryState('settings_1')?.provider, 'pending')
   await assert.rejects(client.changeSettings('ses_settings', { capabilityFingerprint: 'bad', modelId: 'reasoning' }), /fingerprint/)
+  client.close()
+})
+
+test('keeps interrupt and stop routing acks distinct from durable run-control outcomes', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_control' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, sessions: [] })
+  await connected
+
+  const capabilityStates: boolean[] = []
+  const outcomes: string[] = []
+  client.onRunControlCapability((update) => capabilityStates.push(update.capability.stopSupported))
+  client.onRunControlOutcome((update) => outcomes.push(`${update.outcome.operation}/${update.outcome.outcome}`))
+  const interrupt = client.interrupt('ses_control', { commandId: 'interrupt_1' })
+  sockets.last().receive({ frame: 'command.ack', cmd_id: 'interrupt_1', status: 'accepted', reason: '' })
+  assert.equal((await interrupt).status, 'accepted')
+  assert.equal(client.runControlOutcome('interrupt_1'), undefined)
+
+  sockets.last().receive({
+    frame: 'event', type: 'session.run.capabilities', session_id: 'ses_control', seq: 2, time: 2,
+    payload: { schema_version: 1, interrupt_supported: true, stop_supported: false },
+  })
+  sockets.last().receive({
+    frame: 'event', type: 'session.run.outcome', session_id: 'ses_control', seq: 3, time: 3,
+    payload: { cmd_id: 'interrupt_1', operation: 'interrupt', outcome: 'completed', completion_state: 'ready', reason_code: null },
+  })
+  assert.deepEqual(capabilityStates, [false])
+  assert.deepEqual(outcomes, ['interrupt/completed'])
+  assert.equal(client.runControlOutcome('interrupt_1')?.outcome.completionState, 'ready')
+
+  const stop = client.stop('ses_control', { commandId: 'stop_1' })
+  sockets.last().receive({ frame: 'command.ack', cmd_id: 'stop_1', status: 'duplicate', reason: '' })
+  assert.equal((await stop).status, 'duplicate')
+  sockets.last().receive({
+    frame: 'event', type: 'session.run.outcome', session_id: 'ses_control', seq: 4, time: 4,
+    payload: { cmd_id: 'stop_1', operation: 'stop', outcome: 'unsupported', completion_state: null, reason_code: 'stop_unsupported' },
+  })
+  assert.equal(client.runControlOutcome('stop_1')?.outcome.outcome, 'unsupported')
+  assert.equal(client.deliveryState('stop_1')?.routing, 'duplicate')
   client.close()
 })
 
