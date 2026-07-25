@@ -83,7 +83,7 @@ func validAttachAttemptRequest(request store.AttachAttemptRequest) bool {
 }
 
 func attachAttemptFromRequest(request store.AttachAttemptRequest) store.AttachAttempt {
-	return cloneAttachAttempt(store.AttachAttempt{Identity: request.Identity, Fingerprint: request.Fingerprint, ExpiresAt: request.ExpiresAt, Outcome: request.Outcome, IssuedCredentialGeneration: request.IssuedCredentialGeneration})
+	return cloneAttachAttempt(store.AttachAttempt(request))
 }
 
 func cloneAttachAttempt(attempt store.AttachAttempt) store.AttachAttempt {

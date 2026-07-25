@@ -1631,11 +1631,11 @@ func validPostgresSettingsWriter(writer store.SettingsWriter) bool {
 	return writer.ConnectionEpoch > 0 && writer.CredentialGeneration > 0 && writer.LeaseID != "" && len(writer.LeaseID) <= 255
 }
 func validPostgresSettingsID(value string) bool {
-	if len(value) < 1 || len(value) > 128 || !((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z') || (value[0] >= '0' && value[0] <= '9')) {
+	if len(value) < 1 || len(value) > 128 || ((value[0] < 'A' || value[0] > 'Z') && (value[0] < 'a' || value[0] > 'z') && (value[0] < '0' || value[0] > '9')) {
 		return false
 	}
 	for _, char := range value[1:] {
-		if !(char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '.' || char == '_' || char == ':' || char == '/' || char == '-') {
+		if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '.' && char != '_' && char != ':' && char != '/' && char != '-' {
 			return false
 		}
 	}
@@ -1646,7 +1646,7 @@ func validPostgresSettingsFingerprint(value string) bool {
 		return false
 	}
 	for _, char := range value[7:] {
-		if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
 			return false
 		}
 	}
@@ -1677,7 +1677,7 @@ func validPostgresSettingsReason(reason *string) bool {
 		return false
 	}
 	for _, char := range *reason {
-		if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '_') {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' {
 			return false
 		}
 	}

@@ -934,13 +934,13 @@ func TestWebSocketSessionAttachDoesNotHandoffAfterFinalTupleLoss(t *testing.T) {
 	}
 	verifier.grant.GrantFence = fence
 	events.setAfterCommit(func(store *recordingWarmAttachStore) {
-		store.fakeEventStore.mu.Lock()
+		store.mu.Lock()
 		now := time.Now()
-		connection := store.fakeEventStore.connections["ses_target"]
+		connection := store.connections["ses_target"]
 		connection.RevokedAt = &now
 		connection.TerminalAt = &now
-		store.fakeEventStore.connections["ses_target"] = connection
-		store.fakeEventStore.mu.Unlock()
+		store.connections["ses_target"] = connection
+		store.mu.Unlock()
 	})
 	client := dialWebSocket(t, server.URL)
 	defer client.Close(websocket.StatusNormalClosure, "")
@@ -3426,12 +3426,12 @@ func (s *recordingWarmAttachStore) CommitWarmAttach(_ context.Context, request s
 	duplicate := len(s.warmSeen) > 0
 	s.warmSeen = append(s.warmSeen, request)
 	if !duplicate {
-		s.fakeEventStore.mu.Lock()
-		s.fakeEventStore.connections[request.Attachment.Identity.TargetSessionID] = store.AdapterConnection{
+		s.mu.Lock()
+		s.connections[request.Attachment.Identity.TargetSessionID] = store.AdapterConnection{
 			SessionID: request.Attachment.Identity.TargetSessionID, ActiveCredentialGeneration: request.TargetActivation.Generation,
 			CredentialGenerationHighWatermark: request.TargetActivation.Generation, ActiveCredentialExpiresAt: request.TargetActivation.ExpiresAt,
 		}
-		s.fakeEventStore.mu.Unlock()
+		s.mu.Unlock()
 	}
 	if s.afterCommit != nil {
 		s.afterCommit(s)
@@ -3583,8 +3583,8 @@ func (s *recordingWarmAttachStore) WithAdapterConnectionTransaction(_ context.Co
 	if fn == nil {
 		return errors.New("adapter connection transaction callback is nil")
 	}
-	s.fakeEventStore.mu.Lock()
-	defer s.fakeEventStore.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return fn(&warmAttachTransactionStore{recordingWarmAttachStore: s})
 }
 
@@ -3593,10 +3593,10 @@ type warmAttachTransactionStore struct {
 }
 
 func (s *warmAttachTransactionStore) ValidateAdapterAdmission(_ context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
-	connection, ok := s.fakeEventStore.connections[sessionID]
+	connection, ok := s.connections[sessionID]
 	if !ok || admission.CredentialGeneration != connection.ActiveCredentialGeneration ||
 		admission.ConnectionEpoch != connection.ConnectionEpoch || admission.AcceptedFence != connection.AcceptedFence ||
-		admission.GrantFence <= connection.AcceptedFence || admission.GrantFence >= s.fakeEventStore.nextFence ||
+		admission.GrantFence <= connection.AcceptedFence || admission.GrantFence >= s.nextFence ||
 		connection.RevokedAt != nil || connection.TerminalAt != nil || !connection.ActiveCredentialExpiresAt.After(time.Now()) {
 		return store.AdapterConnection{}, errors.New("adapter authority lost")
 	}
@@ -3604,7 +3604,7 @@ func (s *warmAttachTransactionStore) ValidateAdapterAdmission(_ context.Context,
 }
 
 func (s *warmAttachTransactionStore) ValidateWarmAttachTargetActivation(_ context.Context, sessionID string, activation store.WarmAttachTargetActivation) error {
-	connection, ok := s.fakeEventStore.connections[sessionID]
+	connection, ok := s.connections[sessionID]
 	if !ok || connection.ConnectionEpoch != 0 || connection.AcceptedFence != 0 ||
 		connection.ActiveCredentialGeneration != activation.Generation || connection.CredentialGenerationHighWatermark != activation.Generation ||
 		!connection.ActiveCredentialExpiresAt.Equal(activation.ExpiresAt) || connection.RevokedAt != nil || connection.TerminalAt != nil ||

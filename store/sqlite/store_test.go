@@ -1897,7 +1897,7 @@ UPDATE adapter_fence_allocator SET next_fence = ? WHERE singleton = 1;
 CREATE TRIGGER adapter_fence_allocator_advance BEFORE UPDATE OF next_fence ON adapter_fence_allocator WHEN NEW.next_fence <> OLD.next_fence + 1 BEGIN SELECT RAISE(ABORT, 'adapter fence allocator must advance by one'); END;`, int64(math.MaxInt64)); err != nil {
 		t.Fatalf("seed maximum fence: %v", err)
 	}
-	if _, err := connections.Store.AllocateAdapterGrantFence(context.Background()); err == nil {
+	if _, err := connections.AllocateAdapterGrantFence(context.Background()); err == nil {
 		t.Fatal("maximum fence allocation unexpectedly succeeded")
 	}
 	var kind string
@@ -3195,7 +3195,7 @@ func (h *sqliteConnectionHarness) AcceptAdapterHello(ctx context.Context, sessio
 	if err != nil {
 		return store.AdapterConnection{}, err
 	}
-	if fence, err := h.Store.AllocateAdapterGrantFence(ctx); err != nil || fence <= connection.AcceptedFence {
+	if fence, err := h.AllocateAdapterGrantFence(ctx); err != nil || fence <= connection.AcceptedFence {
 		return store.AdapterConnection{}, fmt.Errorf("preallocate post-hello grant fence %d after %d: %v", fence, connection.AcceptedFence, err)
 	}
 	return connection, nil
@@ -3206,7 +3206,7 @@ func (h *sqliteConnectionHarness) ActivateAdapterCredential(ctx context.Context,
 	if err != nil {
 		return store.AdapterConnection{}, err
 	}
-	if fence, err := h.Store.AllocateAdapterGrantFence(ctx); err != nil || fence <= connection.AcceptedFence {
+	if fence, err := h.AllocateAdapterGrantFence(ctx); err != nil || fence <= connection.AcceptedFence {
 		return store.AdapterConnection{}, fmt.Errorf("preallocate post-activation grant fence %d after %d: %v", fence, connection.AcceptedFence, err)
 	}
 	return connection, nil

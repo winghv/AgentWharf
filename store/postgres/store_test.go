@@ -523,7 +523,7 @@ VALUES ('ses_command_corrupt', 'cmd_corrupt', 'session.send', 1, 'pending', stat
 `); err != nil {
 		t.Fatalf("seed corrupt pending command: %v", err)
 	}
-	if _, err := harness.Store.ListPendingCommands(ctx, "ses_command_corrupt", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}); err == nil {
+	if _, err := harness.ListPendingCommands(ctx, "ses_command_corrupt", store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1}); err == nil {
 		t.Fatal("ListPendingCommands() accepted corrupt non-user event payload")
 	}
 }

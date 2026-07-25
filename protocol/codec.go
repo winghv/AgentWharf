@@ -1129,7 +1129,7 @@ func validSettingsReason(value string) bool {
 		return false
 	}
 	for _, ch := range value[1:] {
-		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_') {
+		if (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') && ch != '_' {
 			return false
 		}
 	}
@@ -1402,7 +1402,7 @@ func validFileReferenceFingerprint(value string) bool {
 		return false
 	}
 	for _, ch := range value[len("sha256:"):] {
-		if !(ch >= '0' && ch <= '9') && !(ch >= 'a' && ch <= 'f') {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
 			return false
 		}
 	}
@@ -1542,12 +1542,12 @@ func validSettingsIdentifier(value string) bool {
 	for index := 0; index < len(value); index += 1 {
 		ch := value[index]
 		if index == 0 {
-			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+			if (ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') && (ch < '0' || ch > '9') {
 				return false
 			}
 			continue
 		}
-		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || strings.ContainsRune("._:/-", rune(ch))) {
+		if (ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') && (ch < '0' || ch > '9') && !strings.ContainsRune("._:/-", rune(ch)) {
 			return false
 		}
 	}
@@ -1559,7 +1559,7 @@ func validSettingsFingerprint(value string) bool {
 		return false
 	}
 	for _, ch := range value[len("sha256:"):] {
-		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
 			return false
 		}
 	}

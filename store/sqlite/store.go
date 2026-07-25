@@ -782,6 +782,9 @@ func (s *Store) AcknowledgeSettingsCommandDelivery(ctx context.Context, sessionI
 	if err != nil {
 		return store.SettingsCommand{}, err
 	}
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return store.SettingsCommand{}, fmt.Errorf("commit settings delivery acknowledgement: %w", err)
 	}
@@ -850,6 +853,9 @@ func (s *Store) RecoverSettingsCommand(ctx context.Context, sessionID, commandID
 		}
 	}
 	command, err = querySettingsCommand(ctx, tx, sessionID, commandID)
+	if err != nil {
+		return store.SettingsCommand{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return store.SettingsCommand{}, fmt.Errorf("commit settings recovery: %w", err)
 	}
@@ -1687,14 +1693,10 @@ func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, autho
 		return store.ProposedEventReceipt{}, fmt.Errorf("begin proposed event transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	nowMS, err := sqliteNowMillis(ctx, tx)
-	if err != nil {
-		return store.ProposedEventReceipt{}, err
-	}
 	if err := lockCommandAuthority(ctx, tx, sessionID, authority); err != nil {
 		return store.ProposedEventReceipt{}, err
 	}
-	nowMS, err = sqliteNowMillis(ctx, tx)
+	nowMS, err := sqliteNowMillis(ctx, tx)
 	if err != nil {
 		return store.ProposedEventReceipt{}, err
 	}
@@ -3377,11 +3379,11 @@ func validRunControlReservation(reservation store.RunControlReservation) bool {
 	return validRunControlRequest(reservation.SessionID, store.RunControlRequest{CommandID: reservation.CommandID, Operation: reservation.Operation, PreControlState: reservation.PreControlState, PreControlStateSeq: reservation.PreControlStateSeq, Writer: reservation.Writer}) && reservation.CapabilityVersion > 0 && reservation.ReservationVersion > 0 && !reservation.Deadline.IsZero() && (reservation.Outcome == store.RunControlPending || validRunControlTerminalOutcome(reservation.Outcome)) && ((terminal && reservation.TerminalEventSeq != nil) || (!terminal && reservation.TerminalEventSeq == nil))
 }
 func validSettingsID(value string) bool {
-	if len(value) < 1 || len(value) > 128 || !((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z') || (value[0] >= '0' && value[0] <= '9')) {
+	if len(value) < 1 || len(value) > 128 || ((value[0] < 'A' || value[0] > 'Z') && (value[0] < 'a' || value[0] > 'z') && (value[0] < '0' || value[0] > '9')) {
 		return false
 	}
 	for _, char := range value[1:] {
-		if !(char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '.' || char == '_' || char == ':' || char == '/' || char == '-') {
+		if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '.' && char != '_' && char != ':' && char != '/' && char != '-' {
 			return false
 		}
 	}
@@ -3392,7 +3394,7 @@ func validSettingsFingerprint(value string) bool {
 		return false
 	}
 	for _, char := range value[7:] {
-		if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
 			return false
 		}
 	}
@@ -3423,7 +3425,7 @@ func validSettingsReason(reason *string) bool {
 		return false
 	}
 	for _, char := range *reason {
-		if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '_') {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' {
 			return false
 		}
 	}
