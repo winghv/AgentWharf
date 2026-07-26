@@ -861,7 +861,7 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 }
 
 func startWrapDiagnostics(ctx context.Context, cfg wrapConfig, metrics *core.AdapterMetrics) *core.AdapterDiagnosticsServer {
-	operatorUID, fixedEntryUID, ok := diagnosticsIdentityFromEnv()
+	operatorUID, fixedEntryUID, ok := diagnosticsIdentityFromEnv(uint32(os.Geteuid()))
 	if !ok || cfg.HealthMarker == "" || cfg.ProviderCredential == nil || cfg.ProviderCredential.UID == 0 || cfg.ProviderCredential.UID == operatorUID || cfg.ProviderCredential.UID == fixedEntryUID {
 		return nil
 	}
@@ -885,9 +885,19 @@ func startWrapDiagnostics(ctx context.Context, cfg wrapConfig, metrics *core.Ada
 	return server
 }
 
-func diagnosticsIdentityFromEnv() (operatorUID, fixedEntryUID uint32, ok bool) {
-	operator, operatorErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID")), 10, 32)
-	fixedEntry, fixedEntryErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("AGENTWHARF_FIXED_ENTRY_UID")), 10, 32)
+func diagnosticsIdentityFromEnv(effectiveUID uint32) (operatorUID, fixedEntryUID uint32, ok bool) {
+	operatorRaw := strings.TrimSpace(os.Getenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID"))
+	fixedEntryRaw := strings.TrimSpace(os.Getenv("AGENTWHARF_FIXED_ENTRY_UID"))
+	if operatorRaw == "" && fixedEntryRaw == "" {
+		// HD-036 starts the fixed entry as root. Its effective identity is the
+		// trusted proof when a legacy provisioner has no reserved env fields.
+		if effectiveUID == 0 {
+			return 0, 0, true
+		}
+		return 0, 0, false
+	}
+	operator, operatorErr := strconv.ParseUint(operatorRaw, 10, 32)
+	fixedEntry, fixedEntryErr := strconv.ParseUint(fixedEntryRaw, 10, 32)
 	if operatorErr != nil || fixedEntryErr != nil || operator != fixedEntry {
 		return 0, 0, false
 	}
