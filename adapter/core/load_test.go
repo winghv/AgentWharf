@@ -245,6 +245,41 @@ func TestStartAdapterDiagnosticsUsesBoundedUnixSocket(t *testing.T) {
 	}
 }
 
+func TestAdapterDiagnosticsAcceptsRootFixedEntryIdentity(t *testing.T) {
+	cfg := AdapterDiagnosticsConfig{
+		SocketPath:    "/run/superwhv/adapter-state/diagnostics.sock",
+		RootPath:      "/run/superwhv/adapter-state",
+		MarkerPath:    "/run/superwhv/adapter-state/health",
+		FixedEntryUID: 0,
+		OperatorUID:   0,
+		ProviderUID:   1000,
+	}
+	if err := validateAdapterDiagnosticsIdentity(cfg); err != nil {
+		t.Fatalf("root fixed-entry identity rejected: %v", err)
+	}
+	cfg.OperatorUID = 1001
+	if err := validateAdapterDiagnosticsIdentity(cfg); err == nil {
+		t.Fatal("operator identity mismatch unexpectedly accepted")
+	}
+}
+
+func TestValidateDiagnosticSocketOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "diagnostics.sock")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	owner := uint32(os.Geteuid())
+	if err := validateDiagnosticSocketOwner(path, owner); err != nil {
+		t.Fatalf("matching socket owner rejected: %v", err)
+	}
+	if err := validateDiagnosticSocketOwner(path, owner+1); err == nil {
+		t.Fatal("mismatched socket owner accepted")
+	}
+	if err := validateDiagnosticSocketOwner(filepath.Join(filepath.Dir(path), "missing.sock"), owner); err == nil {
+		t.Fatal("missing socket owner accepted")
+	}
+}
+
 func TestStartAdapterDiagnosticsRejectsUnprovenRootAndSocket(t *testing.T) {
 	uid := uint32(os.Geteuid())
 	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), AdapterDiagnosticsConfig{OperatorUID: uid, ProviderUID: uid + 1}); err == nil {

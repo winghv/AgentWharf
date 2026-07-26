@@ -133,6 +133,19 @@ func TestStartWrapDiagnosticsRequiresFixedEntryProviderProof(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsIdentityFromEnvAcceptsRootFixedEntry(t *testing.T) {
+	t.Setenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID", "0")
+	t.Setenv("AGENTWHARF_FIXED_ENTRY_UID", "0")
+	operatorUID, fixedEntryUID, ok := diagnosticsIdentityFromEnv()
+	if !ok || operatorUID != 0 || fixedEntryUID != 0 {
+		t.Fatalf("root diagnostics identity = (%d, %d, %v)", operatorUID, fixedEntryUID, ok)
+	}
+	t.Setenv("AGENTWHARF_FIXED_ENTRY_UID", "1000")
+	if _, _, ok := diagnosticsIdentityFromEnv(); ok {
+		t.Fatal("mismatched diagnostics identities unexpectedly accepted")
+	}
+}
+
 func TestACPFileReferenceReadsBoundedWorkspaceContent(t *testing.T) {
 	t.Parallel()
 

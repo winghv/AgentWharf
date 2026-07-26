@@ -315,12 +315,19 @@ func StartAdapterDiagnostics(ctx context.Context, socketPath string, metrics *Ad
 	return nil, errors.New("fixed-entry diagnostics configuration is required")
 }
 
+func validateAdapterDiagnosticsIdentity(cfg AdapterDiagnosticsConfig) error {
+	if cfg.SocketPath == "" || cfg.RootPath == "" || cfg.MarkerPath == "" || cfg.ProviderUID == 0 || cfg.OperatorUID != cfg.FixedEntryUID || cfg.OperatorUID == cfg.ProviderUID || cfg.FixedEntryUID == cfg.ProviderUID {
+		return errors.New("diagnostic identity and paths are required")
+	}
+	return nil
+}
+
 func StartAdapterDiagnosticsWithConfig(ctx context.Context, cfg AdapterDiagnosticsConfig) (*AdapterDiagnosticsServer, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if cfg.SocketPath == "" || cfg.RootPath == "" || cfg.MarkerPath == "" || cfg.FixedEntryUID == 0 || cfg.OperatorUID == 0 || cfg.ProviderUID == 0 || cfg.OperatorUID == cfg.ProviderUID || cfg.FixedEntryUID == cfg.ProviderUID {
-		return nil, errors.New("diagnostic identity and paths are required")
+	if err := validateAdapterDiagnosticsIdentity(cfg); err != nil {
+		return nil, err
 	}
 	if filepath.Base(filepath.Clean(cfg.SocketPath)) != "diagnostics.sock" || filepath.Dir(filepath.Clean(cfg.SocketPath)) != filepath.Clean(cfg.RootPath) {
 		return nil, errors.New("diagnostic socket must be directly under its fixed-entry root")
@@ -346,6 +353,11 @@ func StartAdapterDiagnosticsWithConfig(ctx context.Context, cfg AdapterDiagnosti
 		_ = os.Remove(cfg.SocketPath)
 		return nil, fmt.Errorf("protect diagnostic socket: %w", err)
 	}
+	if err := validateDiagnosticSocketOwner(cfg.SocketPath, cfg.FixedEntryUID); err != nil {
+		_ = listener.Close()
+		_ = os.Remove(cfg.SocketPath)
+		return nil, err
+	}
 	peer := &peerUnixListener{listener: listener, operatorUID: cfg.OperatorUID, slots: make(chan struct{}, 2)}
 	handler := &adapterObservabilityHandler{metrics: cfg.Metrics, unixPeer: true, profileSlot: make(chan struct{}, 1)}
 	budget := &diagnosticBudget{}
@@ -362,13 +374,22 @@ func StartAdapterDiagnosticsWithConfig(ctx context.Context, cfg AdapterDiagnosti
 	}
 	result := &AdapterDiagnosticsServer{server: server, ln: peer, path: cfg.SocketPath, cancel: cancel}
 	go func() {
-		if ctx != nil {
-			<-ctx.Done()
-			result.Close()
-		}
+		<-serverCtx.Done()
+		_ = result.Close()
 	}()
 	go func() { _ = server.Serve(peer) }()
 	return result, nil
+}
+
+func validateDiagnosticSocketOwner(socketPath string, ownerUID uint32) error {
+	info, err := os.Lstat(socketPath)
+	if err != nil {
+		return fmt.Errorf("inspect diagnostic socket owner: %w", err)
+	}
+	if uid, ok := pathOwnerUID(info); !ok || uid != ownerUID {
+		return errors.New("diagnostic socket owner is untrusted")
+	}
+	return nil
 }
 
 func validateFixedEntryPath(path string) error {

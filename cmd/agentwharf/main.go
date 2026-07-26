@@ -861,9 +861,8 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 }
 
 func startWrapDiagnostics(ctx context.Context, cfg wrapConfig, metrics *core.AdapterMetrics) *core.AdapterDiagnosticsServer {
-	operatorUID, err := strconv.ParseUint(strings.TrimSpace(os.Getenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID")), 10, 32)
-	fixedEntryUID, fixedEntryErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("AGENTWHARF_FIXED_ENTRY_UID")), 10, 32)
-	if err != nil || fixedEntryErr != nil || operatorUID == 0 || fixedEntryUID == 0 || cfg.HealthMarker == "" || cfg.ProviderCredential == nil || cfg.ProviderCredential.UID == 0 || cfg.ProviderCredential.UID == uint32(operatorUID) || cfg.ProviderCredential.UID == uint32(fixedEntryUID) {
+	operatorUID, fixedEntryUID, ok := diagnosticsIdentityFromEnv()
+	if !ok || cfg.HealthMarker == "" || cfg.ProviderCredential == nil || cfg.ProviderCredential.UID == 0 || cfg.ProviderCredential.UID == operatorUID || cfg.ProviderCredential.UID == fixedEntryUID {
 		return nil
 	}
 	root := filepath.Dir(cfg.HealthMarker)
@@ -884,6 +883,15 @@ func startWrapDiagnostics(ctx context.Context, cfg wrapConfig, metrics *core.Ada
 		return nil
 	}
 	return server
+}
+
+func diagnosticsIdentityFromEnv() (operatorUID, fixedEntryUID uint32, ok bool) {
+	operator, operatorErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID")), 10, 32)
+	fixedEntry, fixedEntryErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("AGENTWHARF_FIXED_ENTRY_UID")), 10, 32)
+	if operatorErr != nil || fixedEntryErr != nil || operator != fixedEntry {
+		return 0, 0, false
+	}
+	return uint32(operator), uint32(fixedEntry), true
 }
 
 func claimProtocolErrorRequiresReclaim(protocolErr *protocol.Error) bool {
