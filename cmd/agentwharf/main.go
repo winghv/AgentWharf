@@ -861,21 +861,24 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 }
 
 func startWrapDiagnostics(ctx context.Context, cfg wrapConfig, metrics *core.AdapterMetrics) *core.AdapterDiagnosticsServer {
-	if cfg.HealthMarker == "" || cfg.ProviderCredential == nil || cfg.ProviderCredential.UID == 0 || cfg.ProviderCredential.UID == uint32(os.Geteuid()) {
-		return nil
-	}
-	markerInfo, err := os.Lstat(cfg.HealthMarker)
-	if err != nil || !markerInfo.Mode().IsRegular() || markerInfo.Mode().Perm() != 0o600 {
+	operatorUID, err := strconv.ParseUint(strings.TrimSpace(os.Getenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID")), 10, 32)
+	fixedEntryUID, fixedEntryErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("AGENTWHARF_FIXED_ENTRY_UID")), 10, 32)
+	if err != nil || fixedEntryErr != nil || operatorUID == 0 || fixedEntryUID == 0 || cfg.HealthMarker == "" || cfg.ProviderCredential == nil || cfg.ProviderCredential.UID == 0 || cfg.ProviderCredential.UID == uint32(operatorUID) || cfg.ProviderCredential.UID == uint32(fixedEntryUID) {
 		return nil
 	}
 	root := filepath.Dir(cfg.HealthMarker)
+	if core.ValidateAdapterDiagnosticsRoot(root, cfg.HealthMarker, uint32(fixedEntryUID)) != nil {
+		return nil
+	}
 	socketPath := filepath.Join(root, "diagnostics.sock")
 	server, err := core.StartAdapterDiagnosticsWithConfig(ctx, core.AdapterDiagnosticsConfig{
-		SocketPath:  socketPath,
-		RootPath:    root,
-		Metrics:     metrics,
-		OperatorUID: uint32(os.Geteuid()),
-		ProviderUID: cfg.ProviderCredential.UID,
+		SocketPath:    socketPath,
+		RootPath:      root,
+		MarkerPath:    cfg.HealthMarker,
+		Metrics:       metrics,
+		FixedEntryUID: uint32(fixedEntryUID),
+		OperatorUID:   uint32(operatorUID),
+		ProviderUID:   cfg.ProviderCredential.UID,
 	})
 	if err != nil {
 		return nil
@@ -1304,7 +1307,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 		defer writeMu.Unlock()
 		return writeCLIProtocolFrame(runCtx, conn, frame)
 	}
-	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, conn, writeFrame)
+	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, conn, writeFrame, metrics)
 	var processAdmission core.ProcessStartAdmission
 	if startAdmission != nil {
 		processAdmission = startAdmission
@@ -1387,6 +1390,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 			if err != nil {
 				return err
 			}
+			metrics.IncMaskedEvent()
 			return writeFrame(&masked)
 		})
 	}()
@@ -1457,7 +1461,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		defer writeMu.Unlock()
 		return writeCLIProtocolFrame(runCtx, conn, frame)
 	}
-	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, conn, writeFrame)
+	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, conn, writeFrame, metrics)
 	var processAdmission core.ProcessStartAdmission
 	if startAdmission != nil {
 		processAdmission = startAdmission
@@ -1578,7 +1582,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		cancel()
 		return errors.New("acp session/new response missing sessionId")
 	}
-	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID, masker); err != nil {
+	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID, masker, metrics); err != nil {
 		cancel()
 		return err
 	}
@@ -1596,6 +1600,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 			if err != nil {
 				return err
 			}
+			metrics.IncMaskedEvent()
 			return writeFrame(&masked)
 		})
 	}()
@@ -1654,8 +1659,9 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 // exchange owns the socket reader directly; later exchanges are delivered by
 // the command reader so ProcessSupervisor retries cannot race command routing.
 type providerStartAdmission struct {
-	conn  *websocket.Conn
-	write func(protocol.Frame) error
+	conn    *websocket.Conn
+	write   func(protocol.Frame) error
+	metrics *core.AdapterMetrics
 
 	mu             sync.Mutex
 	direct         bool
@@ -1667,52 +1673,59 @@ type providerStartAdmission struct {
 	invalidated    bool
 }
 
-func newProviderStartAdmission(version int, conn *websocket.Conn, write func(protocol.Frame) error) *providerStartAdmission {
+func newProviderStartAdmission(version int, conn *websocket.Conn, write func(protocol.Frame) error, metrics *core.AdapterMetrics) *providerStartAdmission {
 	if version != protocol.ProtocolVersionV2 || conn == nil || write == nil {
 		return nil
 	}
 	return &providerStartAdmission{
-		conn: conn, write: write, direct: true,
+		conn: conn, write: write, metrics: metrics, direct: true,
 		prepare: make(chan *protocol.ProviderStartPrepare, 1), ack: make(chan *protocol.ProviderStartAck, 1),
 		firstAdmitted: make(chan struct{}),
 	}
 }
 
+func (a *providerStartAdmission) receiptFailure(err error) error {
+	if a != nil && a.metrics != nil && err != nil {
+		a.metrics.IncReceiptFailure()
+	}
+	return err
+}
+
 func (a *providerStartAdmission) PrepareProcessStart(ctx context.Context, attempt int) error {
 	if a == nil || attempt < 1 {
-		return errors.New("provider start admission is unavailable")
+		return a.receiptFailure(errors.New("provider start admission is unavailable"))
 	}
 	a.mu.Lock()
 	direct := a.direct
 	a.mu.Unlock()
 	if err := a.write(&protocol.ProviderStart{Attempt: attempt}); err != nil {
-		return fmt.Errorf("request provider start admission: %w", err)
+		return a.receiptFailure(fmt.Errorf("request provider start admission: %w", err))
 	}
 	prepare, err := a.nextPrepare(ctx, direct)
 	if err != nil || prepare.Attempt != attempt {
-		return errors.New("provider start preparation rejected")
+		return a.receiptFailure(errors.New("provider start preparation rejected"))
 	}
 	return nil
 }
 
 func (a *providerStartAdmission) ConfirmProcessStarted(ctx context.Context, attempt int) error {
 	if a == nil || attempt < 1 {
-		return errors.New("provider start admission is unavailable")
+		return a.receiptFailure(errors.New("provider start admission is unavailable"))
 	}
 	a.mu.Lock()
 	direct := a.direct
 	a.mu.Unlock()
 	if err := a.write(&protocol.ProviderStartStarted{Attempt: attempt}); err != nil {
-		return fmt.Errorf("confirm provider start: %w", err)
+		return a.receiptFailure(fmt.Errorf("confirm provider start: %w", err))
 	}
 	ack, err := a.nextAck(ctx, direct)
 	if err != nil || ack.Attempt != attempt || ack.Status != protocol.ProviderStartAdmitted || ack.RecoveryHandle == "" {
-		return errors.New("provider start admission rejected")
+		return a.receiptFailure(errors.New("provider start admission rejected"))
 	}
 	a.mu.Lock()
 	if a.invalidated {
 		a.mu.Unlock()
-		return errors.New("provider start authority is unavailable")
+		return a.receiptFailure(errors.New("provider start authority is unavailable"))
 	}
 	a.direct = false
 	a.recoveryHandle = ack.RecoveryHandle
@@ -1919,7 +1932,7 @@ func stopProviderSupervisor(supervisor *core.ProcessSupervisor) {
 	_ = supervisor.Stop(stopCtx)
 }
 
-func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, providerSessionID string, masker *core.EventMasker) error {
+func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, providerSessionID string, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
 	payload, err := json.Marshal(map[string]any{
 		"state":               "ready",
 		"provider":            cfg.Provider,
@@ -1940,6 +1953,7 @@ func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wr
 	if err != nil {
 		return err
 	}
+	metrics.IncMaskedEvent()
 	if err := writeCLIProtocolFrame(ctx, conn, &event); err != nil {
 		return fmt.Errorf("send acp ready event: %w", err)
 	}

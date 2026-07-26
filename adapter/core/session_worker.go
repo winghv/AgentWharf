@@ -554,12 +554,14 @@ func (w *SessionWorker) DeliverCommand(ctx context.Context, command SessionWorke
 		return CommandRoutingReceipt{}, fmt.Errorf("prepare durable command: %w", err)
 	}
 	if routing.CommandID != command.CommandID || !validCommandRoutingStatus(routing.Status) {
+		w.recordReceiptFailure()
 		return CommandRoutingReceipt{}, fmt.Errorf("%w: command routing receipt", ErrInvalidDurableReceipt)
 	}
 	if routing.Status != CommandRoutingAccepted {
 		return routing, nil
 	}
 	if operation.OperationID == "" || operation.Version < 1 || operation.Status != LedgerOperationPending {
+		w.recordReceiptFailure()
 		return CommandRoutingReceipt{}, fmt.Errorf("%w: ledger operation receipt", ErrInvalidDurableReceipt)
 	}
 	execute := func() error {
@@ -617,6 +619,7 @@ func (w *SessionWorker) ProposeEvent(ctx context.Context, proposalID string, pub
 			return fmt.Errorf("commit durable event proposal: %w", err)
 		}
 		if receipt.ProposalID != proposalID || receipt.Seq < 1 || receipt.Status != EventProposalAccepted {
+			w.recordReceiptFailure()
 			return fmt.Errorf("%w: event proposal receipt", ErrInvalidDurableReceipt)
 		}
 		if err := publish(receipt.Seq); err != nil {
@@ -646,6 +649,7 @@ func (w *SessionWorker) finalizeCommandUnknown(command SessionWorkerCommand, ope
 	ctx, cancel := context.WithTimeout(context.Background(), durableReceiptRecoveryTimeout)
 	defer cancel()
 	if err := w.receipts.FinalizeCommand(ctx, w.sessionID, command, operation, CommandOutcomeOutcomeUnknown); err != nil {
+		w.recordReceiptFailure()
 		return fmt.Errorf("%w: %v; finalize outcome_unknown: %v", ErrUnsafeCommandReplay, cause, err)
 	}
 	return fmt.Errorf("%w: %v", ErrUnsafeCommandReplay, cause)

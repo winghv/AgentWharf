@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -96,14 +97,20 @@ func TestServeStartsLocalHubWithSQLiteAndStaticAuth(t *testing.T) {
 }
 
 func TestStartWrapDiagnosticsRequiresFixedEntryProviderProof(t *testing.T) {
+	t.Setenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID", strconv.FormatUint(uint64(os.Geteuid()), 10))
+	t.Setenv("AGENTWHARF_FIXED_ENTRY_UID", strconv.FormatUint(uint64(os.Geteuid()), 10))
 	if server := startWrapDiagnostics(context.Background(), wrapConfig{}, core.NewAdapterMetrics()); server != nil {
 		t.Fatal("diagnostics enabled without fixed-entry proof")
 	}
-	root, err := os.MkdirTemp("/tmp", "aw-wrap-diag-")
+	root, err := os.MkdirTemp("", "aw-wrap-diag-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(root)
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	marker := filepath.Join(root, "health")
 	if err := os.WriteFile(marker, []byte("healthy"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1706,7 +1713,7 @@ func TestProviderStartAdmissionRetainsOpaqueRecoveryHandle(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 	admission := newProviderStartAdmission(protocol.ProtocolVersionV2, conn, func(frame protocol.Frame) error {
 		return writeFrameToConn(ctx, conn, frame)
-	})
+	}, nil)
 	if err := admission.PrepareProcessStart(ctx, 1); err != nil {
 		t.Fatalf("PrepareProcessStart() = %v", err)
 	}

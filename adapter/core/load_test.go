@@ -93,6 +93,9 @@ func TestAdapterObservabilityPprofRoutesAndNilMetrics(t *testing.T) {
 		if response.Code != http.StatusOK && response.Code != http.StatusNotFound {
 			t.Fatalf("pprof %s status = %d", path, response.Code)
 		}
+		if path == "/debug/pprof/cmdline" && strings.Contains(response.Body.String(), "adapter-token") {
+			t.Fatalf("pprof cmdline leaked credential: %q", response.Body.String())
+		}
 	}
 	for _, seconds := range []string{"0", "31", "not-a-number"} {
 		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/debug/pprof/profile?seconds="+seconds, nil)
@@ -134,21 +137,37 @@ func TestStartAdapterDiagnosticsUsesBoundedUnixSocket(t *testing.T) {
 	if _, err := StartAdapterDiagnostics(context.Background(), "", nil); err == nil {
 		t.Fatal("empty diagnostics socket path unexpectedly accepted")
 	}
-	directory, err := os.MkdirTemp("/tmp", "aw-diag-")
+	directory, err := os.MkdirTemp("", "aw-diag-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(directory)
+	directory, err = filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
 	socketPath := filepath.Join(directory, "diagnostics.sock")
 	providerUID := uint32(os.Geteuid()) + 1
+	markerPath := filepath.Join(directory, "health")
+	if err := os.WriteFile(markerPath, []byte("healthy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAdapterDiagnosticsRoot(directory, markerPath, uint32(os.Geteuid())); err != nil {
+		t.Fatalf("ValidateAdapterDiagnosticsRoot() error = %v", err)
+	}
+	if err := ValidateAdapterDiagnosticsRoot(directory, markerPath, providerUID); err == nil {
+		t.Fatal("wrong diagnostics root owner unexpectedly accepted")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server, err := StartAdapterDiagnosticsWithConfig(ctx, AdapterDiagnosticsConfig{
-		SocketPath:  socketPath,
-		RootPath:    directory,
-		Metrics:     NewAdapterMetrics(),
-		OperatorUID: uint32(os.Geteuid()),
-		ProviderUID: providerUID,
+		SocketPath:    socketPath,
+		RootPath:      directory,
+		MarkerPath:    markerPath,
+		Metrics:       NewAdapterMetrics(),
+		FixedEntryUID: uint32(os.Geteuid()),
+		OperatorUID:   uint32(os.Geteuid()),
+		ProviderUID:   providerUID,
 	})
 	if err != nil {
 		t.Fatalf("StartAdapterDiagnostics() error = %v", err)
@@ -231,13 +250,21 @@ func TestStartAdapterDiagnosticsRejectsUnprovenRootAndSocket(t *testing.T) {
 	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), AdapterDiagnosticsConfig{OperatorUID: uid, ProviderUID: uid + 1}); err == nil {
 		t.Fatal("missing diagnostics paths unexpectedly accepted")
 	}
-	root, err := os.MkdirTemp("/tmp", "aw-diag-invalid-")
+	root, err := os.MkdirTemp("", "aw-diag-invalid-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(root)
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	socket := filepath.Join(root, "diagnostics.sock")
-	base := AdapterDiagnosticsConfig{SocketPath: socket, RootPath: root, OperatorUID: uid, ProviderUID: uid + 1}
+	marker := filepath.Join(root, "health")
+	if err := os.WriteFile(marker, []byte("healthy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := AdapterDiagnosticsConfig{SocketPath: socket, RootPath: root, MarkerPath: marker, FixedEntryUID: uid, OperatorUID: uid, ProviderUID: uid + 1}
 	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), AdapterDiagnosticsConfig{SocketPath: socket, RootPath: root, OperatorUID: uid, ProviderUID: uid}); err == nil {
 		t.Fatal("same-UID operator/provider unexpectedly accepted")
 	}

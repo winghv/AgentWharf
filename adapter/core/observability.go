@@ -124,7 +124,10 @@ func (h *adapterObservabilityHandler) servePprof(w http.ResponseWriter, path str
 	case "", "/", "/index.html":
 		pprof.Index(w, r)
 	case "/cmdline":
-		pprof.Cmdline(w, r)
+		// pprof.Cmdline returns os.Args verbatim. The wrap command accepts
+		// bearer credentials, so exposing this route would turn diagnostics
+		// into a credential disclosure channel.
+		http.NotFound(w, r)
 	case "/profile", "/trace":
 		seconds, err := boundedProfileSeconds(r)
 		if err != nil {
@@ -272,11 +275,40 @@ type AdapterDiagnosticsServer struct {
 }
 
 type AdapterDiagnosticsConfig struct {
-	SocketPath  string
-	RootPath    string
-	Metrics     *AdapterMetrics
-	OperatorUID uint32
-	ProviderUID uint32
+	SocketPath    string
+	RootPath      string
+	MarkerPath    string
+	Metrics       *AdapterMetrics
+	FixedEntryUID uint32
+	OperatorUID   uint32
+	ProviderUID   uint32
+}
+
+func ValidateAdapterDiagnosticsRoot(rootPath, markerPath string, ownerUID uint32) error {
+	if rootPath == "" || markerPath == "" || filepath.Dir(filepath.Clean(markerPath)) != filepath.Clean(rootPath) {
+		return errors.New("diagnostic fixed-entry paths are invalid")
+	}
+	if err := validateFixedEntryPath(rootPath); err != nil {
+		return err
+	}
+	if err := validateFixedEntryPath(markerPath); err != nil {
+		return err
+	}
+	rootInfo, err := os.Lstat(rootPath)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode().Perm() != 0o700 {
+		return errors.New("diagnostic fixed-entry root is unavailable")
+	}
+	if uid, ok := pathOwnerUID(rootInfo); !ok || uid != ownerUID {
+		return errors.New("diagnostic fixed-entry root owner is untrusted")
+	}
+	markerInfo, err := os.Lstat(markerPath)
+	if err != nil || !markerInfo.Mode().IsRegular() || markerInfo.Mode().Perm() != 0o600 {
+		return errors.New("diagnostic health marker is unavailable")
+	}
+	if uid, ok := pathOwnerUID(markerInfo); !ok || uid != ownerUID {
+		return errors.New("diagnostic health marker owner is untrusted")
+	}
+	return nil
 }
 
 func StartAdapterDiagnostics(ctx context.Context, socketPath string, metrics *AdapterMetrics) (*AdapterDiagnosticsServer, error) {
@@ -287,15 +319,17 @@ func StartAdapterDiagnosticsWithConfig(ctx context.Context, cfg AdapterDiagnosti
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if cfg.SocketPath == "" || cfg.RootPath == "" || cfg.OperatorUID == cfg.ProviderUID {
+	if cfg.SocketPath == "" || cfg.RootPath == "" || cfg.MarkerPath == "" || cfg.FixedEntryUID == 0 || cfg.OperatorUID == 0 || cfg.ProviderUID == 0 || cfg.OperatorUID == cfg.ProviderUID || cfg.FixedEntryUID == cfg.ProviderUID {
 		return nil, errors.New("diagnostic identity and paths are required")
 	}
-	if filepath.Dir(filepath.Clean(cfg.SocketPath)) != filepath.Clean(cfg.RootPath) {
+	if filepath.Base(filepath.Clean(cfg.SocketPath)) != "diagnostics.sock" || filepath.Dir(filepath.Clean(cfg.SocketPath)) != filepath.Clean(cfg.RootPath) {
 		return nil, errors.New("diagnostic socket must be directly under its fixed-entry root")
 	}
-	rootInfo, err := os.Lstat(cfg.RootPath)
-	if err != nil || !rootInfo.IsDir() || rootInfo.Mode().Perm() != 0o700 {
-		return nil, errors.New("diagnostic fixed-entry root is unavailable")
+	if err := ValidateAdapterDiagnosticsRoot(cfg.RootPath, cfg.MarkerPath, cfg.FixedEntryUID); err != nil {
+		return nil, err
+	}
+	if err := validateFixedEntryPath(cfg.SocketPath); err != nil {
+		return nil, err
 	}
 	if _, err := os.Lstat(cfg.SocketPath); err == nil {
 		// A stale or foreign entry is evidence that the fixed-entry proof is lost.
@@ -335,6 +369,29 @@ func StartAdapterDiagnosticsWithConfig(ctx context.Context, cfg AdapterDiagnosti
 	}()
 	go func() { _ = server.Serve(peer) }()
 	return result, nil
+}
+
+func validateFixedEntryPath(path string) error {
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		return errors.New("diagnostic fixed-entry path must be absolute")
+	}
+	for current := clean; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && current == clean {
+				return nil
+			}
+			return fmt.Errorf("inspect diagnostic fixed-entry path: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("diagnostic fixed-entry path contains symlink")
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+	}
 }
 
 func (s *AdapterDiagnosticsServer) Path() string {
