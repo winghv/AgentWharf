@@ -1378,11 +1378,12 @@ func fencePostgresRunControlsAfterWriterReplacement(ctx context.Context, tx pgx.
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	now, err := postgresSettingsNow(ctx, tx)
-	if err != nil {
-		return err
+	type pendingRunControl struct {
+		commandID string
+		operation store.RunControlOperation
+		version   int64
 	}
+	var pending []pendingRunControl
 	for rows.Next() {
 		var commandID string
 		var operation store.RunControlOperation
@@ -1390,6 +1391,17 @@ func fencePostgresRunControlsAfterWriterReplacement(ctx context.Context, tx pgx.
 		if err := rows.Scan(&commandID, &operation, &version); err != nil {
 			return err
 		}
+		pending = append(pending, pendingRunControl{commandID, operation, version})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, command := range pending {
 		reason := "adapter_disconnected"
 		payload, err := json.Marshal(struct {
 			CommandID       string                    `json:"cmd_id"`
@@ -1397,7 +1409,7 @@ func fencePostgresRunControlsAfterWriterReplacement(ctx context.Context, tx pgx.
 			Outcome         store.RunControlOutcome   `json:"outcome"`
 			CompletionState *string                   `json:"completion_state"`
 			ReasonCode      *string                   `json:"reason_code"`
-		}{commandID, operation, store.RunControlOutcomeUnknown, nil, &reason})
+		}{command.commandID, command.operation, store.RunControlOutcomeUnknown, nil, &reason})
 		if err != nil {
 			return err
 		}
@@ -1405,13 +1417,10 @@ func fencePostgresRunControlsAfterWriterReplacement(ctx context.Context, tx pgx.
 		if err != nil {
 			return err
 		}
-		result, err := tx.Exec(ctx, `UPDATE session_run_controls SET status='outcome_unknown',terminal_event_seq=$1,updated_at=clock_timestamp() WHERE session_id=$2 AND cmd_id=$3 AND reservation_version=$4 AND status='pending'`, seq, sessionID, commandID, version)
+		result, err := tx.Exec(ctx, `UPDATE session_run_controls SET status='outcome_unknown',terminal_event_seq=$1,updated_at=clock_timestamp() WHERE session_id=$2 AND cmd_id=$3 AND reservation_version=$4 AND status='pending'`, seq, sessionID, command.commandID, command.version)
 		if err != nil || result.RowsAffected() != 1 {
 			return errors.New("run-control replacement fence lost race")
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
 	}
 	return fencePostgresFileReferenceCommandsAfterWriterReplacement(ctx, tx, sessionID)
 }
@@ -1424,16 +1433,24 @@ func fencePostgresFileReferenceCommandsAfterWriterReplacement(ctx context.Contex
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	now, err := postgresSettingsNow(ctx, tx)
-	if err != nil {
-		return err
-	}
+	type pendingFileReference struct{ commandID, messageID string }
+	var pending []pendingFileReference
 	for rows.Next() {
 		var commandID, messageID string
 		if err := rows.Scan(&commandID, &messageID); err != nil {
 			return err
 		}
+		pending = append(pending, pendingFileReference{commandID, messageID})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	now, err := postgresSettingsNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, command := range pending {
 		reason := "writer_lost"
 		payload, err := json.Marshal(struct {
 			MessageID      string  `json:"message_id"`
@@ -1441,7 +1458,7 @@ func fencePostgresFileReferenceCommandsAfterWriterReplacement(ctx context.Contex
 			Outcome        string  `json:"outcome"`
 			ReferenceIndex *int    `json:"reference_index"`
 			Reason         *string `json:"reason"`
-		}{messageID, commandID, "outcome_unknown", nil, &reason})
+		}{command.messageID, command.commandID, "outcome_unknown", nil, &reason})
 		if err != nil {
 			return err
 		}
@@ -1449,12 +1466,12 @@ func fencePostgresFileReferenceCommandsAfterWriterReplacement(ctx context.Contex
 		if err != nil {
 			return err
 		}
-		result, err := tx.Exec(ctx, `UPDATE session_file_reference_commands SET status='outcome_unknown',terminal_event_seq=$1,updated_at=clock_timestamp() WHERE session_id=$2 AND cmd_id=$3 AND status IN ('delivery_pending','pending')`, seq, sessionID, commandID)
+		result, err := tx.Exec(ctx, `UPDATE session_file_reference_commands SET status='outcome_unknown',terminal_event_seq=$1,updated_at=clock_timestamp() WHERE session_id=$2 AND cmd_id=$3 AND status IN ('delivery_pending','pending')`, seq, sessionID, command.commandID)
 		if err != nil || result.RowsAffected() != 1 {
 			return errors.New("file-reference replacement fence lost race")
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 func validPostgresRunControlCapabilityUpdate(sessionID string, update store.RunControlCapabilityUpdate) bool {
