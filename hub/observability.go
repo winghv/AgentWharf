@@ -11,7 +11,7 @@ import (
 )
 
 // NewObservabilityHandler adds the host-side diagnostic surface without
-// exposing metrics or profiles to a tenant-facing WebSocket listener.
+// exposing metrics or profiles to a client-facing WebSocket listener.
 func NewObservabilityHandler(token string, next http.Handler) http.Handler {
 	return &observabilityHandler{token: token, next: next}
 }
