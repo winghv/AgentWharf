@@ -1863,7 +1863,7 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 				ledger := harness.Open(t)
 				authority := harness.Authority(t, ledger)
 				harness.Invalidate(t, ledger, kind)
-				request := store.PendingCommandRequest{CommandID: "cmd_contract_stale_" + string(kind), Type: "session.send", ExpiresAt: time.Now().Add(time.Second)}
+				request := store.PendingCommandRequest{CommandID: "cmd_contract_stale_" + string(kind), Type: "session.send", ExpiresAt: time.Now().Add(30 * time.Second)}
 				if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_stale", authority, userCommandEvent(1), request); err == nil {
 					t.Fatal("stale CommitPendingCommand() unexpectedly succeeded")
 				}
@@ -1903,11 +1903,11 @@ func PendingCommandContract(t *testing.T, harness PendingCommandHarness) {
 	t.Run("expired pending command cannot be claimed", func(t *testing.T) {
 		ledger := harness.Open(t)
 		authority := harness.Authority(t, ledger)
-		request := store.PendingCommandRequest{CommandID: "cmd_contract_claim_expired", Type: "session.send", ExpiresAt: time.Now().Add(50 * time.Millisecond)}
+		request := store.PendingCommandRequest{CommandID: "cmd_contract_claim_expired", Type: "session.send", ExpiresAt: time.Now().Add(5 * time.Second)}
 		if _, err := ledger.CommitPendingCommand(context.Background(), "ses_command_expired", authority, userCommandEvent(1), request); err != nil {
 			t.Fatalf("prepare expiry claim: %v", err)
 		}
-		time.Sleep(75 * time.Millisecond)
+		time.Sleep(5*time.Second + 75*time.Millisecond)
 		if _, err := ledger.ClaimPendingCommand(context.Background(), "ses_command_expired", authority, request.CommandID); err == nil {
 			t.Fatal("expired ClaimPendingCommand() unexpectedly succeeded")
 		}
