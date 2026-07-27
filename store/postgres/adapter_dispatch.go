@@ -4,14 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/winghv/agentwharf/store"
 	"github.com/winghv/agentwharf/store/postgres/internal/db"
 )
 
 func (s *Store) ValidateAdapterEffectAdmission(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission) (store.AdapterConnection, error) {
-	if s == nil || s.connectionTx == nil { return store.AdapterConnection{}, errors.New("adapter authority transaction is required") }
-	if err := s.connectionTx.QueryRow(ctx, `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 FOR UPDATE`, sessionID).Scan(new(int)); err != nil { return store.AdapterConnection{}, errors.New("adapter authority lost") }
+	if s == nil || s.connectionTx == nil {
+		return store.AdapterConnection{}, errors.New("adapter authority transaction is required")
+	}
+	if err := s.connectionTx.QueryRow(ctx, `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 FOR UPDATE`, sessionID).Scan(new(int)); err != nil {
+		return store.AdapterConnection{}, errors.New("adapter authority lost")
+	}
 	return s.ValidateAdapterAdmission(ctx, sessionID, admission)
 }
 
@@ -20,7 +25,9 @@ func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admis
 		return 0, errors.New("invalid postgres adapter event commit")
 	}
 	for _, event := range events[:len(events)-1] {
-		if attentionEventProjection(event).terminal { return 0, errors.New("terminal adapter event must be final") }
+		if attentionEventProjection(event).terminal {
+			return 0, errors.New("terminal adapter event must be final")
+		}
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -38,7 +45,11 @@ func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admis
 	if err != nil {
 		return 0, err
 	}
-	if _, err = queries.ValidateAdapterAdmission(ctx, db.ValidateAdapterAdmissionParams{SessionID: sessionID, CredentialGeneration: admission.CredentialGeneration, ConnectionEpoch: admission.ConnectionEpoch, AcceptedFence: admission.AcceptedFence, GrantFence: admission.GrantFence}); err != nil {
+	connection, err := queries.ValidateAdapterAdmission(ctx, db.ValidateAdapterAdmissionParams{
+		SessionID: sessionID, CredentialGeneration: admission.CredentialGeneration,
+		ConnectionEpoch: admission.ConnectionEpoch, AcceptedFence: admission.AcceptedFence, GrantFence: admission.GrantFence,
+	})
+	if err != nil || !connection.ActiveCredentialExpiresAt.Valid || !connection.ActiveCredentialExpiresAt.Time.After(time.Now()) {
 		return 0, errors.New("adapter authority lost")
 	}
 	if terminal {

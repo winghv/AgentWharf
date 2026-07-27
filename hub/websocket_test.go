@@ -2888,10 +2888,7 @@ func TestAdapterDispatchRealSQLiteRejectsExpiryBeforeCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	if _, err := raw.ExecContext(ctx, `CREATE TRIGGER slow_adapter_event BEFORE INSERT ON session_events BEGIN SELECT length(randomblob(2000000)); END`); err != nil {
-		t.Fatal(err)
-	}
-	expiresAt := time.Now().Add(100 * time.Millisecond)
+	expiresAt := time.Now().Add(time.Hour)
 	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
 		SessionID: "ses_sqlite_expiry", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: expiresAt,
 	}); err != nil {
@@ -2901,11 +2898,19 @@ func TestAdapterDispatchRealSQLiteRejectsExpiryBeforeCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := raw.ExecContext(ctx, `CREATE TRIGGER slow_adapter_event BEFORE INSERT ON session_events BEGIN SELECT length(randomblob(500000)); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `UPDATE session_adapter_connections
+SET active_credential_expires_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) + 50
+WHERE session_id = 'ses_sqlite_expiry'`); err != nil {
+		t.Fatal(err)
+	}
 	grant, err := events.AllocateAdapterGrantFence(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pending := make([]store.PendingEvent, 64)
+	pending := make([]store.PendingEvent, 16)
 	for index := range pending {
 		pending[index] = store.PendingEvent{Type: "session.state", Time: time.Now(), Payload: json.RawMessage(`{"state":"working"}`)}
 	}
