@@ -76,6 +76,9 @@ func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 	resetSchema(t, pool)
 	attention := postgres.New(pool)
 	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS session_id`, []string{"ses_page_a", "ses_page_b", "ses_page_c"}); err != nil {
+		t.Fatalf("seed attention page sessions: %v", err)
+	}
 	for _, sessionID := range []string{"ses_page_a", "ses_page_b", "ses_page_c"} {
 		if _, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
 			t.Fatalf("seed %s: %v", sessionID, err)
@@ -104,6 +107,9 @@ func TestAttentionSummaryPageRequiresCurrentAdapterAuthority(t *testing.T) {
 	resetSchema(t, pool)
 	attention := postgres.New(pool)
 	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS session_id`, []string{"ses_active", "ses_expired", "ses_revoked", "ses_terminal", "ses_missing"}); err != nil {
+		t.Fatalf("seed attention authority sessions: %v", err)
+	}
 	for _, sessionID := range []string{"ses_active", "ses_expired", "ses_revoked", "ses_terminal", "ses_missing"} {
 		if _, err := attention.Append(ctx, sessionID, []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
 			t.Fatalf("seed %s: %v", sessionID, err)
@@ -114,7 +120,7 @@ func TestAttentionSummaryPageRequiresCurrentAdapterAuthority(t *testing.T) {
 			}
 		}
 	}
-	if _, err := pool.Exec(ctx, `UPDATE session_adapter_connections SET active_credential_expires_at = clock_timestamp() - interval '1 second' WHERE session_id = 'ses_expired'; UPDATE session_adapter_connections SET revoked_at = clock_timestamp() WHERE session_id = 'ses_revoked'; UPDATE session_adapter_connections SET terminal_at = clock_timestamp() WHERE session_id = 'ses_terminal'`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE session_adapter_connections SET created_at = clock_timestamp() - interval '2 minutes', active_credential_expires_at = clock_timestamp() - interval '1 second' WHERE session_id = 'ses_expired'; UPDATE session_adapter_connections SET revoked_at = clock_timestamp() WHERE session_id = 'ses_revoked'; UPDATE session_adapter_connections SET terminal_at = clock_timestamp() WHERE session_id = 'ses_terminal'`); err != nil {
 		t.Fatal(err)
 	}
 	page, err := attention.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{Limit: 10})
@@ -601,14 +607,14 @@ func TestWarmAttachStoreContract(t *testing.T) {
 			}
 		},
 		Expire: func(t *testing.T, _ store.WarmAttachStore) {
-			if _, err := pool.Exec(context.Background(), `UPDATE session_attachments SET expires_at = clock_timestamp() - interval '1 second' WHERE attach_id = 'att_warm'`); err != nil {
+			if _, err := pool.Exec(context.Background(), `UPDATE session_attachments SET created_at = clock_timestamp() - interval '2 minutes', expires_at = clock_timestamp() - interval '1 second' WHERE attach_id = 'att_warm'`); err != nil {
 				t.Fatalf("expire warm attachment fixture: %v", err)
 			}
 		},
 		Absent: func(t *testing.T, _ store.WarmAttachStore, _ store.WarmAttachRequest) {
 			clearWarmAttachFailpoint(t, pool)
 			var attempts, attachments, commands, references int
-			if err := pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM session_attach_attempts WHERE attach_id = 'att_warm'), (SELECT count(*) FROM session_attachments WHERE attach_id = 'att_warm'), (SELECT count(*) FROM session_pending_commands WHERE cmd_id = 'cmd_warm'), (SELECT count(*) FROM session_events WHERE session_id = 'ses_target' AND payload->>'reference_id' = 'ref_warm'`).Scan(&attempts, &attachments, &commands, &references); err != nil {
+			if err := pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM session_attach_attempts WHERE attach_id = 'att_warm'), (SELECT count(*) FROM session_attachments WHERE attach_id = 'att_warm'), (SELECT count(*) FROM session_pending_commands WHERE cmd_id = 'cmd_warm'), (SELECT count(*) FROM session_events WHERE session_id = 'ses_target' AND payload->>'reference_id' = 'ref_warm')`).Scan(&attempts, &attachments, &commands, &references); err != nil {
 				t.Fatalf("inspect rolled-back warm attach: %v", err)
 			}
 			if attempts+attachments+commands+references != 0 {
@@ -730,7 +736,7 @@ func TestWarmAttachReceivedReceiptExpiresFailClosed(t *testing.T) {
 	if err != nil || claimed.Attachment.DeliveryState != store.AttachmentDeliveryReceived {
 		t.Fatalf("claim credential receipt = %+v, %v", claimed, err)
 	}
-	if _, err := pool.Exec(context.Background(), `UPDATE session_attachments SET expires_at = clock_timestamp() - interval '1 second' WHERE attach_id = $1`, claimed.Attachment.Identity.AttachID); err != nil {
+	if _, err := pool.Exec(context.Background(), `UPDATE session_attachments SET created_at = clock_timestamp() - interval '2 minutes', expires_at = clock_timestamp() - interval '1 second' WHERE attach_id = $1`, claimed.Attachment.Identity.AttachID); err != nil {
 		t.Fatalf("expire claimed credential receipt: %v", err)
 	}
 	expired, err := warm.ExpireWarmAttach(context.Background(), claimed.Attachment.Identity.AttachID, claimed.Attachment.DeliveryVersion)
@@ -1683,7 +1689,7 @@ func TestPrepareAdapterCredentialRotationSupersedesExpiredPending(t *testing.T) 
 	}); err != nil {
 		t.Fatalf("prepare first rotation: %v", err)
 	}
-	if _, err := harness.pool.Exec(ctx, `UPDATE session_adapter_connections SET pending_credential_expires_at = clock_timestamp() - interval '1 second' WHERE session_id = $1`, request.SessionID); err != nil {
+	if _, err := harness.pool.Exec(ctx, `UPDATE session_adapter_connections SET created_at = clock_timestamp() - interval '2 minutes', pending_credential_expires_at = clock_timestamp() - interval '1 second' WHERE session_id = $1`, request.SessionID); err != nil {
 		t.Fatalf("expire pending rotation: %v", err)
 	}
 	recovered, err := harness.PrepareAdapterCredentialRotation(ctx, request.SessionID, store.AdapterCredentialRotation{
@@ -1718,6 +1724,7 @@ INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS ses
 		"ses_connection_transaction", "ses_connection", "ses_connection_expired", "ses_connection_active_expiry", "ses_connection_other",
 		"ses_refresh", "ses_terminate", "ses_revoked", "ses_terminal", "ses_refresh_rollback", "ses_terminate_rollback",
 		"ses_terminate_hello_race", "ses_refresh_hello_race", "ses_refresh_terminate_race", "ses_exact_race", "ses_exact_terminate",
+		"ses_expired_pending_recovery",
 	}); err != nil {
 		t.Fatalf("seed connection sessions: %v", err)
 	}
@@ -1888,6 +1895,9 @@ func (h *postgresCommandHarness) seedAuthority(t *testing.T) {
 		"ses_command_1", "ses_command_claim", "ses_command_stale",
 		"ses_command_expired", "ses_command_reopen", "ses_command_invalid",
 		"ses_command_unknown", "ses_settings_1", "ses_settings_2", "ses_settings_revoked_ack", "ses_settings_revoked_finalize",
+		"ses_run_control_1", "ses_run_control_unsupported", "ses_run_control_replacement",
+		"ses_file_reference_1", "ses_file_reference_replacement", "ses_file_reference_invalid",
+		"ses_file_reference_deadline", "ses_file_reference_cross",
 	}
 	if _, err := h.pool.Exec(context.Background(), `
 INSERT INTO agent_sessions (id) SELECT session_id FROM unnest($1::text[]) AS session_id

@@ -108,7 +108,7 @@ func TestProviderStartAdmissionContract(t *testing.T) {
 		if _, err := harness.RecordProviderStartAdmission(context.Background(), admission); err != nil {
 			t.Fatalf("RecordProviderStartAdmission() = %v", err)
 		}
-		if _, err := harness.pool.Exec(context.Background(), "UPDATE session_workspace_leases SET child_scope_expires_at=clock_timestamp() - interval '1 second'"); err != nil {
+		if _, err := harness.pool.Exec(context.Background(), "UPDATE session_workspace_leases SET created_at=clock_timestamp() - interval '2 minutes', child_scope_expires_at=clock_timestamp() - interval '1 second'"); err != nil {
 			t.Fatalf("expire child scope: %v", err)
 		}
 		admission.ReAdmission = true

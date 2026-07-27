@@ -45,7 +45,7 @@ WHERE command.session_id = $1
   AND command.status IN ('pending', 'received')
   AND command.expires_at > clock_timestamp()
   AND event.type = 'session.message'
-  AND length(event.payload) BETWEEN 1 AND 65536
+  AND octet_length(event.payload::text) BETWEEN 1 AND 65536
 ORDER BY command.event_seq ASC;
 
 -- name: LockPendingCommandForResolve :one

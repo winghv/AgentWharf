@@ -839,9 +839,45 @@ func WarmAttachContract(t *testing.T, harness WarmAttachHarness) {
 	}
 
 	warm := harness.Open(t)
-	committed, err := warm.CommitWarmAttach(ctx, request)
-	if err != nil || committed.Duplicate {
-		t.Fatalf("commit warm attach = %+v, %v", committed, err)
+	// The first commit races two exact submissions: admission idempotency
+	// must yield exactly one creator and one duplicate regardless of
+	// interleaving, and this stays a first-commit race on every backend
+	// because nothing has committed this identity yet.
+	start := make(chan struct{})
+	raceResults := make(chan store.WarmAttachCommit, 2)
+	raceErrors := make(chan error, 2)
+	var raceGroup sync.WaitGroup
+	for range 2 {
+		raceGroup.Add(1)
+		go func() {
+			defer raceGroup.Done()
+			<-start
+			commit, err := warm.CommitWarmAttach(ctx, request)
+			raceResults <- commit
+			raceErrors <- err
+		}()
+	}
+	close(start)
+	raceGroup.Wait()
+	close(raceResults)
+	close(raceErrors)
+	for err := range raceErrors {
+		if err != nil {
+			t.Fatalf("concurrent warm attach: %v", err)
+		}
+	}
+	var committed store.WarmAttachCommit
+	var created, duplicate int
+	for result := range raceResults {
+		if result.Duplicate {
+			duplicate++
+		} else {
+			created++
+			committed = result
+		}
+	}
+	if created != 1 || duplicate != 1 {
+		t.Fatalf("concurrent warm-attach outcomes created=%d duplicate=%d", created, duplicate)
 	}
 	assertWarmAttachCommit(t, committed, request, 1)
 	snapshot, err := warm.AttentionSnapshot(ctx, []string{request.Attachment.Identity.TargetSessionID})
@@ -863,43 +899,6 @@ func WarmAttachContract(t *testing.T, harness WarmAttachHarness) {
 	if err != nil || len(snapshot) != 1 || !reflect.DeepEqual(snapshot[0], committed.Summary) {
 		t.Fatalf("changed retry mutated summary = %+v, %v", snapshot, err)
 	}
-	t.Run("concurrent_exact_retry", func(t *testing.T) {
-		warm := harness.Open(t)
-		start := make(chan struct{})
-		results := make(chan store.WarmAttachCommit, 2)
-		errors := make(chan error, 2)
-		var group sync.WaitGroup
-		for range 2 {
-			group.Add(1)
-			go func() {
-				defer group.Done()
-				<-start
-				commit, err := warm.CommitWarmAttach(ctx, request)
-				results <- commit
-				errors <- err
-			}()
-		}
-		close(start)
-		group.Wait()
-		close(results)
-		close(errors)
-		var created, duplicate int
-		for err := range errors {
-			if err != nil {
-				t.Fatalf("concurrent warm attach: %v", err)
-			}
-		}
-		for result := range results {
-			if result.Duplicate {
-				duplicate++
-			} else {
-				created++
-			}
-		}
-		if created != 1 || duplicate != 1 {
-			t.Fatalf("concurrent warm-attach outcomes created=%d duplicate=%d", created, duplicate)
-		}
-	})
 	if _, err := warm.ExpireWarmAttach(ctx, request.Attachment.Identity.AttachID, committed.Attachment.DeliveryVersion+1); err == nil {
 		t.Fatal("stale warm-attach expiry unexpectedly committed")
 	}
