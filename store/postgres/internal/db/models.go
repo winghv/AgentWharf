@@ -104,6 +104,35 @@ type SessionEventStream struct {
 	UpdatedAt    pgtype.Timestamptz
 }
 
+type SessionFileReferenceCapability struct {
+	SessionID                  string
+	CapabilityEventSeq         int64
+	CapabilityFingerprint      string
+	WriterConnectionEpoch      int64
+	WriterCredentialGeneration int64
+	WriterLeaseID              string
+	CreatedAt                  pgtype.Timestamptz
+	UpdatedAt                  pgtype.Timestamptz
+}
+
+type SessionFileReferenceCommand struct {
+	SessionID                  string
+	CmdID                      string
+	MessageID                  string
+	CapabilityFingerprint      string
+	RequestFingerprint         string
+	ReferenceCount             int32
+	ReservationVersion         int64
+	DeliveryDeadline           pgtype.Timestamptz
+	WriterConnectionEpoch      pgtype.Int8
+	WriterCredentialGeneration pgtype.Int8
+	WriterLeaseID              pgtype.Text
+	Status                     string
+	TerminalEventSeq           pgtype.Int8
+	CreatedAt                  pgtype.Timestamptz
+	UpdatedAt                  pgtype.Timestamptz
+}
+
 type SessionPendingCommand struct {
 	SessionID string
 	CmdID     string
@@ -113,6 +142,80 @@ type SessionPendingCommand struct {
 	ExpiresAt pgtype.Timestamptz
 	CreatedAt pgtype.Timestamptz
 	UpdatedAt pgtype.Timestamptz
+}
+
+type SessionRunControl struct {
+	SessionID                  string
+	CmdID                      string
+	Operation                  string
+	CapabilityVersion          int64
+	ReservationVersion         int64
+	PreControlState            string
+	PreControlStateSeq         int64
+	WriterConnectionEpoch      int64
+	WriterCredentialGeneration int64
+	WriterLeaseID              string
+	Deadline                   pgtype.Timestamptz
+	Status                     string
+	TerminalEventSeq           pgtype.Int8
+	CreatedAt                  pgtype.Timestamptz
+	UpdatedAt                  pgtype.Timestamptz
+}
+
+type SessionRunControlCapability struct {
+	SessionID                  string
+	CapabilityEventSeq         int64
+	CapabilityVersion          int64
+	InterruptSupported         bool
+	StopSupported              bool
+	WriterConnectionEpoch      int64
+	WriterCredentialGeneration int64
+	WriterLeaseID              string
+	CreatedAt                  pgtype.Timestamptz
+	UpdatedAt                  pgtype.Timestamptz
+}
+
+type SessionSettingsCapability struct {
+	SessionID                  string
+	CapabilityEventSeq         int64
+	Fingerprint                string
+	EffectiveModelID           string
+	EffectivePermissionModeID  string
+	CapabilityVersion          int64
+	WriterConnectionEpoch      int64
+	WriterCredentialGeneration int64
+	WriterLeaseID              string
+	CreatedAt                  pgtype.Timestamptz
+	UpdatedAt                  pgtype.Timestamptz
+}
+
+type SessionSettingsCommand struct {
+	SessionID                         string
+	CmdID                             string
+	RequestFingerprint                string
+	RequestedModelID                  pgtype.Text
+	RequestedPermissionModeID         pgtype.Text
+	ReservationVersion                int64
+	DeliveryDeadline                  pgtype.Timestamptz
+	OperationDeadline                 pgtype.Timestamptz
+	WriterConnectionEpoch             int64
+	WriterCredentialGeneration        int64
+	WriterLeaseID                     string
+	ReservedCapabilityEventSeq        int64
+	ReservedFingerprint               string
+	ReservedEffectiveModelID          string
+	ReservedEffectivePermissionModeID string
+	Status                            string
+	TerminalEventSeq                  pgtype.Int8
+	CreatedAt                         pgtype.Timestamptz
+	UpdatedAt                         pgtype.Timestamptz
+}
+
+type SessionSettingsLiveWriter struct {
+	SessionID            string
+	ConnectionEpoch      int64
+	CredentialGeneration int64
+	WriterLeaseID        string
 }
 
 type SessionWorkspaceLease struct {
