@@ -2350,6 +2350,7 @@ func (s *Store) CommitAttachAttempt(ctx context.Context, request store.AttachAtt
 	if s.pool == nil {
 		return store.AttachAttemptCommit{}, errors.New("postgres event store pool is nil")
 	}
+	request.ExpiresAt = postgresTimestamp(request.ExpiresAt)
 	if err := validateAttachAttempt(request); err != nil {
 		return store.AttachAttemptCommit{}, err
 	}
@@ -2442,6 +2443,7 @@ func (s *Store) CommitWarmAttach(ctx context.Context, request store.WarmAttachRe
 	if s.pool == nil {
 		return store.WarmAttachCommit{}, errors.New("postgres event store pool is nil")
 	}
+	request = normalizeWarmAttachRequest(request)
 	if err := validateWarmAttachRequest(request); err != nil {
 		return store.WarmAttachCommit{}, err
 	}
@@ -2713,6 +2715,7 @@ func (s *Store) ReserveWorkspaceLease(ctx context.Context, reserve store.Workspa
 	if s.pool == nil {
 		return store.WorkspaceLease{}, errors.New("postgres event store pool is nil")
 	}
+	reserve = normalizeWorkspaceLeaseReserve(reserve)
 	if err := validateWorkspaceLeaseReserve(reserve); err != nil {
 		return store.WorkspaceLease{}, err
 	}
@@ -2998,10 +3001,50 @@ func nullableInt64(value *int64) pgtype.Int8 {
 	return pgtype.Int8{Int64: *value, Valid: true}
 }
 
+// PostgreSQL stores timestamptz values at microsecond precision. Normalize
+// request timestamps before validation and idempotency comparisons so an exact
+// retry cannot look like a distinct later expiry after its first write.
+func postgresTimestamp(value time.Time) time.Time {
+	return value.UTC().Truncate(time.Microsecond)
+}
+
+func normalizeWarmAttachRequest(request store.WarmAttachRequest) store.WarmAttachRequest {
+	request.Attempt.ExpiresAt = postgresTimestamp(request.Attempt.ExpiresAt)
+	request.Attachment.ExpiresAt = postgresTimestamp(request.Attachment.ExpiresAt)
+	request.TargetActivation.ExpiresAt = postgresTimestamp(request.TargetActivation.ExpiresAt)
+	request.FirstDelivery.ExpiresAt = postgresTimestamp(request.FirstDelivery.ExpiresAt)
+	return request
+}
+
+func normalizeWorkspaceLeaseReserve(reserve store.WorkspaceLeaseReserve) store.WorkspaceLeaseReserve {
+	reserve.ExpiresAt = postgresTimestamp(reserve.ExpiresAt)
+	if reserve.ChildScope != nil {
+		childScope := *reserve.ChildScope
+		childScope.ExpiresAt = postgresTimestamp(childScope.ExpiresAt)
+		reserve.ChildScope = &childScope
+	}
+	return reserve
+}
+
+func normalizeAttachmentUpdate(update store.AttachmentUpdate) store.AttachmentUpdate {
+	if update.ExpiresAt != nil {
+		expiresAt := postgresTimestamp(*update.ExpiresAt)
+		update.ExpiresAt = &expiresAt
+	}
+	if update.Blocker != nil && update.Blocker.ExpiresAt != nil {
+		blocker := *update.Blocker
+		expiresAt := postgresTimestamp(*blocker.ExpiresAt)
+		blocker.ExpiresAt = &expiresAt
+		update.Blocker = &blocker
+	}
+	return update
+}
+
 func (s *Store) CreateAttachment(ctx context.Context, request store.AttachmentCreate) (store.AttachmentCommit, error) {
 	if s.pool == nil {
 		return store.AttachmentCommit{}, errors.New("postgres event store pool is nil")
 	}
+	request.ExpiresAt = postgresTimestamp(request.ExpiresAt)
 	if err := validateAttachmentIdentity(request.Identity); err != nil {
 		return store.AttachmentCommit{}, err
 	}
@@ -3077,6 +3120,7 @@ func (s *Store) UpdateAttachment(ctx context.Context, attachID string, expectedV
 	if s.pool == nil {
 		return store.AttachmentMutation{}, errors.New("postgres event store pool is nil")
 	}
+	update = normalizeAttachmentUpdate(update)
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return store.AttachmentMutation{}, fmt.Errorf("begin attachment update: %w", err)
