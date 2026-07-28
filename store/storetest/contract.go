@@ -930,16 +930,16 @@ func warmAttachRequest() store.WarmAttachRequest {
 
 func assertWarmAttachCommit(t *testing.T, got store.WarmAttachCommit, request store.WarmAttachRequest, summaryVersion int64) {
 	t.Helper()
-	if got.Attempt.Identity != request.Attempt.Identity || got.Attempt.Fingerprint != request.Attempt.Fingerprint || got.Attachment.Identity != request.Attachment.Identity || got.Attachment.Status != store.AttachmentJoinPending || got.Attachment.DeliveryState != store.AttachmentDeliveryPending || !sameWarmAttachTime(got.Attachment.ExpiresAt, &request.Attachment.ExpiresAt) || got.TargetActivation != request.TargetActivation || got.Outbox.TargetSessionID != request.Attachment.Identity.TargetSessionID || got.Outbox.CommandID != request.FirstDelivery.CommandID || got.Outbox.ReferenceID != request.FirstDelivery.ReferenceID || got.Outbox.ReferenceDigest != request.FirstDelivery.ReferenceDigest || !got.Outbox.ExpiresAt.Equal(request.FirstDelivery.ExpiresAt) || got.Outbox.EventSeq < 1 || got.Summary.SessionID != request.Attachment.Identity.TargetSessionID || got.Summary.Blocker == nil || got.Summary.Blocker.Kind != store.AttentionBlockerQueued || got.Summary.SummaryVersion != summaryVersion || got.Summary.LastDurableEventAt == nil || got.Summary.LastClientCommandAt == nil || got.Summary.StateOfProjection != store.AttentionProjectionComplete {
+	if got.Attempt.Identity != request.Attempt.Identity || got.Attempt.Fingerprint != request.Attempt.Fingerprint || got.Attachment.Identity != request.Attachment.Identity || got.Attachment.Status != store.AttachmentJoinPending || got.Attachment.DeliveryState != store.AttachmentDeliveryPending || !sameWarmAttachTime(got.Attachment.ExpiresAt, &request.Attachment.ExpiresAt) || got.TargetActivation.Generation != request.TargetActivation.Generation || !storeTimeEqual(got.TargetActivation.ExpiresAt, request.TargetActivation.ExpiresAt) || got.Outbox.TargetSessionID != request.Attachment.Identity.TargetSessionID || got.Outbox.CommandID != request.FirstDelivery.CommandID || got.Outbox.ReferenceID != request.FirstDelivery.ReferenceID || got.Outbox.ReferenceDigest != request.FirstDelivery.ReferenceDigest || !storeTimeEqual(got.Outbox.ExpiresAt, request.FirstDelivery.ExpiresAt) || got.Outbox.EventSeq < 1 || got.Summary.SessionID != request.Attachment.Identity.TargetSessionID || got.Summary.Blocker == nil || got.Summary.Blocker.Kind != store.AttentionBlockerQueued || got.Summary.SummaryVersion != summaryVersion || got.Summary.LastDurableEventAt == nil || got.Summary.LastClientCommandAt == nil || got.Summary.StateOfProjection != store.AttentionProjectionComplete {
 		t.Fatalf("warm-attach commit = %+v", got)
 	}
-	if got.Summary.Blocker.Reason == nil || *got.Summary.Blocker.Reason != "join_pending" || got.Summary.Blocker.ExpiresAt == nil || !got.Summary.Blocker.ExpiresAt.Equal(request.Attachment.ExpiresAt) || got.Summary.Blocker.BlockingSessionID != nil || got.Summary.Blocker.Operation != nil || got.Summary.LatestSeq != got.Outbox.EventSeq {
+	if got.Summary.Blocker.Reason == nil || *got.Summary.Blocker.Reason != "join_pending" || got.Summary.Blocker.ExpiresAt == nil || !storeTimeEqual(*got.Summary.Blocker.ExpiresAt, request.Attachment.ExpiresAt) || got.Summary.Blocker.BlockingSessionID != nil || got.Summary.Blocker.Operation != nil || got.Summary.LatestSeq != got.Outbox.EventSeq {
 		t.Fatalf("warm-attach summary = %+v; outbox = %+v", got.Summary, got.Outbox)
 	}
 }
 
 func sameWarmAttachTime(left, right *time.Time) bool {
-	return (left == nil && right == nil) || (left != nil && right != nil && left.Equal(*right))
+	return (left == nil && right == nil) || (left != nil && right != nil && storeTimeEqual(*left, *right))
 }
 
 type attentionSummarySurface interface {
@@ -1163,7 +1163,7 @@ func attachAttemptInt64(value int64) *int64 { return &value }
 
 func assertAttachAttempt(t *testing.T, got store.AttachAttempt, want store.AttachAttemptRequest) {
 	t.Helper()
-	if got.Identity != want.Identity || got.Fingerprint != want.Fingerprint || !got.ExpiresAt.Equal(want.ExpiresAt) || got.Outcome != want.Outcome || (got.IssuedCredentialGeneration == nil) != (want.IssuedCredentialGeneration == nil) {
+	if got.Identity != want.Identity || got.Fingerprint != want.Fingerprint || !storeTimeEqual(got.ExpiresAt, want.ExpiresAt) || got.Outcome != want.Outcome || (got.IssuedCredentialGeneration == nil) != (want.IssuedCredentialGeneration == nil) {
 		t.Fatalf("attach attempt = %+v, want %+v", got, want)
 	}
 	if got.IssuedCredentialGeneration != nil && *got.IssuedCredentialGeneration != *want.IssuedCredentialGeneration {
@@ -2415,7 +2415,11 @@ func sameString(left, right *string) bool {
 }
 
 func sameTime(left, right *time.Time) bool {
-	return (left == nil && right == nil) || (left != nil && right != nil && left.Equal(*right))
+	return (left == nil && right == nil) || (left != nil && right != nil && storeTimeEqual(*left, *right))
+}
+
+func storeTimeEqual(left, right time.Time) bool {
+	return left.UTC().Truncate(time.Microsecond).Equal(right.UTC().Truncate(time.Microsecond))
 }
 
 func userCommandEvent(n int) store.PendingEvent {
@@ -2432,7 +2436,7 @@ func nonUserCommandEvent(n int) store.PendingEvent {
 
 func assertPendingCommand(t *testing.T, command store.PendingCommand, sessionID string, request store.PendingCommandRequest, eventSeq int64, status store.PendingCommandStatus) {
 	t.Helper()
-	if command.SessionID != sessionID || command.CommandID != request.CommandID || command.Type != request.Type || command.EventSeq != eventSeq || command.Status != status || !command.ExpiresAt.Equal(request.ExpiresAt) {
+	if command.SessionID != sessionID || command.CommandID != request.CommandID || command.Type != request.Type || command.EventSeq != eventSeq || command.Status != status || !storeTimeEqual(command.ExpiresAt, request.ExpiresAt) {
 		t.Fatalf("pending command = %+v, want session=%s command=%s type=%s event=%d status=%s expiry=%s", command, sessionID, request.CommandID, request.Type, eventSeq, status, request.ExpiresAt)
 	}
 }
@@ -2733,7 +2737,7 @@ func workspaceLease(t *testing.T, leases store.WorkspaceLeaseStore, key store.Wo
 
 func assertWorkspaceLease(t *testing.T, got store.WorkspaceLease, want store.WorkspaceLeaseReserve, status store.WorkspaceLeaseStatus) {
 	t.Helper()
-	if got.Key != want.Key || !sameWorkspaceLeaseChildScope(got.ChildScope, want.ChildScope) || got.Owner != want.Owner || got.Status != status || got.Version < 1 || !got.ExpiresAt.Equal(want.ExpiresAt) {
+	if got.Key != want.Key || !sameWorkspaceLeaseChildScope(got.ChildScope, want.ChildScope) || got.Owner != want.Owner || got.Status != status || got.Version < 1 || !storeTimeEqual(got.ExpiresAt, want.ExpiresAt) {
 		t.Fatalf("workspace lease = %+v, want key=%v owner=%+v status=%s", got, want.Key, want.Owner, status)
 	}
 }
@@ -2742,7 +2746,7 @@ func sameWorkspaceLeaseChildScope(left, right *store.WorkspaceLeaseChildScope) b
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	return left.ParentKey == right.ParentKey && left.CapabilityDigest == right.CapabilityDigest && left.ExpiresAt.Equal(right.ExpiresAt)
+	return left.ParentKey == right.ParentKey && left.CapabilityDigest == right.CapabilityDigest && storeTimeEqual(left.ExpiresAt, right.ExpiresAt)
 }
 
 func assertWorkspaceLeaseReserveRace(t *testing.T, harness WorkspaceLeaseHarness, ctx context.Context) {
