@@ -2023,16 +2023,16 @@ func TestWebSocketServerDeduplicatesAcceptedClientCommands(t *testing.T) {
 
 	command := &protocol.Command{
 		CommandID: "cmd_duplicate",
-		Type:      protocol.CommandSessionInterrupt,
+		Type:      protocol.CommandSessionSend,
 		SessionID: "ses_1",
-		Payload:   json.RawMessage(`{}`),
+		Payload:   json.RawMessage(`{"content":[{"kind":"text","text":"deduplicate"}]}`),
 	}
 	writeFrame(t, client, command)
 	first := readFrame(t, adapter).(*protocol.Command)
 	if first.CommandID != "cmd_duplicate" {
 		t.Fatalf("first routed command = %+v", first)
 	}
-	if ack := readFrame(t, client).(*protocol.CommandAck); ack.Status != protocol.AckAccepted {
+	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckAccepted {
 		t.Fatalf("first ack = %+v", ack)
 	}
 
