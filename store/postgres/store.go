@@ -2424,7 +2424,7 @@ func attachAttempt(row db.SessionAttachAttempt) store.AttachAttempt {
 }
 
 func sameAttachAttempt(current store.AttachAttempt, request store.AttachAttemptRequest) bool {
-	return current.Identity == request.Identity && current.Fingerprint == request.Fingerprint && current.ExpiresAt.Equal(request.ExpiresAt) &&
+	return current.Identity == request.Identity && current.Fingerprint == request.Fingerprint && samePostgresTimestamp(current.ExpiresAt, request.ExpiresAt) &&
 		current.Outcome == request.Outcome && ((current.IssuedCredentialGeneration == nil && request.IssuedCredentialGeneration == nil) ||
 		(current.IssuedCredentialGeneration != nil && request.IssuedCredentialGeneration != nil && *current.IssuedCredentialGeneration == *request.IssuedCredentialGeneration))
 }
@@ -2603,8 +2603,8 @@ func validateWarmAttachRequest(request store.WarmAttachRequest) error {
 		request.BootstrapAdmission.AcceptedFence < 1 || request.BootstrapAdmission.GrantFence <= request.BootstrapAdmission.AcceptedFence ||
 		!validAttachmentText(request.FirstDelivery.CommandID, 256) || !validAttachmentText(request.FirstDelivery.ReferenceID, 255) ||
 		request.FirstDelivery.ReferenceDigest == ([32]byte{}) || request.TargetActivation.Generation < 1 || request.TargetActivation.ExpiresAt.IsZero() || request.Attachment.ExpiresAt.IsZero() ||
-		!request.TargetActivation.ExpiresAt.Equal(request.Attachment.ExpiresAt) ||
-		!request.FirstDelivery.ExpiresAt.Equal(request.Attachment.ExpiresAt) {
+		!samePostgresTimestamp(request.TargetActivation.ExpiresAt, request.Attachment.ExpiresAt) ||
+		!samePostgresTimestamp(request.FirstDelivery.ExpiresAt, request.Attachment.ExpiresAt) {
 		return errors.New("invalid warm attach request")
 	}
 	return nil
@@ -2653,7 +2653,7 @@ func warmAttachDuplicate(ctx context.Context, queries *db.Queries, attempt store
 	connection := adapterConnection(connectionRow)
 	if connection.SessionID != request.Attachment.Identity.TargetSessionID || connection.ConnectionEpoch != 0 || connection.AcceptedFence != 0 ||
 		connection.ActiveCredentialGeneration != request.TargetActivation.Generation || connection.CredentialGenerationHighWatermark != request.TargetActivation.Generation ||
-		!connection.ActiveCredentialExpiresAt.Equal(request.TargetActivation.ExpiresAt) || connection.PendingCredentialGeneration != nil ||
+		!samePostgresTimestamp(connection.ActiveCredentialExpiresAt, request.TargetActivation.ExpiresAt) || connection.PendingCredentialGeneration != nil ||
 		connection.PriorRecoveryGeneration != nil || connection.RotationID != nil || connection.RevokedAt != nil || connection.TerminalAt != nil {
 		return store.WarmAttachCommit{}, errors.New("warm attach target credential is immutable")
 	}
@@ -2665,7 +2665,7 @@ func warmAttachDuplicate(ctx context.Context, queries *db.Queries, attempt store
 	if err != nil {
 		return store.WarmAttachCommit{}, fmt.Errorf("load existing warm attach event: %w", err)
 	}
-	if commandRow.Type != "session.send" || !commandRow.ExpiresAt.Time.Equal(request.FirstDelivery.ExpiresAt) ||
+	if commandRow.Type != "session.send" || !samePostgresTimestamp(commandRow.ExpiresAt.Time, request.FirstDelivery.ExpiresAt) ||
 		!sameWarmAttachEvent(event.Type, event.Payload, request.FirstDelivery) {
 		return store.WarmAttachCommit{}, errors.New("warm attach first delivery is immutable")
 	}
@@ -2968,12 +2968,18 @@ func workspaceLeaseKey(value string) (store.WorkspaceLeaseKey, error) {
 }
 
 func sameWorkspaceLeaseReserve(lease store.WorkspaceLease, reserve store.WorkspaceLeaseReserve) bool {
-	if lease.Key != reserve.Key || lease.Owner != reserve.Owner || !lease.ExpiresAt.Equal(reserve.ExpiresAt) {
+	if lease.Key != reserve.Key || lease.Owner != reserve.Owner || !samePostgresTimestamp(lease.ExpiresAt, reserve.ExpiresAt) {
 		return false
 	}
 	left, right := lease.ChildScope, reserve.ChildScope
 	return (left == nil && right == nil) || (left != nil && right != nil && left.ParentKey == right.ParentKey &&
-		left.CapabilityDigest == right.CapabilityDigest && left.ExpiresAt.Equal(right.ExpiresAt))
+		left.CapabilityDigest == right.CapabilityDigest && samePostgresTimestamp(left.ExpiresAt, right.ExpiresAt))
+}
+
+// PostgreSQL timestamptz is stored at microsecond precision. Identity and
+// idempotency comparisons must use the same durable representation.
+func samePostgresTimestamp(left, right time.Time) bool {
+	return left.UTC().Truncate(time.Microsecond).Equal(right.UTC().Truncate(time.Microsecond))
 }
 
 func nullableInt64(value *int64) pgtype.Int8 {
@@ -3140,7 +3146,7 @@ func validateAttachmentUpdate(current store.Attachment, update store.AttachmentU
 		if !validAttachmentExpiry(*update.ExpiresAt, storeNow) {
 			return errors.New("attachment expiry is outside the Store-clock delivery window")
 		}
-		if current.ExpiresAt != nil && update.ExpiresAt.After(*current.ExpiresAt) {
+		if current.ExpiresAt != nil && update.ExpiresAt.UTC().Truncate(time.Microsecond).After(current.ExpiresAt.UTC().Truncate(time.Microsecond)) {
 			return errors.New("attachment expiry cannot be extended")
 		}
 	}
@@ -3155,7 +3161,7 @@ func validateAttachmentUpdate(current store.Attachment, update store.AttachmentU
 		if reason && (blocker.Reason == nil || update.QueueReason == nil || *blocker.Reason != *update.QueueReason) {
 			return false
 		}
-		if expiry && (blocker.ExpiresAt == nil || update.ExpiresAt == nil || !blocker.ExpiresAt.Equal(*update.ExpiresAt)) {
+		if expiry && (blocker.ExpiresAt == nil || update.ExpiresAt == nil || !samePostgresTimestamp(*blocker.ExpiresAt, *update.ExpiresAt)) {
 			return false
 		}
 		if blockingSession && (blocker.BlockingSessionID == nil || update.BlockingSessionID == nil || *blocker.BlockingSessionID != *update.BlockingSessionID) {
@@ -3167,7 +3173,7 @@ func validateAttachmentUpdate(current store.Attachment, update store.AttachmentU
 	valid := false
 	switch update.Status {
 	case store.AttachmentJoinPending:
-		valid = current.Status == store.AttachmentJoinPending && update.QueueReason == nil && update.ExpiresAt != nil && current.ExpiresAt != nil && update.ExpiresAt.Equal(*current.ExpiresAt) && update.BlockingSessionID == nil && update.Blocker == nil && (update.DeliveryState == store.AttachmentDeliveryPending || update.DeliveryState == store.AttachmentDeliveryReceived || update.DeliveryState == store.AttachmentDeliveryCompleted)
+		valid = current.Status == store.AttachmentJoinPending && update.QueueReason == nil && update.ExpiresAt != nil && current.ExpiresAt != nil && samePostgresTimestamp(*update.ExpiresAt, *current.ExpiresAt) && update.BlockingSessionID == nil && update.Blocker == nil && (update.DeliveryState == store.AttachmentDeliveryPending || update.DeliveryState == store.AttachmentDeliveryReceived || update.DeliveryState == store.AttachmentDeliveryCompleted)
 	case store.AttachmentQueued:
 		valid = update.DeliveryState == store.AttachmentDeliveryPending &&
 			update.QueueReason != nil && validAttachmentText(*update.QueueReason, 128) &&

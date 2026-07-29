@@ -304,13 +304,18 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var adapter *adapterConnection
-	accepted, historyToken, err := h.acceptPeer(ctx, conn, first, &adapter)
+	accepted, historyToken, ack, err := h.acceptPeer(ctx, conn, first, &adapter)
 	if err != nil {
 		return
 	}
 	peer := h.registerPeer(conn, accepted)
 	if peer != nil {
 		defer h.unregisterClient(peer)
+	}
+	if ack != nil {
+		if err := h.writeConnectionFrame(ctx, conn, peer, nil, ack); err != nil {
+			return
+		}
 	}
 	if adapter != nil {
 		defer h.unregisterAdapter(adapter)
@@ -329,25 +334,25 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.readLoop(ctx, conn, accepted, historyToken, peer, adapter)
 }
 
-func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, frame protocol.Frame, adapterOut **adapterConnection) (AcceptedPeer, string, error) {
+func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, frame protocol.Frame, adapterOut **adapterConnection) (AcceptedPeer, string, *protocol.HelloAck, error) {
 	hello, ok := frame.(*protocol.Hello)
 	if !ok {
 		_ = writeProtocolError(ctx, conn, "invalid_hello", "first frame must be hello", true)
 		_ = conn.Close(websocket.StatusPolicyViolation, "invalid hello")
-		return AcceptedPeer{}, "", ErrInvalidHello
+		return AcceptedPeer{}, "", nil, ErrInvalidHello
 	}
 	if h.handshake == nil {
 		err := errors.New("websocket handshake is not configured")
 		_ = writeProtocolError(ctx, conn, "internal_error", err.Error(), true)
 		_ = conn.Close(websocket.StatusInternalError, "handshake not configured")
-		return AcceptedPeer{}, "", err
+		return AcceptedPeer{}, "", nil, err
 	}
 	ack, accepted, err := h.handshake.HandleHello(ctx, hello)
 	if err != nil {
 		code := protocolErrorCode(err)
 		_ = writeProtocolError(ctx, conn, code, err.Error(), true)
 		_ = conn.Close(websocket.StatusPolicyViolation, code)
-		return AcceptedPeer{}, "", err
+		return AcceptedPeer{}, "", nil, err
 	}
 	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 &&
 		len(accepted.currentSubscriptions()) > 0 {
@@ -380,23 +385,24 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, fr
 	if err != nil {
 		_ = writeProtocolError(ctx, conn, "unauthorized", err.Error(), true)
 		_ = conn.Close(websocket.StatusPolicyViolation, "adapter authority lost")
-		return AcceptedPeer{}, "", err
+		return AcceptedPeer{}, "", nil, err
 	}
 	if adapter != nil {
 		if err := h.publishAdapterHello(ctx, adapter, &ack); err != nil {
 			h.rejectAdapter(adapter)
 			adapter.close()
-			return AcceptedPeer{}, "", err
+			return AcceptedPeer{}, "", nil, err
 		}
-	} else if err := writeProtocolFrame(ctx, conn, &ack); err != nil {
-		return AcceptedPeer{}, "", err
 	}
 	*adapterOut = adapter
 	historyToken := ""
 	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
 		historyToken = hello.Token
 	}
-	return accepted, historyToken, nil
+	if accepted.Role == protocol.RoleClient {
+		return accepted, historyToken, &ack, nil
+	}
+	return accepted, historyToken, nil, nil
 }
 
 func (h *webSocketHandler) readHelloFrame(ctx context.Context, conn *managedConn) (protocol.Frame, error) {

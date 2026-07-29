@@ -14,6 +14,11 @@ import (
 	"github.com/winghv/agentwharf/store"
 )
 
+const (
+	contractExpiryWindow = 500 * time.Millisecond
+	contractExpiryWait   = 650 * time.Millisecond
+)
+
 type Harness func(t *testing.T) store.EventStore
 
 type HistoryHarness struct {
@@ -1265,11 +1270,11 @@ func ConnectionContract(t *testing.T, harness ConnectionHarness) {
 		t.Fatalf("stale activation mutated pending lineage = %+v, %v", record, err)
 	}
 	connections = harness.Open(t)
-	expiringInit := store.AdapterConnectionInitialize{SessionID: "ses_connection_expired", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(50 * time.Millisecond)}
+	expiringInit := store.AdapterConnectionInitialize{SessionID: "ses_connection_expired", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(contractExpiryWindow)}
 	if _, err := connections.InitializeAdapterConnection(context.Background(), expiringInit); err != nil {
 		t.Fatalf("initialize expiring connection: %v", err)
 	}
-	time.Sleep(75 * time.Millisecond)
+	time.Sleep(contractExpiryWait)
 	if _, err := connections.AcceptAdapterHello(context.Background(), expiringInit.SessionID, store.AdapterHello{CredentialGeneration: 1}); err == nil {
 		t.Fatal("expired hello unexpectedly succeeded")
 	}
@@ -1288,13 +1293,13 @@ func ConnectionContract(t *testing.T, harness ConnectionHarness) {
 		return err
 	})
 	connections = harness.Open(t)
-	activeExpiryInit := store.AdapterConnectionInitialize{SessionID: "ses_connection_active_expiry", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(50 * time.Millisecond)}
+	activeExpiryInit := store.AdapterConnectionInitialize{SessionID: "ses_connection_active_expiry", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(contractExpiryWindow)}
 	record = initializeAndHello(t, connections, activeExpiryInit)
 	activeExpiryRotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(time.Minute), RotationID: "rot_active_expiry"}
 	if _, err := connections.PrepareAdapterCredentialRotation(context.Background(), activeExpiryInit.SessionID, activeExpiryRotation); err != nil {
 		t.Fatalf("prepare active expiry rotation: %v", err)
 	}
-	time.Sleep(75 * time.Millisecond)
+	time.Sleep(contractExpiryWait)
 	expired = mustAdapterConnection(t, connections, activeExpiryInit.SessionID)
 	assertConnectionNoWrite(t, connections, activeExpiryInit.SessionID, expired, func() error {
 		_, err := connections.ActivateAdapterCredential(context.Background(), activeExpiryInit.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, RotationID: activeExpiryRotation.RotationID})
@@ -1308,11 +1313,11 @@ func ConnectionContract(t *testing.T, harness ConnectionHarness) {
 	if err != nil {
 		t.Fatalf("hello pending expiry: %v", err)
 	}
-	expiringRotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(50 * time.Millisecond), RotationID: "rot_expired"}
+	expiringRotation := store.AdapterCredentialRotation{ExpectedActiveCredentialGeneration: record.ActiveCredentialGeneration, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, ExpiresAt: time.Now().Add(contractExpiryWindow), RotationID: "rot_expired"}
 	if _, err := connections.PrepareAdapterCredentialRotation(context.Background(), init.SessionID, expiringRotation); err != nil {
 		t.Fatalf("prepare expiring rotation: %v", err)
 	}
-	time.Sleep(75 * time.Millisecond)
+	time.Sleep(contractExpiryWait)
 	if _, err := connections.ActivateAdapterCredential(context.Background(), init.SessionID, store.AdapterCredentialActivation{ExpectedActiveCredentialGeneration: 1, ExpectedEpoch: record.ConnectionEpoch, PendingGeneration: 2, RotationID: "rot_expired"}); err == nil {
 		t.Fatal("expired pending credential unexpectedly activated")
 	}
