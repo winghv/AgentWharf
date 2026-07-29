@@ -720,9 +720,20 @@ func TestWebSocketServerDeliversCommittedPendingCommandAfterAdapterReconnect(t *
 		t.Logf("durable pending status before assertion: %q", status)
 		t.Fatalf("durable reconnect command = %#v, want reconstructed session.send", frame)
 	}
-	events.mu.Lock()
-	status := events.pending["ses_1\x00cmd_reconnect"].Status
-	events.mu.Unlock()
+	// A peer can consume the frame between its successful socket write and the
+	// following durable resolution. Wait for the terminal ledger state rather
+	// than treating that valid in-flight observation as a delivery failure.
+	deadline := time.Now().Add(time.Second)
+	var status store.PendingCommandStatus
+	for {
+		events.mu.Lock()
+		status = events.pending["ses_1\x00cmd_reconnect"].Status
+		events.mu.Unlock()
+		if status == store.PendingCommandCompleted || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if status != store.PendingCommandCompleted {
 		t.Fatalf("durable reconnect status = %q, want completed", status)
 	}
