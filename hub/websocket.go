@@ -782,23 +782,25 @@ func writePongFrame(ctx context.Context, conn *managedConn, peer *clientConnecti
 }
 
 func (h *webSocketHandler) replayAccepted(ctx context.Context, peer *clientConnection, accepted AcceptedPeer) error {
-	if h.events == nil || accepted.Role != protocol.RoleClient || peer == nil {
+	if accepted.Role != protocol.RoleClient || peer == nil {
 		return nil
 	}
 	for _, sub := range accepted.currentSubscriptions() {
-		if err := h.events.Replay(ctx, sub.SessionID, sub.LastSeq, func(ev store.Event) error {
-			seq := ev.Seq
-			return peer.writeReplayEvent(ctx, protocol.Event{
-				Type:      ev.Type,
-				SessionID: ev.SessionID,
-				Seq:       &seq,
-				Time:      ev.Time.UnixMilli(),
-				Payload:   ev.Payload,
-			})
-		}); err != nil {
-			_ = peer.writeFrame(ctx, &protocol.Error{Code: "replay_failed", Message: err.Error(), Fatal: true})
-			_ = peer.conn.Close(websocket.StatusInternalError, "replay failed")
-			return err
+		if h.events != nil {
+			if err := h.events.Replay(ctx, sub.SessionID, sub.LastSeq, func(ev store.Event) error {
+				seq := ev.Seq
+				return peer.writeReplayEvent(ctx, protocol.Event{
+					Type:      ev.Type,
+					SessionID: ev.SessionID,
+					Seq:       &seq,
+					Time:      ev.Time.UnixMilli(),
+					Payload:   ev.Payload,
+				})
+			}); err != nil {
+				_ = peer.writeFrame(ctx, &protocol.Error{Code: "replay_failed", Message: err.Error(), Fatal: true})
+				_ = peer.conn.Close(websocket.StatusInternalError, "replay failed")
+				return err
+			}
 		}
 		if err := peer.finishReplay(ctx, sub.SessionID); err != nil {
 			return err
@@ -812,7 +814,10 @@ func (h *webSocketHandler) registerPeer(conn *managedConn, accepted AcceptedPeer
 		return nil
 	}
 	current := accepted.currentSubscriptions()
-	peer := newClientConnection(conn, accepted.ProtocolVersion, current, h.events != nil, h.publisherEphemeralTypes)
+	// Subscribe before hello.ack so no live event is lost between handshake and
+	// replay. Keep every subscription replaying until the ack is on the wire:
+	// sendLiveEvent then buffers concurrent fanout instead of overtaking it.
+	peer := newClientConnection(conn, accepted.ProtocolVersion, current, true, h.publisherEphemeralTypes)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, sub := range current {
