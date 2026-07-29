@@ -1012,7 +1012,16 @@ func TestWebSocketSessionAttachRejectsDuplicateAfterUncertainCredentialHandoff(t
 		_, err := readFrameWithin(target, time.Second)
 		targetResult <- err
 	}()
-	writeFrame(t, target, &protocol.Ping{Nonce: "injected"})
+	// The pending-target reader closes the socket as soon as it consumes this
+	// frame. The close can race the client-side Write completion; either result
+	// is valid as long as the concurrent read confirms no frame was delivered.
+	ping, err := protocol.Encode(&protocol.Ping{Nonce: "injected"})
+	if err != nil {
+		t.Fatalf("encode injected ping: %v", err)
+	}
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), time.Second)
+	_ = target.Write(writeCtx, websocket.MessageText, ping)
+	cancelWrite()
 	if err := <-targetResult; err == nil || errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("pending target socket did not close after injected input: %v", err)
 	}
