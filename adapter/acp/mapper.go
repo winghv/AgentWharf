@@ -116,6 +116,9 @@ func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protoc
 	case "session/request_permission":
 		return m.mapSessionPermissionRequest(raw, providerSessionID)
 	default:
+		if responseSessionID := sessionIDFromResponse(raw, providerSessionID); responseSessionID != "" {
+			return []protocol.Event{m.stateEvent("ready", responseSessionID, copyWithout(raw, "type", "method", "session_id", "sessionId"))}
+		}
 		return m.mapUpdate(raw, providerSessionID)
 	}
 }
@@ -486,6 +489,26 @@ func updateObjects(raw map[string]any, key string) []map[string]any {
 func frameName(value map[string]any) string {
 	if name := firstString(value, "type", "subtype", "kind", "method", "event", "sessionUpdate"); name != "" {
 		return name
+	}
+	return ""
+}
+
+// sessionIDFromResponse recognizes the JSON-RPC session/new result emitted by
+// providers such as claude-agent-acp. It deliberately requires a result and a
+// session ID, so initialize responses and error responses cannot mark a VM
+// adapter ready before a session exists.
+func sessionIDFromResponse(value map[string]any, providerSessionID string) string {
+	if _, ok := value["id"]; !ok {
+		return ""
+	}
+	if _, ok := value["result"]; !ok {
+		return ""
+	}
+	if providerSessionID != "" {
+		return providerSessionID
+	}
+	if result := objectField(value, "result"); result != nil {
+		return firstString(result, "session_id", "sessionId")
 	}
 	return ""
 }

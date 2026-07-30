@@ -130,6 +130,45 @@ func TestMapperSupportsJSONRPCSessionUpdateEnvelope(t *testing.T) {
 	}
 }
 
+func TestMapperMapsJSONRPCSessionNewResponseToReady(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code", Now: func() time.Time {
+		return time.UnixMilli(1700000000456)
+	}})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+	events, err := mapper.MapLine([]byte(`{"jsonrpc":"2.0","id":2,"result":{"sessionId":"acp_ses_1"}}`))
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %+v, want one ready state", events)
+	}
+	assertEvent(t, events[0], "session.state")
+	payload := payloadMap(t, events[0])
+	if payload["state"] != "ready" || payload["provider_session_id"] != "acp_ses_1" {
+		t.Fatalf("ready payload = %+v", payload)
+	}
+}
+
+func TestMapperDoesNotTreatJSONRPCErrorAsReady(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code"})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+	events, err := mapper.MapLine([]byte(`{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"session failed"}}`))
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events = %+v, want no ready state for error", events)
+	}
+}
+
 func TestMapperSupportsLiveACPCamelCaseSessionUpdate(t *testing.T) {
 	t.Parallel()
 
