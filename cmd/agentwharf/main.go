@@ -1330,15 +1330,18 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 	if startAdmission != nil {
 		processAdmission = startAdmission
 	}
+	command, err := providerProcessCommand(cfg, stdinReader, stdoutWriter, providerStderr(masker))
+	if err != nil {
+		return err
+	}
+	command.Credential = cfg.ProviderCredential
+	maxRestarts := 0
+	if cfg.Provider == "claude-code" && cfg.SecretDir != "" {
+		maxRestarts = -1
+	}
 	processConfig := core.ProcessConfig{
-		Command: core.ProcessCommand{
-			Path:       cfg.ProviderCommand[0],
-			Args:       cfg.ProviderCommand[1:],
-			Stdin:      stdinReader,
-			Stdout:     stdoutWriter,
-			Stderr:     os.Stderr,
-			Credential: cfg.ProviderCredential,
-		},
+		Command:        command,
+		MaxRestarts:    maxRestarts,
 		StartAdmission: processAdmission,
 	}
 	var supervisor *core.ProcessSupervisor
@@ -1484,15 +1487,18 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	if startAdmission != nil {
 		processAdmission = startAdmission
 	}
+	command, err := providerProcessCommand(cfg, stdinReader, stdoutWriter, providerStderr(masker))
+	if err != nil {
+		return err
+	}
+	command.Credential = cfg.ProviderCredential
+	maxRestarts := 0
+	if cfg.Provider == "claude-code" && cfg.SecretDir != "" {
+		maxRestarts = -1
+	}
 	processConfig := core.ProcessConfig{
-		Command: core.ProcessCommand{
-			Path:       cfg.ProviderCommand[0],
-			Args:       cfg.ProviderCommand[1:],
-			Stdin:      stdinReader,
-			Stdout:     stdoutWriter,
-			Stderr:     os.Stderr,
-			Credential: cfg.ProviderCredential,
-		},
+		Command:        command,
+		MaxRestarts:    maxRestarts,
 		StartAdmission: processAdmission,
 	}
 	var supervisor *core.ProcessSupervisor
@@ -2064,6 +2070,119 @@ func acknowledgeRunControl(ctx context.Context, command *protocol.Command, write
 	return nil
 }
 
+const maxProviderCredentialBytes = 64 * 1024
+
+func providerStderr(masker *core.EventMasker) io.Writer {
+	if masker == nil {
+		return os.Stderr
+	}
+	return masker.MaskWriter(nonClosingWriter{Writer: os.Stderr})
+}
+
+type nonClosingWriter struct{ io.Writer }
+
+func (nonClosingWriter) Close() error { return nil }
+
+// providerProcessCommand keeps the sandbox environment file-path-only. The
+// approved Claude provider bridge reads those paths only for its child process.
+func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer) (core.ProcessCommand, error) {
+	if len(cfg.ProviderCommand) == 0 {
+		return core.ProcessCommand{}, errors.New("provider command is required")
+	}
+	env, err := providerChildEnvironment(cfg, os.Environ())
+	if err != nil {
+		return core.ProcessCommand{}, err
+	}
+	return core.ProcessCommand{Path: cfg.ProviderCommand[0], Args: cfg.ProviderCommand[1:], Env: env, Stdin: stdin, Stdout: stdout, Stderr: stderr}, nil
+}
+
+func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
+	env := make([]string, 0, 2)
+	if cfg.Provider != "claude-code" || cfg.SecretDir == "" {
+		return env, nil
+	}
+	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"} {
+		path := environmentValue(parent, name)
+		if path == "" {
+			continue
+		}
+		value, err := readProviderCredentialFile(cfg.SecretDir, path)
+		if err != nil {
+			return nil, fmt.Errorf("load %s for provider child: %w", name, err)
+		}
+		env = append(env, name+"="+value)
+	}
+	return env, nil
+}
+
+func environmentValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+func replaceEnvironmentValue(env []string, name string, value string) []string {
+	prefix := name + "="
+	result := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			result = append(result, entry)
+		}
+	}
+	return append(result, prefix+value)
+}
+
+func readProviderCredentialFile(secretDir string, valuePath string) (string, error) {
+	if !filepath.IsAbs(secretDir) || !filepath.IsAbs(valuePath) {
+		return "", errors.New("secret directory and credential path must be absolute")
+	}
+	root, err := filepath.EvalSymlinks(filepath.Clean(secretDir))
+	if err != nil {
+		return "", fmt.Errorf("resolve secret directory: %w", err)
+	}
+	path := filepath.Clean(valuePath)
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve credential file: %w", err)
+	}
+	rel, err := filepath.Rel(root, resolvedPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", errors.New("credential path is outside the injected secret directory")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open credential file: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat credential file: %w", err)
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("recheck credential file: %w", err)
+	}
+	if !info.Mode().IsRegular() || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, pathInfo) || info.Size() > maxProviderCredentialBytes {
+		return "", errors.New("credential file must be a bounded regular file")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxProviderCredentialBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read credential file: %w", err)
+	}
+	if len(data) > maxProviderCredentialBytes {
+		return "", errors.New("credential file must be a bounded regular file")
+	}
+	value := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
+	if value == "" || strings.IndexByte(value, 0) >= 0 {
+		return "", errors.New("credential file must contain a non-empty text value")
+	}
+	return value, nil
+}
+
 func eventMaskerFromSecretDir(dir string) (*core.EventMasker, error) {
 	if dir == "" {
 		return core.NewEventMasker(nil), nil
@@ -2091,6 +2210,10 @@ func eventMaskerFromSecretDir(dir string) (*core.EventMasker, error) {
 		}
 		if len(data) > 0 {
 			secrets = append(secrets, string(data))
+			trimmed := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
+			if trimmed != "" && trimmed != string(data) {
+				secrets = append(secrets, trimmed)
+			}
 		}
 	}
 	return core.NewEventMasker(secrets), nil

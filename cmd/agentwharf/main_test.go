@@ -1887,6 +1887,117 @@ func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	}
 }
 
+func TestRunWrapACPProviderLoadsClaudeCredentialsForChildOnly(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	secretDir := t.TempDir()
+	authPath := filepath.Join(secretDir, "anthropic_auth_token")
+	baseURLPath := filepath.Join(secretDir, "anthropic_base_url")
+	const authToken = "test-auth-token"
+	const baseURL = "https://provider.example.test"
+	if err := os.WriteFile(authPath, []byte(authToken+"\n"), 0o400); err != nil {
+		t.Fatalf("write auth token: %v", err)
+	}
+	if err := os.WriteFile(baseURLPath, []byte(baseURL+"\n"), 0o400); err != nil {
+		t.Fatalf("write base URL: %v", err)
+	}
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", authPath)
+	t.Setenv("ANTHROPIC_BASE_URL", baseURLPath)
+	t.Setenv("AGENTWHARF_ACP_CREDENTIAL_HELPER", "1")
+	t.Setenv("AGENTWHARF_EXPECTED_AUTH_TOKEN", authToken)
+	t.Setenv("AGENTWHARF_EXPECTED_BASE_URL", baseURL)
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_local",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("start serve: %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	client, _, err := websocket.Dial(ctx, running.wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "control-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_local"}},
+	})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runWithInput(ctx, []string{
+			"wrap",
+			"--hub", running.wsURL,
+			"--session-id", "ses_local",
+			"--adapter-token", "adapter-token",
+			"--agent", "claude",
+			"--acp",
+			"--secret-dir", secretDir,
+			"--", os.Args[0],
+		}, nil, io.Discard, io.Discard)
+	}()
+
+	ready := readFrame(t, client).(*protocol.Event)
+	if ready.Type != "session.state" {
+		t.Fatalf("ready event type = %s", ready.Type)
+	}
+	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != authPath || os.Getenv("ANTHROPIC_BASE_URL") != baseURLPath {
+		t.Fatal("adapter process environment must retain secret file paths")
+	}
+	cancel()
+	if err := <-runDone; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("run wrap error = %v", err)
+	}
+}
+
+func TestProviderChildEnvironmentRejectsCredentialOutsideSecretDir(t *testing.T) {
+	secretDir := t.TempDir()
+	outsidePath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(outsidePath, []byte("secret-token"), 0o400); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	parent := []string{"ANTHROPIC_AUTH_TOKEN=" + outsidePath}
+	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, parent)
+	if err == nil || !strings.Contains(err.Error(), "outside the injected secret directory") {
+		t.Fatalf("providerChildEnvironment() error = %v, want outside-secret-dir rejection", err)
+	}
+	if parent[0] != "ANTHROPIC_AUTH_TOKEN="+outsidePath {
+		t.Fatalf("parent environment changed to %q", parent[0])
+	}
+}
+
+func TestProviderChildEnvironmentRejectsCredentialSymlink(t *testing.T) {
+	secretDir := t.TempDir()
+	targetPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(targetPath, []byte("secret-token"), 0o400); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	linkPath := filepath.Join(secretDir, "token")
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Fatalf("create credential symlink: %v", err)
+	}
+	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, []string{"ANTHROPIC_AUTH_TOKEN=" + linkPath})
+	if err == nil || (!strings.Contains(err.Error(), "bounded regular file") && !strings.Contains(err.Error(), "outside the injected secret directory")) {
+		t.Fatalf("providerChildEnvironment() error = %v, want symlink rejection", err)
+	}
+}
+
 func TestRunWrapACPProviderSendsIdleHeartbeat(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2182,6 +2293,10 @@ func TestMain(m *testing.M) {
 		runWrapACPProviderHelper()
 		return
 	}
+	if os.Getenv("AGENTWHARF_ACP_CREDENTIAL_HELPER") == "1" {
+		runWrapACPCredentialProviderHelper()
+		return
+	}
 	if os.Getenv("AGENTWHARF_WRAP_HELPER") == "1" {
 		runWrapProviderHelper()
 		return
@@ -2277,6 +2392,27 @@ func runWrapACPProviderHelper() {
 	fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","messageId":"resp_1","content":{"type":"text","text":"acp saw ping"}}}}`)
 	writeACPResponse(prompt["id"], map[string]any{"stopReason": "end_turn"})
 	os.Exit(0)
+}
+
+func runWrapACPCredentialProviderHelper() {
+	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != os.Getenv("AGENTWHARF_EXPECTED_AUTH_TOKEN") ||
+		os.Getenv("ANTHROPIC_BASE_URL") != os.Getenv("AGENTWHARF_EXPECTED_BASE_URL") {
+		os.Exit(50)
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	init := readACPRequest(scanner)
+	if init["method"] != "initialize" {
+		os.Exit(51)
+	}
+	writeACPResponse(init["id"], map[string]any{"protocolVersion": 1})
+	sessionNew := readACPRequest(scanner)
+	if sessionNew["method"] != "session/new" {
+		os.Exit(52)
+	}
+	writeACPResponse(sessionNew["id"], map[string]any{"sessionId": "acp_ses_credentials"})
+	for {
+		time.Sleep(time.Hour)
+	}
 }
 
 func runWrapACPIdleProviderHelper() {

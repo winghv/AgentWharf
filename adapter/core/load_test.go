@@ -480,3 +480,13 @@ func TestAdapterProviderEnvironmentRejectsCredentialNames(t *testing.T) {
 		t.Fatalf("provider environment = %q", joined)
 	}
 }
+
+func TestAdapterProviderEnvironmentExplicitValuesOverrideInherited(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "file-path")
+	values := providerEnvironment("/bin/echo", []string{"ANTHROPIC_AUTH_TOKEN=resolved-secret"})
+	for _, value := range values {
+		if strings.HasPrefix(value, "ANTHROPIC_AUTH_TOKEN=") && value != "ANTHROPIC_AUTH_TOKEN=resolved-secret" {
+			t.Fatalf("provider environment retained inherited credential: %q", value)
+		}
+	}
+}

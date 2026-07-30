@@ -181,7 +181,7 @@ func (s *ProcessSupervisor) Run(ctx context.Context) error {
 		if err == nil {
 			return nil
 		}
-		if restarts >= s.cfg.MaxRestarts {
+		if s.cfg.MaxRestarts < 0 || restarts >= s.cfg.MaxRestarts {
 			return fmt.Errorf("%w: %w", ErrRestartLimitExceeded, err)
 		}
 		restarts++
@@ -352,8 +352,8 @@ func normalizeProcessConfig(cfg ProcessConfig) (ProcessConfig, error) {
 	if cfg.Command.Path == "" {
 		return ProcessConfig{}, fmt.Errorf("%w: command path is required", ErrInvalidProcessConfig)
 	}
-	if cfg.MaxRestarts < 0 {
-		return ProcessConfig{}, fmt.Errorf("%w: max restarts must not be negative", ErrInvalidProcessConfig)
+	if cfg.MaxRestarts < -1 {
+		return ProcessConfig{}, fmt.Errorf("%w: max restarts must be -1 or non-negative", ErrInvalidProcessConfig)
 	}
 	if cfg.MaxRestarts == 0 {
 		cfg.MaxRestarts = defaultMaxRestarts
@@ -410,14 +410,14 @@ func providerEnvironment(path string, explicit []string) []string {
 		seen[name] = struct{}{}
 		values = append(values, item)
 	}
+	for _, item := range explicit {
+		add(item)
+	}
 	for _, item := range os.Environ() {
 		name, _, ok := strings.Cut(item, "=")
 		if ok && inheritedProviderEnvName(name, testHelper) {
 			add(item)
 		}
-	}
-	for _, item := range explicit {
-		add(item)
 	}
 	return values
 }
@@ -429,7 +429,7 @@ func inheritedProviderEnvName(name string, testHelper bool) bool {
 	switch name {
 	case "PATH", "HOME", "LANG", "TERM", "TMPDIR", "TZ", "USER", "LOGNAME", "SHELL", "PWD":
 		return true
-	case "AGENTWHARF_WRAP_HELPER", "AGENTWHARF_ACP_HELPER", "AGENTWHARF_ACP_IDLE_HELPER", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_RESTART_CRASH_HELPER", "AGENTWHARF_START_BLOCK_HELPER", "AGENTWHARF_START_BLOCK_MARKER":
+	case "AGENTWHARF_WRAP_HELPER", "AGENTWHARF_ACP_HELPER", "AGENTWHARF_ACP_IDLE_HELPER", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_ACP_CREDENTIAL_HELPER", "AGENTWHARF_RESTART_CRASH_HELPER", "AGENTWHARF_START_BLOCK_HELPER", "AGENTWHARF_START_BLOCK_MARKER", "AGENTWHARF_EXPECTED_AUTH_TOKEN", "AGENTWHARF_EXPECTED_BASE_URL":
 		return testHelper
 	default:
 		return false
@@ -451,7 +451,7 @@ func safeProviderEnvName(name string) bool {
 
 func safeProviderHelperEnvName(name string) bool {
 	switch name {
-	case "AGENTWHARF_WRAP_HELPER", "AGENTWHARF_ACP_HELPER", "AGENTWHARF_ACP_IDLE_HELPER", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_RESTART_CRASH_HELPER", "AGENTWHARF_START_BLOCK_HELPER", "AGENTWHARF_START_BLOCK_MARKER", "AGENTWHARF_HELPER_PROCESS":
+	case "AGENTWHARF_WRAP_HELPER", "AGENTWHARF_ACP_HELPER", "AGENTWHARF_ACP_IDLE_HELPER", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_ACP_CREDENTIAL_HELPER", "AGENTWHARF_RESTART_CRASH_HELPER", "AGENTWHARF_START_BLOCK_HELPER", "AGENTWHARF_START_BLOCK_MARKER", "AGENTWHARF_HELPER_PROCESS", "AGENTWHARF_EXPECTED_AUTH_TOKEN", "AGENTWHARF_EXPECTED_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL":
 		return true
 	default:
 		return false
@@ -466,7 +466,13 @@ func (h *execProcessHandle) PID() int {
 }
 
 func (h *execProcessHandle) Wait() error {
-	return h.cmd.Wait()
+	err := h.cmd.Wait()
+	if closer, ok := h.cmd.Stderr.(io.Closer); ok {
+		if closeErr := closer.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
 
 func (h *execProcessHandle) Interrupt() error {

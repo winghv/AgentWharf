@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/winghv/agentwharf/masking"
 	"github.com/winghv/agentwharf/protocol"
@@ -12,11 +13,19 @@ import (
 var ErrInvalidEventPayload = errors.New("invalid event payload")
 
 type EventMasker struct {
-	masker *masking.Masker
+	masker  *masking.Masker
+	secrets []string
 }
 
 func NewEventMasker(secrets []string) *EventMasker {
-	return &EventMasker{masker: masking.New(secrets)}
+	return &EventMasker{masker: masking.New(secrets), secrets: append([]string(nil), secrets...)}
+}
+
+func (m *EventMasker) MaskWriter(writer io.Writer) io.WriteCloser {
+	if m == nil {
+		return masking.NewWriter(writer, nil)
+	}
+	return masking.NewWriter(writer, m.secrets)
 }
 
 func (m *EventMasker) MaskEvent(ev protocol.Event) (protocol.Event, error) {
