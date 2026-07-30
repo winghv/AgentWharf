@@ -116,7 +116,7 @@ func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protoc
 	case "session/request_permission":
 		return m.mapSessionPermissionRequest(raw, providerSessionID)
 	default:
-		if responseSessionID := sessionIDFromResponse(raw, providerSessionID); responseSessionID != "" {
+		if responseSessionID := sessionIDFromResponse(raw); responseSessionID != "" {
 			return []protocol.Event{m.stateEvent("ready", responseSessionID, copyWithout(raw, "type", "method", "session_id", "sessionId"))}
 		}
 		return m.mapUpdate(raw, providerSessionID)
@@ -497,15 +497,9 @@ func frameName(value map[string]any) string {
 // providers such as claude-agent-acp. It deliberately requires a result and a
 // session ID, so initialize responses and error responses cannot mark a VM
 // adapter ready before a session exists.
-func sessionIDFromResponse(value map[string]any, providerSessionID string) string {
+func sessionIDFromResponse(value map[string]any) string {
 	if _, ok := value["id"]; !ok {
 		return ""
-	}
-	if _, ok := value["result"]; !ok {
-		return ""
-	}
-	if providerSessionID != "" {
-		return providerSessionID
 	}
 	if result := objectField(value, "result"); result != nil {
 		return firstString(result, "session_id", "sessionId")

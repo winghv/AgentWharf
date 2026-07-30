@@ -169,6 +169,22 @@ func TestMapperDoesNotTreatJSONRPCErrorAsReady(t *testing.T) {
 	}
 }
 
+func TestMapperDoesNotTreatInitializeResponseAsReady(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code"})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+	events, err := mapper.MapLine([]byte(`{"jsonrpc":"2.0","id":1,"sessionId":"unexpected","result":null}`))
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events = %+v, want no ready state for initialize response", events)
+	}
+}
+
 func TestMapperSupportsLiveACPCamelCaseSessionUpdate(t *testing.T) {
 	t.Parallel()
 
