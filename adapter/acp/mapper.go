@@ -495,7 +495,7 @@ func frameName(value map[string]any) string {
 
 // sessionIDFromResponse recognizes the JSON-RPC session/new result emitted by
 // providers such as claude-agent-acp. It deliberately requires a result and a
-// session ID, so initialize responses and error responses cannot mark a VM
+// session ID, so initialize responses and error responses cannot mark an
 // adapter ready before a session exists.
 func sessionIDFromResponse(value map[string]any) string {
 	if _, ok := value["id"]; !ok {
