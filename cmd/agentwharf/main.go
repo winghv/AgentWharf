@@ -2125,17 +2125,6 @@ func environmentValue(env []string, name string) string {
 	return ""
 }
 
-func replaceEnvironmentValue(env []string, name string, value string) []string {
-	prefix := name + "="
-	result := make([]string, 0, len(env)+1)
-	for _, entry := range env {
-		if !strings.HasPrefix(entry, prefix) {
-			result = append(result, entry)
-		}
-	}
-	return append(result, prefix+value)
-}
-
 func readProviderCredentialFile(secretDir string, valuePath string) (string, error) {
 	if !filepath.IsAbs(secretDir) || !filepath.IsAbs(valuePath) {
 		return "", errors.New("secret directory and credential path must be absolute")
