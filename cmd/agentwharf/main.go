@@ -35,6 +35,7 @@ import (
 	"github.com/winghv/agentwharf/auth"
 	"github.com/winghv/agentwharf/auth/static"
 	"github.com/winghv/agentwharf/hub"
+	"github.com/winghv/agentwharf/masking"
 	"github.com/winghv/agentwharf/protocol"
 	"github.com/winghv/agentwharf/store"
 	"github.com/winghv/agentwharf/store/postgres"
@@ -2105,7 +2106,7 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 		pathEnv  string
 		childEnv string
 	}{
-		{pathEnv: "ANTHROPIC_AUTH_TOKEN", childEnv: "ANTHROPIC_API_KEY"},
+		{pathEnv: "ANTHROPIC_AUTH_TOKEN", childEnv: "ANTHROPIC_AUTH_TOKEN"},
 		{pathEnv: "ANTHROPIC_BASE_URL", childEnv: "ANTHROPIC_BASE_URL"},
 	} {
 		path := environmentValue(parent, credential.pathEnv)
@@ -2172,8 +2173,8 @@ func readProviderCredentialFile(secretDir string, valuePath string) (string, err
 		return "", errors.New("credential file must be a bounded regular file")
 	}
 	value := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
-	if value == "" || strings.IndexByte(value, 0) >= 0 {
-		return "", errors.New("credential file must contain a non-empty text value")
+	if len(value) < masking.MinSecretLength || strings.IndexByte(value, 0) >= 0 {
+		return "", fmt.Errorf("credential file must contain at least %d bytes of text", masking.MinSecretLength)
 	}
 	return value, nil
 }

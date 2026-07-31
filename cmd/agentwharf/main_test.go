@@ -1905,7 +1905,7 @@ func TestRunWrapACPProviderLoadsClaudeCredentialsForChildOnly(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", apiKeyPath)
 	t.Setenv("ANTHROPIC_BASE_URL", baseURLPath)
 	t.Setenv("AGENTWHARF_ACP_CREDENTIAL_HELPER", "1")
-	t.Setenv("AGENTWHARF_EXPECTED_API_KEY", apiKey)
+	t.Setenv("AGENTWHARF_EXPECTED_AUTH_TOKEN", apiKey)
 	t.Setenv("AGENTWHARF_EXPECTED_BASE_URL", baseURL)
 
 	running, err := startServe(ctx, serveConfig{
@@ -1995,6 +1995,18 @@ func TestProviderChildEnvironmentRejectsCredentialSymlink(t *testing.T) {
 	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, []string{"ANTHROPIC_AUTH_TOKEN=" + linkPath})
 	if err == nil || (!strings.Contains(err.Error(), "bounded regular file") && !strings.Contains(err.Error(), "outside the injected secret directory")) {
 		t.Fatalf("providerChildEnvironment() error = %v, want symlink rejection", err)
+	}
+}
+
+func TestProviderChildEnvironmentRejectsCredentialTooShortToMask(t *testing.T) {
+	secretDir := t.TempDir()
+	credentialPath := filepath.Join(secretDir, "token")
+	if err := os.WriteFile(credentialPath, []byte("abc"), 0o400); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, []string{"ANTHROPIC_AUTH_TOKEN=" + credentialPath})
+	if err == nil || !strings.Contains(err.Error(), "at least 4 bytes") {
+		t.Fatalf("providerChildEnvironment() error = %v, want short-credential rejection", err)
 	}
 }
 
@@ -2395,9 +2407,9 @@ func runWrapACPProviderHelper() {
 }
 
 func runWrapACPCredentialProviderHelper() {
-	if os.Getenv("ANTHROPIC_API_KEY") != os.Getenv("AGENTWHARF_EXPECTED_API_KEY") ||
+	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != os.Getenv("AGENTWHARF_EXPECTED_AUTH_TOKEN") ||
 		os.Getenv("ANTHROPIC_BASE_URL") != os.Getenv("AGENTWHARF_EXPECTED_BASE_URL") ||
-		os.Getenv("ANTHROPIC_AUTH_TOKEN") != "" {
+		os.Getenv("ANTHROPIC_API_KEY") != "" {
 		os.Exit(50)
 	}
 	scanner := bufio.NewScanner(os.Stdin)
