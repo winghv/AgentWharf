@@ -40,6 +40,14 @@ func NewAdapterConnectionTx(tx pgx.Tx) *Store {
 }
 
 func (s *Store) SessionAdmissionTruth(ctx context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
+	return s.sessionAdmissionTruth(ctx, sessionID, false)
+}
+
+func (s *Store) AdapterSessionAdmissionTruth(ctx context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
+	return s.sessionAdmissionTruth(ctx, sessionID, true)
+}
+
+func (s *Store) sessionAdmissionTruth(ctx context.Context, sessionID string, admitStarting bool) (store.SessionAdmissionTruth, error) {
 	truth := store.SessionAdmissionTruth{SessionID: sessionID}
 	if !validConnectionID(sessionID) {
 		return truth, errors.New("session admission session ID is invalid")
@@ -55,9 +63,10 @@ func (s *Store) SessionAdmissionTruth(ctx context.Context, sessionID string) (st
 	if err != nil {
 		return truth, fmt.Errorf("select session admission truth: %w", err)
 	}
-	// Control Plane preallocates a warm target as starting so its Task/Run
-	// relation is durable. It becomes Store truth only when Hub attaches it.
-	if row.Status == "starting" {
+	// Client admission keeps a preallocated warm target attach-only. Adapter
+	// admission is distinct: the first authenticated hello must be able to
+	// attach the starting Session before it can emit its ready state.
+	if row.Status == "starting" && !admitStarting {
 		return truth, nil
 	}
 	terminal := row.EndedAt.Valid || row.Status == "ended" || row.Status == "error"

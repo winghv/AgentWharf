@@ -110,6 +110,42 @@ func TestHandshakeAdapterHello(t *testing.T) {
 	})
 }
 
+func TestHandshakeAdapterUsesStartingAdmissionTruth(t *testing.T) {
+	t.Parallel()
+
+	core := hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator: fakeAuth{
+			token: "adapter-token",
+			principal: auth.Principal{Subject: "adapter_1", Scopes: []auth.Scope{
+				auth.SessionAdapter("ses_starting"),
+			}},
+		},
+		EventStore: fakeStore{
+			latest: map[string]int64{"ses_starting": 0},
+			truth: map[string]store.SessionAdmissionTruth{
+				"ses_starting": {SessionID: "ses_starting"},
+			},
+			adapterTruth: map[string]store.SessionAdmissionTruth{
+				"ses_starting": {SessionID: "ses_starting", Provider: "claude-code", Exists: true, Complete: true, Live: true},
+			},
+		},
+	})
+
+	ack, _, err := core.HandleHello(context.Background(), &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleAdapter,
+		Token:           "adapter-token",
+		SessionID:       "ses_starting",
+		Provider:        "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("HandleHello() error = %v", err)
+	}
+	if len(ack.Sessions) != 1 || ack.Sessions[0].SessionID != "ses_starting" {
+		t.Fatalf("adapter ack = %+v", ack)
+	}
+}
+
 func TestHandshakeAdapterRejectsExpiredAdmissionClaim(t *testing.T) {
 	t.Parallel()
 	core := hub.NewHandshake(hub.HandshakeConfig{
@@ -622,9 +658,10 @@ func (f fakeAuth) SessionAdmissionClaim(_ context.Context, _ auth.Principal, ses
 }
 
 type fakeStore struct {
-	latest      map[string]int64
-	truth       map[string]store.SessionAdmissionTruth
-	connections map[string]store.AdapterConnection
+	latest       map[string]int64
+	truth        map[string]store.SessionAdmissionTruth
+	adapterTruth map[string]store.SessionAdmissionTruth
+	connections  map[string]store.AdapterConnection
 }
 
 func (f fakeStore) LatestSeq(_ context.Context, sessionID string) (int64, error) {
@@ -637,6 +674,13 @@ func (f fakeStore) SessionAdmissionTruth(_ context.Context, sessionID string) (s
 	}
 	_, exists := f.latest[sessionID]
 	return store.SessionAdmissionTruth{SessionID: sessionID, Exists: exists, Complete: exists, Live: exists}, nil
+}
+
+func (f fakeStore) AdapterSessionAdmissionTruth(ctx context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
+	if truth, ok := f.adapterTruth[sessionID]; ok {
+		return truth, nil
+	}
+	return f.SessionAdmissionTruth(ctx, sessionID)
 }
 
 func (f fakeStore) AdapterConnection(_ context.Context, sessionID string) (store.AdapterConnection, error) {

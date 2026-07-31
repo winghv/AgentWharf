@@ -61,6 +61,11 @@ VALUES ('ses_live', 'claude-code', 'ready', clock_timestamp()),
 			t.Fatalf("SessionAdmissionTruth(%q) = %+v, %v; want %+v, nil", test.sessionID, got, err, test.want)
 		}
 	}
+	starting, err := events.AdapterSessionAdmissionTruth(ctx, "ses_preallocated_target")
+	wantStarting := store.SessionAdmissionTruth{SessionID: "ses_preallocated_target", Provider: "claude-code", Exists: true, Complete: true, Live: true}
+	if err != nil || starting != wantStarting {
+		t.Fatalf("AdapterSessionAdmissionTruth(starting) = %+v, %v; want %+v, nil", starting, err, wantStarting)
+	}
 	if _, err := events.SessionAdmissionTruth(ctx, ""); err == nil {
 		t.Fatal("empty session ID was accepted")
 	}

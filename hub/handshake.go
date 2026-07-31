@@ -275,7 +275,7 @@ func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, pr
 	if err != nil || claim.Provider != hello.Provider {
 		return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
 	}
-	truth, err := h.sessionAdmissionTruth(ctx, hello.SessionID)
+	truth, err := h.adapterSessionAdmissionTruth(ctx, hello.SessionID)
 	if err != nil || !truth.Exists || !truth.Complete || truth.Terminal || truth.Conflicting {
 		return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
 	}
@@ -327,6 +327,10 @@ type sessionAdmissionTruthStore interface {
 	SessionAdmissionTruth(context.Context, string) (store.SessionAdmissionTruth, error)
 }
 
+type adapterSessionAdmissionTruthStore interface {
+	AdapterSessionAdmissionTruth(context.Context, string) (store.SessionAdmissionTruth, error)
+}
+
 func (h *Handshake) clientAdmission(ctx context.Context, principal auth.Principal, sessionID string, access auth.Access) (auth.SessionAdmissionClaim, auth.SessionAdmissionDecision, error) {
 	claim, err := h.sessionAdmissionClaim(ctx, principal, sessionID)
 	if err != nil {
@@ -365,6 +369,18 @@ func (h *Handshake) sessionAdmissionTruth(ctx context.Context, sessionID string)
 		return store.SessionAdmissionTruth{}, auth.ErrUnauthorized
 	}
 	truth, err := truthStore.SessionAdmissionTruth(ctx, sessionID)
+	if err != nil || truth.SessionID != sessionID {
+		return store.SessionAdmissionTruth{}, auth.ErrUnauthorized
+	}
+	return truth, nil
+}
+
+func (h *Handshake) adapterSessionAdmissionTruth(ctx context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
+	truthStore, ok := h.events.(adapterSessionAdmissionTruthStore)
+	if !ok {
+		return h.sessionAdmissionTruth(ctx, sessionID)
+	}
+	truth, err := truthStore.AdapterSessionAdmissionTruth(ctx, sessionID)
 	if err != nil || truth.SessionID != sessionID {
 		return store.SessionAdmissionTruth{}, auth.ErrUnauthorized
 	}
