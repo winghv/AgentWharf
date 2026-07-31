@@ -2101,7 +2101,7 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 	if cfg.Provider != "claude-code" || cfg.SecretDir == "" {
 		return env, nil
 	}
-	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"} {
+	for _, name := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"} {
 		path := environmentValue(parent, name)
 		if path == "" {
 			continue
