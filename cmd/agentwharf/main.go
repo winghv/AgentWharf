@@ -2101,16 +2101,22 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 	if cfg.Provider != "claude-code" || cfg.SecretDir == "" {
 		return env, nil
 	}
-	for _, name := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"} {
-		path := environmentValue(parent, name)
+	for _, credential := range []struct {
+		pathEnv  string
+		childEnv string
+	}{
+		{pathEnv: "ANTHROPIC_AUTH_TOKEN", childEnv: "ANTHROPIC_API_KEY"},
+		{pathEnv: "ANTHROPIC_BASE_URL", childEnv: "ANTHROPIC_BASE_URL"},
+	} {
+		path := environmentValue(parent, credential.pathEnv)
 		if path == "" {
 			continue
 		}
 		value, err := readProviderCredentialFile(cfg.SecretDir, path)
 		if err != nil {
-			return nil, fmt.Errorf("load %s for provider child: %w", name, err)
+			return nil, fmt.Errorf("load %s for provider child: %w", credential.pathEnv, err)
 		}
-		env = append(env, name+"="+value)
+		env = append(env, credential.childEnv+"="+value)
 	}
 	return env, nil
 }

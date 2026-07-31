@@ -1902,7 +1902,7 @@ func TestRunWrapACPProviderLoadsClaudeCredentialsForChildOnly(t *testing.T) {
 	if err := os.WriteFile(baseURLPath, []byte(baseURL+"\n"), 0o400); err != nil {
 		t.Fatalf("write base URL: %v", err)
 	}
-	t.Setenv("ANTHROPIC_API_KEY", apiKeyPath)
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", apiKeyPath)
 	t.Setenv("ANTHROPIC_BASE_URL", baseURLPath)
 	t.Setenv("AGENTWHARF_ACP_CREDENTIAL_HELPER", "1")
 	t.Setenv("AGENTWHARF_EXPECTED_API_KEY", apiKey)
@@ -1957,7 +1957,7 @@ func TestRunWrapACPProviderLoadsClaudeCredentialsForChildOnly(t *testing.T) {
 	if ready.Type != "session.state" {
 		t.Fatalf("ready event type = %s", ready.Type)
 	}
-	if os.Getenv("ANTHROPIC_API_KEY") != apiKeyPath || os.Getenv("ANTHROPIC_BASE_URL") != baseURLPath {
+	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != apiKeyPath || os.Getenv("ANTHROPIC_BASE_URL") != baseURLPath {
 		t.Fatal("adapter process environment must retain secret file paths")
 	}
 	cancel()
@@ -1972,12 +1972,12 @@ func TestProviderChildEnvironmentRejectsCredentialOutsideSecretDir(t *testing.T)
 	if err := os.WriteFile(outsidePath, []byte("secret-token"), 0o400); err != nil {
 		t.Fatalf("write token: %v", err)
 	}
-	parent := []string{"ANTHROPIC_API_KEY=" + outsidePath}
+	parent := []string{"ANTHROPIC_AUTH_TOKEN=" + outsidePath}
 	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, parent)
 	if err == nil || !strings.Contains(err.Error(), "outside the injected secret directory") {
 		t.Fatalf("providerChildEnvironment() error = %v, want outside-secret-dir rejection", err)
 	}
-	if parent[0] != "ANTHROPIC_API_KEY="+outsidePath {
+	if parent[0] != "ANTHROPIC_AUTH_TOKEN="+outsidePath {
 		t.Fatalf("parent environment changed to %q", parent[0])
 	}
 }
@@ -1992,7 +1992,7 @@ func TestProviderChildEnvironmentRejectsCredentialSymlink(t *testing.T) {
 	if err := os.Symlink(targetPath, linkPath); err != nil {
 		t.Fatalf("create credential symlink: %v", err)
 	}
-	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, []string{"ANTHROPIC_API_KEY=" + linkPath})
+	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, []string{"ANTHROPIC_AUTH_TOKEN=" + linkPath})
 	if err == nil || (!strings.Contains(err.Error(), "bounded regular file") && !strings.Contains(err.Error(), "outside the injected secret directory")) {
 		t.Fatalf("providerChildEnvironment() error = %v, want symlink rejection", err)
 	}
@@ -2396,7 +2396,8 @@ func runWrapACPProviderHelper() {
 
 func runWrapACPCredentialProviderHelper() {
 	if os.Getenv("ANTHROPIC_API_KEY") != os.Getenv("AGENTWHARF_EXPECTED_API_KEY") ||
-		os.Getenv("ANTHROPIC_BASE_URL") != os.Getenv("AGENTWHARF_EXPECTED_BASE_URL") {
+		os.Getenv("ANTHROPIC_BASE_URL") != os.Getenv("AGENTWHARF_EXPECTED_BASE_URL") ||
+		os.Getenv("ANTHROPIC_AUTH_TOKEN") != "" {
 		os.Exit(50)
 	}
 	scanner := bufio.NewScanner(os.Stdin)
