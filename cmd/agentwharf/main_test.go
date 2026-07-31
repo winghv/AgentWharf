@@ -1960,8 +1960,7 @@ func TestRunWrapACPProviderLoadsClaudeCredentialsForChildOnly(t *testing.T) {
 	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != apiKeyPath || os.Getenv("ANTHROPIC_BASE_URL") != baseURLPath {
 		t.Fatal("adapter process environment must retain secret file paths")
 	}
-	cancel()
-	if err := <-runDone; err != nil && !errors.Is(err, context.Canceled) {
+	if err := <-runDone; err != nil {
 		t.Fatalf("run wrap error = %v", err)
 	}
 }
@@ -2423,9 +2422,7 @@ func runWrapACPCredentialProviderHelper() {
 		os.Exit(52)
 	}
 	writeACPResponse(sessionNew["id"], map[string]any{"sessionId": "acp_ses_credentials"})
-	for {
-		time.Sleep(time.Hour)
-	}
+	os.Exit(0)
 }
 
 func runWrapACPIdleProviderHelper() {

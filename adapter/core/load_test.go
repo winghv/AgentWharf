@@ -482,11 +482,21 @@ func TestAdapterProviderEnvironmentRejectsCredentialNames(t *testing.T) {
 }
 
 func TestAdapterProviderEnvironmentExplicitValuesOverrideInherited(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "file-path")
-	values := providerEnvironment("/bin/echo", []string{"ANTHROPIC_API_KEY=resolved-secret"})
+	if !safeProviderEnvName("ANTHROPIC_AUTH_TOKEN") || safeProviderEnvName("ANTHROPIC_API_KEY") {
+		t.Fatal("Claude provider credential allowlist does not preserve auth-token semantics")
+	}
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "file-path")
+	values := providerEnvironment("/bin/echo", []string{"ANTHROPIC_AUTH_TOKEN=resolved-secret"})
+	found := false
 	for _, value := range values {
-		if strings.HasPrefix(value, "ANTHROPIC_API_KEY=") && value != "ANTHROPIC_API_KEY=resolved-secret" {
-			t.Fatalf("provider environment retained inherited credential: %q", value)
+		if strings.HasPrefix(value, "ANTHROPIC_AUTH_TOKEN=") {
+			found = true
+			if value != "ANTHROPIC_AUTH_TOKEN=resolved-secret" {
+				t.Fatalf("provider environment retained inherited credential: %q", value)
+			}
 		}
+	}
+	if !found {
+		t.Fatal("provider environment dropped explicit auth token")
 	}
 }
