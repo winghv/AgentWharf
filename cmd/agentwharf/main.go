@@ -821,7 +821,7 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		return cfg, fmt.Errorf("read hello ack: %w", err)
 	}
 	if protocolErr, ok := frame.(*protocol.Error); ok && claimProtocolErrorRequiresReclaim(protocolErr) {
-		return cfg, fmt.Errorf("%w: %s", errClaimAuthRejection, protocolErr.Code)
+		return cfg, fmt.Errorf("%w: %s: %s", errClaimAuthRejection, protocolErr.Code, protocolErr.Message)
 	}
 	ack, ok := frame.(*protocol.HelloAck)
 	if !ok {

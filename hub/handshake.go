@@ -267,17 +267,25 @@ func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, pr
 	if hello.SessionID == "" || hello.Provider == "" {
 		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: adapter session_id and provider are required", ErrInvalidHello)
 	}
-	if !hasExactSessionAccess(principal, hello.SessionID, auth.AccessAdapter) ||
-		h.authenticator.Authorize(ctx, principal, auth.SessionAdapter(hello.SessionID)) != nil {
-		return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+	if !hasExactSessionAccess(principal, hello.SessionID, auth.AccessAdapter) {
+		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: adapter scope does not match session", auth.ErrUnauthorized)
+	}
+	if h.authenticator.Authorize(ctx, principal, auth.SessionAdapter(hello.SessionID)) != nil {
+		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: adapter scope authorization failed", auth.ErrUnauthorized)
 	}
 	claim, err := h.sessionAdmissionClaim(ctx, principal, hello.SessionID)
-	if err != nil || claim.Provider != hello.Provider {
-		return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+	if err != nil {
+		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: adapter admission claim unavailable", auth.ErrUnauthorized)
+	}
+	if claim.Provider != hello.Provider {
+		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: adapter provider claim mismatch", auth.ErrUnauthorized)
 	}
 	truth, err := h.adapterSessionAdmissionTruth(ctx, hello.SessionID)
-	if err != nil || !truth.Exists || !truth.Complete || truth.Terminal || truth.Conflicting {
-		return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+	if err != nil {
+		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: adapter session truth unavailable", auth.ErrUnauthorized)
+	}
+	if !truth.Exists || !truth.Complete || truth.Terminal || truth.Conflicting {
+		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: adapter session truth rejected", auth.ErrUnauthorized)
 	}
 	summary, err := h.adapterSummary(ctx, hello.SessionID, claim.Provider)
 	if err != nil {
