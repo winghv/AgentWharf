@@ -76,6 +76,9 @@ func TestAdapterConnectionStateRejectsInvalidConfigAndAck(t *testing.T) {
 	badAcks := []protocol.HelloAck{
 		{ProtocolVersion: protocol.ProtocolVersion},
 		{ProtocolVersion: 999, Sessions: []protocol.SessionSummary{{SessionID: "ses_1"}}},
+		{ProtocolVersion: protocol.ProtocolVersion,
+			Capabilities: &protocol.HelloCapabilities{HistoryPage: &protocol.HistoryPageCapability{MaxLimit: 100}},
+			Sessions:     []protocol.SessionSummary{{SessionID: "ses_1"}}},
 		{ProtocolVersion: protocol.ProtocolVersion, Sessions: []protocol.SessionSummary{{SessionID: "ses_other"}}},
 		{ProtocolVersion: protocol.ProtocolVersion, Sessions: []protocol.SessionSummary{{SessionID: "ses_1", Provider: "other"}}},
 	}
@@ -87,5 +90,28 @@ func TestAdapterConnectionStateRejectsInvalidConfigAndAck(t *testing.T) {
 
 	if state.Hello().Resume {
 		t.Fatalf("invalid ack enabled resume")
+	}
+}
+
+func TestAdapterConnectionStateV2RequiresCurrentConnectionAuthorityReceipt(t *testing.T) {
+	state, err := core.NewAdapterConnectionState(core.AdapterConnectionConfig{
+		SessionID: "ses_1", Provider: "claude-code", Token: "adapter-token", ProtocolVersion: protocol.ProtocolVersionV2,
+	})
+	if err != nil {
+		t.Fatalf("NewAdapterConnectionState(v2) error = %v", err)
+	}
+	if hello := state.Hello(); hello.ProtocolVersion != protocol.ProtocolVersionV2 {
+		t.Fatalf("v2 hello = %+v", hello)
+	}
+	for _, receipt := range []*protocol.ConnectionAuthorityReceipt{
+		nil,
+		{SessionID: "ses_other", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease", ExpiresAt: 1},
+	} {
+		if _, err := state.MarkAccepted(protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_1", Provider: "claude-code"}}, ConnectionAuthority: receipt}); !errors.Is(err, core.ErrInvalidHelloAck) {
+			t.Fatalf("MarkAccepted(v2 receipt=%+v) error = %v", receipt, err)
+		}
+	}
+	if _, err := state.MarkAccepted(protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_1", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_1", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease", ExpiresAt: 1}}); err != nil {
+		t.Fatalf("MarkAccepted(v2 current receipt) error = %v", err)
 	}
 }

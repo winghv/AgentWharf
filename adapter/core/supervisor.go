@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,20 +24,50 @@ const (
 )
 
 type ProcessCommand struct {
-	Path   string
-	Args   []string
-	Env    []string
-	Dir    string
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+	Path       string
+	Args       []string
+	Env        []string
+	Dir        string
+	Stdin      io.Reader
+	Stdout     io.Writer
+	Stderr     io.Writer
+	Credential *ProcessCredential
 }
 
+// ProcessCredential is the fixed-entry-only identity for a Provider child.
+type ProcessCredential struct{ UID, GID uint32 }
+
 type ProcessConfig struct {
-	Command     ProcessCommand
-	MaxRestarts int
-	Backoff     time.Duration
-	GracePeriod time.Duration
+	Command        ProcessCommand
+	MaxRestarts    int
+	Backoff        time.Duration
+	GracePeriod    time.Duration
+	StartAdmission ProcessStartAdmission
+}
+
+// ProcessStartAdmission binds every individual Provider child start to a
+// trusted lifecycle. Prepare runs before exec and confirmation runs as soon
+// as a child exists. It deliberately receives no Provider configuration.
+type ProcessStartAdmission interface {
+	PrepareProcessStart(context.Context, int) error
+	ConfirmProcessStarted(context.Context, int) error
+}
+
+// RecoveryStartHandle is an opaque reference returned by an admitted child
+// start. It carries no authority and has no accessor; T42B owns any later
+// GroupSupervisor recovery consumption.
+type RecoveryStartHandle struct{ value string }
+
+func NewRecoveryStartHandle(value string) (RecoveryStartHandle, error) {
+	if len(value) < 32 || len(value) > 128 {
+		return RecoveryStartHandle{}, errors.New("invalid recovery start handle")
+	}
+	for _, char := range value {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') {
+			return RecoveryStartHandle{}, errors.New("invalid recovery start handle")
+		}
+	}
+	return RecoveryStartHandle{value: value}, nil
 }
 
 type ProcessEventType string
@@ -126,7 +157,7 @@ func (s *ProcessSupervisor) Run(ctx context.Context) error {
 			return err
 		}
 
-		process, err := s.start(attempt)
+		process, err := s.start(ctx, attempt)
 		if err != nil {
 			return err
 		}
@@ -150,7 +181,7 @@ func (s *ProcessSupervisor) Run(ctx context.Context) error {
 		if err == nil {
 			return nil
 		}
-		if restarts >= s.cfg.MaxRestarts {
+		if s.cfg.MaxRestarts < 0 || restarts >= s.cfg.MaxRestarts {
 			return fmt.Errorf("%w: %w", ErrRestartLimitExceeded, err)
 		}
 		restarts++
@@ -205,7 +236,39 @@ func (s *ProcessSupervisor) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (s *ProcessSupervisor) start(attempt int) (*runningProcess, error) {
+// Interrupt cancels the current Provider turn without changing supervisor
+// lifecycle state. The process remains available for subsequent work and no
+// stopped event or lease cleanup is emitted.
+func (s *ProcessSupervisor) Interrupt(ctx context.Context) error {
+	if s == nil {
+		return ErrInvalidProcessConfig
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	s.mu.Lock()
+	process := s.current
+	s.mu.Unlock()
+	if process == nil {
+		return errors.New("provider process is not running")
+	}
+	if err := process.handle.Interrupt(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("interrupt provider turn: %w", err)
+	}
+	return nil
+}
+
+func (s *ProcessSupervisor) start(ctx context.Context, attempt int) (*runningProcess, error) {
+	if s.cfg.StartAdmission != nil {
+		if err := s.cfg.StartAdmission.PrepareProcessStart(ctx, attempt); err != nil {
+			return nil, fmt.Errorf("prepare provider start admission: %w", err)
+		}
+	}
 	handle, err := s.runner.Start(s.cfg.Command)
 	if err != nil {
 		return nil, fmt.Errorf("start provider process: %w", err)
@@ -224,6 +287,17 @@ func (s *ProcessSupervisor) start(attempt int) (*runningProcess, error) {
 		process.mu.Unlock()
 		close(process.done)
 	}()
+	if s.cfg.StartAdmission != nil {
+		if err := s.cfg.StartAdmission.ConfirmProcessStarted(ctx, attempt); err != nil {
+			stopCtx, cancel := context.WithTimeout(context.Background(), s.cfg.GracePeriod+time.Second)
+			stopErr := s.Stop(stopCtx)
+			cancel()
+			if stopErr != nil {
+				return nil, fmt.Errorf("confirm provider start admission: %w (stop rejected child: %v)", err, stopErr)
+			}
+			return nil, fmt.Errorf("confirm provider start admission: %w", err)
+		}
+	}
 	s.emit(ProcessEvent{Type: ProcessEventStarted, Attempt: attempt, PID: process.pid()})
 	return process, nil
 }
@@ -278,8 +352,8 @@ func normalizeProcessConfig(cfg ProcessConfig) (ProcessConfig, error) {
 	if cfg.Command.Path == "" {
 		return ProcessConfig{}, fmt.Errorf("%w: command path is required", ErrInvalidProcessConfig)
 	}
-	if cfg.MaxRestarts < 0 {
-		return ProcessConfig{}, fmt.Errorf("%w: max restarts must not be negative", ErrInvalidProcessConfig)
+	if cfg.MaxRestarts < -1 {
+		return ProcessConfig{}, fmt.Errorf("%w: max restarts must be -1 or non-negative", ErrInvalidProcessConfig)
 	}
 	if cfg.MaxRestarts == 0 {
 		cfg.MaxRestarts = defaultMaxRestarts
@@ -307,14 +381,81 @@ func sleepContext(ctx context.Context, duration time.Duration) error {
 func (execProcessRunner) Start(command ProcessCommand) (processHandle, error) {
 	cmd := exec.Command(command.Path, command.Args...)
 	cmd.Dir = command.Dir
-	cmd.Env = append(os.Environ(), command.Env...)
+	cmd.Env = providerEnvironment(command.Path, command.Env)
+	cmd.ExtraFiles = nil
 	cmd.Stdin = command.Stdin
 	cmd.Stdout = command.Stdout
 	cmd.Stderr = command.Stderr
+	if err := applyProcessCredential(cmd, command.Credential); err != nil {
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	return &execProcessHandle{cmd: cmd}, nil
+}
+
+func providerEnvironment(path string, explicit []string) []string {
+	values := make([]string, 0, len(explicit)+8)
+	seen := make(map[string]struct{})
+	testHelper := path == os.Args[0]
+	add := func(item string) {
+		name, _, ok := strings.Cut(item, "=")
+		if !ok || !safeProviderEnvName(name) {
+			return
+		}
+		if _, exists := seen[name]; exists {
+			return
+		}
+		seen[name] = struct{}{}
+		values = append(values, item)
+	}
+	for _, item := range explicit {
+		add(item)
+	}
+	for _, item := range os.Environ() {
+		name, _, ok := strings.Cut(item, "=")
+		if ok && inheritedProviderEnvName(name, testHelper) {
+			add(item)
+		}
+	}
+	return values
+}
+
+func inheritedProviderEnvName(name string, testHelper bool) bool {
+	if strings.HasPrefix(name, "LC_") || strings.HasPrefix(name, "XDG_") {
+		return true
+	}
+	switch name {
+	case "PATH", "HOME", "LANG", "TERM", "TMPDIR", "TZ", "USER", "LOGNAME", "SHELL", "PWD":
+		return true
+	case "AGENTWHARF_WRAP_HELPER", "AGENTWHARF_ACP_HELPER", "AGENTWHARF_ACP_IDLE_HELPER", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_ACP_CREDENTIAL_HELPER", "AGENTWHARF_RESTART_CRASH_HELPER", "AGENTWHARF_START_BLOCK_HELPER", "AGENTWHARF_START_BLOCK_MARKER", "AGENTWHARF_EXPECTED_AUTH_TOKEN", "AGENTWHARF_EXPECTED_BASE_URL":
+		return testHelper
+	default:
+		return false
+	}
+}
+
+func safeProviderEnvName(name string) bool {
+	if name == "" {
+		return false
+	}
+	upper := strings.ToUpper(name)
+	for _, marker := range []string{"TOKEN", "API_KEY", "PASSWORD", "SECRET", "CREDENTIAL", "DSN", "SESSION", "HUB", "CLOUD", "MACHINE", "SIGNER", "CONTROL", "PROXY"} {
+		if strings.Contains(upper, marker) {
+			return safeProviderHelperEnvName(upper)
+		}
+	}
+	return true
+}
+
+func safeProviderHelperEnvName(name string) bool {
+	switch name {
+	case "AGENTWHARF_WRAP_HELPER", "AGENTWHARF_ACP_HELPER", "AGENTWHARF_ACP_IDLE_HELPER", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_ACP_CREDENTIAL_HELPER", "AGENTWHARF_RESTART_CRASH_HELPER", "AGENTWHARF_START_BLOCK_HELPER", "AGENTWHARF_START_BLOCK_MARKER", "AGENTWHARF_HELPER_PROCESS", "AGENTWHARF_EXPECTED_AUTH_TOKEN", "AGENTWHARF_EXPECTED_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *execProcessHandle) PID() int {
@@ -325,7 +466,13 @@ func (h *execProcessHandle) PID() int {
 }
 
 func (h *execProcessHandle) Wait() error {
-	return h.cmd.Wait()
+	err := h.cmd.Wait()
+	if closer, ok := h.cmd.Stderr.(io.Closer); ok {
+		if closeErr := closer.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
 
 func (h *execProcessHandle) Interrupt() error {

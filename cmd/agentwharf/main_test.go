@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,12 +12,17 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/winghv/agentwharf/adapter/core"
+	"github.com/winghv/agentwharf/auth"
+	"github.com/winghv/agentwharf/auth/static"
 	"github.com/winghv/agentwharf/protocol"
 	"nhooyr.io/websocket"
 )
@@ -59,6 +65,14 @@ func TestServeStartsLocalHubWithSQLiteAndStaticAuth(t *testing.T) {
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("stat sqlite db: %v", err)
 	}
+	metricsResponse, err := http.Get("http://" + running.addr + "/adapter/metrics")
+	if err != nil {
+		t.Fatalf("public adapter metrics request: %v", err)
+	}
+	defer metricsResponse.Body.Close()
+	if metricsResponse.StatusCode == http.StatusOK {
+		t.Fatalf("public adapter metrics unexpectedly reachable")
+	}
 
 	conn, _, err := websocket.Dial(ctx, running.wsURL, nil)
 	if err != nil {
@@ -82,6 +96,141 @@ func TestServeStartsLocalHubWithSQLiteAndStaticAuth(t *testing.T) {
 	}
 }
 
+func TestStartWrapDiagnosticsRequiresFixedEntryProviderProof(t *testing.T) {
+	t.Setenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID", strconv.FormatUint(uint64(os.Geteuid()), 10))
+	t.Setenv("AGENTWHARF_FIXED_ENTRY_UID", strconv.FormatUint(uint64(os.Geteuid()), 10))
+	if server := startWrapDiagnostics(context.Background(), wrapConfig{}, core.NewAdapterMetrics()); server != nil {
+		t.Fatal("diagnostics enabled without fixed-entry proof")
+	}
+	root, err := os.MkdirTemp("", "aw-wrap-diag-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, "health")
+	if err := os.WriteFile(marker, []byte("healthy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	providerUID := uint32(os.Geteuid()) + 1
+	cfg := wrapConfig{
+		HealthMarker:       marker,
+		ProviderCredential: &core.ProcessCredential{UID: providerUID, GID: providerUID},
+	}
+	server := startWrapDiagnostics(context.Background(), cfg, core.NewAdapterMetrics())
+	if server == nil {
+		t.Fatal("diagnostics proof was not accepted")
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("close diagnostics: %v", err)
+	}
+	cfg.ProviderCredential.UID = uint32(os.Geteuid())
+	if server := startWrapDiagnostics(context.Background(), cfg, core.NewAdapterMetrics()); server != nil {
+		t.Fatal("diagnostics enabled for same-UID provider")
+	}
+}
+
+func TestDiagnosticsIdentityFromEnvAcceptsRootFixedEntry(t *testing.T) {
+	t.Setenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID", "0")
+	t.Setenv("AGENTWHARF_FIXED_ENTRY_UID", "0")
+	operatorUID, fixedEntryUID, ok := diagnosticsIdentityFromEnv(uint32(os.Geteuid()))
+	if !ok || operatorUID != 0 || fixedEntryUID != 0 {
+		t.Fatalf("root diagnostics identity = (%d, %d, %v)", operatorUID, fixedEntryUID, ok)
+	}
+	t.Setenv("AGENTWHARF_FIXED_ENTRY_UID", "1000")
+	if _, _, ok := diagnosticsIdentityFromEnv(uint32(os.Geteuid())); ok {
+		t.Fatal("mismatched diagnostics identities unexpectedly accepted")
+	}
+	t.Setenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID", "")
+	t.Setenv("AGENTWHARF_FIXED_ENTRY_UID", "")
+	operatorUID, fixedEntryUID, ok = diagnosticsIdentityFromEnv(0)
+	if !ok || operatorUID != 0 || fixedEntryUID != 0 {
+		t.Fatalf("root effective identity fallback = (%d, %d, %v)", operatorUID, fixedEntryUID, ok)
+	}
+	if _, _, ok := diagnosticsIdentityFromEnv(uint32(os.Geteuid())); ok && os.Geteuid() != 0 {
+		t.Fatal("non-root missing diagnostics identity unexpectedly accepted")
+	}
+}
+
+func TestACPFileReferenceReadsBoundedWorkspaceContent(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	content := []byte("package main\n")
+	if err := os.WriteFile(filepath.Join(root, "main.go"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(content)
+	payload := fmt.Sprintf(`{"content":[{"kind":"text","text":"review"},{"kind":"file_reference","disposition":"file","path":"main.go","version":"v1","content_digest":"sha256:%x","bytes":%d,"media_type":"text/plain"}],"capability_fingerprint":"sha256:%064d"}`, digest, len(content), 1)
+	prompt, err := acpPromptFromSessionSendAtRoot([]byte(payload), root)
+	if err != nil {
+		t.Fatalf("acpPromptFromSessionSendAtRoot() error = %v", err)
+	}
+	if len(prompt) != 2 || prompt[1]["type"] != "text" || prompt[1]["text"] != string(content) {
+		t.Fatalf("prompt = %+v", prompt)
+	}
+}
+
+func TestACPFileReferenceFailsClosedOnDigestAndSymlink(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"content":[{"kind":"file_reference","disposition":"file","path":"link.txt","version":"v1","content_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","bytes":7,"media_type":"text/plain"}],"capability_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	if _, err := acpPromptFromSessionSendAtRoot([]byte(payload), root); err == nil {
+		t.Fatal("symlink/digest reference unexpectedly accepted")
+	}
+}
+
+func TestTaskClaimCodeInputRequiresBoundedNonTTYStdin(t *testing.T) {
+	t.Parallel()
+
+	code, err := readClaimCode(strings.NewReader("claim-code-1\n"))
+	if err != nil || string(code) != "claim-code-1" {
+		t.Fatalf("readClaimCode() = %q, %v", string(code), err)
+	}
+	if _, err := readClaimCode(strings.NewReader(strings.Repeat("x", 257))); err == nil {
+		t.Fatal("oversized claim code unexpectedly accepted")
+	}
+	if err := runTaskCommand(context.Background(), []string{"claim", "claim_1"}, strings.NewReader("code\n"), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("runTaskCommand without --code-stdin = %v", err)
+	}
+}
+
+func TestClaimLaunchRetryClassifierDistinguishesTransportFailure(t *testing.T) {
+	t.Parallel()
+
+	if claimLaunchRequiresReclaim(errors.New("read hello ack: websocket EOF")) {
+		t.Fatal("transport hello failure must permit one bounded retry")
+	}
+	for _, message := range []string{"invalid hello ack", "unauthorized adapter", "credential revoked"} {
+		if !claimLaunchRequiresReclaim(errors.New(message)) {
+			t.Fatalf("claimLaunchRequiresReclaim(%q) = false", message)
+		}
+	}
+	for _, frame := range []*protocol.Error{
+		{Code: "unauthorized", Fatal: true},
+		{Code: "invalid_hello", Fatal: true},
+		{Code: "credential_expired", Fatal: true},
+	} {
+		if !claimProtocolErrorRequiresReclaim(frame) || !claimLaunchRequiresReclaim(fmt.Errorf("%w: %s", errClaimAuthRejection, frame.Code)) {
+			t.Fatalf("protocol error %q was not classified as terminal reclaim", frame.Code)
+		}
+	}
+	if claimProtocolErrorRequiresReclaim(&protocol.Error{Code: "temporary", Fatal: false}) {
+		t.Fatal("non-fatal protocol error must not force reclaim")
+	}
+}
+
 func TestRunServeRejectsNonLocalDefaultToken(t *testing.T) {
 	t.Parallel()
 
@@ -95,15 +244,118 @@ func TestRunServeRejectsNonLocalDefaultToken(t *testing.T) {
 	}
 }
 
+func TestStartServeFailsClosedWithoutSessionCredentialSigner(t *testing.T) {
+	t.Setenv("AGENTWHARF_SESSION_CREDENTIAL_SIGNER_KEY_FILE", "")
+	_, err := startServe(context.Background(), serveConfig{
+		Addr: "127.0.0.1:0", DBPath: filepath.Join(t.TempDir(), "events.db"),
+		SessionID: "ses_local", Provider: "claude-code", ControlToken: "control-token", AdapterToken: "adapter-token",
+	})
+	if err == nil || !strings.Contains(err.Error(), "session credential signer") {
+		t.Fatalf("startServe() error = %v, want missing signer failure", err)
+	}
+}
+
+func TestStartServeRejectsUnsafeSessionCredentialSignerFile(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "signer-key")
+	if err := os.WriteFile(keyFile, []byte("test-only-local-session-credential-signer"), 0o644); err != nil {
+		t.Fatalf("write signer key: %v", err)
+	}
+	if err := os.Chmod(keyFile, 0o644); err != nil {
+		t.Fatalf("chmod signer key: %v", err)
+	}
+	_, err := startServe(context.Background(), serveConfig{
+		Addr: "127.0.0.1:0", DBPath: filepath.Join(t.TempDir(), "events.db"),
+		SessionID: "ses_local", Provider: "claude-code", ControlToken: "control-token", AdapterToken: "adapter-token",
+		SessionCredentialSignerKeyFile: keyFile,
+	})
+	if err == nil || !strings.Contains(err.Error(), "private and regular") {
+		t.Fatalf("startServe() error = %v, want unsafe signer failure", err)
+	}
+}
+
+func TestStartServeRejectsSessionCredentialSignerSymlink(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "signer-key")
+	if err := os.WriteFile(keyFile, []byte("test-only-local-session-credential-signer"), 0o600); err != nil {
+		t.Fatalf("write signer key: %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "signer-link")
+	if err := os.Symlink(keyFile, link); err != nil {
+		t.Fatalf("symlink signer key: %v", err)
+	}
+	_, err := startServe(context.Background(), serveConfig{
+		Addr: "127.0.0.1:0", DBPath: filepath.Join(t.TempDir(), "events.db"),
+		SessionID: "ses_local", Provider: "claude-code", ControlToken: "control-token", AdapterToken: "adapter-token",
+		SessionCredentialSignerKeyFile: link,
+	})
+	if err == nil || !strings.Contains(err.Error(), "private and regular") {
+		t.Fatalf("startServe() error = %v, want symlink signer rejection", err)
+	}
+}
+
+func TestParseServeConfigRejectsNonPositiveSessionCredentialSignerKeyVersion(t *testing.T) {
+	for _, version := range []string{"0", "-1"} {
+		if _, err := parseServeConfig([]string{"--session-credential-signer-key-version", version}, io.Discard); err == nil || !strings.Contains(err.Error(), "must be positive") {
+			t.Fatalf("parseServeConfig(%s) error = %v, want non-positive signer rejection", version, err)
+		}
+	}
+}
+
+func TestLocalSessionAuthenticatorAcceptsOnlyCurrentLocalSessionBearer(t *testing.T) {
+	issuer, err := auth.NewLocalSessionCredentialIssuer([]byte("test-only-local-session-credential-signer"), 1)
+	if err != nil {
+		t.Fatalf("new issuer: %v", err)
+	}
+	prepared, err := issuer.PrepareSessionCredential(context.Background(), auth.SessionCredentialRequest{
+		SessionID: "ses_local", Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialTargetAttach, AttachID: "attach_1", JTI: "jti_1"},
+		Generation: 1, RotationID: "rotation_1", RevocationID: "revocation_1", ExpiresAt: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("prepare credential: %v", err)
+	}
+	if err := issuer.ActivateSessionCredential(context.Background(), prepared); err != nil {
+		t.Fatalf("activate credential: %v", err)
+	}
+	base := static.New([]static.Token{{Token: "adapter-token", Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_local")}}})
+	authenticator := localSessionAuthenticator{Authenticator: base, staticAdapterCredential: base.AdapterCredential, sessionCredentialIssuer: issuer, sessionID: "ses_local"}
+	principal, err := authenticator.Authenticate(context.Background(), prepared.Bearer)
+	if err != nil || len(principal.Scopes) != 1 || principal.Scopes[0] != auth.SessionAdapter("ses_local") {
+		t.Fatalf("Authenticate(prepared bearer) = %+v, %v", principal, err)
+	}
+	if _, err := authenticator.Authenticate(context.Background(), "unknown"); err == nil {
+		t.Fatal("unknown local bearer unexpectedly authenticated")
+	}
+	generation, expiresAt, initialize, err := authenticator.AdapterCredential(context.Background(), prepared.Bearer, principal, "ses_local")
+	if err != nil || generation != prepared.Generation || expiresAt != prepared.ExpiresAt.UnixNano() || !initialize {
+		t.Fatalf("AdapterCredential() = %d, %d, %t, %v", generation, expiresAt, initialize, err)
+	}
+}
+
 func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	t.Parallel()
 
 	err := run(context.Background(), nil, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini|logout|machine [options]") {
+	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini|logout|machine|attention-backfill [options]") {
 		t.Fatalf("run() error = %v, want wharf usage", err)
 	}
 	if strings.Contains(err.Error(), "usage: agentwharf") {
 		t.Fatalf("run() error = %v, must not mention legacy agentwharf entrypoint", err)
+	}
+}
+
+func TestAttentionBackfillRequiresOperatorArguments(t *testing.T) {
+	if err := runWithInput(context.Background(), []string{"attention-backfill"}, nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: wharf attention-backfill") {
+		t.Fatalf("missing checkpoint error = %v", err)
+	}
+	t.Setenv("AGENTWHARF_POSTGRES_DSN", "")
+	if err := runWithInput(context.Background(), []string{"attention-backfill", "--checkpoint", "/tmp/checkpoint"}, nil, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "AGENTWHARF_POSTGRES_DSN is required") {
+		t.Fatalf("missing DSN error = %v", err)
+	}
+	t.Setenv("AGENTWHARF_POSTGRES_DSN", "not-a-dsn-secret-marker")
+	if err := runWithInput(context.Background(), []string{"attention-backfill", "--checkpoint", "/tmp/checkpoint"}, nil, io.Discard, io.Discard); err == nil || err.Error() != "open attention backfill postgres pool" {
+		t.Fatalf("invalid DSN error = %v", err)
+	}
+	if err := runWithInput(context.Background(), []string{"attention-backfill", "--postgres-dsn", "postgres://secret@example"}, nil, io.Discard, io.Discard); err == nil || strings.Contains(err.Error(), "postgres://secret@example") {
+		t.Fatalf("legacy DSN argument error = %v", err)
 	}
 }
 
@@ -1242,6 +1494,311 @@ func TestRunWrapProviderCommandWritesHubCommandsToProviderStdin(t *testing.T) {
 	}
 }
 
+func TestRunWrapV2ProviderDoesNotStartAfterAdmissionRejection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	startSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		frame, err := readFrameFromConn(ctx, conn)
+		if err != nil {
+			return
+		}
+		hello, ok := frame.(*protocol.Hello)
+		if !ok || hello.ProtocolVersion != protocol.ProtocolVersionV2 {
+			t.Errorf("hello = %+v", frame)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_v2", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_v2", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_v2", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
+			return
+		}
+		frame, err = readProviderStartFrame(ctx, conn)
+		if err != nil {
+			return
+		}
+		start, ok := frame.(*protocol.ProviderStart)
+		if !ok || start.Attempt != 1 {
+			t.Errorf("provider start frame = %T", frame)
+			return
+		}
+		startSeen <- struct{}{}
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: start.Attempt}); err != nil {
+			return
+		}
+		if _, err := readFrameFromConn(ctx, conn); err != nil {
+			return
+		}
+		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: start.Attempt, Status: protocol.ProviderStartRejected})
+	}))
+	defer server.Close()
+	_, err := runWrap(ctx, wrapConfig{HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_v2", Provider: "claude-code", AdapterToken: "adapter-token", Format: "jsonstream", ProtocolVersion: protocol.ProtocolVersionV2, ProviderCommand: []string{os.Args[0]}}, nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "provider start admission rejected") {
+		t.Fatalf("runWrap(v2 rejected start) error = %v", err)
+	}
+	select {
+	case <-startSeen:
+	case <-time.After(time.Second):
+		t.Fatal("v2 provider start request was not observed")
+	}
+}
+
+func TestRunWrapV2ProviderStopsAfterFinalAdmissionRejection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	marker := filepath.Join(t.TempDir(), "provider-state")
+	t.Setenv("AGENTWHARF_START_BLOCK_HELPER", "1")
+	t.Setenv("AGENTWHARF_START_BLOCK_MARKER", marker)
+	proofSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		if _, err := readFrameFromConn(ctx, conn); err != nil {
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_v2", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_v2", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_v2", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
+			return
+		}
+		if frame, err := readProviderStartFrame(ctx, conn); err != nil || frame.FrameName() != protocol.FrameProviderStart {
+			t.Errorf("provider start request = %T, %v", frame, err)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: 1}); err != nil {
+			return
+		}
+		if frame, err := readFrameFromConn(ctx, conn); err != nil || frame.FrameName() != protocol.FrameProviderStartStarted {
+			t.Errorf("provider start proof = %T, %v", frame, err)
+			return
+		}
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if content, err := os.ReadFile(marker); err == nil && string(content) == "ready" {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if content, _ := os.ReadFile(marker); string(content) != "ready" {
+			t.Errorf("provider did not become ready before final rejection: %q", content)
+			return
+		}
+		proofSeen <- struct{}{}
+		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: 1, Status: protocol.ProviderStartRejected})
+	}))
+	defer server.Close()
+	_, err := runWrap(ctx, wrapConfig{HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_v2", Provider: "claude-code", AdapterToken: "adapter-token", Format: "jsonstream", ProtocolVersion: protocol.ProtocolVersionV2, ProviderCommand: []string{os.Args[0]}}, nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "provider start admission rejected") {
+		t.Fatalf("runWrap(v2 final rejected start) error = %v", err)
+	}
+	assertSignal(t, proofSeen, "provider start proof")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if content, err := os.ReadFile(marker); err == nil && string(content) == "stopped" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	content, _ := os.ReadFile(marker)
+	t.Fatalf("started provider was not stopped after final rejection: %q", content)
+}
+
+func TestRunWrapV2ReAdmitsEveryRestartedChild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	t.Setenv("AGENTWHARF_RESTART_CRASH_HELPER", "1")
+	attempts := make(chan int, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		if _, err := readFrameFromConn(ctx, conn); err != nil {
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_v2", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_v2", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_v2", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
+			return
+		}
+		for expected := 1; expected <= 2; expected++ {
+			frame, err := readProviderStartFrame(ctx, conn)
+			if err != nil {
+				return
+			}
+			start, ok := frame.(*protocol.ProviderStart)
+			if !ok || start.Attempt != expected {
+				t.Errorf("provider start = %T %+v, want attempt %d", frame, frame, expected)
+				return
+			}
+			if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: expected}); err != nil {
+				return
+			}
+			frame, err = readFrameFromConn(ctx, conn)
+			if started, ok := frame.(*protocol.ProviderStartStarted); err != nil || !ok || started.Attempt != expected {
+				t.Errorf("provider start proof = %T %+v, %v", frame, frame, err)
+				return
+			}
+			attempts <- expected
+			if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: expected, Status: protocol.ProviderStartAdmitted, RecoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	_, _ = runWrap(ctx, wrapConfig{HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_v2", Provider: "claude-code", AdapterToken: "adapter-token", Format: "jsonstream", ProtocolVersion: protocol.ProtocolVersionV2, ProviderCommand: []string{os.Args[0], "-test.run=TestProcessSupervisorHelperProcess"}}, nil, io.Discard)
+	for _, want := range []int{1, 2} {
+		select {
+		case got := <-attempts:
+			if got != want {
+				t.Fatalf("admitted attempt = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for admitted attempt %d", want)
+		}
+	}
+}
+
+func TestRunControlCapabilityAndOutcomeProposalsAreCanonical(t *testing.T) {
+	t.Parallel()
+
+	cfg := wrapConfig{ProtocolVersion: protocol.ProtocolVersionV2, SessionID: "ses_run_control"}
+	frames := make([]protocol.Frame, 0, 3)
+	write := func(frame protocol.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	}
+	if err := publishRunControlCapability(context.Background(), nil, cfg, write); err != nil {
+		t.Fatalf("publishRunControlCapability() error = %v", err)
+	}
+	command := &protocol.Command{CommandID: "cmd_run_control_1", Type: protocol.CommandSessionInterrupt, SessionID: cfg.SessionID}
+	if err := acknowledgeRunControl(context.Background(), command, write, cfg, "interrupt", "ready", nil); err != nil {
+		t.Fatalf("acknowledgeRunControl() error = %v", err)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("proposal frames = %d, want 3", len(frames))
+	}
+	capability, ok := frames[0].(*protocol.Event)
+	if !ok || capability.Type != "session.run.capabilities" || capability.ProposalID == "" {
+		t.Fatalf("capability frame = %#v", frames[0])
+	}
+	if _, err := protocol.DecodeRunControlCapabilityPayload(capability.Payload); err != nil {
+		t.Fatalf("capability payload decode error = %v", err)
+	}
+	outcome, ok := frames[2].(*protocol.Event)
+	if !ok || outcome.Type != "session.run.outcome" || outcome.ProposalID == "" {
+		t.Fatalf("outcome frame = %#v", frames[2])
+	}
+	decoded, err := protocol.DecodeRunControlOutcomePayload(outcome.Payload)
+	if err != nil {
+		t.Fatalf("outcome payload decode error = %v; payload=%s", err, outcome.Payload)
+	}
+	if decoded.CommandID != command.CommandID || decoded.Operation != "interrupt" || decoded.Outcome != "completed" || decoded.CompletionState == nil || *decoded.CompletionState != "ready" {
+		t.Fatalf("decoded outcome = %+v", decoded)
+	}
+}
+
+func TestProviderStartAdmissionRetainsOpaqueRecoveryHandle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		frame, err := readProviderStartFrame(ctx, conn)
+		start, ok := frame.(*protocol.ProviderStart)
+		if err != nil || !ok || start.Attempt != 1 {
+			t.Errorf("provider start = %T %+v, %v", frame, frame, err)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: start.Attempt}); err != nil {
+			return
+		}
+		frame, err = readFrameFromConn(ctx, conn)
+		started, ok := frame.(*protocol.ProviderStartStarted)
+		if err != nil || !ok || started.Attempt != start.Attempt {
+			t.Errorf("provider started = %T %+v, %v", frame, frame, err)
+			return
+		}
+		_ = writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: start.Attempt, Status: protocol.ProviderStartAdmitted, RecoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"})
+	}))
+	defer server.Close()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	admission := newProviderStartAdmission(protocol.ProtocolVersionV2, conn, func(frame protocol.Frame) error {
+		return writeFrameToConn(ctx, conn, frame)
+	}, nil)
+	if err := admission.PrepareProcessStart(ctx, 1); err != nil {
+		t.Fatalf("PrepareProcessStart() = %v", err)
+	}
+	if err := admission.ConfirmProcessStarted(ctx, 1); err != nil {
+		t.Fatalf("ConfirmProcessStarted() = %v", err)
+	}
+	if _, err := admission.RecoveryStartHandle(); err != nil {
+		t.Fatalf("RecoveryStartHandle() = %v", err)
+	}
+}
+
+func TestProviderStartAdmissionInvalidationClearsRecoveryReference(t *testing.T) {
+	admission := &providerStartAdmission{recoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}
+	if _, err := admission.RecoveryStartHandle(); err != nil {
+		t.Fatalf("RecoveryStartHandle() before invalidation = %v", err)
+	}
+	admission.invalidate()
+	if _, err := admission.RecoveryStartHandle(); err == nil {
+		t.Fatal("RecoveryStartHandle() succeeded after durable lifecycle invalidation")
+	}
+	if err := admission.VerifyRecoveryStart(context.Background()); err == nil {
+		t.Fatal("VerifyRecoveryStart() succeeded after durable lifecycle invalidation")
+	}
+}
+
+func TestProviderStartAdmissionWatcherInvalidatesClosedSocket(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverConn := make(chan *websocket.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		serverConn <- conn
+		<-ctx.Done()
+	}))
+	defer server.Close()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	admission := &providerStartAdmission{conn: conn, recoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}
+	watchCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	admission.watchLifecycle(watchCtx, stop)
+	select {
+	case peer := <-serverConn:
+		_ = peer.Close(websocket.StatusPolicyViolation, "authority revoked")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for server connection")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := admission.RecoveryStartHandle(); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("closed Hub socket did not invalidate recovery reference")
+}
+
 func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1327,6 +1884,128 @@ func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	}
 	if err := <-runDone; err != nil {
 		t.Fatalf("run wrap error = %v", err)
+	}
+}
+
+func TestRunWrapACPProviderLoadsClaudeCredentialsForChildOnly(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	secretDir := t.TempDir()
+	apiKeyPath := filepath.Join(secretDir, "anthropic_api_key")
+	baseURLPath := filepath.Join(secretDir, "anthropic_base_url")
+	const apiKey = "test-api-key"
+	const baseURL = "https://provider.example.test"
+	if err := os.WriteFile(apiKeyPath, []byte(apiKey+"\n"), 0o400); err != nil {
+		t.Fatalf("write API key: %v", err)
+	}
+	if err := os.WriteFile(baseURLPath, []byte(baseURL+"\n"), 0o400); err != nil {
+		t.Fatalf("write base URL: %v", err)
+	}
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", apiKeyPath)
+	t.Setenv("ANTHROPIC_BASE_URL", baseURLPath)
+	t.Setenv("AGENTWHARF_ACP_CREDENTIAL_HELPER", "1")
+	t.Setenv("AGENTWHARF_EXPECTED_AUTH_TOKEN", apiKey)
+	t.Setenv("AGENTWHARF_EXPECTED_BASE_URL", baseURL)
+
+	running, err := startServe(ctx, serveConfig{
+		Addr:         "127.0.0.1:0",
+		DBPath:       filepath.Join(t.TempDir(), "events.db"),
+		SessionID:    "ses_local",
+		Provider:     "claude-code",
+		ControlToken: "control-token",
+		AdapterToken: "adapter-token",
+	})
+	if err != nil {
+		t.Fatalf("start serve: %v", err)
+	}
+	defer func() {
+		cancel()
+		if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve wait error = %v", err)
+		}
+	}()
+
+	client, _, err := websocket.Dial(ctx, running.wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "")
+	writeFrame(t, client, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "control-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_local"}},
+	})
+	_ = readFrame(t, client).(*protocol.HelloAck)
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runWithInput(ctx, []string{
+			"wrap",
+			"--hub", running.wsURL,
+			"--session-id", "ses_local",
+			"--adapter-token", "adapter-token",
+			"--agent", "claude",
+			"--acp",
+			"--secret-dir", secretDir,
+			"--", os.Args[0],
+		}, nil, io.Discard, io.Discard)
+	}()
+
+	ready := readFrame(t, client).(*protocol.Event)
+	if ready.Type != "session.state" {
+		t.Fatalf("ready event type = %s", ready.Type)
+	}
+	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != apiKeyPath || os.Getenv("ANTHROPIC_BASE_URL") != baseURLPath {
+		t.Fatal("adapter process environment must retain secret file paths")
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("run wrap error = %v", err)
+	}
+}
+
+func TestProviderChildEnvironmentRejectsCredentialOutsideSecretDir(t *testing.T) {
+	secretDir := t.TempDir()
+	outsidePath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(outsidePath, []byte("secret-token"), 0o400); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	parent := []string{"ANTHROPIC_AUTH_TOKEN=" + outsidePath}
+	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, parent)
+	if err == nil || !strings.Contains(err.Error(), "outside the injected secret directory") {
+		t.Fatalf("providerChildEnvironment() error = %v, want outside-secret-dir rejection", err)
+	}
+	if parent[0] != "ANTHROPIC_AUTH_TOKEN="+outsidePath {
+		t.Fatalf("parent environment changed to %q", parent[0])
+	}
+}
+
+func TestProviderChildEnvironmentRejectsCredentialSymlink(t *testing.T) {
+	secretDir := t.TempDir()
+	targetPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(targetPath, []byte("secret-token"), 0o400); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	linkPath := filepath.Join(secretDir, "token")
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Fatalf("create credential symlink: %v", err)
+	}
+	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, []string{"ANTHROPIC_AUTH_TOKEN=" + linkPath})
+	if err == nil || (!strings.Contains(err.Error(), "bounded regular file") && !strings.Contains(err.Error(), "outside the injected secret directory")) {
+		t.Fatalf("providerChildEnvironment() error = %v, want symlink rejection", err)
+	}
+}
+
+func TestProviderChildEnvironmentRejectsCredentialTooShortToMask(t *testing.T) {
+	secretDir := t.TempDir()
+	credentialPath := filepath.Join(secretDir, "token")
+	if err := os.WriteFile(credentialPath, []byte("abc"), 0o400); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, []string{"ANTHROPIC_AUTH_TOKEN=" + credentialPath})
+	if err == nil || !strings.Contains(err.Error(), "at least 4 bytes") {
+		t.Fatalf("providerChildEnvironment() error = %v, want short-credential rejection", err)
 	}
 }
 
@@ -1582,6 +2261,19 @@ func readFrameFromConn(ctx context.Context, conn *websocket.Conn) (protocol.Fram
 	return frame, nil
 }
 
+func readProviderStartFrame(ctx context.Context, conn *websocket.Conn) (protocol.Frame, error) {
+	for {
+		frame, err := readFrameFromConn(ctx, conn)
+		if err != nil {
+			return nil, err
+		}
+		if event, ok := frame.(*protocol.Event); ok && event.Type == "session.run.capabilities" {
+			continue
+		}
+		return frame, nil
+	}
+}
+
 func assertSignal(t *testing.T, ch <-chan struct{}, name string) {
 	t.Helper()
 
@@ -1593,6 +2285,13 @@ func assertSignal(t *testing.T, ch <-chan struct{}, name string) {
 }
 
 func TestMain(m *testing.M) {
+	if os.Getenv("AGENTWHARF_RESTART_CRASH_HELPER") == "1" {
+		os.Exit(2)
+	}
+	if os.Getenv("AGENTWHARF_START_BLOCK_HELPER") == "1" {
+		runWrapStartBlockProviderHelper()
+		return
+	}
 	if os.Getenv("AGENTWHARF_ACP_PERMISSION_HELPER") == "1" {
 		runWrapACPPermissionProviderHelper()
 		return
@@ -1605,11 +2304,31 @@ func TestMain(m *testing.M) {
 		runWrapACPProviderHelper()
 		return
 	}
+	if os.Getenv("AGENTWHARF_ACP_CREDENTIAL_HELPER") == "1" {
+		runWrapACPCredentialProviderHelper()
+		return
+	}
 	if os.Getenv("AGENTWHARF_WRAP_HELPER") == "1" {
 		runWrapProviderHelper()
 		return
 	}
-	os.Exit(m.Run())
+	keyFile, err := os.CreateTemp("", "agentwharf-test-session-signer-*")
+	if err != nil {
+		os.Exit(1)
+	}
+	keyPath := keyFile.Name()
+	if _, err := keyFile.WriteString("test-only-local-session-credential-signer"); err != nil {
+		_ = keyFile.Close()
+		_ = os.Remove(keyPath)
+		os.Exit(1)
+	}
+	if err := keyFile.Close(); err != nil || os.Setenv("AGENTWHARF_SESSION_CREDENTIAL_SIGNER_KEY_FILE", keyPath) != nil {
+		_ = os.Remove(keyPath)
+		os.Exit(1)
+	}
+	code := m.Run()
+	_ = os.Remove(keyPath)
+	os.Exit(code)
 }
 
 func runWrapProviderHelper() {
@@ -1626,6 +2345,21 @@ func runWrapProviderHelper() {
 		os.Exit(4)
 	}
 	_, _ = fmt.Fprintf(os.Stdout, `{"type":"assistant","message":{"id":"reply_1","content":[{"type":"text","text":"provider saw %s"}]}}`+"\n", cmd.CommandID)
+	os.Exit(0)
+}
+
+func runWrapStartBlockProviderHelper() {
+	marker := os.Getenv("AGENTWHARF_START_BLOCK_MARKER")
+	if marker == "" {
+		os.Exit(30)
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt)
+	if os.WriteFile(marker, []byte("ready"), 0600) != nil {
+		os.Exit(30)
+	}
+	<-signals
+	_ = os.WriteFile(marker, []byte("stopped"), 0600)
 	os.Exit(0)
 }
 
@@ -1668,6 +2402,26 @@ func runWrapACPProviderHelper() {
 
 	fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","messageId":"resp_1","content":{"type":"text","text":"acp saw ping"}}}}`)
 	writeACPResponse(prompt["id"], map[string]any{"stopReason": "end_turn"})
+	os.Exit(0)
+}
+
+func runWrapACPCredentialProviderHelper() {
+	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != os.Getenv("AGENTWHARF_EXPECTED_AUTH_TOKEN") ||
+		os.Getenv("ANTHROPIC_BASE_URL") != os.Getenv("AGENTWHARF_EXPECTED_BASE_URL") ||
+		os.Getenv("ANTHROPIC_API_KEY") != "" {
+		os.Exit(50)
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	init := readACPRequest(scanner)
+	if init["method"] != "initialize" {
+		os.Exit(51)
+	}
+	writeACPResponse(init["id"], map[string]any{"protocolVersion": 1})
+	sessionNew := readACPRequest(scanner)
+	if sessionNew["method"] != "session/new" {
+		os.Exit(52)
+	}
+	writeACPResponse(sessionNew["id"], map[string]any{"sessionId": "acp_ses_credentials"})
 	os.Exit(0)
 }
 

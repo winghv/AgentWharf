@@ -1,0 +1,505 @@
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestAdapterMetricsAreBoundedAndSecretFree(t *testing.T) {
+	metrics := NewAdapterMetrics()
+	metrics.SetWorkerCounts(-1, 2, -3)
+	metrics.IncReceiptFailure()
+	metrics.IncMaskedEvent()
+	snapshot := metrics.Snapshot()
+	if snapshot.Workers != 0 || snapshot.ActiveWorkers != 2 || snapshot.QueuedWorkers != 0 || snapshot.ReceiptFailures != 1 || snapshot.MaskedEvents != 1 {
+		t.Fatalf("metric snapshot = %+v", snapshot)
+	}
+	output := snapshot.Prometheus()
+	if !strings.Contains(output, "agentwharf_adapter_active_workers 2") || strings.Contains(output, "session") || strings.Contains(output, "secret") {
+		t.Fatalf("unsafe metric output = %q", output)
+	}
+	var nilMetrics *AdapterMetrics
+	if got := nilMetrics.Snapshot(); got != (AdapterMetricSnapshot{}) {
+		t.Fatalf("nil metric snapshot = %+v", got)
+	}
+}
+
+func TestAdapterObservabilityHandlerRestrictsDiagnostics(t *testing.T) {
+	metrics := NewAdapterMetrics()
+	metrics.SetWorkerCounts(2, 1, 1)
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	handler := NewAdapterObservabilityHandler("adapter-diagnostic-token", metrics, next)
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "192.0.2.10:1000"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("remote metrics status = %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1000"
+	request.Header.Set("Authorization", "Bearer adapter-diagnostic-token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "agentwharf_adapter_workers 2") || strings.Contains(response.Body.String(), "adapter-diagnostic-token") {
+		t.Fatalf("authorized metrics response = %d %q", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/debug/pprof/", nil)
+	request.RemoteAddr = "[::1]:1000"
+	request.Header.Set("Authorization", "Bearer adapter-diagnostic-token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "profile") {
+		t.Fatalf("authorized pprof response = %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1000"
+	request.Header.Set("Authorization", "Bearer adapter-diagnostic-token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST metrics status = %d", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/ws", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("fallback status = %d", response.Code)
+	}
+}
+
+func TestAdapterObservabilityPprofRoutesAndNilMetrics(t *testing.T) {
+	handler := NewAdapterObservabilityHandler("token", nil, nil)
+	for _, path := range []string{"/debug/pprof/cmdline", "/debug/pprof/symbol", "/debug/pprof/unknown", "/debug/pprof/a/b"} {
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1"+path, nil)
+		request.RemoteAddr = "127.0.0.1:1000"
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK && response.Code != http.StatusNotFound {
+			t.Fatalf("pprof %s status = %d", path, response.Code)
+		}
+		if path == "/debug/pprof/cmdline" && strings.Contains(response.Body.String(), "adapter-token") {
+			t.Fatalf("pprof cmdline leaked credential: %q", response.Body.String())
+		}
+	}
+	for _, seconds := range []string{"0", "31", "not-a-number"} {
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/debug/pprof/profile?seconds="+seconds, nil)
+		request.RemoteAddr = "127.0.0.1:1000"
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("profile seconds %q status = %d", seconds, response.Code)
+		}
+	}
+	for _, path := range []string{"/debug/pprof/heap?seconds=0", "/debug/pprof/heap?seconds=31", "/debug/pprof/heap?seconds=86400"} {
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1"+path, nil)
+		request.RemoteAddr = "127.0.0.1:1000"
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("named profile %s status = %d", path, response.Code)
+		}
+	}
+	for _, path := range []string{"/debug/pprof/heap?seconds=1", "/debug/pprof/profile?seconds=1"} {
+		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1"+path, nil)
+		request.RemoteAddr = "127.0.0.1:1000"
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("bounded profile %s status = %d", path, response.Code)
+		}
+	}
+	limitedWriter := &diagnosticResponseWriter{ResponseWriter: httptest.NewRecorder(), written: 16 << 20}
+	if _, err := limitedWriter.Write([]byte("x")); !errors.Is(err, http.ErrAbortHandler) {
+		t.Fatalf("response limit error = %v", err)
+	}
+}
+
+func TestStartAdapterDiagnosticsUsesBoundedUnixSocket(t *testing.T) {
+	if _, err := StartAdapterDiagnostics(context.Background(), "", nil); err == nil {
+		t.Fatal("empty diagnostics socket path unexpectedly accepted")
+	}
+	directory, err := os.MkdirTemp("", "aw-diag-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	directory, err = filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(directory, "diagnostics.sock")
+	providerUID := uint32(os.Geteuid()) + 1
+	markerPath := filepath.Join(directory, "health")
+	if err := os.WriteFile(markerPath, []byte("healthy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAdapterDiagnosticsRoot(directory, markerPath, uint32(os.Geteuid())); err != nil {
+		t.Fatalf("ValidateAdapterDiagnosticsRoot() error = %v", err)
+	}
+	if err := ValidateAdapterDiagnosticsRoot(directory, markerPath, providerUID); err == nil {
+		t.Fatal("wrong diagnostics root owner unexpectedly accepted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server, err := StartAdapterDiagnosticsWithConfig(ctx, AdapterDiagnosticsConfig{
+		SocketPath:    socketPath,
+		RootPath:      directory,
+		MarkerPath:    markerPath,
+		Metrics:       NewAdapterMetrics(),
+		FixedEntryUID: uint32(os.Geteuid()),
+		OperatorUID:   uint32(os.Geteuid()),
+		ProviderUID:   providerUID,
+	})
+	if err != nil {
+		t.Fatalf("StartAdapterDiagnostics() error = %v", err)
+	}
+	if server.Path() != socketPath || server.ln.Addr() == nil {
+		t.Fatalf("diagnostics listener identity = path %q addr %v", server.Path(), server.ln.Addr())
+	}
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		if _, err := os.Stat(socketPath); err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	info, err := os.Stat(socketPath)
+	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o600 {
+		t.Fatalf("diagnostic socket = %v, %v", info, err)
+	}
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "unix", socketPath)
+	}}
+	client := &http.Client{Transport: transport}
+	for requestNumber := 1; requestNumber <= 4; requestNumber++ {
+		response, err := client.Get("http://localhost/metrics")
+		if err != nil {
+			t.Fatalf("metrics request %d: %v", requestNumber, err)
+		}
+		response.Body.Close()
+		if !response.Close {
+			t.Fatalf("metrics request %d unexpectedly kept the diagnostics connection alive", requestNumber)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("metrics request %d status = %d", requestNumber, response.StatusCode)
+		}
+	}
+	response, err := client.Get("http://localhost/metrics")
+	if err != nil {
+		t.Fatalf("rate-limited metrics request: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited metrics status = %d", response.StatusCode)
+	}
+	bodyRequest, err := http.NewRequest(http.MethodPost, "http://localhost/metrics", strings.NewReader("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.Do(bodyRequest)
+	if err != nil {
+		t.Fatalf("body request: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("body request status = %d", response.StatusCode)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("diagnostics close: %v", err)
+	}
+	if _, err := os.Stat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket cleanup error = %v", err)
+	}
+	unsafeDirectory, err := os.MkdirTemp("/tmp", "aw-diag-unsafe-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(unsafeDirectory)
+	unsafePath := filepath.Join(unsafeDirectory, "diagnostics.sock")
+	if err := os.WriteFile(unsafePath, []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), AdapterDiagnosticsConfig{
+		SocketPath:  unsafePath,
+		RootPath:    unsafeDirectory,
+		OperatorUID: uint32(os.Geteuid()),
+		ProviderUID: providerUID,
+	}); err == nil {
+		t.Fatal("regular file diagnostics path unexpectedly accepted")
+	}
+}
+
+func TestAdapterDiagnosticsAcceptsRootFixedEntryIdentity(t *testing.T) {
+	cfg := AdapterDiagnosticsConfig{
+		SocketPath:    "/run/superwhv/adapter-state/diagnostics.sock",
+		RootPath:      "/run/superwhv/adapter-state",
+		MarkerPath:    "/run/superwhv/adapter-state/health",
+		FixedEntryUID: 0,
+		OperatorUID:   0,
+		ProviderUID:   1000,
+	}
+	if err := validateAdapterDiagnosticsIdentity(cfg); err != nil {
+		t.Fatalf("root fixed-entry identity rejected: %v", err)
+	}
+	cfg.OperatorUID = 1001
+	if err := validateAdapterDiagnosticsIdentity(cfg); err == nil {
+		t.Fatal("operator identity mismatch unexpectedly accepted")
+	}
+}
+
+func TestValidateDiagnosticSocketOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "diagnostics.sock")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	owner := uint32(os.Geteuid())
+	if err := validateDiagnosticSocketOwner(path, owner); err != nil {
+		t.Fatalf("matching socket owner rejected: %v", err)
+	}
+	if err := validateDiagnosticSocketOwner(path, owner+1); err == nil {
+		t.Fatal("mismatched socket owner accepted")
+	}
+	if err := validateDiagnosticSocketOwner(filepath.Join(filepath.Dir(path), "missing.sock"), owner); err == nil {
+		t.Fatal("missing socket owner accepted")
+	}
+}
+
+func TestStartAdapterDiagnosticsRejectsUnprovenRootAndSocket(t *testing.T) {
+	uid := uint32(os.Geteuid())
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), AdapterDiagnosticsConfig{OperatorUID: uid, ProviderUID: uid + 1}); err == nil {
+		t.Fatal("missing diagnostics paths unexpectedly accepted")
+	}
+	root, err := os.MkdirTemp("", "aw-diag-invalid-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(root, "diagnostics.sock")
+	marker := filepath.Join(root, "health")
+	if err := os.WriteFile(marker, []byte("healthy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := AdapterDiagnosticsConfig{SocketPath: socket, RootPath: root, MarkerPath: marker, FixedEntryUID: uid, OperatorUID: uid, ProviderUID: uid + 1}
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), AdapterDiagnosticsConfig{SocketPath: socket, RootPath: root, OperatorUID: uid, ProviderUID: uid}); err == nil {
+		t.Fatal("same-UID operator/provider unexpectedly accepted")
+	}
+	for _, cfg := range []AdapterDiagnosticsConfig{
+		{SocketPath: socket, RootPath: filepath.Dir(root), OperatorUID: uid, ProviderUID: uid + 1},
+		{SocketPath: socket, RootPath: filepath.Join(root, "missing"), OperatorUID: uid, ProviderUID: uid + 1},
+	} {
+		if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), cfg); err == nil {
+			t.Fatalf("invalid diagnostics config unexpectedly accepted: %+v", cfg)
+		}
+	}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), base); err == nil {
+		t.Fatal("world-readable diagnostics root unexpectedly accepted")
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socket, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartAdapterDiagnosticsWithConfig(context.Background(), base); err == nil {
+		t.Fatal("occupied diagnostics socket unexpectedly reused")
+	}
+}
+
+func TestAdapterObservabilityHandlerSupportsDedicatedPrefix(t *testing.T) {
+	handler := NewAdapterObservabilityHandlerAt("token", NewAdapterMetrics(), "/adapter", http.NotFoundHandler())
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/adapter/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1000"
+	request.Header.Set("Authorization", "Bearer token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "agentwharf_adapter_workers") {
+		t.Fatalf("prefixed metrics response = %d %q", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1000"
+	request.Header.Set("Authorization", "Bearer token")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("unprefixed metrics status = %d", response.Code)
+	}
+	rootHandler := NewAdapterObservabilityHandlerAt("token", NewAdapterMetrics(), "/", nil)
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1/metrics", nil)
+	request.RemoteAddr = "127.0.0.1:1000"
+	request.Header.Set("Authorization", "Bearer token")
+	response = httptest.NewRecorder()
+	rootHandler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("root-prefix metrics status = %d", response.Code)
+	}
+}
+
+func TestAdapterCredentialAndReceiptBoundaries(t *testing.T) {
+	credential, err := NewSessionCredential("adapter-secret", SessionCredentialMetadata{
+		SessionID: "ses_load", Lineage: SessionCredentialLineage{Kind: "target", AttachID: "att"},
+		Generation: 1, ExpiresAt: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("credential = %v", err)
+	}
+	if credential.String() != "[session credential redacted]" || credential.GoString() != credential.String() {
+		t.Fatalf("credential formatting leaked value: %q %q", credential.String(), credential.GoString())
+	}
+	if _, err := json.Marshal(credential); !errors.Is(err, ErrSessionCredentialNotSerializable) {
+		t.Fatalf("credential JSON error = %v", err)
+	}
+	if _, err := credential.MarshalText(); !errors.Is(err, ErrSessionCredentialNotSerializable) {
+		t.Fatalf("credential text error = %v", err)
+	}
+	if err := credential.validate("other", time.Now()); !errors.Is(err, ErrSessionCredentialMismatch) {
+		t.Fatalf("credential mismatch = %v", err)
+	}
+}
+
+func TestSessionWorkerReceiptFailureMetricIsProcessBounded(t *testing.T) {
+	metrics := NewAdapterMetrics()
+	worker := &SessionWorker{metrics: metrics}
+	worker.recordReceiptFailure()
+	if got := metrics.Snapshot().ReceiptFailures; got != 1 {
+		t.Fatalf("receipt failures = %d", got)
+	}
+	var nilWorker *SessionWorker
+	nilWorker.recordReceiptFailure()
+}
+
+func TestAdapterRotationAndWorkerWrappersFailClosed(t *testing.T) {
+	if _, err := NewSessionWorker(SessionWorkerConfig{}); !errors.Is(err, ErrInvalidSessionWorkerConfig) {
+		t.Fatalf("invalid worker = %v", err)
+	}
+	if err := (*SessionWorker)(nil).ActivateCredentialRotation(CredentialRotationReceipt{}); !errors.Is(err, ErrCredentialRotationUnavailable) {
+		t.Fatalf("nil activation = %v", err)
+	}
+	if _, err := (*SessionWorker)(nil).RetryCredentialActivation("rotation"); !errors.Is(err, ErrCredentialRotationUnavailable) {
+		t.Fatalf("nil retry = %v", err)
+	}
+	if err := (*SessionWorker)(nil).ReconnectCredential(2, 1); !errors.Is(err, ErrCredentialRotationUnavailable) {
+		t.Fatalf("nil reconnect = %v", err)
+	}
+	if _, err := (*SessionWorker)(nil).CredentialRecoveryPermit(); !errors.Is(err, ErrCredentialRotationUnavailable) {
+		t.Fatalf("nil recovery permit = %v", err)
+	}
+	if err := (*SessionWorker)(nil).Run(context.Background()); !errors.Is(err, ErrInvalidSessionWorkerConfig) {
+		t.Fatalf("nil run = %v", err)
+	}
+}
+
+func TestAdapterRotationAndWorkerWrappersHappyPath(t *testing.T) {
+	worker := rotationWorker(t, "ses_load_rotation", &testDurableReceiptGate{})
+	pending := rotationCredential(t, worker.SessionID(), 2)
+	if err := worker.PrepareCredentialRotation("rot_load", pending); err != nil {
+		t.Fatalf("PrepareCredentialRotation() error = %v", err)
+	}
+	if err := worker.PrepareCredentialRotation("rot_load", pending); err != nil {
+		t.Fatalf("idempotent PrepareCredentialRotation() error = %v", err)
+	}
+	receipt, err := worker.AcknowledgeCredentialPossession("rot_load", 1)
+	if err != nil {
+		t.Fatalf("AcknowledgeCredentialPossession() error = %v", err)
+	}
+	if err := worker.ActivateCredentialRotation(receipt); err != nil {
+		t.Fatalf("ActivateCredentialRotation() error = %v", err)
+	}
+	active, err := worker.RetryCredentialActivation("rot_load")
+	if err != nil || active.Status != CredentialRotationActive {
+		t.Fatalf("RetryCredentialActivation() = %+v, %v", active, err)
+	}
+	if err := worker.ReconnectCredential(2, active.Generation); err != nil {
+		t.Fatalf("ReconnectCredential() error = %v", err)
+	}
+	permit, err := worker.CredentialRecoveryPermit()
+	if err != nil || permit.SessionID != worker.SessionID() || permit.Epoch != 2 || permit.Generation != 1 {
+		t.Fatalf("CredentialRecoveryPermit() = %+v, %v", permit, err)
+	}
+	worker.MarkCredentialAuthorityLost()
+	if _, err := worker.CredentialRecoveryPermit(); !errors.Is(err, ErrCredentialAuthorityLost) {
+		t.Fatalf("authority-lost recovery permit = %v", err)
+	}
+}
+
+func TestAdapterGroupConfigurationAndAuthorityReplacement(t *testing.T) {
+	if _, err := NewGroupSupervisor(GroupSupervisorConfig{}); !errors.Is(err, ErrInvalidGroupSupervisorConfig) {
+		t.Fatalf("empty group config = %v", err)
+	}
+	if _, err := NewGroupSupervisor(GroupSupervisorConfig{MaxWorkers: 1}); !errors.Is(err, ErrInvalidGroupSupervisorConfig) {
+		t.Fatalf("missing lease group config = %v", err)
+	}
+	if (*GroupSupervisor)(nil).WorkerCount() != 0 || (*GroupSupervisor)(nil).Run(context.Background(), "x") == nil {
+		t.Fatal("nil group supervisor did not fail closed")
+	}
+	recovery, store := validGroupWorkerRecoveryWithStore("worker_replace", "ses_replace", 7)
+	replacement := recovery.Authority.receipt
+	replacement.AcceptedFence = 2
+	store.connection.AcceptedFence = 2
+	if err := recovery.Authority.lifecycle.Replace(replacement); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	if err := recovery.Authority.lifecycle.VerifyConnectionAuthority(context.Background(), replacement); err != nil {
+		t.Fatalf("VerifyConnectionAuthority(replacement) error = %v", err)
+	}
+	recovery.Authority.lifecycle.Revoke()
+	if err := recovery.Authority.lifecycle.Replace(replacement); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("Replace(revoked) error = %v", err)
+	}
+}
+
+func TestAdapterProviderEnvironmentRejectsCredentialNames(t *testing.T) {
+	if safeProviderEnvName("HUB_TOKEN") || safeProviderEnvName("SESSION_SECRET") || safeProviderEnvName("AGENTWHARF_WRAP_HELPER") != true {
+		t.Fatal("credential environment allowlist is not fail-closed")
+	}
+	values := providerEnvironment("/bin/echo", []string{"HUB_TOKEN=secret", "PATH=/bin", "AGENTWHARF_WRAP_HELPER=ok"})
+	joined := strings.Join(values, "\n")
+	if strings.Contains(joined, "HUB_TOKEN") || !strings.Contains(joined, "PATH=") || !strings.Contains(joined, "AGENTWHARF_WRAP_HELPER=ok") {
+		t.Fatalf("provider environment = %q", joined)
+	}
+}
+
+func TestAdapterProviderEnvironmentExplicitValuesOverrideInherited(t *testing.T) {
+	if !safeProviderEnvName("ANTHROPIC_AUTH_TOKEN") || safeProviderEnvName("ANTHROPIC_API_KEY") {
+		t.Fatal("Claude provider credential allowlist does not preserve auth-token semantics")
+	}
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "file-path")
+	values := providerEnvironment("/bin/echo", []string{"ANTHROPIC_AUTH_TOKEN=resolved-secret"})
+	found := false
+	for _, value := range values {
+		if strings.HasPrefix(value, "ANTHROPIC_AUTH_TOKEN=") {
+			found = true
+			if value != "ANTHROPIC_AUTH_TOKEN=resolved-secret" {
+				t.Fatalf("provider environment retained inherited credential: %q", value)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("provider environment dropped explicit auth token")
+	}
+}

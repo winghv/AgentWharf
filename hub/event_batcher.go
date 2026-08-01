@@ -3,11 +3,53 @@ package hub
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/winghv/agentwharf/protocol"
 	"github.com/winghv/agentwharf/store"
 )
+
+// sessionPublicationGates preserves one durable publication order per Session.
+// A cancelled waiter relays the queue token after its predecessor completes so
+// that later writers cannot bypass it.
+type sessionPublicationGates struct {
+	mu   sync.Mutex
+	tail map[string]chan struct{}
+}
+
+func (g *sessionPublicationGates) acquire(ctx context.Context, sessionID string) (func(), error) {
+	g.mu.Lock()
+	if g.tail == nil {
+		g.tail = make(map[string]chan struct{})
+	}
+	previous := g.tail[sessionID]
+	current := make(chan struct{})
+	g.tail[sessionID] = current
+	g.mu.Unlock()
+
+	if previous != nil {
+		select {
+		case <-previous:
+		case <-ctx.Done():
+			go func() {
+				<-previous
+				g.release(sessionID, current)
+			}()
+			return nil, ctx.Err()
+		}
+	}
+	return func() { g.release(sessionID, current) }, nil
+}
+
+func (g *sessionPublicationGates) release(sessionID string, current chan struct{}) {
+	g.mu.Lock()
+	if g.tail[sessionID] == current {
+		delete(g.tail, sessionID)
+	}
+	close(current)
+	g.mu.Unlock()
+}
 
 type adapterEventBatcherConfig struct {
 	Store       store.EventStore
@@ -16,6 +58,7 @@ type adapterEventBatcherConfig struct {
 	MaxEvents   int
 	Broadcast   func(context.Context, protocol.Event)
 	ReportError func(context.Context, error)
+	Publish     func(context.Context, []pendingAdapterEvent) error
 }
 
 type adapterEventBatcher struct {
@@ -30,6 +73,7 @@ type adapterEventBatcher struct {
 	queue       chan pendingAdapterEvent
 	broadcast   func(context.Context, protocol.Event)
 	reportError func(context.Context, error)
+	publish     func(context.Context, []pendingAdapterEvent) error
 }
 
 type pendingAdapterEvent struct {
@@ -58,6 +102,7 @@ func newAdapterEventBatcher(cfg adapterEventBatcherConfig) *adapterEventBatcher 
 		queue:       make(chan pendingAdapterEvent, maxEvents),
 		broadcast:   cfg.Broadcast,
 		reportError: cfg.ReportError,
+		publish:     cfg.Publish,
 	}
 	go b.run()
 	return b
@@ -155,6 +200,12 @@ func (b *adapterEventBatcher) run() {
 }
 
 func (b *adapterEventBatcher) flush(ctx context.Context, batch []pendingAdapterEvent) {
+	if b.publish != nil {
+		if err := b.publish(ctx, batch); err != nil && b.reportError != nil {
+			b.reportError(ctx, fmt.Errorf("persist event: %w", err))
+		}
+		return
+	}
 	pending := make([]store.PendingEvent, len(batch))
 	for i, item := range batch {
 		pending[i] = item.pending

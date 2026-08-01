@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -38,6 +40,73 @@ func TestProcessSupervisorRestartsCrashedProviderUpToLimit(t *testing.T) {
 	}
 	if started[0].Attempt != 1 || started[1].Attempt != 2 || started[2].Attempt != 3 {
 		t.Fatalf("started attempts = %+v", started)
+	}
+}
+
+func TestProcessSupervisorReAdmitsEveryChildStartAndFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeProcessRunner()
+	admission := &recordingProcessStartAdmission{rejectAttempt: 2}
+	supervisor, err := newProcessSupervisor(ProcessConfig{
+		Command:        ProcessCommand{Path: "provider"},
+		MaxRestarts:    2,
+		Backoff:        time.Millisecond,
+		GracePeriod:    20 * time.Millisecond,
+		StartAdmission: admission,
+	}, runner)
+	if err != nil {
+		t.Fatalf("newProcessSupervisor() error = %v", err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- supervisor.Run(context.Background()) }()
+	first := waitEvent(t, supervisor.Events(), ProcessEventStarted)
+	runner.handle(0).finish(errors.New("crashed"))
+	if err := <-runDone; err == nil {
+		t.Fatal("Run() succeeded after re-admission rejection")
+	}
+	if first.Attempt != 1 {
+		t.Fatalf("started attempt = %d, want 1", first.Attempt)
+	}
+	if got := runner.startCount(); got != 1 {
+		t.Fatalf("started child count = %d, want one admitted child", got)
+	}
+	if got := admission.calls(); !reflect.DeepEqual(got, []string{"prepare:1", "started:1", "prepare:2"}) {
+		t.Fatalf("admission calls = %v", got)
+	}
+}
+
+func TestBindRecoveryStartAdmissionFencesReplacedHandleBeforeRestart(t *testing.T) {
+	t.Parallel()
+
+	source := &fakeRecoveryStartHandleSource{handle: testRecoveryStartHandle(t, "a")}
+	delegate := &recordingProcessStartAdmission{}
+	bound, err := BindRecoveryStartAdmission(ProcessConfig{StartAdmission: delegate}, source)
+	if err != nil {
+		t.Fatalf("BindRecoveryStartAdmission() error = %v", err)
+	}
+	if err := bound.StartAdmission.PrepareProcessStart(context.Background(), 1); err != nil {
+		t.Fatalf("first PrepareProcessStart() error = %v", err)
+	}
+	if err := bound.StartAdmission.ConfirmProcessStarted(context.Background(), 1); err != nil {
+		t.Fatalf("first ConfirmProcessStarted() error = %v", err)
+	}
+
+	source.setHandle(testRecoveryStartHandle(t, "b"))
+	if err := bound.StartAdmission.PrepareProcessStart(context.Background(), 2); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("replaced PrepareProcessStart() error = %v, want ErrRecoveryAuthorityLost", err)
+	}
+	if got := delegate.calls(); !reflect.DeepEqual(got, []string{"prepare:1", "started:1"}) {
+		t.Fatalf("delegate calls after replacement = %v", got)
+	}
+}
+
+func TestBindRecoveryStartAdmissionRequiresStoreBackedDelegate(t *testing.T) {
+	t.Parallel()
+
+	if _, err := BindRecoveryStartAdmission(ProcessConfig{}, &fakeRecoveryStartHandleSource{handle: testRecoveryStartHandle(t, "a")}); !errors.Is(err, ErrRecoveryAuthorityLost) {
+		t.Fatalf("BindRecoveryStartAdmission() error = %v, want ErrRecoveryAuthorityLost", err)
 	}
 }
 
@@ -116,6 +185,41 @@ func TestProcessSupervisorStopsProviderWithInterrupt(t *testing.T) {
 	}
 }
 
+func TestProcessSupervisorInterruptsCurrentTurnWithoutStoppingProvider(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeProcessRunner()
+	supervisor, err := newProcessSupervisor(ProcessConfig{
+		Command:     ProcessCommand{Path: "provider"},
+		MaxRestarts: 1,
+		Backoff:     time.Millisecond,
+		GracePeriod: 20 * time.Millisecond,
+	}, runner)
+	if err != nil {
+		t.Fatalf("newProcessSupervisor() error = %v", err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- supervisor.Run(context.Background()) }()
+	_ = waitEvent(t, supervisor.Events(), ProcessEventStarted)
+
+	if err := supervisor.Interrupt(context.Background()); err != nil {
+		t.Fatalf("Interrupt() error = %v", err)
+	}
+	interrupts, kills := runner.handle(0).counts()
+	if interrupts != 1 || kills != 0 {
+		t.Fatalf("signals after interrupt = interrupt:%d kill:%d, want 1/0", interrupts, kills)
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run() completed after interrupt: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	runner.handle(0).finish(nil)
+	if err := <-runDone; err != nil {
+		t.Fatalf("Run() error after provider completion = %v", err)
+	}
+}
+
 func TestProcessSupervisorConnectsProviderStdio(t *testing.T) {
 	t.Parallel()
 
@@ -143,6 +247,43 @@ func TestProcessSupervisorConnectsProviderStdio(t *testing.T) {
 	}
 	if stdout.String() != "hello provider\n" {
 		t.Fatalf("provider stdout = %q", stdout.String())
+	}
+}
+
+func TestProcessSupervisorProviderDoesNotInheritAdapterEnvironment(t *testing.T) {
+	t.Setenv("AGENTWHARF_SECRET_CANARY", "adapter-secret-canary")
+	var stdout bytes.Buffer
+	supervisor, err := NewProcessSupervisor(ProcessConfig{
+		Command: ProcessCommand{
+			Path:   os.Args[0],
+			Args:   []string{"-test.run=TestProcessSupervisorHelperProcess"},
+			Env:    []string{"AGENTWHARF_HELPER_PROCESS=env"},
+			Stdout: &stdout,
+		},
+		MaxRestarts: 1,
+		GracePeriod: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewProcessSupervisor() error = %v", err)
+	}
+	if err := supervisor.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "secret=" {
+		t.Fatalf("provider environment = %q, want secret=", got)
+	}
+}
+
+func TestSafeProviderEnvNameRejectsArbitrarySensitiveHelpers(t *testing.T) {
+	for _, name := range []string{"MY_SECRET_HELPER", "API_TOKEN_HELPER", "AGENTWHARF_SECRET_HELPER"} {
+		if safeProviderEnvName(name) {
+			t.Fatalf("safeProviderEnvName(%q) = true, want false", name)
+		}
+	}
+	for _, name := range []string{"AGENTWHARF_HELPER_PROCESS", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_START_BLOCK_MARKER"} {
+		if !safeProviderEnvName(name) {
+			t.Fatalf("safeProviderEnvName(%q) = false, want true", name)
+		}
 	}
 }
 
@@ -194,6 +335,51 @@ func TestProcessSupervisorRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
+func TestSessionWorkerOwnsOneSessionAndProviderSupervisor(t *testing.T) {
+	t.Parallel()
+
+	runner := newFakeProcessRunner()
+	worker, err := newSessionWorker(SessionWorkerConfig{
+		SessionID: "ses_worker_1",
+		Provider: ProcessConfig{
+			Command:     ProcessCommand{Path: "provider"},
+			MaxRestarts: 1,
+			Backoff:     time.Millisecond,
+			GracePeriod: 20 * time.Millisecond,
+		},
+	}, runner)
+	if err != nil {
+		t.Fatalf("newSessionWorker() error = %v", err)
+	}
+	if got := worker.SessionID(); got != "ses_worker_1" {
+		t.Fatalf("SessionID() = %q, want ses_worker_1", got)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- worker.Run(context.Background()) }()
+	_ = waitEvent(t, worker.Events(), ProcessEventStarted)
+	if got := len(runner.started); got != 1 {
+		t.Fatalf("provider starts = %d, want one", got)
+	}
+	if err := worker.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("Run() error after Stop() = %v", err)
+	}
+}
+
+func TestSessionWorkerRejectsMissingSessionID(t *testing.T) {
+	t.Parallel()
+
+	_, err := newSessionWorker(SessionWorkerConfig{
+		Provider: ProcessConfig{Command: ProcessCommand{Path: "provider"}},
+	}, newFakeProcessRunner())
+	if !errors.Is(err, ErrInvalidSessionWorkerConfig) {
+		t.Fatalf("newSessionWorker() error = %v, want ErrInvalidSessionWorkerConfig", err)
+	}
+}
+
 func helperCommand(mode string) ProcessCommand {
 	return ProcessCommand{
 		Path: os.Args[0],
@@ -236,6 +422,75 @@ type fakeProcessRunner struct {
 	mu      sync.Mutex
 	nextPID int
 	started []*fakeProcessHandle
+}
+
+func (r *fakeProcessRunner) startCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.started)
+}
+
+type recordingProcessStartAdmission struct {
+	mu            sync.Mutex
+	rejectAttempt int
+	callsSeen     []string
+}
+
+type fakeRecoveryStartHandleSource struct {
+	mu     sync.Mutex
+	handle RecoveryStartHandle
+}
+
+func (s *fakeRecoveryStartHandleSource) RecoveryStartHandle() (RecoveryStartHandle, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.handle.value == "" {
+		return RecoveryStartHandle{}, ErrRecoveryAuthorityLost
+	}
+	return s.handle, nil
+}
+
+func (s *fakeRecoveryStartHandleSource) VerifyRecoveryStart(context.Context) error {
+	_, err := s.RecoveryStartHandle()
+	return err
+}
+
+func (s *fakeRecoveryStartHandleSource) setHandle(handle RecoveryStartHandle) {
+	s.mu.Lock()
+	s.handle = handle
+	s.mu.Unlock()
+}
+
+func testRecoveryStartHandle(t *testing.T, prefix string) RecoveryStartHandle {
+	t.Helper()
+	handle, err := NewRecoveryStartHandle(prefix + strings.Repeat("0", 31))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handle
+}
+
+func (a *recordingProcessStartAdmission) PrepareProcessStart(_ context.Context, attempt int) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.callsSeen = append(a.callsSeen, fmt.Sprintf("prepare:%d", attempt))
+	if attempt == a.rejectAttempt {
+		return errors.New("start admission rejected")
+	}
+	return nil
+}
+
+func (a *recordingProcessStartAdmission) ConfirmProcessStarted(_ context.Context, attempt int) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.callsSeen = append(a.callsSeen, fmt.Sprintf("started:%d", attempt))
+	return nil
+}
+
+func (a *recordingProcessStartAdmission) calls() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.callsSeen...)
 }
 
 type fakeProcessHandle struct {
@@ -302,6 +557,13 @@ func (h *fakeProcessHandle) Kill() error {
 	return nil
 }
 
+func (h *fakeProcessHandle) finish(err error) {
+	h.mu.Lock()
+	h.err = err
+	h.mu.Unlock()
+	h.once.Do(func() { close(h.done) })
+}
+
 func (h *fakeProcessHandle) counts() (int, int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -327,6 +589,9 @@ func runHelperProcess(mode string) {
 		os.Exit(0)
 	case "echo":
 		_, _ = io.Copy(os.Stdout, os.Stdin)
+		os.Exit(0)
+	case "env":
+		_, _ = fmt.Fprintf(os.Stdout, "secret=%s\n", os.Getenv("AGENTWHARF_SECRET_CANARY"))
 		os.Exit(0)
 	case "ignore":
 		signal.Reset(os.Interrupt)

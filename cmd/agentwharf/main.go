@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,18 +21,24 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/winghv/agentwharf/adapter/acp"
 	"github.com/winghv/agentwharf/adapter/core"
 	"github.com/winghv/agentwharf/adapter/fallback/jsonstream"
 	"github.com/winghv/agentwharf/auth"
 	"github.com/winghv/agentwharf/auth/static"
 	"github.com/winghv/agentwharf/hub"
+	"github.com/winghv/agentwharf/masking"
 	"github.com/winghv/agentwharf/protocol"
+	"github.com/winghv/agentwharf/store"
+	"github.com/winghv/agentwharf/store/postgres"
 	"github.com/winghv/agentwharf/store/sqlite"
 	"nhooyr.io/websocket"
 )
@@ -48,7 +56,10 @@ const (
 	cloudAPIMaxAttempts       = 3
 )
 
-var errUnsafeDefaultToken = errors.New("default local tokens require a loopback listen address")
+var (
+	errUnsafeDefaultToken = errors.New("default local tokens require a loopback listen address")
+	errClaimAuthRejection = errors.New("claim authentication rejected")
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -66,7 +77,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: wharf serve|wrap|claude|codex|gemini|logout|machine [options]")
+		return errors.New("usage: wharf serve|wrap|claude|codex|gemini|logout|machine|attention-backfill [options]")
 	}
 
 	switch args[0] {
@@ -114,9 +125,212 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 			return runMachineLogout(stdout)
 		}
 		return errors.New("usage: wharf machine unlink")
+	case "task":
+		return runTaskCommand(ctx, args[1:], stdin, stdout, stderr)
+	case "attention-backfill":
+		return runAttentionBackfill(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+type machineTaskClaimExchangeRequest struct {
+	ClaimCode string `json:"claim_code"`
+}
+
+type machineTaskClaimExchangeResponse struct {
+	Data struct {
+		SessionID    string `json:"session_id"`
+		Provider     string `json:"provider"`
+		HubWSURL     string `json:"hub_ws_url"`
+		AdapterToken string `json:"adapter_token"`
+		ExpiresAt    string `json:"expires_at"`
+		Session      struct {
+			Provider string `json:"provider"`
+		} `json:"session"`
+	} `json:"data"`
+}
+
+func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if len(args) < 2 || args[0] != "claim" {
+		return errors.New("usage: wharf task claim <claim_id> --code-stdin")
+	}
+	claimID := strings.TrimSpace(args[1])
+	if claimID == "" || strings.ContainsAny(claimID, "/\\") {
+		return errors.New("claim unavailable")
+	}
+	codeStdin := false
+	for _, arg := range args[2:] {
+		if arg == "--code-stdin" {
+			codeStdin = true
+			continue
+		}
+		return errors.New("usage: wharf task claim <claim_id> --code-stdin")
+	}
+	if codeStdin && claimInputIsTTY(stdin) {
+		return errors.New("claim code input unavailable")
+	}
+	var code []byte
+	var err error
+	if codeStdin {
+		code, err = readClaimCode(stdin)
+	} else {
+		if !claimInputIsTTY(stdin) {
+			return errors.New("claim code input unavailable")
+		}
+		code, err = readClaimCodeTTY(stdin, stderr)
+	}
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for index := range code {
+			code[index] = 0
+		}
+	}()
+	credential, err := loadMachineCredential()
+	if err != nil {
+		return errors.New("claim unavailable")
+	}
+	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machine-task-claims/"+url.PathEscape(claimID)+"/exchange")
+	if err != nil {
+		return errors.New("claim unavailable")
+	}
+	status, body, err := postCloudAPIJSON(ctx, &http.Client{Timeout: 30 * time.Second}, endpoint, credential.MachineToken, machineTaskClaimExchangeRequest{ClaimCode: string(code)})
+	if err != nil || status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return errors.New("claim unavailable")
+	}
+	var handoff machineTaskClaimExchangeResponse
+	if err := decodeCloudAPIJSON(body, &handoff); err != nil || handoff.Data.SessionID == "" || handoff.Data.HubWSURL == "" || handoff.Data.AdapterToken == "" || handoff.Data.ExpiresAt == "" {
+		return errors.New("claim unavailable")
+	}
+	provider := strings.TrimSpace(handoff.Data.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(handoff.Data.Session.Provider)
+	}
+	if provider == "" || strings.ContainsAny(provider, " \t\r\n") {
+		return errors.New("claim unavailable")
+	}
+	expiresAt, err := time.Parse(time.RFC3339, handoff.Data.ExpiresAt)
+	if err != nil || !expiresAt.After(time.Now().UTC()) {
+		return errors.New("claim unavailable")
+	}
+	agent := provider
+	if provider == "claude-code" {
+		agent = "claude"
+	}
+	cfg := wrapConfig{
+		HubURL:          handoff.Data.HubWSURL,
+		SessionID:       handoff.Data.SessionID,
+		Agent:           agent,
+		Provider:        provider,
+		AdapterToken:    handoff.Data.AdapterToken,
+		Format:          "acp",
+		ProviderCommand: defaultProviderCommand(agent),
+		ProtocolVersion: protocol.ProtocolVersion,
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := runWrap(ctx, cfg, strings.NewReader(""), stderr); err == nil {
+			return nil
+		} else if claimLaunchRequiresReclaim(err) {
+			return errors.New("reclaim required")
+		} else if attempt == 1 {
+			return errors.New("reclaim required")
+		}
+	}
+	return errors.New("reclaim required")
+}
+
+func claimLaunchRequiresReclaim(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errClaimAuthRejection) || errors.Is(err, core.ErrInvalidHelloAck) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "unauthorized") || strings.Contains(lower, "invalid hello ack") || strings.Contains(lower, "credential")
+}
+
+func claimInputIsTTY(input io.Reader) bool {
+	file, ok := input.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func readClaimCode(input io.Reader) ([]byte, error) {
+	line, err := bufio.NewReader(io.LimitReader(input, 257)).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, errors.New("claim code input unavailable")
+	}
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	if line == "" || len(line) > 256 || strings.ContainsAny(line, "\r\n") {
+		return nil, errors.New("claim code input unavailable")
+	}
+	return []byte(line), nil
+}
+
+func readClaimCodeTTY(input io.Reader, prompt io.Writer) ([]byte, error) {
+	file, ok := input.(*os.File)
+	if !ok || !claimInputIsTTY(input) {
+		return nil, errors.New("claim code input unavailable")
+	}
+	if err := setTerminalEcho(file, false); err != nil {
+		return nil, errors.New("claim code input unavailable")
+	}
+	defer func() { _ = setTerminalEcho(file, true) }()
+	if prompt != nil {
+		_, _ = fmt.Fprint(prompt, "Claim code: ")
+	}
+	code, err := readClaimCode(file)
+	if prompt != nil {
+		_, _ = fmt.Fprintln(prompt)
+	}
+	return code, err
+}
+
+func setTerminalEcho(file *os.File, enabled bool) error {
+	argument := "-echo"
+	if enabled {
+		argument = "echo"
+	}
+	command := exec.Command("stty", argument)
+	command.Stdin = file
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	return command.Run()
+}
+
+func runAttentionBackfill(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("attention-backfill", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	checkpoint := flags.String("checkpoint", "", "absolute checkpoint path")
+	batch := flags.Int("batch-size", 256, "sessions per bounded transaction")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *checkpoint == "" {
+		return errors.New("usage: wharf attention-backfill --checkpoint ABSOLUTE_PATH [--batch-size 1..256]")
+	}
+	dsn := os.Getenv("AGENTWHARF_POSTGRES_DSN")
+	if dsn == "" {
+		return errors.New("AGENTWHARF_POSTGRES_DSN is required")
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return errors.New("open attention backfill postgres pool")
+	}
+	defer pool.Close()
+	result, err := postgres.New(pool).RunAttentionBackfill(ctx, postgres.FileAttentionBackfillCheckpointStore{Path: *checkpoint}, *batch)
+	if err != nil {
+		return fmt.Errorf("run attention backfill: %w", err)
+	}
+	_, _ = fmt.Fprintf(stdout, "attention-backfill processed=%d incomplete=%d done=%t\n", result.Processed, result.Incomplete, result.Done)
+	return nil
 }
 
 func runMachineLogout(stdout io.Writer) error {
@@ -139,27 +353,32 @@ func runMachineLogout(stdout io.Writer) error {
 }
 
 type serveConfig struct {
-	Addr         string
-	DBPath       string
-	SessionID    string
-	Provider     string
-	ControlToken string
-	AdapterToken string
+	Addr                              string
+	DBPath                            string
+	SessionID                         string
+	Provider                          string
+	ControlToken                      string
+	AdapterToken                      string
+	SessionCredentialSignerKeyFile    string
+	SessionCredentialSignerKeyVersion int64
 }
 
 type wrapConfig struct {
-	HubURL          string
-	SessionID       string
-	Agent           string
-	Provider        string
-	AdapterToken    string
-	Format          string
-	SecretDir       string
-	Managed         bool
-	Pair            bool
-	CloudAPIURL     string
-	Heartbeat       heartbeatConfig
-	ProviderCommand []string
+	HubURL             string
+	SessionID          string
+	Agent              string
+	Provider           string
+	AdapterToken       string
+	Format             string
+	SecretDir          string
+	Managed            bool
+	Pair               bool
+	CloudAPIURL        string
+	Heartbeat          heartbeatConfig
+	ProviderCommand    []string
+	HealthMarker       string
+	ProviderCredential *core.ProcessCredential
+	ProtocolVersion    int
 }
 
 type heartbeatConfig struct {
@@ -217,12 +436,14 @@ type machineSessionResponse struct {
 
 func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
 	cfg := serveConfig{
-		Addr:         defaultServeAddr,
-		DBPath:       defaultDBPath(),
-		SessionID:    defaultSessionID,
-		Provider:     defaultProvider,
-		ControlToken: defaultControlToken,
-		AdapterToken: defaultAdapterToken,
+		Addr:                              defaultServeAddr,
+		DBPath:                            defaultDBPath(),
+		SessionID:                         defaultSessionID,
+		Provider:                          defaultProvider,
+		ControlToken:                      defaultControlToken,
+		AdapterToken:                      defaultAdapterToken,
+		SessionCredentialSignerKeyFile:    envOrDefault("AGENTWHARF_SESSION_CREDENTIAL_SIGNER_KEY_FILE", ""),
+		SessionCredentialSignerKeyVersion: 1,
 	}
 
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -233,25 +454,31 @@ func parseServeConfig(args []string, stderr io.Writer) (serveConfig, error) {
 	flags.StringVar(&cfg.Provider, "provider", cfg.Provider, "provider name")
 	flags.StringVar(&cfg.ControlToken, "control-token", cfg.ControlToken, "client control token")
 	flags.StringVar(&cfg.AdapterToken, "adapter-token", cfg.AdapterToken, "adapter token")
+	flags.StringVar(&cfg.SessionCredentialSignerKeyFile, "session-credential-signer-key-file", cfg.SessionCredentialSignerKeyFile, "local session credential signer key file")
+	flags.Int64Var(&cfg.SessionCredentialSignerKeyVersion, "session-credential-signer-key-version", cfg.SessionCredentialSignerKeyVersion, "local session credential signer key version")
 	if err := flags.Parse(args); err != nil {
 		return serveConfig{}, err
 	}
 	if flags.NArg() != 0 {
 		return serveConfig{}, fmt.Errorf("unexpected serve arguments: %v", flags.Args())
 	}
+	if cfg.SessionCredentialSignerKeyVersion < 1 {
+		return serveConfig{}, errors.New("session credential signer key version must be positive")
+	}
 	return normalizeServeConfig(cfg)
 }
 
 func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	cfg := wrapConfig{
-		HubURL:       envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
-		SessionID:    envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
-		Agent:        envOrDefault("AGENTWHARF_AGENT", "claude"),
-		Provider:     envOrDefault("AGENTWHARF_PROVIDER", ""),
-		AdapterToken: envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
-		Format:       envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
-		SecretDir:    envOrDefault("AGENTWHARF_SECRET_DIR", ""),
-		CloudAPIURL:  envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", "")),
+		HubURL:          envOrDefault("AGENTWHARF_HUB_URL", defaultWrapHubURL),
+		SessionID:       envOrDefault("AGENTWHARF_SESSION_ID", defaultSessionID),
+		Agent:           envOrDefault("AGENTWHARF_AGENT", "claude"),
+		Provider:        envOrDefault("AGENTWHARF_PROVIDER", ""),
+		AdapterToken:    envOrDefault("AGENTWHARF_ADAPTER_TOKEN", defaultAdapterToken),
+		Format:          envOrDefault("AGENTWHARF_FORMAT", "jsonstream"),
+		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
+		CloudAPIURL:     envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", "")),
+		ProtocolVersion: protocol.ProtocolVersion,
 	}
 	var useACP bool
 	var useJSONStream bool
@@ -269,6 +496,7 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL, usually ending in /v1")
 	flags.BoolVar(&useACP, "acp", false, "read ACP JSON frames from stdin")
 	flags.BoolVar(&useJSONStream, "jsonstream", false, "read Claude stream-json lines from stdin")
+	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", cfg.ProtocolVersion, "Adapter protocol version (1 or 2)")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
 	}
@@ -311,6 +539,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	flags.StringVar(&cfg.SecretDir, "secret-dir", cfg.SecretDir, "directory containing injected secret files for masking")
 	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL")
 	flags.BoolVar(&cfg.Pair, "pair", cfg.Pair, "pair this machine with SuperWHV before connecting")
+	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", protocol.ProtocolVersion, "Adapter protocol version (1 or 2)")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
 	}
@@ -360,6 +589,12 @@ func normalizeServeConfig(cfg serveConfig) (serveConfig, error) {
 			return serveConfig{}, err
 		}
 		cfg.AdapterToken = token
+	}
+	if cfg.SessionCredentialSignerKeyFile == "" {
+		cfg.SessionCredentialSignerKeyFile = strings.TrimSpace(os.Getenv("AGENTWHARF_SESSION_CREDENTIAL_SIGNER_KEY_FILE"))
+	}
+	if cfg.SessionCredentialSignerKeyVersion == 0 {
+		cfg.SessionCredentialSignerKeyVersion = 1
 	}
 	if !isLoopbackAddr(cfg.Addr) && usesDefaultToken(cfg) {
 		return serveConfig{}, errUnsafeDefaultToken
@@ -414,6 +649,21 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	cfg.SecretDir = filepath.Clean(cfg.SecretDir)
 	if cfg.SecretDir == "." {
 		cfg.SecretDir = ""
+	}
+	if cfg.ProtocolVersion == 0 {
+		cfg.ProtocolVersion = protocol.ProtocolVersion
+	}
+	if cfg.ProtocolVersion != protocol.ProtocolVersion && cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
+		return wrapConfig{}, errors.New("wrap protocol version must be 1 or 2")
+	}
+	if marker := strings.TrimSpace(os.Getenv("SUPERWHV_FIXED_ENTRY_HEALTH_PATH")); marker != "" {
+		uid, uidErr := strconv.ParseUint(os.Getenv("AGENTWHARF_PROVIDER_UID"), 10, 32)
+		gid, gidErr := strconv.ParseUint(os.Getenv("AGENTWHARF_PROVIDER_GID"), 10, 32)
+		if uidErr != nil || gidErr != nil || uid == 0 || gid == 0 {
+			return wrapConfig{}, errors.New("fixed entry requires non-root provider uid and gid")
+		}
+		cfg.HealthMarker = marker
+		cfg.ProviderCredential = &core.ProcessCredential{UID: uint32(uid), GID: uint32(gid)}
 	}
 	return cfg, nil
 }
@@ -528,6 +778,13 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	if err := validateProviderCommand(cfg); err != nil {
 		return cfg, err
 	}
+	metrics := core.NewAdapterMetrics()
+	diagnostics := startWrapDiagnostics(ctx, cfg, metrics)
+	if diagnostics != nil {
+		defer diagnostics.Close()
+	}
+	metrics.SetWorkerCounts(1, 0, 0)
+	defer metrics.SetWorkerCounts(0, 0, 0)
 	if cfg.Managed {
 		cfg, err = prepareManagedWrapSession(ctx, cfg, pairOutput)
 		if err != nil {
@@ -547,9 +804,10 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	state, err := core.NewAdapterConnectionState(core.AdapterConnectionConfig{
-		SessionID: cfg.SessionID,
-		Provider:  cfg.Provider,
-		Token:     cfg.AdapterToken,
+		SessionID:       cfg.SessionID,
+		Provider:        cfg.Provider,
+		Token:           cfg.AdapterToken,
+		ProtocolVersion: cfg.ProtocolVersion,
 	})
 	if err != nil {
 		return cfg, err
@@ -561,6 +819,9 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	frame, err := readCLIProtocolFrame(ctx, conn)
 	if err != nil {
 		return cfg, fmt.Errorf("read hello ack: %w", err)
+	}
+	if protocolErr, ok := frame.(*protocol.Error); ok && claimProtocolErrorRequiresReclaim(protocolErr) {
+		return cfg, fmt.Errorf("%w: %s: %s", errClaimAuthRejection, protocolErr.Code, protocolErr.Message)
 	}
 	ack, ok := frame.(*protocol.HelloAck)
 	if !ok {
@@ -575,7 +836,12 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	}
 
 	if len(cfg.ProviderCommand) > 0 {
-		return cfg, runWrapProvider(ctx, cfg, conn, masker)
+		if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
+			if ack.ConnectionAuthority == nil {
+				return cfg, errors.New("provider start requires v2 connection authority")
+			}
+		}
+		return cfg, runWrapProvider(ctx, cfg, conn, masker, metrics)
 	}
 
 	events, err := translateWrapInput(ctx, cfg, stdin)
@@ -590,8 +856,62 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		if err := writeCLIProtocolFrame(ctx, conn, &event); err != nil {
 			return cfg, fmt.Errorf("send event %s: %w", event.Type, err)
 		}
+		metrics.IncMaskedEvent()
 	}
 	return cfg, nil
+}
+
+func startWrapDiagnostics(ctx context.Context, cfg wrapConfig, metrics *core.AdapterMetrics) *core.AdapterDiagnosticsServer {
+	operatorUID, fixedEntryUID, ok := diagnosticsIdentityFromEnv(uint32(os.Geteuid()))
+	if !ok || cfg.HealthMarker == "" || cfg.ProviderCredential == nil || cfg.ProviderCredential.UID == 0 || cfg.ProviderCredential.UID == operatorUID || cfg.ProviderCredential.UID == fixedEntryUID {
+		return nil
+	}
+	root := filepath.Dir(cfg.HealthMarker)
+	if core.ValidateAdapterDiagnosticsRoot(root, cfg.HealthMarker, uint32(fixedEntryUID)) != nil {
+		return nil
+	}
+	socketPath := filepath.Join(root, "diagnostics.sock")
+	server, err := core.StartAdapterDiagnosticsWithConfig(ctx, core.AdapterDiagnosticsConfig{
+		SocketPath:    socketPath,
+		RootPath:      root,
+		MarkerPath:    cfg.HealthMarker,
+		Metrics:       metrics,
+		FixedEntryUID: uint32(fixedEntryUID),
+		OperatorUID:   uint32(operatorUID),
+		ProviderUID:   cfg.ProviderCredential.UID,
+	})
+	if err != nil {
+		return nil
+	}
+	return server
+}
+
+func diagnosticsIdentityFromEnv(effectiveUID uint32) (operatorUID, fixedEntryUID uint32, ok bool) {
+	operatorRaw := strings.TrimSpace(os.Getenv("AGENTWHARF_DIAGNOSTICS_OPERATOR_UID"))
+	fixedEntryRaw := strings.TrimSpace(os.Getenv("AGENTWHARF_FIXED_ENTRY_UID"))
+	if operatorRaw == "" && fixedEntryRaw == "" {
+		// HD-036 starts the fixed entry as root. Its effective identity is the
+		// trusted proof when a legacy provisioner has no reserved env fields.
+		if effectiveUID == 0 {
+			return 0, 0, true
+		}
+		return 0, 0, false
+	}
+	operator, operatorErr := strconv.ParseUint(operatorRaw, 10, 32)
+	fixedEntry, fixedEntryErr := strconv.ParseUint(fixedEntryRaw, 10, 32)
+	if operatorErr != nil || fixedEntryErr != nil || operator != fixedEntry {
+		return 0, 0, false
+	}
+	return uint32(operator), uint32(fixedEntry), true
+}
+
+func claimProtocolErrorRequiresReclaim(protocolErr *protocol.Error) bool {
+	if protocolErr == nil {
+		return false
+	}
+	code := strings.ToLower(strings.TrimSpace(protocolErr.Code))
+	return protocolErr.Fatal || code == "unauthorized" || code == "invalid_hello" ||
+		strings.Contains(code, "credential") || strings.Contains(code, "expired") || strings.Contains(code, "revoked")
 }
 
 func prepareManagedWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
@@ -981,9 +1301,14 @@ func sameCloudAPIURL(left string, right string) bool {
 	return strings.TrimRight(strings.TrimSpace(left), "/") == strings.TrimRight(strings.TrimSpace(right), "/")
 }
 
-func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker) error {
+func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
+	stopHealth, err := core.StartFixedEntryHealth(ctx, cfg.HealthMarker)
+	if err != nil {
+		return err
+	}
+	defer stopHealth()
 	if cfg.Format == "acp" {
-		return runWrapACPProvider(ctx, cfg, conn, masker)
+		return runWrapACPProvider(ctx, cfg, conn, masker, metrics)
 	}
 
 	stdinReader, stdinWriter, err := os.Pipe()
@@ -993,47 +1318,106 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 	defer stdinReader.Close()
 	defer stdinWriter.Close()
 	stdoutReader, stdoutWriter := io.Pipe()
-	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
-		Command: core.ProcessCommand{
-			Path:   cfg.ProviderCommand[0],
-			Args:   cfg.ProviderCommand[1:],
-			Stdin:  stdinReader,
-			Stdout: stdoutWriter,
-			Stderr: os.Stderr,
-		},
-	})
-	if err != nil {
-		return err
-	}
-
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	processDone := make(chan error, 1)
-	outputDone := make(chan error, 1)
-	commandDone := make(chan error, 1)
 	var writeMu sync.Mutex
 	writeFrame := func(frame protocol.Frame) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		return writeCLIProtocolFrame(runCtx, conn, frame)
 	}
+	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, conn, writeFrame, metrics)
+	var processAdmission core.ProcessStartAdmission
+	if startAdmission != nil {
+		processAdmission = startAdmission
+	}
+	command, err := providerProcessCommand(cfg, stdinReader, stdoutWriter, providerStderr(masker))
+	if err != nil {
+		return err
+	}
+	command.Credential = cfg.ProviderCredential
+	maxRestarts := 0
+	if cfg.Provider == "claude-code" && cfg.SecretDir != "" {
+		maxRestarts = -1
+	}
+	processConfig := core.ProcessConfig{
+		Command:        command,
+		MaxRestarts:    maxRestarts,
+		StartAdmission: processAdmission,
+	}
+	var supervisor *core.ProcessSupervisor
+	var recoveryGroup *core.GroupSupervisor
+	if startAdmission != nil {
+		recoveryGroup, err = core.NewGroupSupervisor(core.GroupSupervisorConfig{
+			MaxWorkers:                 1,
+			AllowReferenceOnlyRecovery: true,
+			NewWorker: func(workerCfg core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
+				if supervisor == nil {
+					return nil, errors.New("provider supervisor is unavailable")
+				}
+				workerCfg.Metrics = metrics
+				return supervisor, nil
+			},
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if startAdmission != nil {
+		processConfig, err = recoveryGroup.BindRecoveryStartAdmission(processConfig, startAdmission)
+		if err != nil {
+			return err
+		}
+	}
+	supervisor, err = core.NewProcessSupervisor(processConfig)
+	if err != nil {
+		return err
+	}
+
+	processDone := make(chan error, 1)
+	outputDone := make(chan error, 1)
+	commandDone := make(chan error, 1)
 	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
-	go func() {
-		err := supervisor.Run(runCtx)
-		_ = stdoutWriter.Close()
-		processDone <- err
-	}()
+	startSupervisor := func() {
+		go func() {
+			err := supervisor.Run(runCtx)
+			_ = stdoutWriter.Close()
+			processDone <- err
+		}()
+	}
+	startSupervisor()
+	metrics.SetWorkerCounts(1, 1, 0)
+	defer metrics.SetWorkerCounts(0, 0, 0)
+	if err := waitForFirstProviderStartAdmission(runCtx, startAdmission, processDone); err != nil {
+		cancel()
+		stopProviderSupervisor(supervisor)
+		return err
+	}
+	if startAdmission != nil {
+		if err := composeProviderGroupRecovery(runCtx, cfg, processConfig, supervisor, recoveryGroup, startAdmission); err != nil {
+			cancel()
+			stopProviderSupervisor(supervisor)
+			return err
+		}
+		startAdmission.watchLifecycle(runCtx, cancel)
+	}
+	if err := publishRunControlCapability(runCtx, conn, cfg, writeFrame); err != nil {
+		cancel()
+		stopProviderSupervisor(supervisor)
+		return err
+	}
 	go func() {
 		outputDone <- streamProviderOutput(runCtx, cfg, stdoutReader, func(event protocol.Event) error {
 			masked, err := maskEvent(masker, event)
 			if err != nil {
 				return err
 			}
+			metrics.IncMaskedEvent()
 			return writeFrame(&masked)
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToProvider(runCtx, conn, stdinWriter, writeFrame, observePong)
+		commandDone <- forwardHubCommandsToProvider(runCtx, conn, stdinWriter, writeFrame, observePong, startAdmission, supervisor, cfg)
 	}()
 
 	var processErr error
@@ -1083,7 +1467,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, 
 	}
 }
 
-func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker) error {
+func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Conn, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
 	stdinReader, stdinWriter, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("create provider stdin pipe: %w", err)
@@ -1091,27 +1475,91 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	defer stdinReader.Close()
 	defer stdinWriter.Close()
 	stdoutReader, stdoutWriter := io.Pipe()
-	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{
-		Command: core.ProcessCommand{
-			Path:   cfg.ProviderCommand[0],
-			Args:   cfg.ProviderCommand[1:],
-			Stdin:  stdinReader,
-			Stdout: stdoutWriter,
-			Stderr: os.Stderr,
-		},
-	})
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var writeMu sync.Mutex
+	writeFrame := func(frame protocol.Frame) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeCLIProtocolFrame(runCtx, conn, frame)
+	}
+	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, conn, writeFrame, metrics)
+	var processAdmission core.ProcessStartAdmission
+	if startAdmission != nil {
+		processAdmission = startAdmission
+	}
+	command, err := providerProcessCommand(cfg, stdinReader, stdoutWriter, providerStderr(masker))
+	if err != nil {
+		return err
+	}
+	command.Credential = cfg.ProviderCredential
+	maxRestarts := 0
+	if cfg.Provider == "claude-code" && cfg.SecretDir != "" {
+		maxRestarts = -1
+	}
+	processConfig := core.ProcessConfig{
+		Command:        command,
+		MaxRestarts:    maxRestarts,
+		StartAdmission: processAdmission,
+	}
+	var supervisor *core.ProcessSupervisor
+	var recoveryGroup *core.GroupSupervisor
+	if startAdmission != nil {
+		recoveryGroup, err = core.NewGroupSupervisor(core.GroupSupervisorConfig{
+			MaxWorkers:                 1,
+			AllowReferenceOnlyRecovery: true,
+			NewWorker: func(workerCfg core.SessionWorkerConfig) (core.SessionWorkerRunner, error) {
+				if supervisor == nil {
+					return nil, errors.New("provider supervisor is unavailable")
+				}
+				workerCfg.Metrics = metrics
+				return supervisor, nil
+			},
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if startAdmission != nil {
+		processConfig, err = recoveryGroup.BindRecoveryStartAdmission(processConfig, startAdmission)
+		if err != nil {
+			return err
+		}
+	}
+	supervisor, err = core.NewProcessSupervisor(processConfig)
 	if err != nil {
 		return err
 	}
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	processDone := make(chan error, 1)
-	go func() {
-		err := supervisor.Run(runCtx)
-		_ = stdoutWriter.Close()
-		processDone <- err
-	}()
+	startSupervisor := func() {
+		go func() {
+			err := supervisor.Run(runCtx)
+			_ = stdoutWriter.Close()
+			processDone <- err
+		}()
+	}
+	startSupervisor()
+	metrics.SetWorkerCounts(1, 1, 0)
+	defer metrics.SetWorkerCounts(0, 0, 0)
+	if err := waitForFirstProviderStartAdmission(runCtx, startAdmission, processDone); err != nil {
+		cancel()
+		stopProviderSupervisor(supervisor)
+		return err
+	}
+	if startAdmission != nil {
+		if err := composeProviderGroupRecovery(runCtx, cfg, processConfig, supervisor, recoveryGroup, startAdmission); err != nil {
+			cancel()
+			stopProviderSupervisor(supervisor)
+			return err
+		}
+		startAdmission.watchLifecycle(runCtx, cancel)
+	}
+	if err := publishRunControlCapability(runCtx, conn, cfg, writeFrame); err != nil {
+		cancel()
+		stopProviderSupervisor(supervisor)
+		return err
+	}
 
 	scanner := bufio.NewScanner(stdoutReader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -1159,21 +1607,15 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		cancel()
 		return errors.New("acp session/new response missing sessionId")
 	}
-	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID, masker); err != nil {
+	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID, masker, metrics); err != nil {
 		cancel()
 		return err
 	}
 
 	outputDone := make(chan error, 1)
 	commandDone := make(chan error, 1)
-	var writeMu sync.Mutex
 	var permissionMu sync.Mutex
 	pendingPermissions := make(map[string]acpPendingPermission)
-	writeFrame := func(frame protocol.Frame) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		return writeCLIProtocolFrame(runCtx, conn, frame)
-	}
 	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
 	go func() {
 		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, func(line []byte) {
@@ -1183,11 +1625,12 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 			if err != nil {
 				return err
 			}
+			metrics.IncMaskedEvent()
 			return writeFrame(&masked)
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, observePong, providerSessionID, 3, pendingPermissions, &permissionMu)
+		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, observePong, providerSessionID, 3, pendingPermissions, &permissionMu, startAdmission, supervisor, cfg)
 	}()
 
 	processFinished := false
@@ -1237,7 +1680,284 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	}
 }
 
-func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, providerSessionID string, masker *core.EventMasker) error {
+// providerStartAdmission is the Adapter-side, per-child handshake. The first
+// exchange owns the socket reader directly; later exchanges are delivered by
+// the command reader so ProcessSupervisor retries cannot race command routing.
+type providerStartAdmission struct {
+	conn    *websocket.Conn
+	write   func(protocol.Frame) error
+	metrics *core.AdapterMetrics
+
+	mu             sync.Mutex
+	direct         bool
+	recoveryHandle string
+	prepare        chan *protocol.ProviderStartPrepare
+	ack            chan *protocol.ProviderStartAck
+	firstAdmitted  chan struct{}
+	firstAdmitOnce sync.Once
+	invalidated    bool
+}
+
+func newProviderStartAdmission(version int, conn *websocket.Conn, write func(protocol.Frame) error, metrics *core.AdapterMetrics) *providerStartAdmission {
+	if version != protocol.ProtocolVersionV2 || conn == nil || write == nil {
+		return nil
+	}
+	return &providerStartAdmission{
+		conn: conn, write: write, metrics: metrics, direct: true,
+		prepare: make(chan *protocol.ProviderStartPrepare, 1), ack: make(chan *protocol.ProviderStartAck, 1),
+		firstAdmitted: make(chan struct{}),
+	}
+}
+
+func (a *providerStartAdmission) receiptFailure(err error) error {
+	if a != nil && a.metrics != nil && err != nil {
+		a.metrics.IncReceiptFailure()
+	}
+	return err
+}
+
+func (a *providerStartAdmission) PrepareProcessStart(ctx context.Context, attempt int) error {
+	if a == nil || attempt < 1 {
+		return a.receiptFailure(errors.New("provider start admission is unavailable"))
+	}
+	a.mu.Lock()
+	direct := a.direct
+	a.mu.Unlock()
+	if err := a.write(&protocol.ProviderStart{Attempt: attempt}); err != nil {
+		return a.receiptFailure(fmt.Errorf("request provider start admission: %w", err))
+	}
+	prepare, err := a.nextPrepare(ctx, direct)
+	if err != nil || prepare.Attempt != attempt {
+		return a.receiptFailure(errors.New("provider start preparation rejected"))
+	}
+	return nil
+}
+
+func (a *providerStartAdmission) ConfirmProcessStarted(ctx context.Context, attempt int) error {
+	if a == nil || attempt < 1 {
+		return a.receiptFailure(errors.New("provider start admission is unavailable"))
+	}
+	a.mu.Lock()
+	direct := a.direct
+	a.mu.Unlock()
+	if err := a.write(&protocol.ProviderStartStarted{Attempt: attempt}); err != nil {
+		return a.receiptFailure(fmt.Errorf("confirm provider start: %w", err))
+	}
+	ack, err := a.nextAck(ctx, direct)
+	if err != nil || ack.Attempt != attempt || ack.Status != protocol.ProviderStartAdmitted || ack.RecoveryHandle == "" {
+		return a.receiptFailure(errors.New("provider start admission rejected"))
+	}
+	a.mu.Lock()
+	if a.invalidated {
+		a.mu.Unlock()
+		return a.receiptFailure(errors.New("provider start authority is unavailable"))
+	}
+	a.direct = false
+	a.recoveryHandle = ack.RecoveryHandle
+	a.mu.Unlock()
+	a.firstAdmitOnce.Do(func() { close(a.firstAdmitted) })
+	return nil
+}
+
+func (a *providerStartAdmission) nextPrepare(ctx context.Context, direct bool) (*protocol.ProviderStartPrepare, error) {
+	if direct {
+		frame, err := readCLIProtocolFrame(ctx, a.conn)
+		if err != nil {
+			return nil, err
+		}
+		prepare, ok := frame.(*protocol.ProviderStartPrepare)
+		if !ok {
+			return nil, errors.New("provider start preparation rejected")
+		}
+		return prepare, nil
+	}
+	select {
+	case prepare := <-a.prepare:
+		return prepare, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (a *providerStartAdmission) nextAck(ctx context.Context, direct bool) (*protocol.ProviderStartAck, error) {
+	if direct {
+		frame, err := readCLIProtocolFrame(ctx, a.conn)
+		if err != nil {
+			return nil, err
+		}
+		ack, ok := frame.(*protocol.ProviderStartAck)
+		if !ok {
+			return nil, errors.New("provider start admission rejected")
+		}
+		return ack, nil
+	}
+	select {
+	case ack := <-a.ack:
+		return ack, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (a *providerStartAdmission) deliver(frame protocol.Frame) error {
+	if a == nil {
+		return errors.New("unexpected provider start lifecycle frame")
+	}
+	switch typed := frame.(type) {
+	case *protocol.ProviderStartPrepare:
+		select {
+		case a.prepare <- typed:
+			return nil
+		default:
+			return errors.New("unexpected provider start preparation")
+		}
+	case *protocol.ProviderStartAck:
+		select {
+		case a.ack <- typed:
+			return nil
+		default:
+			return errors.New("unexpected provider start acknowledgement")
+		}
+	default:
+		return errors.New("unexpected provider start lifecycle frame")
+	}
+}
+
+// RecoveryStartHandle returns only the opaque committed-start reference that a
+// later GroupSupervisor recovery fence may compare. It cannot expose a Store
+// key, credential, path, content, or Provider configuration.
+func (a *providerStartAdmission) RecoveryStartHandle() (core.RecoveryStartHandle, error) {
+	if a == nil {
+		return core.RecoveryStartHandle{}, errors.New("provider start admission is unavailable")
+	}
+	a.mu.Lock()
+	if a.invalidated {
+		a.mu.Unlock()
+		return core.RecoveryStartHandle{}, errors.New("provider start authority is unavailable")
+	}
+	handle := a.recoveryHandle
+	a.mu.Unlock()
+	return core.NewRecoveryStartHandle(handle)
+}
+
+// VerifyRecoveryStart turns the Hub's Store-backed connection lifecycle into
+// the local recovery fence. Hub closes this socket when replacement,
+// revocation, terminalization, expiry or quarantine invalidates the durable
+// tuple; no bearer or Store key is carried into the Adapter.
+func (a *providerStartAdmission) VerifyRecoveryStart(ctx context.Context) error {
+	if a == nil || a.conn == nil {
+		return errors.New("provider start authority is unavailable")
+	}
+	if _, err := a.RecoveryStartHandle(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *providerStartAdmission) invalidate() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.invalidated = true
+	a.recoveryHandle = ""
+	a.mu.Unlock()
+}
+
+func (a *providerStartAdmission) watchLifecycle(ctx context.Context, cancel context.CancelFunc) {
+	if a == nil || cancel == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := a.VerifyRecoveryStart(ctx); err != nil {
+					cancel()
+					return
+				}
+				pingCtx, pingCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+				err := a.conn.Ping(pingCtx)
+				pingCancel()
+				if err != nil && (websocket.CloseStatus(err) != -1 || errors.Is(err, net.ErrClosed)) {
+					a.invalidate()
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+}
+
+// composeProviderGroupRecovery is the production composition point for the
+// real GroupSupervisor.Recover path. The existing ProcessSupervisor remains
+// the child runner; GroupSupervisor stores only session membership and the
+// opaque reference, while Hub/Store remains the durable authority.
+
+func composeProviderGroupRecovery(ctx context.Context, cfg wrapConfig, processConfig core.ProcessConfig, supervisor *core.ProcessSupervisor, group *core.GroupSupervisor, admission *providerStartAdmission) error {
+	if supervisor == nil || group == nil || admission == nil {
+		return errors.New("provider recovery composition is unavailable")
+	}
+	handle, err := admission.RecoveryStartHandle()
+	if err != nil {
+		return err
+	}
+	recovery := core.GroupWorkerRecovery{
+		Admission: core.GroupWorkerAdmission{
+			WorkerID:  cfg.SessionID,
+			SessionID: cfg.SessionID,
+			Worker: core.SessionWorkerConfig{
+				SessionID: cfg.SessionID,
+				Provider:  processConfig,
+			},
+		},
+		StartHandle:       handle,
+		StartHandleSource: admission,
+	}
+	if err := group.Recover(ctx, recovery); err != nil {
+		return err
+	}
+	return nil
+}
+
+func waitForFirstProviderStartAdmission(ctx context.Context, admission *providerStartAdmission, processDone <-chan error) error {
+	if admission == nil {
+		return nil
+	}
+	select {
+	case <-admission.firstAdmitted:
+		return nil
+	default:
+	}
+	select {
+	case <-admission.firstAdmitted:
+		return nil
+	case err := <-processDone:
+		select {
+		case <-admission.firstAdmitted:
+			return nil
+		default:
+		}
+		if err == nil {
+			return errors.New("provider exited before start admission")
+		}
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("wait provider start admission: %w", ctx.Err())
+	}
+}
+
+func stopProviderSupervisor(supervisor *core.ProcessSupervisor) {
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopCancel()
+	_ = supervisor.Stop(stopCtx)
+}
+
+func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, providerSessionID string, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
 	payload, err := json.Marshal(map[string]any{
 		"state":               "ready",
 		"provider":            cfg.Provider,
@@ -1258,10 +1978,205 @@ func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wr
 	if err != nil {
 		return err
 	}
+	metrics.IncMaskedEvent()
 	if err := writeCLIProtocolFrame(ctx, conn, &event); err != nil {
 		return fmt.Errorf("send acp ready event: %w", err)
 	}
 	return nil
+}
+
+func publishRunControlCapability(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, writeFrame func(protocol.Frame) error) error {
+	if cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
+		return nil
+	}
+	proposalID, err := randomToken()
+	if err != nil {
+		return fmt.Errorf("generate run-control capability proposal: %w", err)
+	}
+	payload, err := json.Marshal(protocol.RunControlCapabilityPayload{
+		SchemaVersion: 1, InterruptSupported: true, StopSupported: true,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal run-control capability: %w", err)
+	}
+	return writeFrame(&protocol.Event{
+		Type: "session.run.capabilities", SessionID: cfg.SessionID,
+		Time: time.Now().UTC().UnixMilli(), Payload: payload, ProposalID: proposalID,
+	})
+}
+
+func handleProviderRunControl(ctx context.Context, command *protocol.Command, supervisor *core.ProcessSupervisor, writeFrame func(protocol.Frame) error, cfg wrapConfig, stop bool) error {
+	if command == nil || supervisor == nil {
+		return errors.New("run-control provider is unavailable")
+	}
+	operation := "interrupt"
+	completionState := "ready"
+	if stop {
+		operation = "stop"
+		completionState = "ended"
+	}
+	var operationErr error
+	if stop {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		operationErr = supervisor.Stop(stopCtx)
+		cancel()
+	} else {
+		operationErr = supervisor.Interrupt(ctx)
+	}
+	return acknowledgeRunControl(ctx, command, writeFrame, cfg, operation, completionState, operationErr)
+}
+
+func acknowledgeRunControl(ctx context.Context, command *protocol.Command, writeFrame func(protocol.Frame) error, cfg wrapConfig, operation, completionState string, operationErr error) error {
+	if command == nil || writeFrame == nil {
+		return errors.New("run-control acknowledgement is unavailable")
+	}
+	if err := writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted}); err != nil {
+		return fmt.Errorf("ack run-control command %s: %w", command.CommandID, err)
+	}
+	outcome := "completed"
+	var completion *string
+	var reason *string
+	if operationErr == nil {
+		completion = &completionState
+	} else if errors.Is(operationErr, context.DeadlineExceeded) {
+		outcome = "timeout"
+		code := "run_control_timeout"
+		reason = &code
+	} else if operation == "stop" {
+		outcome = "outcome_unknown"
+		code := "adapter_cleanup_uncertain"
+		reason = &code
+	} else {
+		outcome = "rejected"
+		code := "provider_rejected"
+		reason = &code
+	}
+	proposalID, err := randomToken()
+	if err != nil {
+		return fmt.Errorf("generate run-control outcome proposal: %w", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"cmd_id": command.CommandID, "operation": operation, "outcome": outcome,
+		"completion_state": completion, "reason_code": reason,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal run-control outcome: %w", err)
+	}
+	if err := writeFrame(&protocol.Event{
+		Type: "session.run.outcome", SessionID: cfg.SessionID,
+		Time: time.Now().UTC().UnixMilli(), Payload: payload, ProposalID: proposalID,
+	}); err != nil {
+		return fmt.Errorf("publish run-control outcome %s: %w", command.CommandID, err)
+	}
+	return nil
+}
+
+const maxProviderCredentialBytes = 64 * 1024
+
+func providerStderr(masker *core.EventMasker) io.Writer {
+	if masker == nil {
+		return os.Stderr
+	}
+	return masker.MaskWriter(nonClosingWriter{Writer: os.Stderr})
+}
+
+type nonClosingWriter struct{ io.Writer }
+
+func (nonClosingWriter) Close() error { return nil }
+
+// providerProcessCommand keeps the sandbox environment file-path-only. The
+// approved Claude provider bridge reads those paths only for its child process.
+func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, stderr io.Writer) (core.ProcessCommand, error) {
+	if len(cfg.ProviderCommand) == 0 {
+		return core.ProcessCommand{}, errors.New("provider command is required")
+	}
+	env, err := providerChildEnvironment(cfg, os.Environ())
+	if err != nil {
+		return core.ProcessCommand{}, err
+	}
+	return core.ProcessCommand{Path: cfg.ProviderCommand[0], Args: cfg.ProviderCommand[1:], Env: env, Stdin: stdin, Stdout: stdout, Stderr: stderr}, nil
+}
+
+func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
+	env := make([]string, 0, 2)
+	if cfg.Provider != "claude-code" || cfg.SecretDir == "" {
+		return env, nil
+	}
+	for _, credential := range []struct {
+		pathEnv  string
+		childEnv string
+	}{
+		{pathEnv: "ANTHROPIC_AUTH_TOKEN", childEnv: "ANTHROPIC_AUTH_TOKEN"},
+		{pathEnv: "ANTHROPIC_BASE_URL", childEnv: "ANTHROPIC_BASE_URL"},
+	} {
+		path := environmentValue(parent, credential.pathEnv)
+		if path == "" {
+			continue
+		}
+		value, err := readProviderCredentialFile(cfg.SecretDir, path)
+		if err != nil {
+			return nil, fmt.Errorf("load %s for provider child: %w", credential.pathEnv, err)
+		}
+		env = append(env, credential.childEnv+"="+value)
+	}
+	return env, nil
+}
+
+func environmentValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+func readProviderCredentialFile(secretDir string, valuePath string) (string, error) {
+	if !filepath.IsAbs(secretDir) || !filepath.IsAbs(valuePath) {
+		return "", errors.New("secret directory and credential path must be absolute")
+	}
+	root, err := filepath.EvalSymlinks(filepath.Clean(secretDir))
+	if err != nil {
+		return "", fmt.Errorf("resolve secret directory: %w", err)
+	}
+	path := filepath.Clean(valuePath)
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve credential file: %w", err)
+	}
+	rel, err := filepath.Rel(root, resolvedPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", errors.New("credential path is outside the injected secret directory")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open credential file: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat credential file: %w", err)
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("recheck credential file: %w", err)
+	}
+	if !info.Mode().IsRegular() || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, pathInfo) || info.Size() > maxProviderCredentialBytes {
+		return "", errors.New("credential file must be a bounded regular file")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxProviderCredentialBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read credential file: %w", err)
+	}
+	if len(data) > maxProviderCredentialBytes {
+		return "", errors.New("credential file must be a bounded regular file")
+	}
+	value := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
+	if len(value) < masking.MinSecretLength || strings.IndexByte(value, 0) >= 0 {
+		return "", fmt.Errorf("credential file must contain at least %d bytes of text", masking.MinSecretLength)
+	}
+	return value, nil
 }
 
 func eventMaskerFromSecretDir(dir string) (*core.EventMasker, error) {
@@ -1291,6 +2206,10 @@ func eventMaskerFromSecretDir(dir string) (*core.EventMasker, error) {
 		}
 		if len(data) > 0 {
 			secrets = append(secrets, string(data))
+			trimmed := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
+			if trimmed != "" && trimmed != string(data) {
+				secrets = append(secrets, trimmed)
+			}
 		}
 	}
 	return core.NewEventMasker(secrets), nil
@@ -1380,7 +2299,7 @@ func translateWrapLine(cfg wrapConfig, line []byte) ([]protocol.Event, error) {
 	}
 }
 
-func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string)) error {
+func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, cfg wrapConfig) error {
 	defer stdin.Close()
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
@@ -1388,16 +2307,20 @@ func forwardHubCommandsToProvider(ctx context.Context, conn *websocket.Conn, std
 			return ignoreContextError(err)
 		}
 		switch typed := frame.(type) {
+		case *protocol.ProviderStartPrepare, *protocol.ProviderStartAck:
+			if err := startAdmission.deliver(typed); err != nil {
+				return err
+			}
 		case *protocol.Command:
+			if typed.Type == protocol.CommandSessionInterrupt || typed.Type == protocol.CommandSessionStop {
+				return handleProviderRunControl(ctx, typed, supervisor, writeFrame, cfg, typed.Type == protocol.CommandSessionStop)
+			}
 			if err := writeProviderCommand(stdin, typed); err != nil {
 				return err
 			}
 			ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
 			if err := writeFrame(&ack); err != nil {
 				return fmt.Errorf("ack provider command %s: %w", typed.CommandID, err)
-			}
-			if typed.Type == protocol.CommandSessionStop {
-				return nil
 			}
 		case *protocol.Ping:
 			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
@@ -1452,7 +2375,7 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 	return nil
 }
 
-func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex) error {
+func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex, startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, cfg wrapConfig) error {
 	defer stdin.Close()
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
@@ -1460,8 +2383,20 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 			return ignoreContextError(err)
 		}
 		switch typed := frame.(type) {
+		case *protocol.ProviderStartPrepare, *protocol.ProviderStartAck:
+			if err := startAdmission.deliver(typed); err != nil {
+				return err
+			}
 		case *protocol.Command:
 			switch typed.Type {
+			case protocol.CommandSessionInterrupt:
+				if err := writeACPRequest(stdin, nextID, "session/cancel", map[string]any{"sessionId": providerSessionID}); err != nil {
+					return fmt.Errorf("write acp provider interrupt %s: %w", typed.CommandID, err)
+				}
+				nextID++
+				if err := acknowledgeRunControl(ctx, typed, writeFrame, cfg, "interrupt", "ready", nil); err != nil {
+					return err
+				}
 			case protocol.CommandSessionSend:
 				prompt, err := acpPromptFromSessionSend(typed.Payload)
 				if err != nil {
@@ -1499,9 +2434,8 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 					return fmt.Errorf("ack acp permission response %s: %w", typed.CommandID, err)
 				}
 			case protocol.CommandSessionStop:
-				ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
-				if err := writeFrame(&ack); err != nil {
-					return fmt.Errorf("ack acp provider stop %s: %w", typed.CommandID, err)
+				if err := handleProviderRunControl(ctx, typed, supervisor, writeFrame, cfg, true); err != nil {
+					return err
 				}
 				return nil
 			default:
@@ -1663,29 +2597,125 @@ func readACPResponse(ctx context.Context, scanner *bufio.Scanner, id int64) (map
 }
 
 func acpPromptFromSessionSend(payload []byte) ([]map[string]any, error) {
+	return acpPromptFromSessionSendAtRoot(payload, ".")
+}
+
+func acpPromptFromSessionSendAtRoot(payload []byte, rootPath string) ([]map[string]any, error) {
+	filePayload, err := protocol.DecodeFileReferenceSendPayload(payload)
+	if err != nil {
+		return nil, fmt.Errorf("invalid session.send payload: %w", err)
+	}
 	var decoded struct {
-		Content []struct {
-			Kind string `json:"kind"`
-			Text string `json:"text"`
-		} `json:"content"`
+		Content []json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		return nil, fmt.Errorf("invalid session.send payload: %w", err)
 	}
 	prompt := make([]map[string]any, 0, len(decoded.Content))
-	for _, part := range decoded.Content {
-		if part.Kind != "text" || part.Text == "" {
-			continue
+	if !filePayload.HasReferences {
+		for _, raw := range decoded.Content {
+			var part struct {
+				Kind string `json:"kind"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(raw, &part); err != nil {
+				return nil, fmt.Errorf("invalid session.send content: %w", err)
+			}
+			if part.Kind != "text" || part.Text == "" {
+				continue
+			}
+			prompt = append(prompt, map[string]any{"type": "text", "text": part.Text})
 		}
-		prompt = append(prompt, map[string]any{
-			"type": "text",
-			"text": part.Text,
-		})
+	} else {
+		root, err := os.OpenRoot(rootPath)
+		if err != nil {
+			return nil, errors.New("file reference workspace unavailable")
+		}
+		defer root.Close()
+		for index, raw := range decoded.Content {
+			var part map[string]any
+			if err := json.Unmarshal(raw, &part); err != nil {
+				return nil, fmt.Errorf("invalid file-reference content %d", index)
+			}
+			kind := stringFieldFromAny(part["kind"])
+			if kind == "text" {
+				text := stringFieldFromAny(part["text"])
+				if text == "" {
+					return nil, fmt.Errorf("invalid file-reference text %d", index)
+				}
+				prompt = append(prompt, map[string]any{"type": "text", "text": text})
+				continue
+			}
+			if kind != "file_reference" {
+				return nil, fmt.Errorf("unsupported session content %d", index)
+			}
+			content, err := readACPFileReference(root, part)
+			if err != nil {
+				return nil, fmt.Errorf("file reference %d rejected: %w", index, err)
+			}
+			prompt = append(prompt, content)
+		}
 	}
 	if len(prompt) == 0 {
 		return nil, errors.New("session.send payload has no text content")
 	}
 	return prompt, nil
+}
+
+func readACPFileReference(root *os.Root, part map[string]any) (map[string]any, error) {
+	if len(part) != 7 {
+		return nil, errors.New("invalid file-reference fields")
+	}
+	path := stringFieldFromAny(part["path"])
+	disposition := stringFieldFromAny(part["disposition"])
+	digest := stringFieldFromAny(part["content_digest"])
+	mediaType := stringFieldFromAny(part["media_type"])
+	declaredBytes, ok := part["bytes"].(float64)
+	if !ok || declaredBytes < 0 || declaredBytes > 10*1024*1024 || declaredBytes != float64(int64(declaredBytes)) {
+		return nil, errors.New("invalid file-reference size")
+	}
+	if disposition != "file" && disposition != "image" || path == "" || strings.HasPrefix(path, "/") || strings.Contains(path, "\\") || strings.Contains(path, "..") || strings.Contains(path, "\x00") {
+		return nil, errors.New("unsafe file-reference path")
+	}
+	if !strings.HasPrefix(digest, "sha256:") || len(digest) != len("sha256:")+64 {
+		return nil, errors.New("invalid file-reference digest")
+	}
+	if disposition == "image" && !allowedACPImageType(mediaType) {
+		return nil, errors.New("unsupported image type")
+	}
+	file, err := root.Open(path)
+	if err != nil {
+		return nil, errors.New("reference unavailable")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(declaredBytes) {
+		return nil, errors.New("reference changed")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, int64(declaredBytes)+1))
+	if err != nil || int64(len(data)) != int64(declaredBytes) {
+		return nil, errors.New("reference read failed")
+	}
+	digestSum := sha256.Sum256(data)
+	if fmt.Sprintf("sha256:%x", digestSum[:]) != digest {
+		return nil, errors.New("reference digest mismatch")
+	}
+	if disposition == "image" {
+		return map[string]any{"type": "image", "data": base64.StdEncoding.EncodeToString(data), "mimeType": mediaType}, nil
+	}
+	if !utf8.Valid(data) {
+		return nil, errors.New("non-text file requires image disposition")
+	}
+	return map[string]any{"type": "text", "text": string(data)}, nil
+}
+
+func allowedACPImageType(mediaType string) bool {
+	switch mediaType {
+	case "image/png", "image/jpeg", "image/webp", "image/gif":
+		return true
+	default:
+		return false
+	}
 }
 
 func stringFieldFromAny(value any) string {
@@ -1783,15 +2813,22 @@ func readCLIProtocolFrame(ctx context.Context, conn *websocket.Conn) (protocol.F
 }
 
 type runningServe struct {
-	server *http.Server
-	store  interface{ Close() error }
-	done   chan error
-	addr   string
-	wsURL  string
+	server      *http.Server
+	store       interface{ Close() error }
+	diagnostics *core.AdapterDiagnosticsServer
+	done        chan error
+	addr        string
+	wsURL       string
+	waitOnce    sync.Once
+	waitErr     error
 }
 
 func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 	cfg, err := normalizeServeConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	issuer, err := newLocalSessionCredentialIssuer(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -1809,7 +2846,7 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 		return nil, fmt.Errorf("listen %s: %w", cfg.Addr, err)
 	}
 
-	authenticator := static.New([]static.Token{
+	baseAuthenticator := static.New([]static.Token{
 		{
 			Token:   cfg.ControlToken,
 			Subject: "local-client",
@@ -1821,17 +2858,15 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 			Scopes:  []auth.Scope{auth.SessionAdapter(cfg.SessionID)},
 		},
 	})
+	authenticator := localSessionAuthenticator{Authenticator: baseAuthenticator, staticAdapterCredential: baseAuthenticator.AdapterCredential, sessionCredentialIssuer: issuer, sessionID: cfg.SessionID, provider: cfg.Provider}
+	sessionStore := localSessionStore{Store: eventStore, sessionID: cfg.SessionID}
 	handshake := hub.NewHandshake(hub.HandshakeConfig{
 		Authenticator: authenticator,
-		EventStore:    eventStore,
-		SessionLookup: singleSessionLookup{
-			sessionID: cfg.SessionID,
-			provider:  cfg.Provider,
-			state:     "ready",
-		},
+		EventStore:    sessionStore,
 	})
+	webSocketHandler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: sessionStore, SessionCredentialIssuer: issuer, SessionCredentialLifecycle: issuer})
 	server := &http.Server{
-		Handler:           hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: eventStore}),
+		Handler:           hub.NewObservabilityHandler(cfg.ControlToken, webSocketHandler),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -1861,27 +2896,94 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 	return running, nil
 }
 
+func newLocalSessionCredentialIssuer(cfg serveConfig) (*auth.LocalSessionCredentialIssuer, error) {
+	if cfg.SessionCredentialSignerKeyFile == "" {
+		return nil, errors.New("session credential signer key file is required")
+	}
+	info, err := os.Lstat(cfg.SessionCredentialSignerKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("read session credential signer key: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return nil, errors.New("session credential signer key file must be private and regular")
+	}
+	file, err := os.Open(cfg.SessionCredentialSignerKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("open session credential signer key: %w", err)
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || openedInfo.Mode().Perm()&0o077 != 0 || !os.SameFile(info, openedInfo) {
+		return nil, errors.New("session credential signer key file changed or is unsafe")
+	}
+	key, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil || len(key) == 0 || len(key) > 4096 {
+		return nil, errors.New("session credential signer key is invalid")
+	}
+	issuer, err := auth.NewLocalSessionCredentialIssuer(key, cfg.SessionCredentialSignerKeyVersion)
+	if err != nil {
+		return nil, errors.New("session credential signer configuration is invalid")
+	}
+	return issuer, nil
+}
+
 func (r *runningServe) wait() error {
-	serveErr := <-r.done
-	closeErr := r.store.Close()
-	if serveErr != nil {
-		return serveErr
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close sqlite store: %w", closeErr)
-	}
-	return nil
+	r.waitOnce.Do(func() {
+		serveErr := <-r.done
+		var diagnosticsErr error
+		if r.diagnostics != nil {
+			diagnosticsErr = r.diagnostics.Close()
+		}
+		closeErr := r.store.Close()
+		if serveErr != nil {
+			r.waitErr = serveErr
+		} else if closeErr != nil {
+			r.waitErr = fmt.Errorf("close sqlite store: %w", closeErr)
+		} else if diagnosticsErr != nil {
+			r.waitErr = fmt.Errorf("close adapter diagnostics: %w", diagnosticsErr)
+		}
+	})
+	return r.waitErr
 }
 
-type singleSessionLookup struct {
+type localSessionAuthenticator struct {
+	auth.Authenticator
+	staticAdapterCredential func(context.Context, string, auth.Principal, string) (int64, int64, bool, error)
+	sessionCredentialIssuer *auth.LocalSessionCredentialIssuer
+	sessionID               string
+	provider                string
+}
+
+func (a localSessionAuthenticator) Authenticate(ctx context.Context, token string) (auth.Principal, error) {
+	principal, err := a.Authenticator.Authenticate(ctx, token)
+	if err == nil {
+		return principal, nil
+	}
+	if a.sessionCredentialIssuer == nil {
+		return auth.Principal{}, err
+	}
+	principal, issuerErr := a.sessionCredentialIssuer.AuthenticateSessionCredential(ctx, token)
+	if issuerErr != nil || len(principal.Scopes) != 1 || principal.Scopes[0] != auth.SessionAdapter(a.sessionID) {
+		return auth.Principal{}, err
+	}
+	return principal, nil
+}
+
+func (a localSessionAuthenticator) SessionAdmissionClaim(_ context.Context, _ auth.Principal, sessionID string) (auth.SessionAdmissionClaim, error) {
+	if sessionID != a.sessionID {
+		return auth.SessionAdmissionClaim{}, auth.ErrUnauthorized
+	}
+	return auth.SessionAdmissionClaim{SessionID: sessionID, Provider: a.provider, ExpiresAt: time.Now().Add(5 * time.Minute)}, nil
+}
+
+type localSessionStore struct {
+	*sqlite.Store
 	sessionID string
-	provider  string
-	state     string
 }
 
-func (s singleSessionLookup) LookupSession(_ context.Context, sessionID string) (hub.SessionInfo, error) {
+func (s localSessionStore) SessionAdmissionTruth(_ context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
 	if sessionID != s.sessionID {
-		return hub.SessionInfo{}, hub.ErrSessionNotFound
+		return store.SessionAdmissionTruth{}, auth.ErrUnauthorized
 	}
-	return hub.SessionInfo{State: s.state, Provider: s.provider}, nil
+	return store.SessionAdmissionTruth{SessionID: sessionID, Exists: true, Complete: true, Live: true}, nil
 }

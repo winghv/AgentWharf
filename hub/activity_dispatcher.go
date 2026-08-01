@@ -1,0 +1,176 @@
+package hub
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/winghv/agentwharf/store"
+)
+
+const (
+	defaultActivityDispatchInterval = time.Minute
+	defaultActivityDispatchTimeout  = 5 * time.Second
+)
+
+// ActivitySink receives provider-neutral, Store-committed activity summaries.
+// It deliberately contains only durable summary facts, so dispatch cannot
+// become another source of activity truth.
+type ActivitySummary struct {
+	SessionID           string
+	State               string
+	LastDurableSeq      int64
+	LedgerVersion       int64
+	LastDurableEventAt  *time.Time
+	LastClientCommandAt *time.Time
+	StoreSnapshotAt     time.Time
+	ProjectionState     string
+	BlockerKind         string
+	BlockerExpiresAt    *time.Time
+}
+
+type ActivitySink interface {
+	PublishActivitySummary(context.Context, ActivitySummary) error
+}
+
+type ActivitySinkFunc func(context.Context, ActivitySummary) error
+
+func (fn ActivitySinkFunc) PublishActivitySummary(ctx context.Context, summary ActivitySummary) error {
+	return fn(ctx, summary)
+}
+
+type ActivityDispatcherConfig struct {
+	Interval time.Duration
+}
+
+// ActivityDispatcher performs bounded keyset rescans. It has one ticker for
+// the whole Store and creates no Session-specific timers or goroutines.
+type ActivityDispatcher struct {
+	pages     store.AttentionSummaryPageStore
+	sink      ActivitySink
+	interval  time.Duration
+	scanToken chan struct{}
+	refreshMu sync.Mutex
+	refresh   *activityRefresh
+}
+
+type activityRefresh struct {
+	done chan struct{}
+	err  error
+}
+
+func NewActivityDispatcher(pages store.AttentionSummaryPageStore, sink ActivitySink, cfg ActivityDispatcherConfig) *ActivityDispatcher {
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = defaultActivityDispatchInterval
+	}
+	return &ActivityDispatcher{
+		pages: pages, sink: sink, interval: interval, scanToken: make(chan struct{}, 1),
+	}
+}
+
+func (d *ActivityDispatcher) Run(ctx context.Context) error {
+	if err := d.dispatchPeriodic(ctx); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(d.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := d.dispatchPeriodic(ctx); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (d *ActivityDispatcher) dispatchPeriodic(ctx context.Context) error {
+	periodicCtx, cancel := context.WithTimeout(ctx, defaultActivityDispatchTimeout)
+	defer cancel()
+	return d.DispatchOnce(periodicCtx)
+}
+
+func (d *ActivityDispatcher) DispatchOnce(ctx context.Context) error {
+	if d == nil || d.pages == nil || d.sink == nil {
+		return errors.New("activity dispatcher is not configured")
+	}
+	select {
+	case d.scanToken <- struct{}{}:
+		defer func() { <-d.scanToken }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return d.dispatchOnce(ctx)
+}
+
+func (d *ActivityDispatcher) dispatchOnce(ctx context.Context) error {
+	after := ""
+	for {
+		page, err := d.pages.AttentionSummaryPage(ctx, store.AttentionSummaryPageRequest{
+			AfterSessionID: after,
+			Limit:          store.MaxAttentionSummaryPageSize,
+		})
+		if err != nil {
+			return err
+		}
+		if page.SnapshotAt.IsZero() {
+			return errors.New("activity summary page snapshot is missing")
+		}
+		for _, summary := range page.Summaries {
+			if summary.SessionID <= after {
+				return errors.New("activity summary page is not strictly ordered")
+			}
+			after = summary.SessionID
+			activity := ActivitySummary{SessionID: summary.SessionID, State: summary.State, LastDurableSeq: summary.LatestSeq,
+				LedgerVersion: summary.SummaryVersion, LastDurableEventAt: summary.LastDurableEventAt, LastClientCommandAt: summary.LastClientCommandAt,
+				StoreSnapshotAt: page.SnapshotAt.UTC(), ProjectionState: summary.StateOfProjection}
+			if summary.Blocker != nil {
+				activity.BlockerKind, activity.BlockerExpiresAt = summary.Blocker.Kind, summary.Blocker.ExpiresAt
+			}
+			if err := d.sink.PublishActivitySummary(ctx, activity); err != nil {
+				return err
+			}
+		}
+		if page.NextAfterSessionID == nil {
+			return nil
+		}
+		if len(page.Summaries) == 0 || *page.NextAfterSessionID == "" || *page.NextAfterSessionID != after {
+			return errors.New("activity summary page continuation is invalid")
+		}
+	}
+}
+
+// RequestActivityRefresh requests one immediate Store-derived summary rescan.
+// Concurrent calls wait for the same scan, so the request cannot multiply
+// Store reads, callbacks, or background work.
+func (d *ActivityDispatcher) RequestActivityRefresh(ctx context.Context) error {
+	if d == nil || d.pages == nil || d.sink == nil {
+		return errors.New("activity dispatcher is not configured")
+	}
+
+	d.refreshMu.Lock()
+	if inFlight := d.refresh; inFlight != nil {
+		d.refreshMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-inFlight.done:
+			return inFlight.err
+		}
+	}
+	inFlight := &activityRefresh{done: make(chan struct{})}
+	d.refresh = inFlight
+	d.refreshMu.Unlock()
+
+	err := d.DispatchOnce(ctx)
+	d.refreshMu.Lock()
+	inFlight.err = err
+	d.refresh = nil
+	close(inFlight.done)
+	d.refreshMu.Unlock()
+	return err
+}
