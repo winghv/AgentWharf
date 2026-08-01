@@ -3231,9 +3231,10 @@ type clientConnection struct {
 }
 
 type subscriptionState struct {
-	lastSeq   int64
-	replaying bool
-	buffered  []protocol.Event
+	lastSeq            int64
+	replaying          bool
+	buffered           []protocol.Event
+	bufferedEphemerals map[string]int
 }
 
 func newClientConnection(conn *managedConn, protocolVersion int, subscriptions []protocol.Subscription, replaying bool, publisherEphemeralTypes map[string]struct{}) *clientConnection {
@@ -3246,8 +3247,9 @@ func newClientConnection(conn *managedConn, protocolVersion int, subscriptions [
 	}
 	for _, sub := range subscriptions {
 		peer.subscriptions[sub.SessionID] = &subscriptionState{
-			lastSeq:   sub.LastSeq,
-			replaying: replaying,
+			lastSeq:            sub.LastSeq,
+			replaying:          replaying,
+			bufferedEphemerals: make(map[string]int),
 		}
 	}
 	return peer
@@ -3303,11 +3305,21 @@ func (c *clientConnection) sendLiveEvent(ctx context.Context, ev protocol.Event)
 		return nil
 	}
 	if state.replaying {
+		if ev.Seq == nil {
+			if index, found := state.bufferedEphemerals[ev.Type]; found {
+				state.buffered[index] = cloneProtocolEvent(ev)
+				c.mu.Unlock()
+				return nil
+			}
+		}
 		if len(state.buffered) >= maxReplayBufferedEvents {
 			c.mu.Unlock()
 			return errReplayBufferOverflow
 		}
 		state.buffered = append(state.buffered, cloneProtocolEvent(ev))
+		if ev.Seq == nil {
+			state.bufferedEphemerals[ev.Type] = len(state.buffered) - 1
+		}
 		c.mu.Unlock()
 		return nil
 	}
@@ -3339,6 +3351,7 @@ func (c *clientConnection) finishReplay(ctx context.Context, sessionID string) e
 		}
 		buffered := append([]protocol.Event(nil), state.buffered...)
 		state.buffered = nil
+		clear(state.bufferedEphemerals)
 		if len(buffered) == 0 {
 			state.replaying = false
 			c.mu.Unlock()
