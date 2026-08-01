@@ -26,29 +26,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p dist
+          dist="$RUNNER_TEMP/agentwharf-dist"
+          mkdir -p "$dist"
 
           build_unix() {
             local os="$1"
             local arch="$2"
-            local work="dist/agentwharf-$os-$arch"
+            local work="$dist/agentwharf-$os-$arch"
 
             rm -rf "$work"
             mkdir -p "$work"
             GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
               go build -trimpath -ldflags="-s -w" -o "$work/agentwharf" ./cmd/agentwharf
-            tar -C "$work" -czf "dist/agentwharf-$os-$arch.tar.gz" agentwharf
+            tar -C "$work" -czf "$dist/agentwharf-$os-$arch.tar.gz" agentwharf
           }
 
           build_windows() {
             local arch="$1"
-            local work="dist/agentwharf-windows-$arch"
+            local work="$dist/agentwharf-windows-$arch"
 
             rm -rf "$work"
             mkdir -p "$work"
             GOOS=windows GOARCH="$arch" CGO_ENABLED=0 \
               go build -trimpath -ldflags="-s -w" -o "$work/agentwharf.exe" ./cmd/agentwharf
-            (cd "$work" && zip -q "../agentwharf-windows-$arch.zip" agentwharf.exe)
+            (cd "$work" && zip -q "$dist/agentwharf-windows-$arch.zip" agentwharf.exe)
           }
 
           build_unix linux amd64
@@ -58,10 +59,10 @@ jobs:
           build_windows amd64
           build_windows arm64
 
-          cp scripts/install.sh dist/install.sh
-          chmod 0755 dist/install.sh
+          cp scripts/install.sh "$dist/install.sh"
+          chmod 0755 "$dist/install.sh"
 
-          (cd dist && shasum -a 256 \
+          (cd "$dist" && shasum -a 256 \
             agentwharf-darwin-amd64.tar.gz \
             agentwharf-darwin-arm64.tar.gz \
             agentwharf-linux-amd64.tar.gz \
@@ -76,20 +77,21 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          dist="$RUNNER_TEMP/agentwharf-dist"
 
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" \
-              dist/*.tar.gz \
-              dist/*.zip \
-              dist/install.sh \
-              dist/checksums.txt \
+              "$dist"/*.tar.gz \
+              "$dist"/*.zip \
+              "$dist"/install.sh \
+              "$dist"/checksums.txt \
               --clobber
           else
             gh release create "$TAG_NAME" \
-              dist/*.tar.gz \
-              dist/*.zip \
-              dist/install.sh \
-              dist/checksums.txt \
+              "$dist"/*.tar.gz \
+              "$dist"/*.zip \
+              "$dist"/install.sh \
+              "$dist"/checksums.txt \
               --title "$TAG_NAME" \
               --generate-notes
           fi
