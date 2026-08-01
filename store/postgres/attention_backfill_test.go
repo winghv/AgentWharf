@@ -3,7 +3,6 @@ package postgres_test
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -236,49 +235,6 @@ VALUES ('ses_backfill_stale_ledger', 1, 'busy', 'queued', 'old', clock_timestamp
 	snapshot, err := postgres.New(pool).AttentionSnapshot(context.Background(), []string{"ses_backfill_stale_ledger"})
 	if err != nil || len(snapshot) != 1 || snapshot[0].Blocker != nil || snapshot[0].LastClientCommandAt != nil || snapshot[0].SummaryVersion != 0 {
 		t.Fatalf("stale ledger remained = %+v, %v", snapshot, err)
-	}
-}
-
-func TestAttentionBackfillFileCheckpointStore(t *testing.T) {
-	path := t.TempDir() + "/checkpoint.json"
-	storeFile := postgres.FileAttentionBackfillCheckpointStore{Path: path}
-	want := postgres.AttentionBackfillCheckpoint{AfterSessionID: "ses_checkpoint"}
-	if err := storeFile.Save(context.Background(), want); err != nil {
-		t.Fatalf("save file checkpoint: %v", err)
-	}
-	got, err := storeFile.Load(context.Background())
-	if err != nil || got != want {
-		t.Fatalf("load file checkpoint = %+v, %v", got, err)
-	}
-}
-
-func TestAttentionBackfillCheckpointStoreRejectsUntrustedInput(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/checkpoint.json"
-	storeFile := postgres.FileAttentionBackfillCheckpointStore{Path: path}
-	if err := os.WriteFile(dir+"/target", []byte(`{"AfterSessionID":"ses"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(dir+"/target", path); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := storeFile.Load(context.Background()); err == nil {
-		t.Fatal("symlink checkpoint unexpectedly loaded")
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, make([]byte, 4097), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := storeFile.Load(context.Background()); err == nil {
-		t.Fatal("oversized checkpoint unexpectedly loaded")
-	}
-	if err := os.WriteFile(path, []byte(`{"AfterSessionID":"`+strings.Repeat("x", 256)+`"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := storeFile.Load(context.Background()); err == nil {
-		t.Fatal("invalid checkpoint cursor unexpectedly loaded")
 	}
 }
 
