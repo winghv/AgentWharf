@@ -196,6 +196,9 @@ func TestStartAdapterDiagnosticsUsesBoundedUnixSocket(t *testing.T) {
 			t.Fatalf("metrics request %d: %v", requestNumber, err)
 		}
 		response.Body.Close()
+		if !response.Close {
+			t.Fatalf("metrics request %d unexpectedly kept the diagnostics connection alive", requestNumber)
+		}
 		if response.StatusCode != http.StatusOK {
 			t.Fatalf("metrics request %d status = %d", requestNumber, response.StatusCode)
 		}

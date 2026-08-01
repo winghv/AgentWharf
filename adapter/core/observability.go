@@ -372,6 +372,10 @@ func StartAdapterDiagnosticsWithConfig(ctx context.Context, cfg AdapterDiagnosti
 		},
 		BaseContext: func(net.Listener) context.Context { return serverCtx },
 	}
+	// The Unix listener deliberately permits only two concurrent trusted peers.
+	// Diagnostics are small, bounded snapshots, so keeping idle HTTP connections
+	// open can consume both slots and make a later probe fail closed as a reset.
+	server.SetKeepAlivesEnabled(false)
 	result := &AdapterDiagnosticsServer{server: server, ln: peer, path: cfg.SocketPath, cancel: cancel}
 	go func() {
 		<-serverCtx.Done()
