@@ -16,7 +16,7 @@ func TestAppendAdapterEventsRevalidatesInsidePostgresTransaction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	const sessionID = "ses_dispatch_atomic"
-	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ($1)`, sessionID); err != nil {
+	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id, status) VALUES ($1, 'starting')`, sessionID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := harness.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
@@ -67,6 +67,47 @@ func TestAppendAdapterEventsRevalidatesInsidePostgresTransaction(t *testing.T) {
 	}
 }
 
+func TestAppendAdapterReadyProjectsSessionAdmissionState(t *testing.T) {
+	harness := newPostgresConnectionHarness(t)
+	ctx := context.Background()
+	const sessionID = "ses_dispatch_ready_projection"
+	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id, provider, status, started_at) VALUES ($1, 'claude-code', 'starting', clock_timestamp())`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := harness.AcceptAdapterHello(ctx, sessionID, store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := harness.AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.AppendAdapterEvents(ctx, sessionID, store.AdapterConnectionAdmission{
+		CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch,
+		AcceptedFence: connection.AcceptedFence, GrantFence: grant,
+	}, []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	truth, err := harness.SessionAdmissionTruth(ctx, sessionID)
+	want := store.SessionAdmissionTruth{SessionID: sessionID, Provider: "claude-code", Exists: true, Complete: true, Live: true}
+	if err != nil || truth != want {
+		t.Fatalf("SessionAdmissionTruth() = %+v, %v; want %+v, nil", truth, err, want)
+	}
+	var status string
+	var endedAt *time.Time
+	if err := harness.pool.QueryRow(ctx, `SELECT status, ended_at FROM agent_sessions WHERE id=$1`, sessionID).Scan(&status, &endedAt); err != nil {
+		t.Fatal(err)
+	}
+	if status != "ready" || endedAt != nil {
+		t.Fatalf("projected session = status %q ended_at %v, want ready/nil", status, endedAt)
+	}
+}
+
 func TestAppendAdapterEventsCommitsTerminalAttentionAndFencesAuthority(t *testing.T) {
 	for _, event := range []struct {
 		name    string
@@ -113,6 +154,14 @@ func TestAppendAdapterEventsCommitsTerminalAttentionAndFencesAuthority(t *testin
 			}
 			if latest, err := harness.LatestSeq(ctx, sessionID); err != nil || latest != 1 {
 				t.Fatalf("terminal latest sequence = %d, %v", latest, err)
+			}
+			var status string
+			var endedAt *time.Time
+			if err := harness.pool.QueryRow(ctx, `SELECT status, ended_at FROM agent_sessions WHERE id=$1`, sessionID).Scan(&status, &endedAt); err != nil {
+				t.Fatal(err)
+			}
+			if status != event.outcome || endedAt == nil {
+				t.Fatalf("terminal session projection = status %q ended_at %v, want %s/non-nil", status, endedAt, event.outcome)
 			}
 		})
 	}
@@ -373,7 +422,7 @@ func TestAppendAdapterEventsRejectsExpiryAfterInsertBeforeCommit(t *testing.T) {
 	if _, err := harness.pool.Exec(ctx, `CREATE TRIGGER slow_adapter_event BEFORE INSERT ON session_events FOR EACH ROW EXECUTE FUNCTION slow_adapter_event()`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ($1)`, sessionID); err != nil {
+	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id, status) VALUES ($1, 'starting')`, sessionID); err != nil {
 		t.Fatal(err)
 	}
 	expiresAt := time.Now().Add(300 * time.Millisecond)
@@ -402,5 +451,12 @@ func TestAppendAdapterEventsRejectsExpiryAfterInsertBeforeCommit(t *testing.T) {
 	}
 	if latest, err := harness.LatestSeq(ctx, sessionID); err != nil || latest != 0 {
 		t.Fatalf("latest seq after insert expiry = %d, %v", latest, err)
+	}
+	var status string
+	if err := harness.pool.QueryRow(ctx, `SELECT status FROM agent_sessions WHERE id=$1`, sessionID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "starting" {
+		t.Fatalf("failed adapter append projected status %q, want starting", status)
 	}
 }

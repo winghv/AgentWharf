@@ -11,6 +11,37 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const projectAgentSessionState = `-- name: ProjectAgentSessionState :execrows
+UPDATE agent_sessions
+SET status = $1::text,
+	ended_at = CASE
+		WHEN $2::boolean THEN COALESCE(ended_at, $3::timestamptz)
+		ELSE ended_at
+	END
+WHERE id = $4::text
+	AND status NOT IN ('ended', 'error')
+`
+
+type ProjectAgentSessionStateParams struct {
+	Status     string
+	Terminal   bool
+	ObservedAt pgtype.Timestamptz
+	SessionID  string
+}
+
+func (q *Queries) ProjectAgentSessionState(ctx context.Context, arg ProjectAgentSessionStateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, projectAgentSessionState,
+		arg.Status,
+		arg.Terminal,
+		arg.ObservedAt,
+		arg.SessionID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const sessionAdmissionTruth = `-- name: SessionAdmissionTruth :one
 SELECT id, provider, status, ended_at
 FROM agent_sessions

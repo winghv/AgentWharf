@@ -71,6 +71,67 @@ VALUES ('ses_live', 'claude-code', 'ready', clock_timestamp()),
 	}
 }
 
+func TestAppendProjectsCanonicalAgentSessionStates(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_session_state_projection_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	events := postgres.New(pool)
+	ctx := context.Background()
+
+	for _, test := range []struct {
+		name       string
+		eventType  string
+		payload    string
+		wantStatus string
+		terminal   bool
+	}{
+		{name: "ready", eventType: "session.state", payload: `{"state":"ready"}`, wantStatus: "ready"},
+		{name: "working", eventType: "session.state", payload: `{"state":"working"}`, wantStatus: "busy"},
+		{name: "waiting permission", eventType: "session.state", payload: `{"state":"waiting_permission"}`, wantStatus: "waiting_permission"},
+		{name: "recovering", eventType: "session.state", payload: `{"state":"recovering"}`, wantStatus: "recovering"},
+		{name: "ended", eventType: "session.state", payload: `{"state":"ended"}`, wantStatus: "ended", terminal: true},
+		{name: "error state", eventType: "session.state", payload: `{"state":"error"}`, wantStatus: "error", terminal: true},
+		{name: "error event", eventType: "session.error", payload: `{"reason":"provider_failed"}`, wantStatus: "error", terminal: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sessionID := "ses_projection_" + strings.ReplaceAll(test.name, " ", "_")
+			if _, err := pool.Exec(ctx, `INSERT INTO agent_sessions (id, provider, status, started_at) VALUES ($1, 'claude-code', 'starting', clock_timestamp())`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := events.Append(ctx, sessionID, []store.PendingEvent{{Type: test.eventType, Time: time.Now(), Payload: []byte(test.payload)}}); err != nil {
+				t.Fatal(err)
+			}
+			var status string
+			var endedAt *time.Time
+			if err := pool.QueryRow(ctx, `SELECT status, ended_at FROM agent_sessions WHERE id=$1`, sessionID).Scan(&status, &endedAt); err != nil {
+				t.Fatal(err)
+			}
+			if status != test.wantStatus || (endedAt != nil) != test.terminal {
+				t.Fatalf("projected session = status %q ended_at %v, want %s terminal=%t", status, endedAt, test.wantStatus, test.terminal)
+			}
+		})
+	}
+
+	const invalidSessionID = "ses_projection_invalid"
+	if _, err := pool.Exec(ctx, `INSERT INTO agent_sessions (id, provider, status, started_at) VALUES ($1, 'claude-code', 'starting', clock_timestamp())`, invalidSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := events.Append(ctx, invalidSessionID, []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"unknown"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	var invalidStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM agent_sessions WHERE id=$1`, invalidSessionID).Scan(&invalidStatus); err != nil {
+		t.Fatal(err)
+	}
+	if invalidStatus != "starting" {
+		t.Fatalf("invalid state projected as %q, want starting", invalidStatus)
+	}
+}
+
 func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_attention_page_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))

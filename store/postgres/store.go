@@ -210,6 +210,9 @@ func appendEventsLocked(ctx context.Context, queries *db.Queries, sessionID stri
 		if err := projectAttentionEvent(ctx, queries, sessionID, seq, projection, storeNow.Time); err != nil {
 			return 0, false, fmt.Errorf("project attention event seq %d: %w", seq, err)
 		}
+		if err := projectAgentSessionState(ctx, queries, sessionID, projection, storeNow.Time); err != nil {
+			return 0, false, fmt.Errorf("project agent session state seq %d: %w", seq, err)
+		}
 		terminal = terminal || projection.terminal
 	}
 	return firstSeq, terminal, nil
@@ -238,6 +241,17 @@ func projectAttentionEvent(ctx context.Context, queries *db.Queries, sessionID s
 		EventTime: pgtype.Timestamptz{Time: at, Valid: true}, StateObserved: projection.stateObserved,
 		ProjectionIncomplete: projection.projectionIncomplete,
 	})
+}
+
+func projectAgentSessionState(ctx context.Context, queries *db.Queries, sessionID string, projection attentionProjection, at time.Time) error {
+	state, ok := projection.state.(string)
+	if !projection.stateObserved || projection.projectionIncomplete || !ok || state == "" {
+		return nil
+	}
+	_, err := queries.ProjectAgentSessionState(ctx, db.ProjectAgentSessionStateParams{
+		Status: state, Terminal: projection.terminal, ObservedAt: pgtype.Timestamptz{Time: at, Valid: true}, SessionID: sessionID,
+	})
+	return err
 }
 
 func attentionEventProjection(event store.PendingEvent) attentionProjection {
