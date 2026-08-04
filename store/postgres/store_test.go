@@ -132,6 +132,43 @@ func TestAppendProjectsCanonicalAgentSessionStates(t *testing.T) {
 	}
 }
 
+func TestAppendWithCallerTransactionRollsBackWithLifecycleRows(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_event_tx_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO agent_sessions (id, provider, status, started_at) VALUES ('ses_event_tx', 'claude-code', 'starting', clock_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := postgres.NewEventStoreTx(tx).Append(ctx, "ses_event_tx", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ended"}`)}}); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("Append() with caller transaction: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var eventCount int
+	if err := pool.QueryRow(ctx, `SELECT status FROM agent_sessions WHERE id='ses_event_tx'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM session_events WHERE session_id='ses_event_tx'`).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if status != "starting" || eventCount != 0 {
+		t.Fatalf("caller transaction rollback left status=%q events=%d, want starting/0", status, eventCount)
+	}
+}
+
 func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_attention_page_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))

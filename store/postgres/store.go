@@ -22,6 +22,7 @@ import (
 type Store struct {
 	pool         *pgxpool.Pool
 	connectionTx pgx.Tx
+	eventTx      pgx.Tx
 }
 
 var _ store.SessionAdmissionTruthStore = (*Store)(nil)
@@ -37,6 +38,14 @@ func New(pool *pgxpool.Pool) *Store {
 // transaction. The caller alone commits or rolls it back.
 func NewAdapterConnectionTx(tx pgx.Tx) *Store {
 	return &Store{connectionTx: tx}
+}
+
+// NewEventStoreTx binds EventStore mutations to a caller-owned transaction.
+// The caller alone commits or rolls back the transaction. This is used when
+// a platform-owned lifecycle transition must commit its durable Session event
+// and companion rows atomically.
+func NewEventStoreTx(tx pgx.Tx) *Store {
+	return &Store{eventTx: tx}
 }
 
 func (s *Store) SessionAdmissionTruth(ctx context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
@@ -152,6 +161,9 @@ func (s *Store) Append(ctx context.Context, sessionID string, evs []store.Pendin
 	if len(evs) == 0 {
 		return 0, nil
 	}
+	if s.eventTx != nil {
+		return appendEventsInTx(ctx, s.eventTx, sessionID, evs)
+	}
 	if s.pool == nil {
 		return 0, errors.New("postgres event store pool is nil")
 	}
@@ -164,6 +176,17 @@ func (s *Store) Append(ctx context.Context, sessionID string, evs []store.Pendin
 		_ = tx.Rollback(ctx)
 	}()
 
+	firstSeq, err = appendEventsInTx(ctx, tx, sessionID, evs)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit append transaction: %w", err)
+	}
+	return firstSeq, nil
+}
+
+func appendEventsInTx(ctx context.Context, tx pgx.Tx, sessionID string, evs []store.PendingEvent) (firstSeq int64, err error) {
 	queries := db.New(tx)
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
 		return 0, fmt.Errorf("lock session event stream: %w", err)
@@ -176,10 +199,6 @@ func (s *Store) Append(ctx context.Context, sessionID string, evs []store.Pendin
 		if err := queries.FenceAttentionTerminal(ctx, sessionID); err != nil {
 			return 0, fmt.Errorf("fence terminal append event: %w", err)
 		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit append transaction: %w", err)
 	}
 	return firstSeq, nil
 }
