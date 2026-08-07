@@ -2516,3 +2516,110 @@ func payloadObject(t *testing.T, payload []byte) map[string]any {
 	}
 	return out
 }
+
+// The absolute working directory must never reach a durable event. This pins
+// the reduction at the emission point and mirrors, case for case, the Client
+// canonicalizer in console/src/sessionContextChips.ts. The two must agree: the
+// Client re-canonicalizes what it receives, so a divergence would silently
+// change the folder chip. Cases marked "parity" are copied from
+// console/test/sessionContextChips.test.ts.
+func TestCwdEventBasenameKeepsAbsolutePathOutOfDurableEvents(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"parity: posix path reduces to final segment", "/home/user/my-project", "my-project"},
+		{"parity: windows path reduces to final segment", "C:\\Users\\dev\\my-project", "my-project"},
+		{"parity: filesystem root has no segment", "/", ""},
+		{"parity: bare name passes through", "my-project", "my-project"},
+		{"parity: NUL and unit-separator are stripped", "/home/user/\x00evil\x1f", "evil"},
+		{"parity: DEL is stripped", "/home/user/evil\x7f", "evil"},
+		{"parity: traversal-terminal path is suppressed", "/home/user/..", ""},
+		{"parity: mid-path traversal keeps the real leaf", "/home/../projects/safe-app", "safe-app"},
+		{"parity: over-long segment is suppressed", "/home/" + strings.Repeat("a", 256), ""},
+		{"parity: empty input yields nothing", "", ""},
+		{"parity: non-ascii segment survives", "/home/user/超维项目", "超维项目"},
+		// Beyond the shared cases: the account name is the specific thing that
+		// must not survive, and a newline could otherwise smuggle framing.
+		{"account name is dropped", "/Users/alice/VscodeProjects/app", "app"},
+		{"newline is stripped", "/home/user/pro\nject", "project"},
+		{"trailing separator is ignored", "/home/user/my-project/", "my-project"},
+		{"already reduced input is unchanged", "my-project", "my-project"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := cwdEventBasename(tc.raw); got != tc.want {
+				t.Fatalf("cwdEventBasename(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// Reduction is idempotent, which is what lets the Client re-canonicalize a
+// received value without changing it.
+func TestCwdEventBasenameIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		"/Users/alice/VscodeProjects/app",
+		"C:\\Users\\dev\\my-project",
+		"/home/user/超维项目",
+		"my-project",
+	} {
+		once := cwdEventBasename(raw)
+		if twice := cwdEventBasename(once); twice != once {
+			t.Fatalf("cwdEventBasename not idempotent for %q: %q then %q", raw, once, twice)
+		}
+	}
+}
+
+// The emitted payload must carry only the basename, and must omit the key
+// outright when no safe segment exists rather than sending an empty string.
+func TestACPProviderReadyEventCarriesOnlyCwdBasename(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		cwd       string
+		wantValue string
+		wantKey   bool
+	}{
+		{"absolute path is reduced", "/Users/alice/VscodeProjects/superwhv", "superwhv", true},
+		{"unreducible path omits the key", "/", "", false},
+		{"traversal-terminal path omits the key", "/Users/alice/..", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Call the production payload builder, not a local copy of it, so a
+			// regression to the raw path fails here.
+			payload, err := acpProviderReadyPayload("claude-code", "acp_ses_1", tc.cwd)
+			if err != nil {
+				t.Fatalf("acpProviderReadyPayload() error = %v", err)
+			}
+
+			decoded := payloadObject(t, payload)
+			decodedMetadata, ok := decoded["metadata"].(map[string]any)
+			if !ok {
+				t.Fatalf("metadata missing from payload %s", string(payload))
+			}
+			value, present := decodedMetadata["cwd"]
+			if present != tc.wantKey {
+				t.Fatalf("cwd present = %v, want %v (payload %s)", present, tc.wantKey, string(payload))
+			}
+			if tc.wantKey && value != tc.wantValue {
+				t.Fatalf("cwd = %v, want %q", value, tc.wantValue)
+			}
+			// Whatever the input, no ancestor segment and no separator may
+			// survive into the serialized durable event.
+			for _, leaked := range []string{"VscodeProjects", "alice", "/Users"} {
+				if strings.Contains(string(payload), leaked) {
+					t.Fatalf("payload leaked %q: %s", leaked, string(payload))
+				}
+			}
+		})
+	}
+}

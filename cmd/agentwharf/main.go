@@ -1607,7 +1607,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		cancel()
 		return errors.New("acp session/new response missing sessionId")
 	}
-	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID, masker, metrics); err != nil {
+	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID, cwd, masker, metrics); err != nil {
 		cancel()
 		return err
 	}
@@ -1957,14 +1957,68 @@ func stopProviderSupervisor(supervisor *core.ProcessSupervisor) {
 	_ = supervisor.Stop(stopCtx)
 }
 
-func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, providerSessionID string, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
-	payload, err := json.Marshal(map[string]any{
+// cwdEventBasename reduces an absolute working directory to its final segment
+// for transmission in a durable protocol event.
+//
+// The full path is host content: it carries the operating-system account name
+// and the operator's whole directory layout, and `session.state` is durable, so
+// an absolute path would be retained in the EventStore and every replay of it.
+// `docs/03-sandbox-security.md` already forbids 文件路径 in records that leave
+// Adapter-only state, and the owner-approved decision for this field is
+// basename only. The reduction therefore happens here, before the event is
+// built, rather than in a consumer: a client-side basename would still leave
+// the full path durably stored.
+//
+// Control characters are stripped and both slash styles are split so a
+// Windows-style path reduces identically. A trailing ".." leaves the effective
+// directory undeterminable from the string alone, and an over-long segment
+// cannot be a real directory name, so both yield "" and the field is omitted
+// rather than carrying something misleading. The result is idempotent: feeding
+// an already-reduced basename back through returns it unchanged.
+func cwdEventBasename(raw string) string {
+	sanitized := strings.Map(func(r rune) rune {
+		if r <= 0x1f || r == 0x7f {
+			return -1
+		}
+		return r
+	}, raw)
+	segments := strings.FieldsFunc(sanitized, func(r rune) bool {
+		return r == '/' || r == '\\'
+	})
+	if len(segments) == 0 || segments[len(segments)-1] == ".." {
+		return ""
+	}
+	basename := segments[len(segments)-1]
+	if len(basename) > 255 {
+		return ""
+	}
+	return basename
+}
+
+// acpProviderReadyPayload builds the durable `session.state` ready payload.
+//
+// Kept separate from the send path so the reduction of cwd is testable without
+// a websocket: a test that rebuilt this map itself would assert only against its
+// own copy and would keep passing if the real payload regressed to the full
+// path.
+func acpProviderReadyPayload(provider string, providerSessionID string, cwd string) ([]byte, error) {
+	// Omit the key entirely when the path cannot be reduced safely, so a
+	// consumer sees an absent field rather than an empty or misleading one.
+	metadata := map[string]any{}
+	if basename := cwdEventBasename(cwd); basename != "" {
+		metadata["cwd"] = basename
+	}
+	return json.Marshal(map[string]any{
 		"state":               "ready",
-		"provider":            cfg.Provider,
+		"provider":            provider,
 		"provider_session_id": providerSessionID,
-		"metadata":            map[string]any{},
+		"metadata":            metadata,
 		"source":              "acp",
 	})
+}
+
+func sendACPProviderReadyEvent(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, providerSessionID string, cwd string, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
+	payload, err := acpProviderReadyPayload(cfg.Provider, providerSessionID, cwd)
 	if err != nil {
 		return fmt.Errorf("marshal acp ready event: %w", err)
 	}
