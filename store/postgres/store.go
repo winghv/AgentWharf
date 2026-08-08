@@ -3478,19 +3478,28 @@ func compactJSON(payload []byte) []byte {
 // an event row that outlives its Session as a permanently unreachable orphan
 // still carrying its payload.
 //
-// Lock order. appendEventsInTx takes this lock as its first statement, so
-// callers MUST take it before any row lock on agent_sessions to stay on that
-// order. AppendAdapterEvents is the one deliberate exception: it locks
-// session_adapter_connections FOR UPDATE first and takes this lock second, so
-// adapter authority is revalidated before any event-stream work. The resulting
-// global order is:
+// Lock order. Every path in this package takes this lock BEFORE any row lock,
+// session_adapter_connections included. Callers MUST do the same. There is one
+// global order and no exception to it:
 //
-//	session_adapter_connections row lock -> this advisory lock -> every other row lock
+//	this advisory lock -> session_adapter_connections row lock -> every other row lock
 //
-// A caller that removes session_adapter_connections rows while holding this
-// lock therefore closes a cycle against AppendAdapterEvents, and Postgres
-// aborts one side with SQLSTATE 40P01. Such a caller MUST take that row lock
-// before this one.
+// The order matters because three paths here take this lock and then write
+// session_adapter_connections: appendEventsInTx via FenceAttentionTerminal on a
+// terminal event (reachable from the exported Append),
+// TerminateAdapterConnectionBeforeHello, and acceptAdapterHelloWithWriterLeaseTx.
+// A caller that row-locks session_adapter_connections before taking this lock
+// closes a cycle against all three, and Postgres aborts one side with SQLSTATE
+// 40P01 -- failing either the caller or a durable event append.
+//
+// AppendAdapterEvents formerly inverted the order, row-locking
+// session_adapter_connections first so adapter authority was revalidated before
+// any event-stream work. It now takes this lock first and revalidates second.
+// That preserves the guarantee that no event is appended without valid
+// authority -- the row is still checked before the append, and rechecked after
+// it in the same transaction -- while removing the only ordering exception.
+// TestAppendAdapterEventsLocksEventStreamBeforeAuthority pins the current order
+// and fails with SQLSTATE 55P03 if the old one is restored.
 func SessionAppendLockKey(sessionID string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(sessionID))

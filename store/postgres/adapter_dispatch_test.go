@@ -216,7 +216,17 @@ func TestAppendAdapterEventsRejectsTerminalAttentionWithTail(t *testing.T) {
 	}
 }
 
-func TestAppendAdapterEventsLocksAuthorityBeforeEventStream(t *testing.T) {
+// TestAppendAdapterEventsLocksEventStreamBeforeAuthority pins the global lock
+// order: the advisory event-stream lock is taken before the adapter authority
+// row. This test previously pinned the reverse order, which made
+// AppendAdapterEvents the only path that locked the authority row first and so
+// closed an ABBA cycle against appendEventsInTx (public Store.Append),
+// TerminateAdapterConnectionBeforeHello and acceptAdapterHelloWithWriterLeaseTx,
+// all of which take the advisory lock before touching
+// session_adapter_connections. Admission is unchanged: the authority row lock
+// still gates every append and ValidateAdapterAdmission re-checks it after the
+// append in the same transaction.
+func TestAppendAdapterEventsLocksEventStreamBeforeAuthority(t *testing.T) {
 	harness := newPostgresConnectionHarness(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -237,19 +247,20 @@ func TestAppendAdapterEventsLocksAuthorityBeforeEventStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tracer := newQueryStartSignal("FROM session_adapter_connections WHERE session_id=$1")
+	tracer := newQueryStartSignal("pg_advisory_xact_lock")
 	harness.pool.Close()
 	harness.pool = openPool(t, harness.dsn, harness.schemaName, tracer)
 	harness.Store = postgres.New(harness.pool)
 	blocker := openPool(t, harness.dsn, harness.schemaName, nil)
 	t.Cleanup(blocker.Close)
-	authorityTx, err := blocker.Begin(ctx)
+	streamTx, err := blocker.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer authorityTx.Rollback(context.Background())
-	var locked int
-	if err := authorityTx.QueryRow(ctx, `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 FOR UPDATE`, sessionID).Scan(&locked); err != nil {
+	defer streamTx.Rollback(context.Background())
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(sessionID))
+	if _, err := streamTx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(hash.Sum64())); err != nil {
 		t.Fatal(err)
 	}
 	result := make(chan error, 1)
@@ -263,27 +274,26 @@ func TestAppendAdapterEventsLocksAuthorityBeforeEventStream(t *testing.T) {
 	select {
 	case <-tracer.started:
 	case <-ctx.Done():
-		t.Fatal("adapter append did not start authority validation")
+		t.Fatal("adapter append did not start event-stream locking")
 	}
-	streamTx, err := blocker.Begin(ctx)
+	// The append is now waiting for the advisory lock this test holds. Under the
+	// required order it has not touched the authority row yet, so NOWAIT
+	// succeeds. If it had locked the authority row first, NOWAIT fails with
+	// lock_not_available and the two paths deadlock. The outcome does not depend
+	// on how far the append progressed past the tracer, so this is not a race.
+	authorityTx, err := blocker.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var acquired bool
-	hash := fnv.New64a()
-	_, _ = hash.Write([]byte(sessionID))
-	if err := streamTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, int64(hash.Sum64())).Scan(&acquired); err != nil {
-		t.Fatal(err)
+	var locked int
+	authorityErr := authorityTx.QueryRow(ctx, `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 FOR UPDATE NOWAIT`, sessionID).Scan(&locked)
+	_ = authorityTx.Rollback(context.Background())
+	if authorityErr != nil {
+		_ = streamTx.Rollback(context.Background())
+		<-result
+		t.Fatalf("adapter append holds the authority row while waiting for the event-stream lock, so it deadlocks against every advisory-first path: %v", authorityErr)
 	}
 	if err := streamTx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if !acquired {
-		_ = authorityTx.Rollback(context.Background())
-		<-result
-		t.Fatal("adapter append acquired the event-stream lock before the authority row")
-	}
-	if err := authorityTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-result; err != nil {

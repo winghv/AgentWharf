@@ -35,11 +35,22 @@ func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admis
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := db.New(tx)
-	if err = tx.QueryRow(ctx, `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 AND active_credential_generation=$2 AND connection_epoch=$3 AND accepted_fence=$4 AND connection_epoch>0 AND accepted_fence>0 AND $5::BIGINT>accepted_fence AND active_credential_expires_at>clock_timestamp() AND revoked_at IS NULL AND terminal_at IS NULL FOR UPDATE`, sessionID, admission.CredentialGeneration, admission.ConnectionEpoch, admission.AcceptedFence, admission.GrantFence).Scan(new(int)); err != nil {
-		return 0, errors.New("adapter authority lost")
-	}
+	// Lock order: the advisory event-stream lock is taken first, then the adapter
+	// authority row. Every other path that touches both locks uses this order
+	// (appendEventsInTx before FenceAttentionTerminal,
+	// TerminateAdapterConnectionBeforeHello, acceptAdapterHelloWithWriterLeaseTx),
+	// so locking the authority row first here would close an ABBA cycle against
+	// them and Postgres would abort one side with SQLSTATE 40P01.
+	//
+	// Holding the advisory lock across the authority check does not weaken
+	// admission. The row lock below still gates every append, and
+	// ValidateAdapterAdmission re-checks authority after the append inside this
+	// same transaction, so no event can commit without valid adapter authority.
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
 		return 0, fmt.Errorf("lock session event stream: %w", err)
+	}
+	if err = tx.QueryRow(ctx, `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 AND active_credential_generation=$2 AND connection_epoch=$3 AND accepted_fence=$4 AND connection_epoch>0 AND accepted_fence>0 AND $5::BIGINT>accepted_fence AND active_credential_expires_at>clock_timestamp() AND revoked_at IS NULL AND terminal_at IS NULL FOR UPDATE`, sessionID, admission.CredentialGeneration, admission.ConnectionEpoch, admission.AcceptedFence, admission.GrantFence).Scan(new(int)); err != nil {
+		return 0, errors.New("adapter authority lost")
 	}
 	firstSeq, terminal, err := appendEventsLocked(ctx, queries, sessionID, events)
 	if err != nil {
