@@ -3463,8 +3463,33 @@ func compactJSON(payload []byte) []byte {
 	return compact.Bytes()
 }
 
-func advisoryLockKey(sessionID string) int64 {
+// SessionAppendLockKey derives the Postgres advisory lock key that serializes
+// every write to one Session's durable event stream. All append paths in this
+// package take pg_advisory_xact_lock on this key before touching session_events
+// or session_event_streams.
+//
+// This is exported because the key is a cross-module contract, not an
+// implementation detail. session_events and session_event_streams carry no
+// foreign key to agent_sessions, so a row-level FOR UPDATE on the Session row
+// does NOT conflict with an append: an FK insert would take FOR KEY SHARE on
+// the parent row, and with no FK there is nothing to take. Any component that
+// removes a Session's durable events -- specifically the platform's Session
+// hard delete -- must therefore take this same lock, in the same transaction,
+// before deleting them. Otherwise a concurrent Append commits an event row that
+// outlives its Session as a permanently unreachable orphan still carrying
+// tenant content.
+//
+// Callers MUST take this lock before any row lock on agent_sessions, matching
+// the order in appendEventsInTx, so the two paths cannot deadlock.
+func SessionAppendLockKey(sessionID string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(sessionID))
 	return int64(binary.BigEndian.Uint64(h.Sum(nil)))
+}
+
+// advisoryLockKey is the in-package spelling of SessionAppendLockKey. Both must
+// stay a single implementation: two Sessions that hash differently across
+// modules would silently stop serializing against each other.
+func advisoryLockKey(sessionID string) int64 {
+	return SessionAppendLockKey(sessionID)
 }
