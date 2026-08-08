@@ -3473,14 +3473,24 @@ func compactJSON(payload []byte) []byte {
 // foreign key to agent_sessions, so a row-level FOR UPDATE on the Session row
 // does NOT conflict with an append: an FK insert would take FOR KEY SHARE on
 // the parent row, and with no FK there is nothing to take. Any component that
-// removes a Session's durable events -- specifically the platform's Session
-// hard delete -- must therefore take this same lock, in the same transaction,
-// before deleting them. Otherwise a concurrent Append commits an event row that
-// outlives its Session as a permanently unreachable orphan still carrying
-// tenant content.
+// removes a Session's durable events must therefore take this same lock, in the
+// same transaction, before deleting them. Otherwise a concurrent Append commits
+// an event row that outlives its Session as a permanently unreachable orphan
+// still carrying its payload.
 //
-// Callers MUST take this lock before any row lock on agent_sessions, matching
-// the order in appendEventsInTx, so the two paths cannot deadlock.
+// Lock order. appendEventsInTx takes this lock as its first statement, so
+// callers MUST take it before any row lock on agent_sessions to stay on that
+// order. AppendAdapterEvents is the one deliberate exception: it locks
+// session_adapter_connections FOR UPDATE first and takes this lock second, so
+// adapter authority is revalidated before any event-stream work. The resulting
+// global order is:
+//
+//	session_adapter_connections row lock -> this advisory lock -> every other row lock
+//
+// A caller that removes session_adapter_connections rows while holding this
+// lock therefore closes a cycle against AppendAdapterEvents, and Postgres
+// aborts one side with SQLSTATE 40P01. Such a caller MUST take that row lock
+// before this one.
 func SessionAppendLockKey(sessionID string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(sessionID))

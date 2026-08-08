@@ -13,17 +13,17 @@ import (
 )
 
 // TestSessionAppendLockKeyIsTheKeyAppendActuallyTakes pins the cross-module
-// contract that the platform's Session hard delete depends on.
+// contract that an external Session hard delete depends on.
 //
-// SessionAppendLockKey is exported so the platform deleter can take the SAME
+// SessionAppendLockKey is exported so an external deleter can take the SAME
 // advisory lock that Append takes. session_events and session_event_streams
 // carry no foreign key to agent_sessions, so a row-level FOR UPDATE on the
 // Session row does not conflict with an append; this advisory lock is the only
 // thing that serializes them. If the exported key ever stopped matching the key
 // Append takes internally, both sides would still acquire a lock, both would
 // still succeed, and the serialization would silently disappear -- taking with
-// it the guarantee that a "permanent erasure" cannot leave tenant content
-// behind as an unreachable orphan.
+// it the guarantee that a "permanent erasure" cannot leave event payloads
+// behind as unreachable orphans.
 //
 // The assertion is behavioral, not a hash comparison: an equality check against
 // a recomputed FNV value would pass even if Append had been changed to lock a
