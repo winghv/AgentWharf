@@ -1,72 +1,19 @@
 package core
 
 import (
-	"errors"
-	"os"
 	"os/exec"
 	"testing"
-	"time"
 )
 
-// Kill is the escalation path the supervisor takes when Interrupt does not stop
-// a Provider child, so it is the last thing standing between a stuck Provider
-// and a leaked process. It had no test. Both branches are exercised here
-// against a real process rather than a fake handle, because the property under
-// test is that the OS process actually dies -- a mock would only prove that a
-// method was called.
-func TestExecProcessHandleKillTerminatesARunningChild(t *testing.T) {
-	t.Parallel()
-
-	// A shell that sleeps far longer than the test: if Kill does not work, the
-	// Wait below blocks and the test fails by timeout rather than passing
-	// silently.
-	handle, err := execProcessRunner{}.Start(ProcessCommand{
-		Path: shellPathForKillTest(t),
-		Args: []string{"-c", "sleep 300"},
-	})
-	if err != nil {
-		t.Fatalf("Start: unexpected error: %v", err)
-	}
-
-	pid := handle.PID()
-	if pid <= 0 {
-		t.Fatalf("PID() = %d, want a positive pid for a started process", pid)
-	}
-
-	if err := handle.Kill(); err != nil {
-		t.Fatalf("Kill: unexpected error: %v", err)
-	}
-
-	// Wait must return, and it must report the abnormal termination rather than
-	// a nil error -- a caller that saw nil would record a clean Provider exit
-	// for a process it had just killed.
-	waitErr := make(chan error, 1)
-	go func() { waitErr <- handle.Wait() }()
-
-	select {
-	case err := <-waitErr:
-		if err == nil {
-			t.Fatal("Wait returned nil after Kill; a killed child must not be reported as a clean exit")
-		}
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			t.Fatalf("Wait error = %v (%T), want *exec.ExitError carrying the signal", err, err)
-		}
-		if exitErr.Success() {
-			t.Fatalf("exit state reports success after Kill: %v", exitErr)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("Wait did not return within 30s after Kill; the child was not terminated")
-	}
-
-	// Confirm against the OS rather than trusting Wait alone. Signal 0 probes
-	// liveness without delivering anything; on a reaped pid it must fail.
-	if proc, findErr := os.FindProcess(pid); findErr == nil {
-		if sigErr := proc.Signal(os.Signal(nil)); sigErr == nil {
-			t.Fatalf("pid %d still accepts signals after Kill and Wait; the process was not reaped", pid)
-		}
-	}
-}
+// The real-child half of Kill's coverage lives in supervisor_kill_unix_test.go.
+// It asserts which signal terminated the child and probes the pid afterwards,
+// both of which need syscall.Kill and syscall.WaitStatus. Those do not exist on
+// Windows, and `GOOS=windows go vet ./...` is green today, so keeping them in
+// this untagged file would have regressed a working cross-compile invariant to
+// buy an assertion that only means anything on unix anyway.
+//
+// What stays here is the part that is genuinely portable: the nil-Process
+// guard, which is reachable on every platform.
 
 // The nil-Process branch is reachable whenever Kill races a handle whose child
 // never started, and it must be a no-op rather than a nil dereference. Without

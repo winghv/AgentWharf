@@ -30,8 +30,20 @@ func TestProbeChildConfidentialityIsUnavailableWithoutTheLinuxProof(t *testing.T
 	if errors.Is(err, ErrChildConfidentialityUnproven) {
 		t.Fatalf("error = %v, want ErrChildConfidentialityUnavailable only; this build never runs a probe, so reporting it as unproven claims a measurement that did not happen", err)
 	}
-	if report != (ChildConfidentialityReport{}) {
-		t.Fatalf("report = %+v, want the zero value; a non-Linux build has nothing to report", report)
+	// This comparison cannot fail today, and that is deliberate rather than
+	// overlooked: on this build ChildConfidentialityReport is an empty struct, so
+	// the zero value is its only value. An earlier version of this test wrote it
+	// as `report != (ChildConfidentialityReport{})` and presented it as a check on
+	// the returned report; an independent reviewer measured that it was incapable
+	// of failing.
+	//
+	// The explicit conversion is what earns the line its place. It is legal only
+	// while the non-Linux report has no fields, so adding one breaks compilation
+	// here and forces whoever adds it to say what this build should report --
+	// which is the property actually worth defending. The runtime check is not
+	// load-bearing; the conversion is.
+	if report != ChildConfidentialityReport(struct{}{}) {
+		t.Fatalf("report = %+v, want the zero value; a build with no approved proof has nothing to report", report)
 	}
 }
 
