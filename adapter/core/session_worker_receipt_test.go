@@ -102,6 +102,39 @@ func TestSessionWorkerCommandUsesDistinctRoutingAndLedgerReceipts(t *testing.T) 
 	}
 }
 
+func TestSessionWorkerAcceptsSettingsChangeThroughTheDurableCommandGate(t *testing.T) {
+	receipts := &testDurableReceiptGate{
+		commandAck: CommandRoutingReceipt{CommandID: "cmd_settings", Status: CommandRoutingAccepted},
+		ledgerReceipt: LedgerOperationReceipt{
+			OperationID: "op_settings",
+			Version:     1,
+			Status:      LedgerOperationPending,
+		},
+	}
+	worker, err := newSessionWorker(SessionWorkerConfig{
+		SessionID:       "ses_settings",
+		DurableReceipts: receipts,
+		Provider:        ProcessConfig{Command: ProcessCommand{Path: "provider"}},
+	}, newFakeProcessRunner())
+	if err != nil {
+		t.Fatalf("newSessionWorker() error = %v", err)
+	}
+	var applied bool
+	ack, err := worker.DeliverCommand(context.Background(), SessionWorkerCommand{
+		CommandID: "cmd_settings",
+		Type:      "session.settings.change",
+	}, func(context.Context) error {
+		applied = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("DeliverCommand(settings) error = %v", err)
+	}
+	if !applied || ack.Status != CommandRoutingAccepted {
+		t.Fatalf("settings command result = applied:%v ack:%+v", applied, ack)
+	}
+}
+
 func TestSessionWorkerRejectsUnknownCommandAndStaleReceiptWithoutSideEffect(t *testing.T) {
 	receipts := &testDurableReceiptGate{
 		commandAck:    CommandRoutingReceipt{CommandID: "other", Status: CommandRoutingAccepted},

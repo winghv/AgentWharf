@@ -114,12 +114,16 @@ export interface SettingsCapability {
   schemaVersion: number
   fingerprint: string
   models: SettingsCapabilityChoice[]
+  reasoningEfforts: SettingsCapabilityChoice[]
   permissionModes: SettingsCapabilityChoice[]
   effectiveModelId: string
+  effectiveReasoningEffortId?: string
   effectivePermissionModeId: string
   modelChange: 'allowed' | 'read_only'
+  reasoningEffortChange: 'allowed' | 'read_only' | 'unsupported'
   permissionChange: 'allowed' | 'read_only'
   modelReadOnlyReason?: string
+  reasoningEffortReadOnlyReason?: string
   permissionReadOnlyReason?: string
 }
 
@@ -131,6 +135,7 @@ export interface SettingsEffective {
   effectiveFingerprint: string
   outcome: SettingsChangeOutcome
   effectiveModelId: string
+  effectiveReasoningEffortId?: string
   effectivePermissionModeId: string
   reasonCode?: string
 }
@@ -359,6 +364,7 @@ export interface AttachCommandOptions extends SendCommandOptions {}
 export interface SettingsChangeOptions extends SendCommandOptions {
   capabilityFingerprint: string
   modelId?: string
+  reasoningEffortId?: string
   permissionModeId?: string
 }
 
@@ -611,17 +617,21 @@ export class AgentWharfClient {
     if (!isSettingsFingerprint(options.capabilityFingerprint)) {
       return Promise.reject(new Error('settings capability fingerprint is required'))
     }
-    if (options.modelId === undefined && options.permissionModeId === undefined) {
+    if (options.modelId === undefined && options.reasoningEffortId === undefined && options.permissionModeId === undefined) {
       return Promise.reject(new Error('settings change requires a requested value'))
     }
     if (options.modelId !== undefined && !isSettingsIdentifier(options.modelId)) {
       return Promise.reject(new Error('settings model id is invalid'))
+    }
+    if (options.reasoningEffortId !== undefined && !isSettingsIdentifier(options.reasoningEffortId)) {
+      return Promise.reject(new Error('settings reasoning effort id is invalid'))
     }
     if (options.permissionModeId !== undefined && !isSettingsIdentifier(options.permissionModeId)) {
       return Promise.reject(new Error('settings permission mode id is invalid'))
     }
     const payload: JsonObject = { capability_fingerprint: options.capabilityFingerprint }
     if (options.modelId !== undefined) payload.model_id = options.modelId
+    if (options.reasoningEffortId !== undefined) payload.reasoning_effort_id = options.reasoningEffortId
     if (options.permissionModeId !== undefined) payload.permission_mode_id = options.permissionModeId
     return this.sendCommand('session.settings.change', sessionId, payload, options)
   }
@@ -1308,15 +1318,15 @@ function cloneAttentionSummary(summary: AttentionSummary): AttentionSummary {
 
 function decodeSettingsCapability(value: JsonValue): SettingsCapability {
   const object = asJsonObject(value)
-  if (object === null || typeof object.schema_version !== 'number' || !Number.isInteger(object.schema_version) || typeof object.fingerprint !== 'string' ||
+  if (object === null || (object.schema_version !== 1 && object.schema_version !== 2) || typeof object.fingerprint !== 'string' ||
     !isSettingsFingerprint(object.fingerprint) || !Array.isArray(object.models) || !Array.isArray(object.permission_modes) ||
     typeof object.effective_model_id !== 'string' || typeof object.effective_permission_mode_id !== 'string' ||
     (object.model_change !== 'allowed' && object.model_change !== 'read_only') ||
     (object.permission_change !== 'allowed' && object.permission_change !== 'read_only')) {
     throw new Error('invalid settings capability event')
   }
-  const models = decodeSettingsChoices(object.models)
-  const permissionModes = decodeSettingsChoices(object.permission_modes)
+  const models = decodeSettingsChoices(object.models, 32)
+  const permissionModes = decodeSettingsChoices(object.permission_modes, 16)
   if (!isSettingsIdentifier(object.effective_model_id) || !isSettingsIdentifier(object.effective_permission_mode_id) ||
     !models.some((choice) => choice.id === object.effective_model_id) ||
     !permissionModes.some((choice) => choice.id === object.effective_permission_mode_id)) {
@@ -1330,22 +1340,60 @@ function decodeSettingsCapability(value: JsonValue): SettingsCapability {
     object.permission_change === 'allowed' && permissionReadOnlyReason !== undefined) {
     throw new Error('invalid settings capability event')
   }
+  if (object.schema_version === 1) {
+    return {
+      schemaVersion: 1,
+      fingerprint: object.fingerprint,
+      models,
+      reasoningEfforts: [],
+      permissionModes,
+      effectiveModelId: object.effective_model_id,
+      effectivePermissionModeId: object.effective_permission_mode_id,
+      modelChange: object.model_change,
+      reasoningEffortChange: 'unsupported',
+      permissionChange: object.permission_change,
+      ...(modelReadOnlyReason === undefined ? {} : { modelReadOnlyReason }),
+      reasoningEffortReadOnlyReason: 'provider_unsupported',
+      ...(permissionReadOnlyReason === undefined ? {} : { permissionReadOnlyReason }),
+    }
+  }
+  if (!Array.isArray(object.reasoning_efforts) ||
+    (object.reasoning_effort_change !== 'allowed' && object.reasoning_effort_change !== 'read_only' && object.reasoning_effort_change !== 'unsupported')) {
+    throw new Error('invalid settings capability event')
+  }
+  const reasoningEfforts = object.reasoning_efforts.length === 0 ? [] : decodeSettingsChoices(object.reasoning_efforts, 16)
+  const effectiveReasoningEffortId = object.effective_reasoning_effort_id === null ? undefined : object.effective_reasoning_effort_id
+  const reasoningEffortReadOnlyReason = optionalSettingsReason(object.reasoning_effort_read_only_reason)
+  if (object.reasoning_effort_change === 'unsupported') {
+    if (reasoningEfforts.length !== 0 || effectiveReasoningEffortId !== undefined || reasoningEffortReadOnlyReason === undefined) {
+      throw new Error('invalid settings capability event')
+    }
+  } else if (typeof effectiveReasoningEffortId !== 'string' || !isSettingsIdentifier(effectiveReasoningEffortId) ||
+    !reasoningEfforts.some((choice) => choice.id === effectiveReasoningEffortId) ||
+    object.reasoning_effort_change === 'allowed' && (reasoningEfforts.length < 2 || reasoningEffortReadOnlyReason !== undefined) ||
+    object.reasoning_effort_change === 'read_only' && reasoningEffortReadOnlyReason === undefined) {
+    throw new Error('invalid settings capability event')
+  }
   return {
     schemaVersion: object.schema_version,
     fingerprint: object.fingerprint,
     models,
+    reasoningEfforts,
     permissionModes,
     effectiveModelId: object.effective_model_id,
+    ...(effectiveReasoningEffortId === undefined ? {} : { effectiveReasoningEffortId }),
     effectivePermissionModeId: object.effective_permission_mode_id,
     modelChange: object.model_change,
+    reasoningEffortChange: object.reasoning_effort_change,
     permissionChange: object.permission_change,
     ...(modelReadOnlyReason === undefined ? {} : { modelReadOnlyReason }),
+    ...(reasoningEffortReadOnlyReason === undefined ? {} : { reasoningEffortReadOnlyReason }),
     ...(permissionReadOnlyReason === undefined ? {} : { permissionReadOnlyReason }),
   }
 }
 
-function decodeSettingsChoices(value: JsonValue[]): SettingsCapabilityChoice[] {
-  if (value.length < 1 || value.length > 32) throw new Error('invalid settings capability choices')
+function decodeSettingsChoices(value: JsonValue[], maximum: number): SettingsCapabilityChoice[] {
+  if (value.length < 1 || value.length > maximum) throw new Error('invalid settings capability choices')
   return value.map((entry) => {
     const object = asJsonObject(entry)
     if (object === null || typeof object.id !== 'string' || typeof object.label !== 'string' ||
@@ -1376,12 +1424,19 @@ function decodeSettingsEffective(value: JsonValue): SettingsEffective {
   if (reasonCode !== undefined && (typeof reasonCode !== 'string' || !isSettingsIdentifier(reasonCode))) {
     throw new Error('invalid settings effective event')
   }
+  const effectiveReasoningEffortId = object.effective_reasoning_effort_id === undefined || object.effective_reasoning_effort_id === null
+    ? undefined
+    : object.effective_reasoning_effort_id
+  if (effectiveReasoningEffortId !== undefined && (typeof effectiveReasoningEffortId !== 'string' || !isSettingsIdentifier(effectiveReasoningEffortId))) {
+    throw new Error('invalid settings effective event')
+  }
   return {
     commandId: object.cmd_id,
     requestFingerprint: object.request_fingerprint,
     effectiveFingerprint: object.effective_fingerprint,
     outcome: outcome as SettingsChangeOutcome,
     effectiveModelId: object.effective_model_id,
+    ...(effectiveReasoningEffortId === undefined ? {} : { effectiveReasoningEffortId }),
     effectivePermissionModeId: object.effective_permission_mode_id,
     ...(reasonCode === undefined ? {} : { reasonCode }),
   }
@@ -1428,7 +1483,7 @@ function decodeRunControlOutcome(value: JsonValue): RunControlOutcomeState {
 }
 
 function cloneSettingsCapabilityUpdate(update: SettingsCapabilityUpdate): SettingsCapabilityUpdate {
-  return { sessionId: update.sessionId, seq: update.seq, capability: { ...update.capability, models: update.capability.models.map((choice) => ({ ...choice })), permissionModes: update.capability.permissionModes.map((choice) => ({ ...choice })) } }
+  return { sessionId: update.sessionId, seq: update.seq, capability: { ...update.capability, models: update.capability.models.map((choice) => ({ ...choice })), reasoningEfforts: update.capability.reasoningEfforts.map((choice) => ({ ...choice })), permissionModes: update.capability.permissionModes.map((choice) => ({ ...choice })) } }
 }
 
 function cloneSettingsEffectiveUpdate(update: SettingsEffectiveUpdate): SettingsEffectiveUpdate {

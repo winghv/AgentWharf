@@ -672,13 +672,14 @@ func (s *Store) PublishSettingsCapability(ctx context.Context, sessionID string,
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO session_settings_capabilities
-(session_id, capability_event_seq, fingerprint, effective_model_id, effective_permission_mode_id, capability_version, writer_connection_epoch, writer_credential_generation, writer_lease_id, created_at_ms, updated_at_ms)
-VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+(session_id, capability_event_seq, fingerprint, effective_model_id, effective_reasoning_effort_id, effective_permission_mode_id, capability_version, writer_connection_epoch, writer_credential_generation, writer_lease_id, created_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
 ON CONFLICT(session_id) DO UPDATE SET capability_event_seq=excluded.capability_event_seq, fingerprint=excluded.fingerprint, effective_model_id=excluded.effective_model_id,
+ effective_reasoning_effort_id=excluded.effective_reasoning_effort_id,
  effective_permission_mode_id=excluded.effective_permission_mode_id, capability_version=session_settings_capabilities.capability_version+1,
  writer_connection_epoch=excluded.writer_connection_epoch, writer_credential_generation=excluded.writer_credential_generation,
  writer_lease_id=excluded.writer_lease_id, updated_at_ms=excluded.updated_at_ms
-`, sessionID, update.EventSeq, update.Fingerprint, update.EffectiveModelID, update.EffectivePermissionModeID, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID, nowMS, nowMS); err != nil {
+`, sessionID, update.EventSeq, update.Fingerprint, update.EffectiveModelID, update.EffectiveReasoningEffortID, update.EffectivePermissionModeID, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID, nowMS, nowMS); err != nil {
 		return store.SettingsCapability{}, fmt.Errorf("upsert settings capability: %w", err)
 	}
 	capability, err := querySettingsCapability(ctx, tx, sessionID)
@@ -714,7 +715,7 @@ func (s *Store) SettingsCommandReserve(ctx context.Context, sessionID string, re
 	}
 	existing, err := querySettingsCommand(ctx, tx, sessionID, request.CommandID)
 	if err == nil {
-		if existing.RequestFingerprint != request.RequestFingerprint || !sameSettingsOptionalID(existing.RequestedModelID, request.RequestedModelID) || !sameSettingsOptionalID(existing.RequestedPermissionModeID, request.RequestedPermissionModeID) {
+		if existing.RequestFingerprint != request.RequestFingerprint || !sameSettingsOptionalID(existing.RequestedModelID, request.RequestedModelID) || !sameSettingsOptionalID(existing.RequestedReasoningEffortID, request.RequestedReasoningEffortID) || !sameSettingsOptionalID(existing.RequestedPermissionModeID, request.RequestedPermissionModeID) {
 			return store.SettingsCommandReserve{}, errors.New("settings command ID is reused")
 		}
 		if err := tx.Commit(); err != nil {
@@ -730,9 +731,9 @@ func (s *Store) SettingsCommandReserve(ctx context.Context, sessionID string, re
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO session_settings_commands
-(session_id, cmd_id, request_fingerprint, requested_model_id, requested_permission_mode_id, reservation_version, delivery_deadline_ms, writer_connection_epoch, writer_credential_generation, writer_lease_id, reserved_capability_event_seq, reserved_fingerprint, reserved_effective_model_id, reserved_effective_permission_mode_id, status, created_at_ms, updated_at_ms)
-VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'delivery_pending', ?, ?)
-`, sessionID, request.CommandID, request.RequestFingerprint, request.RequestedModelID, request.RequestedPermissionModeID, nowMS+5000, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, capability.EventSeq, capability.Fingerprint, capability.EffectiveModelID, capability.EffectivePermissionModeID, nowMS, nowMS); err != nil {
+(session_id, cmd_id, request_fingerprint, requested_model_id, requested_reasoning_effort_id, requested_permission_mode_id, reservation_version, delivery_deadline_ms, writer_connection_epoch, writer_credential_generation, writer_lease_id, reserved_capability_event_seq, reserved_fingerprint, reserved_effective_model_id, reserved_effective_reasoning_effort_id, reserved_effective_permission_mode_id, status, created_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivery_pending', ?, ?)
+`, sessionID, request.CommandID, request.RequestFingerprint, request.RequestedModelID, request.RequestedReasoningEffortID, request.RequestedPermissionModeID, nowMS+5000, request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, capability.EventSeq, capability.Fingerprint, capability.EffectiveModelID, capability.EffectiveReasoningEffortID, capability.EffectivePermissionModeID, nowMS, nowMS); err != nil {
 		return store.SettingsCommandReserve{}, fmt.Errorf("insert settings reservation: %w", err)
 	}
 	command, err := querySettingsCommand(ctx, tx, sessionID, request.CommandID)
@@ -860,7 +861,7 @@ func (s *Store) RecoverSettingsCommand(ctx context.Context, sessionID, commandID
 }
 
 func (s *Store) FinalizeSettingsCommand(ctx context.Context, sessionID, commandID string, finalize store.SettingsCommandFinalize) (store.SettingsCommand, error) {
-	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || !validSettingsNonterminalStatus(finalize.ExpectedStatus) || !validSettingsTerminalStatus(finalize.Outcome) || !validSettingsCapabilityUpdate(sessionID, store.SettingsCapabilityUpdate{EventSeq: finalize.EffectiveCapability.EventSeq, Fingerprint: finalize.EffectiveCapability.Fingerprint, EffectiveModelID: finalize.EffectiveCapability.EffectiveModelID, EffectivePermissionModeID: finalize.EffectiveCapability.EffectivePermissionModeID, Writer: finalize.EffectiveCapability.Writer}) || (finalize.EffectiveCapability.SessionID != "" && finalize.EffectiveCapability.SessionID != sessionID) {
+	if !validConnectionID(sessionID) || commandID == "" || finalize.ReservationVersion < 1 || !validSettingsNonterminalStatus(finalize.ExpectedStatus) || !validSettingsTerminalStatus(finalize.Outcome) || !validSettingsCapabilityUpdate(sessionID, store.SettingsCapabilityUpdate{EventSeq: finalize.EffectiveCapability.EventSeq, Fingerprint: finalize.EffectiveCapability.Fingerprint, EffectiveModelID: finalize.EffectiveCapability.EffectiveModelID, EffectiveReasoningEffortID: finalize.EffectiveCapability.EffectiveReasoningEffortID, EffectivePermissionModeID: finalize.EffectiveCapability.EffectivePermissionModeID, Writer: finalize.EffectiveCapability.Writer}) || (finalize.EffectiveCapability.SessionID != "" && finalize.EffectiveCapability.SessionID != sessionID) {
 		return store.SettingsCommand{}, errors.New("invalid settings finalization")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -3168,14 +3169,18 @@ func validatePendingCommandInput(event store.PendingEvent, request store.Pending
 }
 func querySettingsCapability(ctx context.Context, tx *sql.Tx, sessionID string) (store.SettingsCapability, error) {
 	var capability store.SettingsCapability
-	err := tx.QueryRowContext(ctx, `SELECT session_id, capability_event_seq, fingerprint, effective_model_id, effective_permission_mode_id, capability_version, writer_connection_epoch, writer_credential_generation, writer_lease_id FROM session_settings_capabilities WHERE session_id=?`, sessionID).Scan(
-		&capability.SessionID, &capability.EventSeq, &capability.Fingerprint, &capability.EffectiveModelID, &capability.EffectivePermissionModeID,
+	var effectiveReasoningEffortID sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT session_id, capability_event_seq, fingerprint, effective_model_id, effective_reasoning_effort_id, effective_permission_mode_id, capability_version, writer_connection_epoch, writer_credential_generation, writer_lease_id FROM session_settings_capabilities WHERE session_id=?`, sessionID).Scan(
+		&capability.SessionID, &capability.EventSeq, &capability.Fingerprint, &capability.EffectiveModelID, &effectiveReasoningEffortID, &capability.EffectivePermissionModeID,
 		&capability.Version, &capability.Writer.ConnectionEpoch, &capability.Writer.CredentialGeneration, &capability.Writer.LeaseID,
 	)
 	if err != nil {
 		return store.SettingsCapability{}, err
 	}
-	if !validSettingsCapabilityUpdate(capability.SessionID, store.SettingsCapabilityUpdate{EventSeq: capability.EventSeq, Fingerprint: capability.Fingerprint, EffectiveModelID: capability.EffectiveModelID, EffectivePermissionModeID: capability.EffectivePermissionModeID, Writer: capability.Writer}) || capability.Version < 1 {
+	if effectiveReasoningEffortID.Valid {
+		capability.EffectiveReasoningEffortID = &effectiveReasoningEffortID.String
+	}
+	if !validSettingsCapabilityUpdate(capability.SessionID, store.SettingsCapabilityUpdate{EventSeq: capability.EventSeq, Fingerprint: capability.Fingerprint, EffectiveModelID: capability.EffectiveModelID, EffectiveReasoningEffortID: capability.EffectiveReasoningEffortID, EffectivePermissionModeID: capability.EffectivePermissionModeID, Writer: capability.Writer}) || capability.Version < 1 {
 		return store.SettingsCapability{}, errors.New("settings capability row is invalid")
 	}
 	return capability, nil
@@ -3183,14 +3188,14 @@ func querySettingsCapability(ctx context.Context, tx *sql.Tx, sessionID string) 
 
 func querySettingsCommand(ctx context.Context, tx *sql.Tx, sessionID, commandID string) (store.SettingsCommand, error) {
 	var command store.SettingsCommand
-	var modelID, permissionID sql.NullString
+	var modelID, reasoningEffortID, permissionID, reservedReasoningEffortID sql.NullString
 	var deadlineMS int64
 	var operationDeadline, terminalSeq sql.NullInt64
 	var status string
-	err := tx.QueryRowContext(ctx, `SELECT session_id, cmd_id, request_fingerprint, requested_model_id, requested_permission_mode_id, reservation_version, delivery_deadline_ms, operation_deadline_ms, writer_connection_epoch, writer_credential_generation, writer_lease_id, reserved_capability_event_seq, reserved_fingerprint, reserved_effective_model_id, reserved_effective_permission_mode_id, status, terminal_event_seq FROM session_settings_commands WHERE session_id=? AND cmd_id=?`, sessionID, commandID).Scan(
-		&command.SessionID, &command.CommandID, &command.RequestFingerprint, &modelID, &permissionID, &command.ReservationVersion,
+	err := tx.QueryRowContext(ctx, `SELECT session_id, cmd_id, request_fingerprint, requested_model_id, requested_reasoning_effort_id, requested_permission_mode_id, reservation_version, delivery_deadline_ms, operation_deadline_ms, writer_connection_epoch, writer_credential_generation, writer_lease_id, reserved_capability_event_seq, reserved_fingerprint, reserved_effective_model_id, reserved_effective_reasoning_effort_id, reserved_effective_permission_mode_id, status, terminal_event_seq FROM session_settings_commands WHERE session_id=? AND cmd_id=?`, sessionID, commandID).Scan(
+		&command.SessionID, &command.CommandID, &command.RequestFingerprint, &modelID, &reasoningEffortID, &permissionID, &command.ReservationVersion,
 		&deadlineMS, &operationDeadline, &command.Writer.ConnectionEpoch, &command.Writer.CredentialGeneration, &command.Writer.LeaseID,
-		&command.ReservedCapability.EventSeq, &command.ReservedCapability.Fingerprint, &command.ReservedCapability.EffectiveModelID, &command.ReservedCapability.EffectivePermissionModeID, &status, &terminalSeq,
+		&command.ReservedCapability.EventSeq, &command.ReservedCapability.Fingerprint, &command.ReservedCapability.EffectiveModelID, &reservedReasoningEffortID, &command.ReservedCapability.EffectivePermissionModeID, &status, &terminalSeq,
 	)
 	if err != nil {
 		return store.SettingsCommand{}, err
@@ -3201,6 +3206,12 @@ func querySettingsCommand(ctx context.Context, tx *sql.Tx, sessionID, commandID 
 	command.Status = store.SettingsCommandStatus(status)
 	if modelID.Valid {
 		command.RequestedModelID = &modelID.String
+	}
+	if reasoningEffortID.Valid {
+		command.RequestedReasoningEffortID = &reasoningEffortID.String
+	}
+	if reservedReasoningEffortID.Valid {
+		command.ReservedCapability.EffectiveReasoningEffortID = &reservedReasoningEffortID.String
 	}
 	if permissionID.Valid {
 		command.RequestedPermissionModeID = &permissionID.String
@@ -3220,19 +3231,21 @@ func querySettingsCommand(ctx context.Context, tx *sql.Tx, sessionID, commandID 
 }
 
 func validSettingsCapabilityUpdate(sessionID string, update store.SettingsCapabilityUpdate) bool {
-	return validConnectionID(sessionID) && update.EventSeq > 0 && validSettingsFingerprint(update.Fingerprint) && validSettingsID(update.EffectiveModelID) && validSettingsID(update.EffectivePermissionModeID) && validSettingsWriter(update.Writer)
+	return validConnectionID(sessionID) && update.EventSeq > 0 && validSettingsFingerprint(update.Fingerprint) && validSettingsID(update.EffectiveModelID) &&
+		(update.EffectiveReasoningEffortID == nil || validSettingsID(*update.EffectiveReasoningEffortID)) && validSettingsID(update.EffectivePermissionModeID) && validSettingsWriter(update.Writer)
 }
 
 func validSettingsCommandRequest(sessionID string, request store.SettingsCommandRequest) bool {
 	return validConnectionID(sessionID) && request.CommandID != "" && len(request.CommandID) <= 256 && validSettingsFingerprint(request.RequestFingerprint) &&
-		(request.RequestedModelID != nil || request.RequestedPermissionModeID != nil) &&
+		(request.RequestedModelID != nil || request.RequestedReasoningEffortID != nil || request.RequestedPermissionModeID != nil) &&
 		(request.RequestedModelID == nil || validSettingsID(*request.RequestedModelID)) &&
+		(request.RequestedReasoningEffortID == nil || validSettingsID(*request.RequestedReasoningEffortID)) &&
 		(request.RequestedPermissionModeID == nil || validSettingsID(*request.RequestedPermissionModeID)) && validSettingsWriter(request.Writer)
 }
 
 func validSettingsCommandRow(command store.SettingsCommand) bool {
 	terminal := command.Status != store.SettingsCommandDeliveryPending && command.Status != store.SettingsCommandPending && command.Status != store.SettingsCommandRecoveryPending
-	return validSettingsCommandRequest(command.SessionID, store.SettingsCommandRequest{CommandID: command.CommandID, RequestFingerprint: command.RequestFingerprint, RequestedModelID: command.RequestedModelID, RequestedPermissionModeID: command.RequestedPermissionModeID, Writer: command.Writer}) && command.ReservationVersion > 0 && !command.DeliveryDeadline.IsZero() && validSettingsStatus(command.Status) && sameSettingsCapability(command.ReservedCapability, store.SettingsCapability{SessionID: command.SessionID, EventSeq: command.ReservedCapability.EventSeq, Fingerprint: command.ReservedCapability.Fingerprint, EffectiveModelID: command.ReservedCapability.EffectiveModelID, EffectivePermissionModeID: command.ReservedCapability.EffectivePermissionModeID, Writer: command.Writer}) && ((terminal && command.TerminalEventSeq != nil) || (!terminal && command.TerminalEventSeq == nil))
+	return validSettingsCommandRequest(command.SessionID, store.SettingsCommandRequest{CommandID: command.CommandID, RequestFingerprint: command.RequestFingerprint, RequestedModelID: command.RequestedModelID, RequestedReasoningEffortID: command.RequestedReasoningEffortID, RequestedPermissionModeID: command.RequestedPermissionModeID, Writer: command.Writer}) && command.ReservationVersion > 0 && !command.DeliveryDeadline.IsZero() && validSettingsStatus(command.Status) && sameSettingsCapability(command.ReservedCapability, store.SettingsCapability{SessionID: command.SessionID, EventSeq: command.ReservedCapability.EventSeq, Fingerprint: command.ReservedCapability.Fingerprint, EffectiveModelID: command.ReservedCapability.EffectiveModelID, EffectiveReasoningEffortID: command.ReservedCapability.EffectiveReasoningEffortID, EffectivePermissionModeID: command.ReservedCapability.EffectivePermissionModeID, Writer: command.Writer}) && ((terminal && command.TerminalEventSeq != nil) || (!terminal && command.TerminalEventSeq == nil))
 }
 
 func validSettingsWriter(writer store.SettingsWriter) bool {
@@ -3415,7 +3428,7 @@ func sameSettingsOptionalID(left, right *string) bool {
 	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
 }
 func sameSettingsCapability(left, right store.SettingsCapability) bool {
-	return left.SessionID == right.SessionID && left.EventSeq == right.EventSeq && left.Fingerprint == right.Fingerprint && left.EffectiveModelID == right.EffectiveModelID && left.EffectivePermissionModeID == right.EffectivePermissionModeID && left.Version == right.Version && left.Writer == right.Writer
+	return left.SessionID == right.SessionID && left.EventSeq == right.EventSeq && left.Fingerprint == right.Fingerprint && left.EffectiveModelID == right.EffectiveModelID && sameSettingsOptionalID(left.EffectiveReasoningEffortID, right.EffectiveReasoningEffortID) && left.EffectivePermissionModeID == right.EffectivePermissionModeID && left.Version == right.Version && left.Writer == right.Writer
 }
 func validSettingsReason(reason *string) bool {
 	if reason == nil || len(*reason) < 1 || len(*reason) > 64 || (*reason)[0] < 'a' || (*reason)[0] > 'z' {
@@ -3431,7 +3444,7 @@ func validSettingsReason(reason *string) bool {
 
 func validateSettingsFinalization(command store.SettingsCommand, capability store.SettingsCapability, finalize store.SettingsCommandFinalize, nowMS int64) error {
 	if finalize.Outcome == store.SettingsCommandApplied {
-		if finalize.ReasonCode != nil || (command.RequestedModelID != nil && *command.RequestedModelID != capability.EffectiveModelID) || (command.RequestedPermissionModeID != nil && *command.RequestedPermissionModeID != capability.EffectivePermissionModeID) || (command.RequestedModelID == nil && command.ReservedCapability.EffectiveModelID != capability.EffectiveModelID) || (command.RequestedPermissionModeID == nil && command.ReservedCapability.EffectivePermissionModeID != capability.EffectivePermissionModeID) {
+		if finalize.ReasonCode != nil || (command.RequestedModelID != nil && *command.RequestedModelID != capability.EffectiveModelID) || (command.RequestedReasoningEffortID != nil && (capability.EffectiveReasoningEffortID == nil || *command.RequestedReasoningEffortID != *capability.EffectiveReasoningEffortID)) || (command.RequestedPermissionModeID != nil && *command.RequestedPermissionModeID != capability.EffectivePermissionModeID) || (command.RequestedModelID == nil && command.ReservedCapability.EffectiveModelID != capability.EffectiveModelID) || (command.RequestedReasoningEffortID == nil && !sameSettingsOptionalID(command.ReservedCapability.EffectiveReasoningEffortID, capability.EffectiveReasoningEffortID)) || (command.RequestedPermissionModeID == nil && command.ReservedCapability.EffectivePermissionModeID != capability.EffectivePermissionModeID) {
 			return errors.New("applied settings finalization does not match the request")
 		}
 	} else if !validSettingsReason(finalize.ReasonCode) {
@@ -3943,6 +3956,115 @@ func nullMilliTimePointer(value sql.NullInt64) *time.Time {
 	return &copy
 }
 
+func sqliteTableHasColumn(ctx context.Context, executor sqliteConnectionExecutor, table, column string) (bool, error) {
+	var count int
+	if err := executor.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&count); err != nil {
+		return false, fmt.Errorf("inspect sqlite column %s.%s: %w", table, column, err)
+	}
+	return count == 1, nil
+}
+
+// migrateSQLiteSettingsReasoning upgrades stores created by settings schema v1.
+// The capability table only needs one nullable column. The command table must be
+// rebuilt because its v1 CHECK constraint rejects a reasoning-only request.
+// SQLite DDL is transactional, so a failed or interrupted upgrade leaves the v1
+// tables intact and the same migration can be retried on the next Open.
+func (s *Store) migrateSQLiteSettingsReasoning(ctx context.Context) error {
+	hasEffectiveReasoning, err := sqliteTableHasColumn(ctx, s.db, "session_settings_capabilities", "effective_reasoning_effort_id")
+	if err != nil {
+		return err
+	}
+	hasRequestedReasoning, err := sqliteTableHasColumn(ctx, s.db, "session_settings_commands", "requested_reasoning_effort_id")
+	if err != nil {
+		return err
+	}
+	hasReservedReasoning, err := sqliteTableHasColumn(ctx, s.db, "session_settings_commands", "reserved_effective_reasoning_effort_id")
+	if err != nil {
+		return err
+	}
+	if hasEffectiveReasoning && hasRequestedReasoning && hasReservedReasoning {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin sqlite settings reasoning migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if !hasEffectiveReasoning {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE session_settings_capabilities ADD COLUMN effective_reasoning_effort_id TEXT CHECK (effective_reasoning_effort_id IS NULL OR length(effective_reasoning_effort_id) BETWEEN 1 AND 128)`); err != nil {
+			return fmt.Errorf("add sqlite effective reasoning effort column: %w", err)
+		}
+	}
+	if !hasRequestedReasoning || !hasReservedReasoning {
+		requestedReasoningValue := "NULL"
+		if hasRequestedReasoning {
+			requestedReasoningValue = "requested_reasoning_effort_id"
+		}
+		reservedReasoningValue := "NULL"
+		if hasReservedReasoning {
+			reservedReasoningValue = "reserved_effective_reasoning_effort_id"
+		}
+		if _, err := tx.ExecContext(ctx, `
+CREATE TABLE session_settings_commands_reasoning_v2 (
+    session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
+    cmd_id TEXT NOT NULL CHECK (length(cmd_id) BETWEEN 1 AND 256),
+    request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 71 AND substr(request_fingerprint, 1, 7) = 'sha256:'),
+    requested_model_id TEXT CHECK (requested_model_id IS NULL OR length(requested_model_id) BETWEEN 1 AND 128),
+    requested_reasoning_effort_id TEXT CHECK (requested_reasoning_effort_id IS NULL OR length(requested_reasoning_effort_id) BETWEEN 1 AND 128),
+    requested_permission_mode_id TEXT CHECK (requested_permission_mode_id IS NULL OR length(requested_permission_mode_id) BETWEEN 1 AND 128),
+    reservation_version INTEGER NOT NULL CHECK (reservation_version > 0),
+    delivery_deadline_ms INTEGER NOT NULL,
+    operation_deadline_ms INTEGER,
+    writer_connection_epoch INTEGER NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation INTEGER NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (length(writer_lease_id) BETWEEN 1 AND 255),
+    reserved_capability_event_seq INTEGER NOT NULL,
+    reserved_fingerprint TEXT NOT NULL CHECK (length(reserved_fingerprint) = 71 AND substr(reserved_fingerprint, 1, 7) = 'sha256:'),
+    reserved_effective_model_id TEXT NOT NULL CHECK (length(reserved_effective_model_id) BETWEEN 1 AND 128),
+    reserved_effective_reasoning_effort_id TEXT CHECK (reserved_effective_reasoning_effort_id IS NULL OR length(reserved_effective_reasoning_effort_id) BETWEEN 1 AND 128),
+    reserved_effective_permission_mode_id TEXT NOT NULL CHECK (length(reserved_effective_permission_mode_id) BETWEEN 1 AND 128),
+    status TEXT NOT NULL CHECK (status IN ('delivery_pending', 'pending', 'recovery_pending', 'applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective')),
+    terminal_event_seq INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id, cmd_id),
+    FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
+    FOREIGN KEY (session_id, reserved_capability_event_seq) REFERENCES session_events(session_id, seq),
+    CHECK (requested_model_id IS NOT NULL OR requested_reasoning_effort_id IS NOT NULL OR requested_permission_mode_id IS NOT NULL),
+    CHECK ((status = 'delivery_pending' AND operation_deadline_ms IS NULL AND terminal_event_seq IS NULL)
+        OR (status IN ('pending', 'recovery_pending') AND operation_deadline_ms IS NOT NULL AND terminal_event_seq IS NULL)
+        OR (status IN ('applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective') AND terminal_event_seq IS NOT NULL)),
+    CHECK (delivery_deadline_ms > created_at_ms AND delivery_deadline_ms <= created_at_ms + 5000),
+    CHECK (operation_deadline_ms IS NULL OR (operation_deadline_ms > created_at_ms AND operation_deadline_ms <= created_at_ms + 35000))
+);
+INSERT INTO session_settings_commands_reasoning_v2 (
+    session_id, cmd_id, request_fingerprint, requested_model_id, requested_reasoning_effort_id, requested_permission_mode_id,
+    reservation_version, delivery_deadline_ms, operation_deadline_ms, writer_connection_epoch, writer_credential_generation,
+    writer_lease_id, reserved_capability_event_seq, reserved_fingerprint, reserved_effective_model_id,
+    reserved_effective_reasoning_effort_id, reserved_effective_permission_mode_id, status, terminal_event_seq, created_at_ms, updated_at_ms
+)
+SELECT session_id, cmd_id, request_fingerprint, requested_model_id, `+requestedReasoningValue+`, requested_permission_mode_id,
+    reservation_version, delivery_deadline_ms, operation_deadline_ms, writer_connection_epoch, writer_credential_generation,
+    writer_lease_id, reserved_capability_event_seq, reserved_fingerprint, reserved_effective_model_id,
+    `+reservedReasoningValue+`, reserved_effective_permission_mode_id, status, terminal_event_seq, created_at_ms, updated_at_ms
+FROM session_settings_commands;
+DROP TABLE session_settings_commands;
+ALTER TABLE session_settings_commands_reasoning_v2 RENAME TO session_settings_commands;
+CREATE UNIQUE INDEX session_settings_commands_one_nonterminal_idx
+ON session_settings_commands (session_id)
+WHERE status IN ('delivery_pending', 'pending', 'recovery_pending');
+`); err != nil {
+			return fmt.Errorf("rebuild sqlite settings commands for reasoning effort: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite settings reasoning migration: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) init(ctx context.Context) error {
 	if _, err := s.fenceDB.ExecContext(ctx, `PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000`); err != nil {
 		return fmt.Errorf("configure sqlite fence store: %w", err)
@@ -4057,6 +4179,7 @@ CREATE TABLE IF NOT EXISTS session_settings_capabilities (
     capability_event_seq INTEGER NOT NULL,
     fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 71 AND substr(fingerprint, 1, 7) = 'sha256:'),
     effective_model_id TEXT NOT NULL CHECK (length(effective_model_id) BETWEEN 1 AND 128),
+    effective_reasoning_effort_id TEXT CHECK (effective_reasoning_effort_id IS NULL OR length(effective_reasoning_effort_id) BETWEEN 1 AND 128),
     effective_permission_mode_id TEXT NOT NULL CHECK (length(effective_permission_mode_id) BETWEEN 1 AND 128),
     capability_version INTEGER NOT NULL CHECK (capability_version > 0),
     writer_connection_epoch INTEGER NOT NULL CHECK (writer_connection_epoch > 0),
@@ -4072,6 +4195,7 @@ CREATE TABLE IF NOT EXISTS session_settings_commands (
     cmd_id TEXT NOT NULL CHECK (length(cmd_id) BETWEEN 1 AND 256),
     request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 71 AND substr(request_fingerprint, 1, 7) = 'sha256:'),
     requested_model_id TEXT CHECK (requested_model_id IS NULL OR length(requested_model_id) BETWEEN 1 AND 128),
+    requested_reasoning_effort_id TEXT CHECK (requested_reasoning_effort_id IS NULL OR length(requested_reasoning_effort_id) BETWEEN 1 AND 128),
     requested_permission_mode_id TEXT CHECK (requested_permission_mode_id IS NULL OR length(requested_permission_mode_id) BETWEEN 1 AND 128),
     reservation_version INTEGER NOT NULL CHECK (reservation_version > 0),
     delivery_deadline_ms INTEGER NOT NULL,
@@ -4082,6 +4206,7 @@ CREATE TABLE IF NOT EXISTS session_settings_commands (
     reserved_capability_event_seq INTEGER NOT NULL,
     reserved_fingerprint TEXT NOT NULL CHECK (length(reserved_fingerprint) = 71 AND substr(reserved_fingerprint, 1, 7) = 'sha256:'),
     reserved_effective_model_id TEXT NOT NULL CHECK (length(reserved_effective_model_id) BETWEEN 1 AND 128),
+    reserved_effective_reasoning_effort_id TEXT CHECK (reserved_effective_reasoning_effort_id IS NULL OR length(reserved_effective_reasoning_effort_id) BETWEEN 1 AND 128),
     reserved_effective_permission_mode_id TEXT NOT NULL CHECK (length(reserved_effective_permission_mode_id) BETWEEN 1 AND 128),
     status TEXT NOT NULL CHECK (status IN ('delivery_pending', 'pending', 'recovery_pending', 'applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective')),
     terminal_event_seq INTEGER,
@@ -4090,7 +4215,7 @@ CREATE TABLE IF NOT EXISTS session_settings_commands (
     PRIMARY KEY (session_id, cmd_id),
     FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
     FOREIGN KEY (session_id, reserved_capability_event_seq) REFERENCES session_events(session_id, seq),
-    CHECK (requested_model_id IS NOT NULL OR requested_permission_mode_id IS NOT NULL),
+    CHECK (requested_model_id IS NOT NULL OR requested_reasoning_effort_id IS NOT NULL OR requested_permission_mode_id IS NOT NULL),
     CHECK ((status = 'delivery_pending' AND operation_deadline_ms IS NULL AND terminal_event_seq IS NULL)
         OR (status IN ('pending', 'recovery_pending') AND operation_deadline_ms IS NOT NULL AND terminal_event_seq IS NULL)
         OR (status IN ('applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective') AND terminal_event_seq IS NOT NULL)),
@@ -4253,6 +4378,9 @@ CREATE INDEX IF NOT EXISTS session_workspace_leases_owner_idx
 ON session_workspace_leases (session_id, connection_epoch, credential_generation, status);
 	`); err != nil {
 		return fmt.Errorf("initialize sqlite event store schema: %w", err)
+	}
+	if err := s.migrateSQLiteSettingsReasoning(ctx); err != nil {
+		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO session_attention_migration (singleton, state) VALUES (1, CASE WHEN ? THEN 'pending' ELSE 'complete' END) ON CONFLICT (singleton) DO NOTHING`, legacyStore); err != nil {
 		return fmt.Errorf("initialize sqlite attention migration marker: %w", err)

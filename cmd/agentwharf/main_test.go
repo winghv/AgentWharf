@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -430,6 +432,7 @@ func TestParseAgentEntrypointDefaultsToManagedClaudeSession(t *testing.T) {
 	if cfg.Agent != "claude" ||
 		cfg.Provider != "claude-code" ||
 		cfg.Format != "acp" ||
+		cfg.ProtocolVersion != protocol.ProtocolVersionV2 ||
 		!cfg.Managed ||
 		cfg.Pair ||
 		cfg.CloudAPIURL != defaultManagedCloudAPIURL ||
@@ -450,6 +453,7 @@ func TestParseAgentEntrypointUsesInjectedSessionWithoutPairing(t *testing.T) {
 	if cfg.Agent != "codex" ||
 		cfg.Provider != "codex" ||
 		cfg.Format != "acp" ||
+		cfg.ProtocolVersion != protocol.ProtocolVersionV2 ||
 		cfg.Managed ||
 		cfg.Pair ||
 		cfg.CloudAPIURL != "" ||
@@ -458,6 +462,16 @@ func TestParseAgentEntrypointUsesInjectedSessionWithoutPairing(t *testing.T) {
 		cfg.AdapterToken != "adapter-token" ||
 		strings.Join(cfg.ProviderCommand, " ") != "codex-acp" {
 		t.Fatalf("agent entrypoint config = %+v", cfg)
+	}
+}
+
+func TestParseAgentEntrypointAllowsExplicitV1Compatibility(t *testing.T) {
+	cfg, err := parseAgentEntrypointConfig("claude", []string{"--protocol-version", "1"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
+	}
+	if cfg.ProtocolVersion != protocol.ProtocolVersion {
+		t.Fatalf("protocol version = %d, want explicit v1", cfg.ProtocolVersion)
 	}
 }
 
@@ -1887,6 +1901,419 @@ func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	}
 }
 
+func TestRunWrapACPProviderAppliesV2SettingsAndPublishesReadback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	t.Setenv("AGENTWHARF_ACP_HELPER", "1")
+	type settingsRunResult struct {
+		initial   protocol.SettingsCapabilityPayload
+		effective protocol.SettingsEffectivePayload
+		message   string
+	}
+	result := make(chan settingsRunResult, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		frame, err := readFrameFromConn(ctx, conn)
+		hello, ok := frame.(*protocol.Hello)
+		if err != nil || !ok || hello.ProtocolVersion != protocol.ProtocolVersionV2 || hello.Role != protocol.RoleAdapter {
+			t.Errorf("adapter hello = %T %+v, %v", frame, frame, err)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{
+			ProtocolVersion: protocol.ProtocolVersionV2,
+			Sessions:        []protocol.SessionSummary{{SessionID: "ses_settings", Provider: "claude-code"}},
+			Capabilities: &protocol.HelloCapabilities{Settings: &protocol.SettingsCapability{
+				SchemaVersion: protocol.SettingsCapabilitySchemaVersion, MaxPendingChanges: 1, ProviderResponseTimeoutSeconds: 30,
+			}},
+			ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{
+				SessionID: "ses_settings", ConnectionEpoch: 1, CredentialGeneration: 1,
+				AcceptedFence: 1, WriterLeaseID: "lease_v2", ExpiresAt: time.Now().Add(time.Minute).UnixMilli(),
+			},
+		}); err != nil {
+			t.Errorf("write hello ack: %v", err)
+			return
+		}
+		frame, err = readProviderStartFrame(ctx, conn)
+		start, ok := frame.(*protocol.ProviderStart)
+		if err != nil || !ok || start.Attempt != 1 {
+			t.Errorf("provider start = %T %+v, %v", frame, frame, err)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: start.Attempt}); err != nil {
+			t.Errorf("write provider start prepare: %v", err)
+			return
+		}
+		frame, err = readFrameFromConn(ctx, conn)
+		started, ok := frame.(*protocol.ProviderStartStarted)
+		if err != nil || !ok || started.Attempt != start.Attempt {
+			t.Errorf("provider started = %T %+v, %v", frame, frame, err)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{
+			Attempt: start.Attempt, Status: protocol.ProviderStartAdmitted,
+			RecoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+		}); err != nil {
+			t.Errorf("write provider start ack: %v", err)
+			return
+		}
+
+		var observed settingsRunResult
+		var nextSeq int64 = 1
+		for observed.initial.Fingerprint == "" {
+			frame, err = readFrameFromConn(ctx, conn)
+			if err != nil {
+				t.Errorf("read initial capability: %v", err)
+				return
+			}
+			switch typed := frame.(type) {
+			case *protocol.Event:
+				if typed.ProposalID != "" {
+					if err := writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: typed.ProposalID, Seq: nextSeq, Status: protocol.EventReceiptAccepted}); err != nil {
+						t.Errorf("write event receipt: %v", err)
+						return
+					}
+					nextSeq++
+				}
+				if typed.Type == "session.settings.capabilities" {
+					observed.initial, err = protocol.DecodeSettingsCapabilityPayload(typed.Payload)
+					if err != nil {
+						t.Errorf("decode initial settings capability: %v", err)
+						return
+					}
+				}
+			case *protocol.Ping:
+				_ = writeFrameToConn(ctx, conn, &protocol.Pong{Nonce: typed.Nonce})
+			}
+		}
+		settingsPayload, _ := json.Marshal(map[string]any{
+			"capability_fingerprint": observed.initial.Fingerprint,
+			"model_id":               "reasoning",
+			"reasoning_effort_id":    "high",
+			"permission_mode_id":     "workspace",
+		})
+		if err := writeFrameToConn(ctx, conn, &protocol.Command{
+			CommandID: "cmd_settings_apply", Type: protocol.CommandSettingsChange,
+			SessionID: "ses_settings", Payload: settingsPayload,
+		}); err != nil {
+			t.Errorf("write settings command: %v", err)
+			return
+		}
+		for {
+			frame, err = readFrameFromConn(ctx, conn)
+			if err != nil {
+				t.Errorf("read settings ack: %v", err)
+				return
+			}
+			if ack, ok := frame.(*protocol.CommandAck); ok && ack.CommandID == "cmd_settings_apply" {
+				if ack.Status != protocol.AckAccepted {
+					t.Errorf("settings ack = %+v", ack)
+					return
+				}
+				break
+			}
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.SettingsDeliveryExecute{
+			SessionID: "ses_settings", CommandID: "cmd_settings_apply",
+			ReservationVersion: 1, OperationTimeoutMS: 30000,
+		}); err != nil {
+			t.Errorf("write settings execute: %v", err)
+			return
+		}
+		for observed.effective.CommandID == "" {
+			frame, err = readFrameFromConn(ctx, conn)
+			if err != nil {
+				t.Errorf("read settings result: %v", err)
+				return
+			}
+			event, ok := frame.(*protocol.Event)
+			if !ok {
+				continue
+			}
+			if event.ProposalID != "" {
+				if err := writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: nextSeq, Status: protocol.EventReceiptAccepted}); err != nil {
+					t.Errorf("write settings result receipt: %v", err)
+					return
+				}
+				nextSeq++
+			}
+			if event.Type == "session.settings.effective" {
+				observed.effective, err = protocol.DecodeSettingsEffectivePayload(event.Payload)
+				if err != nil {
+					t.Errorf("decode effective settings: %v", err)
+					return
+				}
+			}
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.Command{
+			CommandID: "cmd_after_settings", Type: protocol.CommandSessionSend,
+			SessionID: "ses_settings", Payload: []byte(`{"content":[{"kind":"text","text":"ping"}]}`),
+		}); err != nil {
+			t.Errorf("write post-settings command: %v", err)
+			return
+		}
+		commandAckSeen := false
+		for !commandAckSeen || observed.message == "" {
+			frame, err = readFrameFromConn(ctx, conn)
+			if err != nil {
+				t.Errorf("read post-settings result: %v", err)
+				return
+			}
+			switch typed := frame.(type) {
+			case *protocol.CommandAck:
+				commandAckSeen = typed.CommandID == "cmd_after_settings" && typed.Status == protocol.AckAccepted
+			case *protocol.Event:
+				if typed.Type == "session.message" && strings.Contains(string(typed.Payload), "acp saw ping") {
+					observed.message = string(typed.Payload)
+				}
+			case *protocol.Ping:
+				_ = writeFrameToConn(ctx, conn, &protocol.Pong{Nonce: typed.Nonce})
+			}
+		}
+		result <- observed
+		for {
+			frame, err = readFrameFromConn(ctx, conn)
+			if err != nil {
+				return
+			}
+			if ping, ok := frame.(*protocol.Ping); ok {
+				_ = writeFrameToConn(ctx, conn, &protocol.Pong{Nonce: ping.Nonce})
+			}
+		}
+	}))
+	defer server.Close()
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := runWrap(ctx, wrapConfig{
+			HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_settings",
+			Provider: "claude-code", AdapterToken: "adapter-token", Agent: "claude",
+			ProtocolVersion: protocol.ProtocolVersionV2, Format: "acp", ProviderCommand: []string{os.Args[0]},
+		}, nil, io.Discard)
+		runDone <- err
+	}()
+	observed := <-result
+	if observed.initial.EffectiveModelID != "balanced" || observed.initial.EffectiveReasoningEffortID == nil || *observed.initial.EffectiveReasoningEffortID != "medium" || observed.initial.EffectivePermissionModeID != "ask" {
+		t.Fatalf("initial capability = %+v", observed.initial)
+	}
+	if observed.effective.CommandID != "cmd_settings_apply" || observed.effective.Outcome != "applied" ||
+		observed.effective.EffectiveModelID != "reasoning" || observed.effective.EffectiveReasoningEffortID == nil || *observed.effective.EffectiveReasoningEffortID != "high" || observed.effective.EffectivePermissionModeID != "workspace" {
+		t.Fatalf("effective settings = %+v", observed.effective)
+	}
+	if !strings.Contains(observed.message, "acp saw ping") {
+		t.Fatalf("post-settings message = %q", observed.message)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("run wrap error = %v", err)
+	}
+}
+
+func TestForwardACPSettingsRevalidatesCapabilityBeforeProviderSideEffect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	serverConn := make(chan *websocket.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		serverConn <- conn
+		<-ctx.Done()
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	}))
+	defer server.Close()
+	adapterConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapterConn.Close(websocket.StatusNormalClosure, "")
+	hubConn := <-serverConn
+
+	tracker := newACPSettingsTracker(map[string]any{"configOptions": testACPConfigOptions("balanced", "ask")})
+	reserved, ok := tracker.Current()
+	if !ok {
+		t.Fatal("initial settings capability unavailable")
+	}
+	providerInput := &recordingWriteCloser{}
+	responses := newACPResponseRouter()
+	var permissionMu sync.Mutex
+	var settingsMu sync.Mutex
+	done := make(chan error, 1)
+	go func() {
+		done <- forwardHubCommandsToACPProvider(
+			ctx,
+			adapterConn,
+			providerInput,
+			func(frame protocol.Frame) error { return writeFrameToConn(ctx, adapterConn, frame) },
+			func(string) {},
+			"acp_ses_1",
+			3,
+			map[string]acpPendingPermission{},
+			&permissionMu,
+			responses,
+			tracker,
+			&settingsMu,
+			nil,
+			nil,
+			wrapConfig{ProtocolVersion: protocol.ProtocolVersionV2, SessionID: "ses_settings"},
+		)
+	}()
+	requestedModel := "reasoning"
+	payload, err := json.Marshal(map[string]any{
+		"capability_fingerprint": reserved.Capability.Fingerprint,
+		"model_id":               requestedModel,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFrameToConn(ctx, hubConn, &protocol.Command{
+		CommandID: "cmd_stale_before_execute", Type: protocol.CommandSettingsChange,
+		SessionID: "ses_settings", Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ackFrame, err := readFrameFromConn(ctx, hubConn)
+	ack, ok := ackFrame.(*protocol.CommandAck)
+	if err != nil || !ok || ack.Status != protocol.AckAccepted {
+		t.Fatalf("settings reservation ack = %T %+v, %v", ackFrame, ackFrame, err)
+	}
+	settingsMu.Lock()
+	_, _, err = tracker.UpdateFromResult(map[string]any{"configOptions": testACPConfigOptions("reasoning", "ask")}, 1)
+	settingsMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFrameToConn(ctx, hubConn, &protocol.SettingsDeliveryExecute{
+		SessionID: "ses_settings", CommandID: "cmd_stale_before_execute",
+		ReservationVersion: 1, OperationTimeoutMS: 30000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var effective protocol.SettingsEffectivePayload
+	for effective.CommandID == "" {
+		frame, err := readFrameFromConn(ctx, hubConn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		event, ok := frame.(*protocol.Event)
+		if !ok || event.Type != "session.settings.effective" {
+			continue
+		}
+		effective, err = protocol.DecodeSettingsEffectivePayload(event.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if effective.Outcome != "stale_capability" || effective.EffectiveModelID != "reasoning" {
+		t.Fatalf("stale execution = %+v", effective)
+	}
+	if providerInput.Len() != 0 {
+		t.Fatalf("provider received stale settings side effect: %q", providerInput.String())
+	}
+	cancel()
+	if err := <-done; err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+		t.Fatalf("forward settings loop error = %v", err)
+	}
+}
+
+func TestForwardACPSettingsRejectsOtherSessionAndMismatchedExecute(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	serverConn := make(chan *websocket.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		serverConn <- conn
+		<-ctx.Done()
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	}))
+	defer server.Close()
+	adapterConn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapterConn.Close(websocket.StatusNormalClosure, "")
+	hubConn := <-serverConn
+
+	tracker := newACPSettingsTracker(map[string]any{"configOptions": testACPConfigOptions("balanced", "ask")})
+	reserved, ok := tracker.Current()
+	if !ok {
+		t.Fatal("initial settings capability unavailable")
+	}
+	providerInput := &recordingWriteCloser{}
+	responses := newACPResponseRouter()
+	var permissionMu sync.Mutex
+	var settingsMu sync.Mutex
+	done := make(chan error, 1)
+	go func() {
+		done <- forwardHubCommandsToACPProvider(
+			ctx,
+			adapterConn,
+			providerInput,
+			func(frame protocol.Frame) error { return writeFrameToConn(ctx, adapterConn, frame) },
+			func(string) {},
+			"acp_ses_1",
+			3,
+			map[string]acpPendingPermission{},
+			&permissionMu,
+			responses,
+			tracker,
+			&settingsMu,
+			nil,
+			nil,
+			wrapConfig{ProtocolVersion: protocol.ProtocolVersionV2, SessionID: "ses_settings"},
+		)
+	}()
+	payload, err := json.Marshal(map[string]any{
+		"capability_fingerprint": reserved.Capability.Fingerprint,
+		"model_id":               "reasoning",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFrameToConn(ctx, hubConn, &protocol.Command{
+		CommandID: "cmd_wrong_session", Type: protocol.CommandSettingsChange,
+		SessionID: "ses_other", Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ackFrame, err := readFrameFromConn(ctx, hubConn)
+	ack, ok := ackFrame.(*protocol.CommandAck)
+	if err != nil || !ok || ack.CommandID != "cmd_wrong_session" || ack.Status != protocol.AckRejected || ack.Reason != "settings_unsupported" {
+		t.Fatalf("wrong-session settings ack = %T %+v, %v", ackFrame, ackFrame, err)
+	}
+	if providerInput.Len() != 0 {
+		t.Fatalf("provider received wrong-session settings side effect: %q", providerInput.String())
+	}
+	if err := writeFrameToConn(ctx, hubConn, &protocol.Command{
+		CommandID: "cmd_right_session", Type: protocol.CommandSettingsChange,
+		SessionID: "ses_settings", Payload: payload,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ackFrame, err = readFrameFromConn(ctx, hubConn)
+	ack, ok = ackFrame.(*protocol.CommandAck)
+	if err != nil || !ok || ack.CommandID != "cmd_right_session" || ack.Status != protocol.AckAccepted {
+		t.Fatalf("right-session settings ack = %T %+v, %v", ackFrame, ackFrame, err)
+	}
+	if err := writeFrameToConn(ctx, hubConn, &protocol.SettingsDeliveryExecute{
+		SessionID: "ses_settings", CommandID: "cmd_other", ReservationVersion: 99, OperationTimeoutMS: 30000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "no matching reservation") {
+		t.Fatalf("wrong-command execute error = %v", err)
+	}
+	if providerInput.Len() != 0 {
+		t.Fatalf("provider received mismatched execute side effect: %q", providerInput.String())
+	}
+}
+
 func TestRunWrapACPProviderLoadsClaudeCredentialsForChildOnly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2381,23 +2808,51 @@ func runWrapACPProviderHelper() {
 	if sessionNew["method"] != "session/new" {
 		os.Exit(11)
 	}
-	writeACPResponse(sessionNew["id"], map[string]any{"sessionId": "acp_ses_1"})
+	writeACPResponse(sessionNew["id"], map[string]any{
+		"sessionId":     "acp_ses_1",
+		"configOptions": testACPConfigOptions("balanced", "ask", "medium"),
+	})
 
 	prompt := readACPRequest(scanner)
+	if prompt["method"] == acpSetConfigOptionMethod {
+		params, _ := prompt["params"].(map[string]any)
+		if params["sessionId"] != "acp_ses_1" || params["configId"] != "model" || params["value"] != "reasoning" {
+			os.Exit(12)
+		}
+		// ACP providers may publish the authoritative config update before the
+		// matching RPC response. The Adapter must keep draining stdout instead of
+		// holding a settings lock across the request/response wait.
+		writeACPConfigUpdate("reasoning", "ask", "medium")
+		writeACPResponse(prompt["id"], map[string]any{"configOptions": testACPConfigOptions("reasoning", "ask", "medium")})
+		prompt = readACPRequest(scanner)
+		params, _ = prompt["params"].(map[string]any)
+		if prompt["method"] != acpSetConfigOptionMethod || params["sessionId"] != "acp_ses_1" || params["configId"] != "reasoning_effort" || params["value"] != "high" {
+			os.Exit(13)
+		}
+		writeACPResponse(prompt["id"], map[string]any{"configOptions": testACPConfigOptions("reasoning", "ask", "high")})
+		prompt = readACPRequest(scanner)
+		params, _ = prompt["params"].(map[string]any)
+		if prompt["method"] != acpSetConfigOptionMethod || params["sessionId"] != "acp_ses_1" || params["configId"] != "mode" || params["value"] != "workspace" {
+			os.Exit(18)
+		}
+		writeACPCurrentModeUpdate("workspace")
+		writeACPResponse(prompt["id"], map[string]any{"configOptions": testACPConfigOptions("reasoning", "workspace", "high")})
+		prompt = readACPRequest(scanner)
+	}
 	if prompt["method"] != "session/prompt" {
-		os.Exit(12)
+		os.Exit(14)
 	}
 	params, _ := prompt["params"].(map[string]any)
 	if params["sessionId"] != "acp_ses_1" {
-		os.Exit(13)
+		os.Exit(15)
 	}
 	items, _ := params["prompt"].([]any)
 	if len(items) != 1 {
-		os.Exit(14)
+		os.Exit(16)
 	}
 	textPart, _ := items[0].(map[string]any)
 	if textPart["text"] != "ping" {
-		os.Exit(15)
+		os.Exit(17)
 	}
 
 	fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","messageId":"resp_1","content":{"type":"text","text":"acp saw ping"}}}}`)
@@ -2467,7 +2922,47 @@ func writeACPResponse(id any, result map[string]any) {
 	fmt.Fprintln(os.Stdout, string(encoded))
 }
 
+func writeACPConfigUpdate(model, mode string, reasoning ...string) {
+	encoded, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]any{
+			"sessionId": "acp_ses_1",
+			"update": map[string]any{
+				"sessionUpdate": "config_option_update",
+				"configOptions": testACPConfigOptions(model, mode, reasoning...),
+			},
+		},
+	})
+	if err != nil {
+		os.Exit(23)
+	}
+	fmt.Fprintln(os.Stdout, string(encoded))
+}
+
+func writeACPCurrentModeUpdate(mode string) {
+	encoded, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]any{
+			"sessionId": "acp_ses_1",
+			"update": map[string]any{
+				"sessionUpdate": "current_mode_update",
+				"currentModeId": mode,
+			},
+		},
+	})
+	if err != nil {
+		os.Exit(24)
+	}
+	fmt.Fprintln(os.Stdout, string(encoded))
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+type recordingWriteCloser struct{ bytes.Buffer }
+
+func (w *recordingWriteCloser) Close() error { return nil }
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)

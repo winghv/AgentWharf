@@ -337,11 +337,11 @@ test('routes settings changes and keeps durable capability/effective events sepa
   client.onSettingsCapability((update) => capabilities.push(update.capability.effectiveModelId))
   client.onSettingsEffective((update) => effectives.push(update.effective.outcome))
   const command = client.changeSettings('ses_settings', {
-    commandId: 'settings_1', capabilityFingerprint: `sha256:${'a'.repeat(64)}`, modelId: 'reasoning',
+    commandId: 'settings_1', capabilityFingerprint: `sha256:${'a'.repeat(64)}`, modelId: 'reasoning', reasoningEffortId: 'high',
   })
   assert.deepEqual(sockets.last().sentFrames()[1], {
     frame: 'command', cmd_id: 'settings_1', type: 'session.settings.change', session_id: 'ses_settings',
-    payload: { capability_fingerprint: `sha256:${'a'.repeat(64)}`, model_id: 'reasoning' },
+    payload: { capability_fingerprint: `sha256:${'a'.repeat(64)}`, model_id: 'reasoning', reasoning_effort_id: 'high' },
   })
   sockets.last().receive({ frame: 'command.ack', cmd_id: 'settings_1', status: 'accepted', reason: '' })
   assert.equal((await command).status, 'accepted')
@@ -351,23 +351,37 @@ test('routes settings changes and keeps durable capability/effective events sepa
   sockets.last().receive({
     frame: 'event', type: 'session.settings.capabilities', session_id: 'ses_settings', seq: 3, time: 3,
     payload: {
-      schema_version: 1, fingerprint, models: [{ id: 'balanced', label: 'Balanced' }, { id: 'reasoning', label: 'Reasoning' }],
+      schema_version: 2, fingerprint, models: [{ id: 'balanced', label: 'Balanced' }, { id: 'reasoning', label: 'Reasoning' }],
+      reasoning_efforts: [{ id: 'high', label: 'High' }, { id: 'medium', label: 'Medium' }],
       permission_modes: [{ id: 'ask', label: 'Ask first' }], effective_model_id: 'reasoning', effective_permission_mode_id: 'ask',
-      model_change: 'allowed', permission_change: 'read_only', model_read_only_reason: null, permission_read_only_reason: 'policy',
+      effective_reasoning_effort_id: 'high', model_change: 'allowed', reasoning_effort_change: 'allowed', permission_change: 'read_only',
+      model_read_only_reason: null, reasoning_effort_read_only_reason: null, permission_read_only_reason: 'policy',
     },
   })
   sockets.last().receive({
     frame: 'event', type: 'session.settings.effective', session_id: 'ses_settings', seq: 4, time: 4,
     payload: {
       cmd_id: 'settings_1', request_fingerprint: `sha256:${'a'.repeat(64)}`, effective_fingerprint: fingerprint,
-      outcome: 'applied', effective_model_id: 'reasoning', effective_permission_mode_id: 'ask', reason_code: null,
+      outcome: 'applied', effective_model_id: 'reasoning', effective_reasoning_effort_id: 'high', effective_permission_mode_id: 'ask', reason_code: null,
     },
   })
   assert.deepEqual(capabilities, ['reasoning'])
   assert.deepEqual(effectives, ['applied'])
   assert.equal(client.settingsCapability('ses_settings')?.capability.fingerprint, fingerprint)
+  assert.equal(client.settingsCapability('ses_settings')?.capability.effectiveReasoningEffortId, 'high')
   assert.equal(client.settingsEffective('settings_1')?.effective.outcome, 'applied')
   assert.equal(client.deliveryState('settings_1')?.provider, 'pending')
+  sockets.last().receive({
+    frame: 'event', type: 'session.settings.capabilities', session_id: 'ses_settings', seq: 5, time: 5,
+    payload: {
+      schema_version: 1, fingerprint: `sha256:${'c'.repeat(64)}`,
+      models: [{ id: 'reasoning', label: 'Reasoning' }], permission_modes: [{ id: 'ask', label: 'Ask first' }],
+      effective_model_id: 'reasoning', effective_permission_mode_id: 'ask', model_change: 'read_only', permission_change: 'read_only',
+      model_read_only_reason: 'provider_read_only', permission_read_only_reason: 'provider_read_only',
+    },
+  })
+  assert.deepEqual(client.settingsCapability('ses_settings')?.capability.reasoningEfforts, [])
+  assert.equal(client.settingsCapability('ses_settings')?.capability.reasoningEffortChange, 'unsupported')
   await assert.rejects(client.changeSettings('ses_settings', { capabilityFingerprint: 'bad', modelId: 'reasoning' }), /fingerprint/)
   client.close()
 })

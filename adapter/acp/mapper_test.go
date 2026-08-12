@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/winghv/agentwharf/adapter/acp"
 	"github.com/winghv/agentwharf/protocol"
@@ -280,6 +281,97 @@ func TestMapperMapsACPPermissionRequest(t *testing.T) {
 	detail := payload["detail"].(map[string]any)
 	if detail["provider_session_id"] != "acp_ses_1" || len(detail["options"].([]any)) != 1 {
 		t.Fatalf("permission detail = %+v", detail)
+	}
+}
+
+func TestMapperMapsCorrelatedACPToolCallLifecycle(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code", Now: func() time.Time {
+		return time.UnixMilli(1700000000456)
+	}})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+
+	events, err := mapper.MapReader(context.Background(), strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"call_001","title":"Run tests","kind":"execute","status":"in_progress","rawInput":{"command":"go test ./..."}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_001","status":"completed","rawOutput":"ok"}}}`,
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("MapReader() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %+v, want correlated start and result", events)
+	}
+
+	assertEvent(t, events[0], "session.tool_call")
+	start := payloadMap(t, events[0])
+	if start["tool_call_id"] != "call_001" || start["phase"] != "start" || start["name"] != "execute" || start["result"] != nil {
+		t.Fatalf("start payload = %+v", start)
+	}
+	input := start["input"].(map[string]any)
+	if input["command"] != "go test ./..." {
+		t.Fatalf("start input = %+v", input)
+	}
+
+	assertEvent(t, events[1], "session.tool_call")
+	result := payloadMap(t, events[1])
+	if result["tool_call_id"] != "call_001" || result["phase"] != "result" {
+		t.Fatalf("result payload = %+v", result)
+	}
+	if _, ok := result["name"]; ok {
+		t.Fatalf("delta result unexpectedly overwrote the start name: %+v", result)
+	}
+	resultBody := result["result"].(map[string]any)
+	if resultBody["status"] != "ok" || resultBody["output_preview"] != "ok" || resultBody["truncated"] != false {
+		t.Fatalf("result body = %+v", resultBody)
+	}
+}
+
+func TestMapperMapsACPToolCallFailureAndBoundsOutputPreview(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code", Now: func() time.Time {
+		return time.UnixMilli(1700000000456)
+	}})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+
+	longOutput := strings.Repeat("界", 2000)
+	line, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]any{
+			"sessionId": "acp_ses_1",
+			"update": map[string]any{
+				"sessionUpdate": "tool_call_update",
+				"toolCallId":    "call_failed",
+				"kind":          "execute",
+				"status":        "failed",
+				"content":       longOutput,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal test frame: %v", err)
+	}
+	events, err := mapper.MapLine(line)
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %+v, want one result", events)
+	}
+	result := payloadMap(t, events[0])
+	if result["tool_call_id"] != "call_failed" || result["phase"] != "result" || result["name"] != "execute" {
+		t.Fatalf("result payload = %+v", result)
+	}
+	resultBody := result["result"].(map[string]any)
+	preview := resultBody["output_preview"].(string)
+	if resultBody["status"] != "error" || resultBody["truncated"] != true || len(preview) > 4096 || !utf8.ValidString(preview) {
+		t.Fatalf("bounded result body = status=%v truncated=%v bytes=%d valid_utf8=%v", resultBody["status"], resultBody["truncated"], len(preview), utf8.ValidString(preview))
 	}
 }
 

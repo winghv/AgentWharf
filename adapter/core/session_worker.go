@@ -657,7 +657,7 @@ func (w *SessionWorker) finalizeCommandUnknown(command SessionWorkerCommand, ope
 
 func supportedSessionWorkerCommand(commandType string) bool {
 	switch commandType {
-	case "session.send", "permission.respond", "session.interrupt", "session.stop":
+	case "session.send", "permission.respond", "session.interrupt", "session.stop", "session.settings.change":
 		return true
 	default:
 		return false

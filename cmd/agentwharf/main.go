@@ -227,7 +227,7 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		AdapterToken:    handoff.Data.AdapterToken,
 		Format:          "acp",
 		ProviderCommand: defaultProviderCommand(agent),
-		ProtocolVersion: protocol.ProtocolVersion,
+		ProtocolVersion: protocol.HubProtocolVersion,
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if _, err := runWrap(ctx, cfg, strings.NewReader(""), stderr); err == nil {
@@ -539,7 +539,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	flags.StringVar(&cfg.SecretDir, "secret-dir", cfg.SecretDir, "directory containing injected secret files for masking")
 	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL")
 	flags.BoolVar(&cfg.Pair, "pair", cfg.Pair, "pair this machine with SuperWHV before connecting")
-	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", protocol.ProtocolVersion, "Adapter protocol version (1 or 2)")
+	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", protocol.HubProtocolVersion, "Adapter protocol version (1 or 2)")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
 	}
@@ -651,6 +651,8 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 		cfg.SecretDir = ""
 	}
 	if cfg.ProtocolVersion == 0 {
+		// Programmatic legacy callers historically omitted this field. CLI
+		// entrypoints set the v2 default explicitly above.
 		cfg.ProtocolVersion = protocol.ProtocolVersion
 	}
 	if cfg.ProtocolVersion != protocol.ProtocolVersion && cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
@@ -1607,6 +1609,16 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		cancel()
 		return errors.New("acp session/new response missing sessionId")
 	}
+	settingsTracker := newACPSettingsTracker(sessionResult)
+	var settingsMu sync.Mutex
+	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
+		if state, ok := settingsTracker.Current(); ok {
+			if err := publishACPSettingsCapability(writeFrame, cfg.SessionID, state); err != nil {
+				cancel()
+				return fmt.Errorf("publish initial acp settings capability: %w", err)
+			}
+		}
+	}
 	if err := sendACPProviderReadyEvent(runCtx, conn, cfg, providerSessionID, cwd, masker, metrics); err != nil {
 		cancel()
 		return err
@@ -1616,10 +1628,21 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 	commandDone := make(chan error, 1)
 	var permissionMu sync.Mutex
 	pendingPermissions := make(map[string]acpPendingPermission)
+	responses := newACPResponseRouter()
 	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
 	go func() {
-		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, func(line []byte) {
+		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, responses, func(line []byte, sourceSequence uint64) error {
 			trackACPPermissionRequest(line, pendingPermissions, &permissionMu)
+			settingsMu.Lock()
+			defer settingsMu.Unlock()
+			state, changed, err := settingsTracker.ObserveProviderLine(line, providerSessionID, sourceSequence)
+			if err != nil {
+				return fmt.Errorf("observe acp settings update: %w", err)
+			}
+			if cfg.ProtocolVersion == protocol.ProtocolVersionV2 && changed {
+				return publishACPSettingsCapability(writeFrame, cfg.SessionID, state)
+			}
+			return nil
 		}, func(event protocol.Event) error {
 			masked, err := maskEvent(masker, event)
 			if err != nil {
@@ -1630,7 +1653,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		})
 	}()
 	go func() {
-		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, observePong, providerSessionID, 3, pendingPermissions, &permissionMu, startAdmission, supervisor, cfg)
+		commandDone <- forwardHubCommandsToACPProvider(runCtx, conn, stdinWriter, writeFrame, observePong, providerSessionID, 3, pendingPermissions, &permissionMu, responses, settingsTracker, &settingsMu, startAdmission, supervisor, cfg)
 	}()
 
 	processFinished := false
@@ -1654,6 +1677,11 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, conn *websocket.Con
 		case err := <-outputDone:
 			outputFinished = true
 			outputErr = ignoreContextError(err)
+			if outputErr != nil {
+				cancel()
+				stopProviderSupervisor(supervisor)
+				return outputErr
+			}
 		case err := <-commandDone:
 			if err != nil {
 				cancel()
@@ -2404,14 +2432,21 @@ type acpPendingPermission struct {
 	Options []map[string]any
 }
 
-func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio.Scanner, observe func([]byte), send func(protocol.Event) error) error {
+func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio.Scanner, responses *acpResponseRouter, observe func([]byte, uint64) error, send func(protocol.Event) error) error {
+	var sourceSequence uint64
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		sourceSequence++
 		line := append([]byte(nil), scanner.Bytes()...)
+		if responses != nil && responses.Deliver(line, sourceSequence) {
+			continue
+		}
 		if observe != nil {
-			observe(line)
+			if err := observe(line, sourceSequence); err != nil {
+				return err
+			}
 		}
 		events, err := translateWrapLine(cfg, line)
 		if err != nil {
@@ -2429,8 +2464,9 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 	return nil
 }
 
-func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex, startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, cfg wrapConfig) error {
+func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex, responses *acpResponseRouter, settingsTracker *acpSettingsTracker, settingsMu *sync.Mutex, startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, cfg wrapConfig) error {
 	defer stdin.Close()
+	var pendingSettings *acpSettingsReservation
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
 		if err != nil {
@@ -2487,6 +2523,41 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 				if err := writeFrame(&ack); err != nil {
 					return fmt.Errorf("ack acp permission response %s: %w", typed.CommandID, err)
 				}
+			case protocol.CommandSettingsChange:
+				if cfg.ProtocolVersion != protocol.ProtocolVersionV2 || typed.SessionID != cfg.SessionID || pendingSettings != nil {
+					ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: "settings_unsupported"}
+					if pendingSettings != nil {
+						ack.Reason = "settings_change_pending"
+					}
+					if err := writeFrame(&ack); err != nil {
+						return fmt.Errorf("reject acp settings command %s: %w", typed.CommandID, err)
+					}
+					continue
+				}
+				change, err := protocol.DecodeSettingsChangePayload(typed.Payload)
+				settingsMu.Lock()
+				state, available := settingsTracker.Current()
+				settingsMu.Unlock()
+				reason := "settings_unsupported"
+				if err == nil && available {
+					reason = validateACPSettingsChange(state, change)
+				}
+				if err != nil || !available || reason != "" {
+					ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: reason}
+					if err := writeFrame(&ack); err != nil {
+						return fmt.Errorf("reject acp settings command %s: %w", typed.CommandID, err)
+					}
+					continue
+				}
+				reservation := acpSettingsReservation{
+					Command: *typed, Change: change, Reserved: state,
+					Deadline: time.Now().Add(acpSettingsOperationTimeout),
+				}
+				pendingSettings = &reservation
+				if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
+					pendingSettings = nil
+					return fmt.Errorf("ack acp settings command %s: %w", typed.CommandID, err)
+				}
 			case protocol.CommandSessionStop:
 				if err := handleProviderRunControl(ctx, typed, supervisor, writeFrame, cfg, true); err != nil {
 					return err
@@ -2498,6 +2569,51 @@ func forwardHubCommandsToACPProvider(ctx context.Context, conn *websocket.Conn, 
 					return fmt.Errorf("reject acp provider command %s: %w", typed.CommandID, err)
 				}
 			}
+		case *protocol.SettingsDeliveryExecute:
+			// The Store reservation version is first disclosed to the Adapter by
+			// this post-CAS frame. Local identity is therefore bound by the same
+			// authenticated Session WebSocket, exact command ID, one pending slot,
+			// and one-time consumption; the Hub remains authoritative for the
+			// positive Store generation carried here.
+			if pendingSettings == nil || cfg.ProtocolVersion != protocol.ProtocolVersionV2 || typed.SessionID != cfg.SessionID || typed.CommandID != pendingSettings.Command.CommandID || typed.ReservationVersion < 1 {
+				return errors.New("acp settings execute has no matching reservation")
+			}
+			reservation := *pendingSettings
+			pendingSettings = nil
+			if !time.Now().Before(reservation.Deadline) {
+				return errors.New("acp settings execute arrived after the operation fence")
+			}
+			operationCtx, cancel := context.WithDeadline(ctx, reservation.Deadline)
+			execution := executeACPSettingsChange(operationCtx, reservation, providerSessionID, stdin, responses, settingsTracker, settingsMu, &nextID)
+			cancel()
+			if !execution.PublishResult {
+				stopProviderSupervisor(supervisor)
+				return errors.New("acp settings provider result requires fresh reconnect readback")
+			}
+			settingsMu.Lock()
+			latest, available := settingsTracker.Current()
+			if !available {
+				settingsMu.Unlock()
+				stopProviderSupervisor(supervisor)
+				return errors.New("acp settings capability disappeared after execution")
+			}
+			execution = reconcileACPSettingsExecution(execution, latest)
+			if err := publishACPSettingsCapability(writeFrame, cfg.SessionID, execution.State); err != nil {
+				settingsMu.Unlock()
+				return fmt.Errorf("publish acp settings readback: %w", err)
+			}
+			if err := publishACPSettingsEffective(writeFrame, cfg.SessionID, reservation, execution); err != nil {
+				settingsMu.Unlock()
+				return fmt.Errorf("publish acp settings effective result: %w", err)
+			}
+			settingsMu.Unlock()
+			if execution.TerminateProvider {
+				stopProviderSupervisor(supervisor)
+				return errors.New("acp settings provider operation exceeded its safe fence")
+			}
+		case *protocol.EventReceipt:
+			// Durable capability/effective receipts are terminal acknowledgements;
+			// the Adapter has no additional side effect to perform.
 		case *protocol.Ping:
 			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
 				return fmt.Errorf("send pong: %w", err)
@@ -2628,18 +2744,36 @@ func readACPResponse(ctx context.Context, scanner *bufio.Scanner, id int64) (map
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		var message map[string]any
-		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(scanner.Bytes(), &fields); err != nil {
 			return nil, fmt.Errorf("decode acp response %d: %w", id, err)
 		}
-		if fmt.Sprint(message["id"]) != fmt.Sprint(id) {
+		if fields["method"] != nil {
+			if fields["id"] != nil {
+				return nil, fmt.Errorf("acp request %d received an unexpected Provider request during initialization", id)
+			}
 			continue
 		}
-		if errValue, ok := message["error"]; ok {
-			return nil, fmt.Errorf("acp request %d failed: %v", id, errValue)
-		}
-		result, ok := message["result"].(map[string]any)
+		responseKey, ok := acpRPCIDKey(fields["id"])
 		if !ok {
+			continue
+		}
+		if responseKey != acpNumericRPCIDKey(id) {
+			if responseKey == "s:"+fmt.Sprint(id) {
+				return nil, fmt.Errorf("acp response %d changed the JSON-RPC id type", id)
+			}
+			continue
+		}
+		rawError := fields["error"]
+		rawResult := fields["result"]
+		if rawError != nil && string(rawError) != "null" {
+			if rawResult != nil {
+				return nil, fmt.Errorf("acp response %d has both result and error", id)
+			}
+			return nil, fmt.Errorf("acp request %d failed: %s", id, compactJSON(rawError))
+		}
+		var result map[string]any
+		if rawResult == nil || json.Unmarshal(rawResult, &result) != nil {
 			return nil, fmt.Errorf("acp response %d missing result", id)
 		}
 		return result, nil

@@ -301,6 +301,58 @@ func TestSettingsCapabilityPayloadRejectsNonCanonicalChoices(t *testing.T) {
 	}
 }
 
+func TestSettingsCapabilityV2CarriesOnlyProviderConfirmedReasoningEfforts(t *testing.T) {
+	effectiveReasoning := "high"
+	capability := SettingsCapabilityPayload{
+		SchemaVersion: SettingsCapabilitySchemaVersion,
+		Models: []SettingsCapabilityChoice{
+			{ID: "balanced", Label: "Balanced"},
+			{ID: "reasoning", Label: "Reasoning"},
+		},
+		ReasoningEfforts: []SettingsCapabilityChoice{
+			{ID: "high", Label: "High"},
+			{ID: "medium", Label: "Medium"},
+		},
+		PermissionModes: []SettingsCapabilityChoice{
+			{ID: "ask", Label: "Ask first"},
+		},
+		EffectiveModelID:              "reasoning",
+		EffectiveReasoningEffortID:    &effectiveReasoning,
+		EffectivePermissionModeID:     "ask",
+		ModelChange:                   "allowed",
+		ReasoningEffortChange:         "allowed",
+		PermissionChange:              "read_only",
+		ReasoningEffortReadOnlyReason: nil,
+		PermissionReadOnlyReason:      settingsTestString("provider_read_only"),
+	}
+	capability.Fingerprint = SettingsCapabilityFingerprint(capability)
+	payload, err := json.Marshal(capability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeSettingsCapabilityPayload(payload)
+	if err != nil {
+		t.Fatalf("DecodeSettingsCapabilityPayload(v2) error = %v", err)
+	}
+	if decoded.EffectiveReasoningEffortID == nil || *decoded.EffectiveReasoningEffortID != "high" || len(decoded.ReasoningEfforts) != 2 {
+		t.Fatalf("decoded reasoning capability = %+v", decoded)
+	}
+
+	unsupported := capability
+	unsupported.ReasoningEfforts = []SettingsCapabilityChoice{}
+	unsupported.EffectiveReasoningEffortID = nil
+	unsupported.ReasoningEffortChange = "unsupported"
+	unsupported.ReasoningEffortReadOnlyReason = settingsTestString("provider_unsupported")
+	unsupported.Fingerprint = SettingsCapabilityFingerprint(unsupported)
+	payload, err = json.Marshal(unsupported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded, err = DecodeSettingsCapabilityPayload(payload); err != nil || decoded.EffectiveReasoningEffortID != nil || decoded.ReasoningEffortChange != "unsupported" {
+		t.Fatalf("unsupported reasoning capability = %+v, %v", decoded, err)
+	}
+}
+
 func TestSettingsDeliveryExecuteFrameIsStrictAndV2Bounded(t *testing.T) {
 	valid := `{"frame":"settings.delivery.execute","session_id":"ses_1","cmd_id":"cmd_settings_1","reservation_version":7,"operation_timeout_ms":30000}`
 	frame, err := Decode([]byte(valid))
@@ -338,6 +390,8 @@ func TestSettingsEffectivePayloadRejectsNonCanonicalPayloads(t *testing.T) {
 		}
 	}
 }
+
+func settingsTestString(value string) *string { return &value }
 
 func TestRunControlPayloadsRequireExactCanonicalMembers(t *testing.T) {
 	capability := []byte(`{"schema_version":1,"interrupt_supported":true,"stop_supported":false}`)

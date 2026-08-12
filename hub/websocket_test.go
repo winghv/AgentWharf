@@ -256,14 +256,16 @@ func TestWebSocketSettingsRoutesCapabilityReserveDeliveryAndTerminalResult(t *te
 		t.Fatalf("settings client hello = %#v", frame)
 	}
 	if clientAck.Capabilities == nil || clientAck.Capabilities.Settings == nil ||
-		clientAck.Capabilities.Settings.SchemaVersion != 1 || clientAck.Capabilities.Settings.MaxPendingChanges != 1 ||
+		clientAck.Capabilities.Settings.SchemaVersion != protocol.SettingsCapabilitySchemaVersion || clientAck.Capabilities.Settings.MaxPendingChanges != 1 ||
 		clientAck.Capabilities.Settings.ProviderResponseTimeoutSeconds != 30 {
 		t.Fatalf("settings hello capability = %+v", clientAck.Capabilities)
 	}
 	writeAdapterHelloV2(t, adapter, "adapter-token")
 	_ = readFrame(t, adapter).(*protocol.HelloAck)
 
-	publishSettingsCapability(t, adapter, "capability_initial", 1001, settingsCapabilityPayload("sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000", "balanced"))
+	const initialFingerprint = "sha256:2553e4010a314a5d39437ad091c86dce520bcda5332ee36fc5c8619cf8e1b6d9"
+	const effectiveFingerprint = "sha256:c07881fa55c375d31831a340f1814b640f22fb722eeb24e9341a5b356cd3472e"
+	publishSettingsCapability(t, adapter, "capability_initial", 1001, settingsCapabilityPayloadV2(initialFingerprint, "balanced", "medium"))
 	if event := readFrame(t, client).(*protocol.Event); event.Type != "session.settings.capabilities" || event.Seq == nil || *event.Seq != 1 {
 		t.Fatalf("initial capability fanout = %+v", event)
 	}
@@ -273,13 +275,13 @@ func TestWebSocketSettingsRoutesCapabilityReserveDeliveryAndTerminalResult(t *te
 		t.Fatalf("stale settings acknowledgement = %+v", ack)
 	}
 
-	command := &protocol.Command{CommandID: "cmd_settings_route", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","model_id":"reasoning"}`)}
+	command := &protocol.Command{CommandID: "cmd_settings_route", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:2553e4010a314a5d39437ad091c86dce520bcda5332ee36fc5c8619cf8e1b6d9","model_id":"reasoning","reasoning_effort_id":"high"}`)}
 	writeFrame(t, client, command)
 	delivered := readFrame(t, adapter).(*protocol.Command)
 	if delivered.CommandID != command.CommandID || delivered.Type != protocol.CommandSettingsChange || string(delivered.Payload) != string(command.Payload) {
 		t.Fatalf("settings delivery = %+v", delivered)
 	}
-	pending := &protocol.Command{CommandID: "cmd_settings_pending", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","model_id":"balanced"}`)}
+	pending := &protocol.Command{CommandID: "cmd_settings_pending", Type: protocol.CommandSettingsChange, SessionID: "ses_1", Payload: json.RawMessage(`{"capability_fingerprint":"sha256:2553e4010a314a5d39437ad091c86dce520bcda5332ee36fc5c8619cf8e1b6d9","model_id":"balanced"}`)}
 	writeFrame(t, client, pending)
 	if ack := readCommandAckFor(t, client, pending.CommandID); ack.Status != protocol.AckRejected || ack.Reason != "settings_change_pending" {
 		t.Fatalf("pending settings acknowledgement = %+v", ack)
@@ -297,11 +299,11 @@ func TestWebSocketSettingsRoutesCapabilityReserveDeliveryAndTerminalResult(t *te
 		t.Fatalf("duplicate settings acknowledgement = %+v", ack)
 	}
 
-	publishSettingsCapability(t, adapter, "capability_effective", 1002, settingsCapabilityPayload("sha256:5e6c6921513d5a3e3ed9f5fc0a67bb94e55a66f822a76b1ced587d5a908e2761", "reasoning"))
+	publishSettingsCapability(t, adapter, "capability_effective", 1002, settingsCapabilityPayloadV2(effectiveFingerprint, "reasoning", "high"))
 	if event := readFrame(t, client).(*protocol.Event); event.Type != "session.settings.capabilities" || event.Seq == nil || *event.Seq != 2 {
 		t.Fatalf("effective capability fanout = %+v", event)
 	}
-	writeFrame(t, adapter, &protocol.Event{Type: "session.settings.effective", SessionID: "ses_1", Time: 1003, ProposalID: "effective_result", Payload: json.RawMessage(`{"cmd_id":"cmd_settings_route","request_fingerprint":"sha256:a77186c8bf756736dc64be46864c21e4b10fd8ad8d719abf2e00dfa51c341000","effective_fingerprint":"sha256:5e6c6921513d5a3e3ed9f5fc0a67bb94e55a66f822a76b1ced587d5a908e2761","outcome":"applied","effective_model_id":"reasoning","effective_permission_mode_id":"ask","reason_code":null}`)})
+	writeFrame(t, adapter, &protocol.Event{Type: "session.settings.effective", SessionID: "ses_1", Time: 1003, ProposalID: "effective_result", Payload: json.RawMessage(`{"cmd_id":"cmd_settings_route","request_fingerprint":"sha256:2553e4010a314a5d39437ad091c86dce520bcda5332ee36fc5c8619cf8e1b6d9","effective_fingerprint":"sha256:c07881fa55c375d31831a340f1814b640f22fb722eeb24e9341a5b356cd3472e","outcome":"applied","effective_model_id":"reasoning","effective_reasoning_effort_id":"high","effective_permission_mode_id":"ask","reason_code":null}`)})
 	if receipt := readFrame(t, adapter).(*protocol.EventReceipt); receipt.ProposalID != "effective_result" || receipt.Seq != 3 {
 		t.Fatalf("settings terminal receipt = %+v", receipt)
 	}
@@ -310,7 +312,7 @@ func TestWebSocketSettingsRoutesCapabilityReserveDeliveryAndTerminalResult(t *te
 		t.Fatalf("settings terminal fanout = %+v", terminal)
 	}
 	stored, err := events.SettingsCommand(ctx, "ses_1", command.CommandID)
-	if err != nil || stored.Status != store.SettingsCommandApplied || stored.TerminalEventSeq == nil || *stored.TerminalEventSeq != 3 {
+	if err != nil || stored.Status != store.SettingsCommandApplied || stored.RequestedReasoningEffortID == nil || *stored.RequestedReasoningEffortID != "high" || stored.TerminalEventSeq == nil || *stored.TerminalEventSeq != 3 {
 		t.Fatalf("settings command terminal state = %+v, %v", stored, err)
 	}
 }
@@ -691,6 +693,10 @@ func publishSettingsCapability(t *testing.T, adapter *websocket.Conn, proposalID
 
 func settingsCapabilityPayload(fingerprint, effectiveModel string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(`{"schema_version":1,"fingerprint":%q,"models":[{"id":"balanced","label":"Balanced"},{"id":"reasoning","label":"Reasoning"}],"permission_modes":[{"id":"ask","label":"Ask first"},{"id":"workspace","label":"Workspace"}],"effective_model_id":%q,"effective_permission_mode_id":"ask","model_change":"allowed","permission_change":"allowed","model_read_only_reason":null,"permission_read_only_reason":null}`, fingerprint, effectiveModel))
+}
+
+func settingsCapabilityPayloadV2(fingerprint, effectiveModel, effectiveReasoning string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{"schema_version":2,"fingerprint":%q,"models":[{"id":"balanced","label":"Balanced"},{"id":"reasoning","label":"Reasoning"}],"reasoning_efforts":[{"id":"high","label":"High"},{"id":"low","label":"Low"},{"id":"medium","label":"Medium"}],"permission_modes":[{"id":"ask","label":"Ask first"},{"id":"workspace","label":"Workspace"}],"effective_model_id":%q,"effective_reasoning_effort_id":%q,"effective_permission_mode_id":"ask","model_change":"allowed","reasoning_effort_change":"allowed","permission_change":"allowed","model_read_only_reason":null,"reasoning_effort_read_only_reason":null,"permission_read_only_reason":null}`, fingerprint, effectiveModel, effectiveReasoning))
 }
 
 func TestWebSocketServerDeliversCommittedPendingCommandAfterAdapterReconnect(t *testing.T) {
