@@ -372,7 +372,7 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, fr
 				}
 				ack.Capabilities.RunControl = &protocol.RunControlCapability{SchemaVersion: 1, MaxPending: 1, CompletionTimeoutSeconds: 30}
 			}
-			ack.Capabilities.Settings = &protocol.SettingsCapability{SchemaVersion: 1, MaxPendingChanges: 1, ProviderResponseTimeoutSeconds: 30}
+			ack.Capabilities.Settings = &protocol.SettingsCapability{SchemaVersion: protocol.SettingsCapabilitySchemaVersion, MaxPendingChanges: 1, ProviderResponseTimeoutSeconds: 30}
 		}
 		if _, ok := h.events.(store.HistoryStore); ok {
 			if ack.Capabilities == nil {
@@ -1401,16 +1401,17 @@ func (h *webSocketHandler) commitSettingsCapabilityProposal(ctx context.Context,
 		cached, alreadyPublished := h.settingsCapabilities[event.SessionID]
 		h.commandMu.Unlock()
 		if alreadyPublished && cached.EventSeq == seq && cached.Fingerprint == capability.Fingerprint &&
-			cached.EffectiveModelID == capability.EffectiveModelID && cached.EffectivePermissionModeID == capability.EffectivePermissionModeID &&
+			cached.EffectiveModelID == capability.EffectiveModelID && sameSettingsOptionalID(cached.EffectiveReasoningEffortID, capability.EffectiveReasoningEffortID) && cached.EffectivePermissionModeID == capability.EffectivePermissionModeID &&
 			cached.Writer == adapter.settingsWriter {
 			return nil, nil
 		}
 		published, err := ledger.PublishSettingsCapability(commitCtx, event.SessionID, store.SettingsCapabilityUpdate{
-			EventSeq:                  seq,
-			Fingerprint:               capability.Fingerprint,
-			EffectiveModelID:          capability.EffectiveModelID,
-			EffectivePermissionModeID: capability.EffectivePermissionModeID,
-			Writer:                    adapter.settingsWriter,
+			EventSeq:                   seq,
+			Fingerprint:                capability.Fingerprint,
+			EffectiveModelID:           capability.EffectiveModelID,
+			EffectiveReasoningEffortID: capability.EffectiveReasoningEffortID,
+			EffectivePermissionModeID:  capability.EffectivePermissionModeID,
+			Writer:                     adapter.settingsWriter,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("publish settings capability: %w", err)
@@ -1850,11 +1851,12 @@ func (h *webSocketHandler) handleSettingsChange(ctx context.Context, conn *manag
 	}
 
 	reserve, err := ledger.SettingsCommandReserve(ctx, cmd.SessionID, store.SettingsCommandRequest{
-		CommandID:                 cmd.CommandID,
-		RequestFingerprint:        change.CapabilityFingerprint,
-		RequestedModelID:          change.RequestedModelID,
-		RequestedPermissionModeID: change.RequestedPermissionModeID,
-		Writer:                    adapter.settingsWriter,
+		CommandID:                  cmd.CommandID,
+		RequestFingerprint:         change.CapabilityFingerprint,
+		RequestedModelID:           change.RequestedModelID,
+		RequestedReasoningEffortID: change.RequestedReasoningEffortID,
+		RequestedPermissionModeID:  change.RequestedPermissionModeID,
+		Writer:                     adapter.settingsWriter,
 	})
 	if err != nil {
 		reason := settingsReserveFailureReason(ctx, ledger, cmd.SessionID, err)
@@ -2053,7 +2055,7 @@ func (h *webSocketHandler) finalizeSettingsEffectiveLocked(ctx context.Context, 
 	capability, found := h.settingsCapabilities[event.SessionID]
 	h.commandMu.Unlock()
 	if !found || capability.Fingerprint != effective.EffectiveFingerprint || capability.EffectiveModelID != effective.EffectiveModelID ||
-		capability.EffectivePermissionModeID != effective.EffectivePermissionModeID || capability.Writer != adapter.settingsWriter {
+		!sameSettingsOptionalID(capability.EffectiveReasoningEffortID, effective.EffectiveReasoningEffortID) || capability.EffectivePermissionModeID != effective.EffectivePermissionModeID || capability.Writer != adapter.settingsWriter {
 		return errors.New("settings effective capability is not current")
 	}
 	outcome, reason := settingsFinalizationOutcome(command, capability, effective)
@@ -2090,13 +2092,16 @@ func settingsFinalizationOutcome(command store.SettingsCommand, capability store
 	if outcome == store.SettingsCommandApplied {
 		modelMatches := command.RequestedModelID == nil && capability.EffectiveModelID == command.ReservedCapability.EffectiveModelID ||
 			command.RequestedModelID != nil && capability.EffectiveModelID == *command.RequestedModelID
+		reasoningMatches := command.RequestedReasoningEffortID == nil && sameSettingsOptionalID(capability.EffectiveReasoningEffortID, command.ReservedCapability.EffectiveReasoningEffortID) ||
+			command.RequestedReasoningEffortID != nil && capability.EffectiveReasoningEffortID != nil && *capability.EffectiveReasoningEffortID == *command.RequestedReasoningEffortID
 		permissionMatches := command.RequestedPermissionModeID == nil && capability.EffectivePermissionModeID == command.ReservedCapability.EffectivePermissionModeID ||
 			command.RequestedPermissionModeID != nil && capability.EffectivePermissionModeID == *command.RequestedPermissionModeID
-		if modelMatches && permissionMatches {
+		if modelMatches && reasoningMatches && permissionMatches {
 			return outcome, effective.ReasonCode
 		}
 	} else if outcome != store.SettingsCommandOutcomeUnknown && outcome != store.SettingsCommandMismatched &&
 		capability.EffectiveModelID == command.ReservedCapability.EffectiveModelID &&
+		sameSettingsOptionalID(capability.EffectiveReasoningEffortID, command.ReservedCapability.EffectiveReasoningEffortID) &&
 		capability.EffectivePermissionModeID == command.ReservedCapability.EffectivePermissionModeID {
 		return outcome, effective.ReasonCode
 	} else if outcome == store.SettingsCommandOutcomeUnknown || outcome == store.SettingsCommandMismatched {
@@ -2123,6 +2128,10 @@ func settingsReserveFailureReason(ctx context.Context, ledger store.SettingsComm
 }
 
 func settingsCommandKey(sessionID, commandID string) string { return sessionID + "\x00" + commandID }
+
+func sameSettingsOptionalID(left, right *string) bool {
+	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
+}
 
 func (h *webSocketHandler) settingsCurrentAdapter(sessionID string) *adapterConnection {
 	h.mu.Lock()

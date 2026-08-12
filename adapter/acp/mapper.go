@@ -12,6 +12,7 @@ import (
 	"io"
 	"sort"
 	"time"
+	"unicode/utf8"
 
 	"github.com/winghv/agentwharf/protocol"
 )
@@ -20,6 +21,8 @@ var (
 	ErrInvalidConfig   = errors.New("invalid acp mapper config")
 	ErrInvalidACPEvent = errors.New("invalid acp event")
 )
+
+const maxToolOutputPreviewBytes = 4096
 
 type Config struct {
 	SessionID string
@@ -204,18 +207,83 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		}
 		return []protocol.Event{m.messageEvent(messageID, text)}
 	case "tool_use", "tool_call":
-		return []protocol.Event{m.event("session.tool_call", map[string]any{
-			"tool_call_id": firstString(update, "tool_call_id", "toolCallId", "id"),
-			"phase":        "start",
-			"name":         stringField(update, "name"),
-			"input":        objectOrNil(update["input"]),
-			"result":       nil,
-		})}
+		return m.toolCallEvents(update, false)
+	case "tool_call_update", "tool_result":
+		return m.toolCallEvents(update, true)
 	case "permission_request":
 		return m.permissionRequestEvent(update, firstString(update, "request_id", "requestId", "id"), providerSessionID)
 	default:
 		return nil
 	}
+}
+
+func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol.Event {
+	toolCallID := firstString(update, "tool_call_id", "toolCallId", "tool_use_id", "toolUseId", "id")
+	if toolCallID == "" {
+		return nil
+	}
+
+	status := firstString(update, "status", "phase")
+	if !isUpdate || status == "pending" || status == "in_progress" || status == "start" {
+		input := objectOrNil(firstAny(update, "rawInput", "raw_input", "input"))
+		return []protocol.Event{m.event("session.tool_call", map[string]any{
+			"tool_call_id": toolCallID,
+			"phase":        "start",
+			"name":         firstString(update, "name", "kind", "title"),
+			"input":        input,
+			"result":       nil,
+		})}
+	}
+
+	resultStatus := ""
+	switch status {
+	case "completed", "result", "ok", "success":
+		resultStatus = "ok"
+	case "failed", "error":
+		resultStatus = "error"
+	case "cancelled", "canceled":
+		resultStatus = "cancelled"
+	default:
+		return nil
+	}
+
+	preview, truncated := toolOutputPreview(firstAny(update, "rawOutput", "raw_output", "result", "content"))
+	payload := map[string]any{
+		"tool_call_id": toolCallID,
+		"phase":        "result",
+		"input":        nil,
+		"result": map[string]any{
+			"status":         resultStatus,
+			"output_preview": preview,
+			"truncated":      truncated,
+		},
+	}
+	if name := firstString(update, "name", "kind", "title"); name != "" {
+		payload["name"] = name
+	}
+	return []protocol.Event{m.event("session.tool_call", payload)}
+}
+
+func toolOutputPreview(value any) (string, bool) {
+	if value == nil {
+		return "", false
+	}
+	preview, ok := value.(string)
+	if !ok {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "", false
+		}
+		preview = string(encoded)
+	}
+	if len(preview) <= maxToolOutputPreviewBytes {
+		return preview, false
+	}
+	limit := maxToolOutputPreviewBytes
+	for limit > 0 && !utf8.ValidString(preview[:limit]) {
+		limit--
+	}
+	return preview[:limit], true
 }
 
 func (m *Mapper) settingsCapabilityEvent(raw map[string]any) *protocol.Event {
@@ -487,7 +555,7 @@ func updateObjects(raw map[string]any, key string) []map[string]any {
 }
 
 func frameName(value map[string]any) string {
-	if name := firstString(value, "type", "subtype", "kind", "method", "event", "sessionUpdate"); name != "" {
+	if name := firstString(value, "type", "subtype", "sessionUpdate", "kind", "method", "event"); name != "" {
 		return name
 	}
 	return ""

@@ -647,20 +647,22 @@ type SettingsWriter struct {
 	LeaseID              string
 }
 type SettingsCapability struct {
-	SessionID                 string
-	EventSeq                  int64
-	Fingerprint               string
-	EffectiveModelID          string
-	EffectivePermissionModeID string
-	Version                   int64
-	Writer                    SettingsWriter
+	SessionID                  string
+	EventSeq                   int64
+	Fingerprint                string
+	EffectiveModelID           string
+	EffectiveReasoningEffortID *string
+	EffectivePermissionModeID  string
+	Version                    int64
+	Writer                     SettingsWriter
 }
 type SettingsCapabilityUpdate struct {
-	EventSeq                  int64
-	Fingerprint               string
-	EffectiveModelID          string
-	EffectivePermissionModeID string
-	Writer                    SettingsWriter
+	EventSeq                   int64
+	Fingerprint                string
+	EffectiveModelID           string
+	EffectiveReasoningEffortID *string
+	EffectivePermissionModeID  string
+	Writer                     SettingsWriter
 }
 type SettingsCommandStatus string
 
@@ -678,25 +680,27 @@ const (
 )
 
 type SettingsCommandRequest struct {
-	CommandID                 string
-	RequestFingerprint        string
-	RequestedModelID          *string
-	RequestedPermissionModeID *string
-	Writer                    SettingsWriter
+	CommandID                  string
+	RequestFingerprint         string
+	RequestedModelID           *string
+	RequestedReasoningEffortID *string
+	RequestedPermissionModeID  *string
+	Writer                     SettingsWriter
 }
 type SettingsCommand struct {
-	SessionID                 string
-	CommandID                 string
-	RequestFingerprint        string
-	RequestedModelID          *string
-	RequestedPermissionModeID *string
-	ReservationVersion        int64
-	DeliveryDeadline          time.Time
-	OperationDeadline         *time.Time
-	Writer                    SettingsWriter
-	ReservedCapability        SettingsCapability
-	Status                    SettingsCommandStatus
-	TerminalEventSeq          *int64
+	SessionID                  string
+	CommandID                  string
+	RequestFingerprint         string
+	RequestedModelID           *string
+	RequestedReasoningEffortID *string
+	RequestedPermissionModeID  *string
+	ReservationVersion         int64
+	DeliveryDeadline           time.Time
+	OperationDeadline          *time.Time
+	Writer                     SettingsWriter
+	ReservedCapability         SettingsCapability
+	Status                     SettingsCommandStatus
+	TerminalEventSeq           *int64
 }
 type SettingsCommandReserve struct {
 	Command   SettingsCommand
@@ -713,14 +717,15 @@ type SettingsCommandFinalize struct {
 
 func SettingsTerminalEventPayload(command SettingsCommand, capability SettingsCapability, outcome SettingsCommandStatus, reason *string) ([]byte, error) {
 	return json.Marshal(struct {
-		CommandID                 string                `json:"cmd_id"`
-		RequestFingerprint        string                `json:"request_fingerprint"`
-		EffectiveFingerprint      string                `json:"effective_fingerprint"`
-		Outcome                   SettingsCommandStatus `json:"outcome"`
-		EffectiveModelID          string                `json:"effective_model_id"`
-		EffectivePermissionModeID string                `json:"effective_permission_mode_id"`
-		ReasonCode                *string               `json:"reason_code"`
-	}{command.CommandID, command.RequestFingerprint, capability.Fingerprint, outcome, capability.EffectiveModelID, capability.EffectivePermissionModeID, reason})
+		CommandID                  string                `json:"cmd_id"`
+		RequestFingerprint         string                `json:"request_fingerprint"`
+		EffectiveFingerprint       string                `json:"effective_fingerprint"`
+		Outcome                    SettingsCommandStatus `json:"outcome"`
+		EffectiveModelID           string                `json:"effective_model_id"`
+		EffectiveReasoningEffortID *string               `json:"effective_reasoning_effort_id"`
+		EffectivePermissionModeID  string                `json:"effective_permission_mode_id"`
+		ReasonCode                 *string               `json:"reason_code"`
+	}{command.CommandID, command.RequestFingerprint, capability.Fingerprint, outcome, capability.EffectiveModelID, capability.EffectiveReasoningEffortID, capability.EffectivePermissionModeID, reason})
 }
 
 type SettingsCommandStore interface {

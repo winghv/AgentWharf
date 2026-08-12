@@ -26,6 +26,154 @@ func TestEventStoreContract(t *testing.T) {
 	})
 }
 
+func TestOpenMigratesSettingsReasoningSchemaV1(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "settings-v1.db")
+	initial, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openRawSQLite(t, path)
+	if _, err := db.ExecContext(ctx, `
+DROP INDEX session_settings_commands_one_nonterminal_idx;
+DROP TABLE session_settings_commands;
+DROP TABLE session_settings_capabilities;
+CREATE TABLE session_settings_capabilities (
+    session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 255),
+    capability_event_seq INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 71 AND substr(fingerprint, 1, 7) = 'sha256:'),
+    effective_model_id TEXT NOT NULL CHECK (length(effective_model_id) BETWEEN 1 AND 128),
+    effective_permission_mode_id TEXT NOT NULL CHECK (length(effective_permission_mode_id) BETWEEN 1 AND 128),
+    capability_version INTEGER NOT NULL CHECK (capability_version > 0),
+    writer_connection_epoch INTEGER NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation INTEGER NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (length(writer_lease_id) BETWEEN 1 AND 255),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (session_id, capability_event_seq) REFERENCES session_events(session_id, seq)
+);
+CREATE TABLE session_settings_commands (
+    session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255),
+    cmd_id TEXT NOT NULL CHECK (length(cmd_id) BETWEEN 1 AND 256),
+    request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 71 AND substr(request_fingerprint, 1, 7) = 'sha256:'),
+    requested_model_id TEXT CHECK (requested_model_id IS NULL OR length(requested_model_id) BETWEEN 1 AND 128),
+    requested_permission_mode_id TEXT CHECK (requested_permission_mode_id IS NULL OR length(requested_permission_mode_id) BETWEEN 1 AND 128),
+    reservation_version INTEGER NOT NULL CHECK (reservation_version > 0),
+    delivery_deadline_ms INTEGER NOT NULL,
+    operation_deadline_ms INTEGER,
+    writer_connection_epoch INTEGER NOT NULL CHECK (writer_connection_epoch > 0),
+    writer_credential_generation INTEGER NOT NULL CHECK (writer_credential_generation > 0),
+    writer_lease_id TEXT NOT NULL CHECK (length(writer_lease_id) BETWEEN 1 AND 255),
+    reserved_capability_event_seq INTEGER NOT NULL,
+    reserved_fingerprint TEXT NOT NULL CHECK (length(reserved_fingerprint) = 71 AND substr(reserved_fingerprint, 1, 7) = 'sha256:'),
+    reserved_effective_model_id TEXT NOT NULL CHECK (length(reserved_effective_model_id) BETWEEN 1 AND 128),
+    reserved_effective_permission_mode_id TEXT NOT NULL CHECK (length(reserved_effective_permission_mode_id) BETWEEN 1 AND 128),
+    status TEXT NOT NULL CHECK (status IN ('delivery_pending', 'pending', 'recovery_pending', 'applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective')),
+    terminal_event_seq INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (session_id, cmd_id),
+    FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
+    FOREIGN KEY (session_id, reserved_capability_event_seq) REFERENCES session_events(session_id, seq),
+    CHECK (requested_model_id IS NOT NULL OR requested_permission_mode_id IS NOT NULL),
+    CHECK ((status = 'delivery_pending' AND operation_deadline_ms IS NULL AND terminal_event_seq IS NULL)
+        OR (status IN ('pending', 'recovery_pending') AND operation_deadline_ms IS NOT NULL AND terminal_event_seq IS NULL)
+        OR (status IN ('applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective') AND terminal_event_seq IS NOT NULL)),
+    CHECK (delivery_deadline_ms > created_at_ms AND delivery_deadline_ms <= created_at_ms + 5000),
+    CHECK (operation_deadline_ms IS NULL OR (operation_deadline_ms > created_at_ms AND operation_deadline_ms <= created_at_ms + 35000))
+);
+CREATE UNIQUE INDEX session_settings_commands_one_nonterminal_idx
+ON session_settings_commands (session_id)
+WHERE status IN ('delivery_pending', 'pending', 'recovery_pending');
+INSERT INTO session_events (session_id, seq, type, payload, event_time_ms, created_at_ms)
+VALUES ('ses_settings_v1', 1, 'session.settings.capabilities', '{}', 1000, 1000);
+INSERT INTO session_settings_capabilities (
+    session_id, capability_event_seq, fingerprint, effective_model_id, effective_permission_mode_id,
+    capability_version, writer_connection_epoch, writer_credential_generation, writer_lease_id, created_at_ms, updated_at_ms
+)
+VALUES ('ses_settings_v1', 1, 'sha256:' || lower(hex(zeroblob(32))), 'model-a', 'default', 1, 1, 1, 'lease-1', 1000, 1000);
+INSERT INTO session_settings_commands (
+    session_id, cmd_id, request_fingerprint, requested_model_id, requested_permission_mode_id,
+    reservation_version, delivery_deadline_ms, operation_deadline_ms, writer_connection_epoch,
+    writer_credential_generation, writer_lease_id, reserved_capability_event_seq, reserved_fingerprint,
+    reserved_effective_model_id, reserved_effective_permission_mode_id, status, terminal_event_seq, created_at_ms, updated_at_ms
+)
+VALUES ('ses_settings_v1', 'cmd_model', 'sha256:' || lower(hex(zeroblob(32))), 'model-b', NULL,
+    1, 2000, NULL, 1, 1, 'lease-1', 1, 'sha256:' || lower(hex(zeroblob(32))),
+    'model-a', 'default', 'delivery_pending', NULL, 1000, 1000);
+`); err != nil {
+		t.Fatalf("seed settings schema v1: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("migrate settings schema v1: %v", err)
+	}
+	if err := migrated.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db = openRawSQLite(t, path)
+	for table, columns := range map[string][]string{
+		"session_settings_capabilities": {"effective_reasoning_effort_id"},
+		"session_settings_commands":     {"requested_reasoning_effort_id", "reserved_effective_reasoning_effort_id"},
+	} {
+		for _, column := range columns {
+			var count int
+			if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("migrated column %s.%s count = %d, %v", table, column, count, err)
+			}
+		}
+	}
+	var model, permission string
+	var reasoning sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT effective_model_id, effective_reasoning_effort_id, effective_permission_mode_id FROM session_settings_capabilities WHERE session_id = 'ses_settings_v1'`).Scan(&model, &reasoning, &permission); err != nil || model != "model-a" || reasoning.Valid || permission != "default" {
+		t.Fatalf("migrated capability = model %q reasoning %+v permission %q, %v", model, reasoning, permission, err)
+	}
+	var requestedModel, requestedPermission sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT requested_model_id, requested_reasoning_effort_id, requested_permission_mode_id FROM session_settings_commands WHERE session_id = 'ses_settings_v1' AND cmd_id = 'cmd_model'`).Scan(&requestedModel, &reasoning, &requestedPermission); err != nil || !requestedModel.Valid || requestedModel.String != "model-b" || reasoning.Valid || requestedPermission.Valid {
+		t.Fatalf("migrated command = model %+v reasoning %+v permission %+v, %v", requestedModel, reasoning, requestedPermission, err)
+	}
+	if _, err := db.ExecContext(ctx, `
+DELETE FROM session_settings_commands WHERE session_id = 'ses_settings_v1';
+INSERT INTO session_settings_commands (
+    session_id, cmd_id, request_fingerprint, requested_model_id, requested_reasoning_effort_id, requested_permission_mode_id,
+    reservation_version, delivery_deadline_ms, operation_deadline_ms, writer_connection_epoch,
+    writer_credential_generation, writer_lease_id, reserved_capability_event_seq, reserved_fingerprint,
+    reserved_effective_model_id, reserved_effective_reasoning_effort_id, reserved_effective_permission_mode_id,
+    status, terminal_event_seq, created_at_ms, updated_at_ms
+)
+VALUES ('ses_settings_v1', 'cmd_reasoning', 'sha256:' || lower(hex(zeroblob(32))), NULL, 'high', NULL,
+    1, 2000, NULL, 1, 1, 'lease-1', 1, 'sha256:' || lower(hex(zeroblob(32))),
+    'model-a', 'medium', 'default', 'delivery_pending', NULL, 1000, 1000);
+`); err != nil {
+		t.Fatalf("insert reasoning-only command after migration: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("repeat settings reasoning migration: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openRawSQLite(t, path)
+	var requested, reserved string
+	if err := db.QueryRowContext(ctx, `SELECT requested_reasoning_effort_id, reserved_effective_reasoning_effort_id FROM session_settings_commands WHERE session_id = 'ses_settings_v1' AND cmd_id = 'cmd_reasoning'`).Scan(&requested, &reserved); err != nil || requested != "high" || reserved != "medium" {
+		t.Fatalf("reasoning-only command after repeat open = %q/%q, %v", requested, reserved, err)
+	}
+}
+
 func TestAttentionSummaryStoreContract(t *testing.T) {
 	var _ store.AttentionSummaryStore = (*sqlite.Store)(nil)
 }

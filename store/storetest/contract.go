@@ -64,12 +64,14 @@ func SettingsCommandContract(t *testing.T, harness SettingsCommandHarness) {
 	FileReferenceCommandContract(t, fileReferences, harness)
 	ctx := context.Background()
 	capability := store.SettingsCapabilityUpdate{
-		Fingerprint:      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		EffectiveModelID: "reasoning", EffectivePermissionModeID: "ask",
+		Fingerprint:                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		EffectiveModelID:           "reasoning",
+		EffectiveReasoningEffortID: settingsString("medium"),
+		EffectivePermissionModeID:  "ask",
 	}
 	request := store.SettingsCommandRequest{
 		CommandID: "cmd_settings_1", RequestFingerprint: capability.Fingerprint,
-		RequestedModelID: settingsString("reasoning"),
+		RequestedModelID: settingsString("reasoning"), RequestedReasoningEffortID: settingsString("medium"),
 	}
 	ledger := harness.Open(t)
 	writer := bindSettingsWriter(t, ledger, "ses_settings_1", "lease_current")
@@ -114,6 +116,9 @@ func SettingsCommandContract(t *testing.T, harness SettingsCommandHarness) {
 	stale.LeaseID = "lease_stale"
 	if _, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, "ses_settings_1", request.CommandID, reserved.Command.ReservationVersion, stale); err == nil {
 		t.Fatal("stale writer delivery acknowledgement unexpectedly succeeded")
+	}
+	if _, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, "ses_settings_1", request.CommandID, reserved.Command.ReservationVersion+1, writer); err == nil {
+		t.Fatal("wrong reservation version delivery acknowledgement unexpectedly succeeded")
 	}
 	acknowledged, err := ledger.AcknowledgeSettingsCommandDelivery(ctx, "ses_settings_1", request.CommandID, reserved.Command.ReservationVersion, writer)
 	if err != nil || acknowledged.Status != store.SettingsCommandPending || acknowledged.OperationDeadline == nil {
@@ -695,13 +700,13 @@ func assertRevokedSettingsWriter(t *testing.T, ledger store.SettingsCommandStore
 	ctx := context.Background()
 	for _, sessionID := range []string{"ses_settings_revoked_ack", "ses_settings_revoked_finalize"} {
 		current := bindSettingsWriter(t, ledger, sessionID, "lease_"+sessionID)
-		update := store.SettingsCapabilityUpdate{Fingerprint: capability.Fingerprint, EffectiveModelID: capability.EffectiveModelID, EffectivePermissionModeID: capability.EffectivePermissionModeID}
+		update := store.SettingsCapabilityUpdate{Fingerprint: capability.Fingerprint, EffectiveModelID: capability.EffectiveModelID, EffectiveReasoningEffortID: capability.EffectiveReasoningEffortID, EffectivePermissionModeID: capability.EffectivePermissionModeID}
 		update.Writer, update.EventSeq = current, appendSettingsCapabilityEvent(t, ledger, sessionID)
 		published, err := ledger.PublishSettingsCapability(ctx, sessionID, update)
 		if err != nil {
 			t.Fatalf("publish revoked-writer fixture %s: %v", sessionID, err)
 		}
-		request := store.SettingsCommandRequest{CommandID: "cmd_" + sessionID, RequestFingerprint: published.Fingerprint, RequestedModelID: settingsString("reasoning"), Writer: current}
+		request := store.SettingsCommandRequest{CommandID: "cmd_" + sessionID, RequestFingerprint: published.Fingerprint, RequestedModelID: settingsString("reasoning"), RequestedReasoningEffortID: settingsString("medium"), Writer: current}
 		reserved, err := ledger.SettingsCommandReserve(ctx, sessionID, request)
 		if err != nil || reserved.Duplicate {
 			t.Fatalf("reserve revoked-writer fixture %s: %+v, %v", sessionID, reserved, err)

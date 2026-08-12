@@ -567,7 +567,7 @@ func (s *Store) PublishSettingsCapability(ctx context.Context, sessionID string,
 	if err := verifyPostgresSettingsCapabilityEvent(ctx, tx, sessionID, update.EventSeq); err != nil {
 		return store.SettingsCapability{}, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO session_settings_capabilities (session_id,capability_event_seq,fingerprint,effective_model_id,effective_permission_mode_id,capability_version,writer_connection_epoch,writer_credential_generation,writer_lease_id) VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8) ON CONFLICT (session_id) DO UPDATE SET capability_event_seq=EXCLUDED.capability_event_seq,fingerprint=EXCLUDED.fingerprint,effective_model_id=EXCLUDED.effective_model_id,effective_permission_mode_id=EXCLUDED.effective_permission_mode_id,capability_version=session_settings_capabilities.capability_version+1,writer_connection_epoch=EXCLUDED.writer_connection_epoch,writer_credential_generation=EXCLUDED.writer_credential_generation,writer_lease_id=EXCLUDED.writer_lease_id,updated_at=statement_timestamp()`, sessionID, update.EventSeq, update.Fingerprint, update.EffectiveModelID, update.EffectivePermissionModeID, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO session_settings_capabilities (session_id,capability_event_seq,fingerprint,effective_model_id,effective_reasoning_effort_id,effective_permission_mode_id,capability_version,writer_connection_epoch,writer_credential_generation,writer_lease_id) VALUES ($1,$2,$3,$4,$5,$6,1,$7,$8,$9) ON CONFLICT (session_id) DO UPDATE SET capability_event_seq=EXCLUDED.capability_event_seq,fingerprint=EXCLUDED.fingerprint,effective_model_id=EXCLUDED.effective_model_id,effective_reasoning_effort_id=EXCLUDED.effective_reasoning_effort_id,effective_permission_mode_id=EXCLUDED.effective_permission_mode_id,capability_version=session_settings_capabilities.capability_version+1,writer_connection_epoch=EXCLUDED.writer_connection_epoch,writer_credential_generation=EXCLUDED.writer_credential_generation,writer_lease_id=EXCLUDED.writer_lease_id,updated_at=statement_timestamp()`, sessionID, update.EventSeq, update.Fingerprint, update.EffectiveModelID, update.EffectiveReasoningEffortID, update.EffectivePermissionModeID, update.Writer.ConnectionEpoch, update.Writer.CredentialGeneration, update.Writer.LeaseID); err != nil {
 		return store.SettingsCapability{}, err
 	}
 	result, err := queryPostgresSettingsCapability(ctx, tx, sessionID, false)
@@ -578,7 +578,7 @@ func (s *Store) PublishSettingsCapability(ctx context.Context, sessionID string,
 }
 
 func validPostgresSettingsCapability(update store.SettingsCapabilityUpdate) bool {
-	return update.EventSeq > 0 && validPostgresSettingsFingerprint(update.Fingerprint) && validPostgresSettingsID(update.EffectiveModelID) && validPostgresSettingsID(update.EffectivePermissionModeID) && validPostgresSettingsWriter(update.Writer)
+	return update.EventSeq > 0 && validPostgresSettingsFingerprint(update.Fingerprint) && validPostgresSettingsID(update.EffectiveModelID) && (update.EffectiveReasoningEffortID == nil || validPostgresSettingsID(*update.EffectiveReasoningEffortID)) && validPostgresSettingsID(update.EffectivePermissionModeID) && validPostgresSettingsWriter(update.Writer)
 }
 
 func (s *Store) SettingsCommandReserve(ctx context.Context, sessionID string, request store.SettingsCommandRequest) (store.SettingsCommandReserve, error) {
@@ -606,7 +606,7 @@ func (s *Store) SettingsCommandReserve(ctx context.Context, sessionID string, re
 	}
 	existing, err := queryPostgresSettingsCommand(ctx, tx, sessionID, request.CommandID, true)
 	if err == nil {
-		if existing.RequestFingerprint != request.RequestFingerprint || !samePostgresSettingsOptionalID(existing.RequestedModelID, request.RequestedModelID) || !samePostgresSettingsOptionalID(existing.RequestedPermissionModeID, request.RequestedPermissionModeID) {
+		if existing.RequestFingerprint != request.RequestFingerprint || !samePostgresSettingsOptionalID(existing.RequestedModelID, request.RequestedModelID) || !samePostgresSettingsOptionalID(existing.RequestedReasoningEffortID, request.RequestedReasoningEffortID) || !samePostgresSettingsOptionalID(existing.RequestedPermissionModeID, request.RequestedPermissionModeID) {
 			return store.SettingsCommandReserve{}, errors.New("settings command ID is reused")
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -628,7 +628,7 @@ func (s *Store) SettingsCommandReserve(ctx context.Context, sessionID string, re
 	if err != nil {
 		return store.SettingsCommandReserve{}, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO session_settings_commands (session_id,cmd_id,request_fingerprint,requested_model_id,requested_permission_mode_id,reservation_version,delivery_deadline,writer_connection_epoch,writer_credential_generation,writer_lease_id,reserved_capability_event_seq,reserved_fingerprint,reserved_effective_model_id,reserved_effective_permission_mode_id,status) VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,$11,$12,$13,'delivery_pending')`, sessionID, request.CommandID, request.RequestFingerprint, request.RequestedModelID, request.RequestedPermissionModeID, now.Add(5*time.Second), request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, capability.EventSeq, capability.Fingerprint, capability.EffectiveModelID, capability.EffectivePermissionModeID)
+	_, err = tx.Exec(ctx, `INSERT INTO session_settings_commands (session_id,cmd_id,request_fingerprint,requested_model_id,requested_reasoning_effort_id,requested_permission_mode_id,reservation_version,delivery_deadline,writer_connection_epoch,writer_credential_generation,writer_lease_id,reserved_capability_event_seq,reserved_fingerprint,reserved_effective_model_id,reserved_effective_reasoning_effort_id,reserved_effective_permission_mode_id,status) VALUES ($1,$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11,$12,$13,$14,$15,'delivery_pending')`, sessionID, request.CommandID, request.RequestFingerprint, request.RequestedModelID, request.RequestedReasoningEffortID, request.RequestedPermissionModeID, now.Add(5*time.Second), request.Writer.ConnectionEpoch, request.Writer.CredentialGeneration, request.Writer.LeaseID, capability.EventSeq, capability.Fingerprint, capability.EffectiveModelID, capability.EffectiveReasoningEffortID, capability.EffectivePermissionModeID)
 	if err != nil {
 		return store.SettingsCommandReserve{}, fmt.Errorf("insert settings reservation: %w", err)
 	}
@@ -696,6 +696,15 @@ func (s *Store) RecoverSettingsCommand(ctx context.Context, sessionID, commandID
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
 		return store.SettingsCommand{}, fmt.Errorf("lock settings recovery stream: %w", err)
 	}
+	// Settings mutations and schema rollback share one table-lock order:
+	// capability first, command second. Recover previously locked the command
+	// first and could deadlock with the v2 -> v1 PostgreSQL migration after that
+	// migration had locked session_settings_capabilities and started waiting on
+	// session_settings_commands.
+	capability, err := queryPostgresSettingsCapability(ctx, tx, sessionID, true)
+	if err != nil {
+		return store.SettingsCommand{}, errors.New("settings recovery capability is unavailable")
+	}
 	command, err := queryPostgresSettingsCommand(ctx, tx, sessionID, commandID, true)
 	if err != nil || command.Writer != priorWriter {
 		return store.SettingsCommand{}, errors.New("settings recovery lost writer fence")
@@ -730,8 +739,7 @@ func (s *Store) RecoverSettingsCommand(ctx context.Context, sessionID, commandID
 	if command.Status != store.SettingsCommandPending {
 		return store.SettingsCommand{}, errors.New("settings recovery requires a pending command")
 	}
-	capability, err := queryPostgresSettingsCapability(ctx, tx, sessionID, true)
-	if err != nil || capability.Writer == priorWriter || capability.EventSeq <= command.ReservedCapability.EventSeq {
+	if capability.Writer == priorWriter || capability.EventSeq <= command.ReservedCapability.EventSeq {
 		return store.SettingsCommand{}, errors.New("settings recovery requires a fresh replacement writer")
 	}
 	if err := validatePostgresLiveSettingsWriter(ctx, tx, sessionID, capability.Writer); err != nil {
@@ -779,6 +787,14 @@ func (s *Store) FinalizeSettingsCommand(ctx context.Context, sessionID, commandI
 			return store.SettingsCommand{}, err
 		}
 	}
+	// Keep the capability -> command row-lock order even for timeout
+	// finalization, where no writer is present to lock the capability as part of
+	// validatePostgresCurrentSettingsWriter. This is the same order used by the
+	// PostgreSQL reasoning-settings down migration.
+	capability, err := queryPostgresSettingsCapability(ctx, tx, sessionID, true)
+	if err != nil {
+		return store.SettingsCommand{}, errors.New("effective settings capability is not current")
+	}
 	command, err := queryPostgresSettingsCommand(ctx, tx, sessionID, commandID, true)
 	if err != nil {
 		return store.SettingsCommand{}, err
@@ -786,8 +802,7 @@ func (s *Store) FinalizeSettingsCommand(ctx context.Context, sessionID, commandI
 	if command.ReservationVersion != finalize.ReservationVersion || command.Status != finalize.ExpectedStatus || (finalize.Writer != nil && command.Writer != *finalize.Writer) {
 		return store.SettingsCommand{}, errors.New("settings finalization is fenced")
 	}
-	capability, err := queryPostgresSettingsCapability(ctx, tx, sessionID, true)
-	if err != nil || !samePostgresSettingsCapability(capability, finalize.EffectiveCapability) {
+	if !samePostgresSettingsCapability(capability, finalize.EffectiveCapability) {
 		return store.SettingsCommand{}, errors.New("effective settings capability is not current")
 	}
 	now, err := postgresSettingsNow(ctx, tx)
@@ -1627,31 +1642,36 @@ func queryPostgresFileReferenceCommand(ctx context.Context, querier postgresSett
 }
 
 func queryPostgresSettingsCapability(ctx context.Context, querier postgresSettingsQuerier, sessionID string, lock bool) (store.SettingsCapability, error) {
-	query := `SELECT session_id,capability_event_seq,fingerprint,effective_model_id,effective_permission_mode_id,capability_version,writer_connection_epoch,writer_credential_generation,writer_lease_id FROM session_settings_capabilities WHERE session_id=$1`
+	query := `SELECT session_id,capability_event_seq,fingerprint,effective_model_id,effective_reasoning_effort_id,effective_permission_mode_id,capability_version,writer_connection_epoch,writer_credential_generation,writer_lease_id FROM session_settings_capabilities WHERE session_id=$1`
 	if lock {
 		query += ` FOR UPDATE`
 	}
 	var capability store.SettingsCapability
-	if err := querier.QueryRow(ctx, query, sessionID).Scan(&capability.SessionID, &capability.EventSeq, &capability.Fingerprint, &capability.EffectiveModelID, &capability.EffectivePermissionModeID, &capability.Version, &capability.Writer.ConnectionEpoch, &capability.Writer.CredentialGeneration, &capability.Writer.LeaseID); err != nil {
+	var effectiveReasoningEffortID pgtype.Text
+	if err := querier.QueryRow(ctx, query, sessionID).Scan(&capability.SessionID, &capability.EventSeq, &capability.Fingerprint, &capability.EffectiveModelID, &effectiveReasoningEffortID, &capability.EffectivePermissionModeID, &capability.Version, &capability.Writer.ConnectionEpoch, &capability.Writer.CredentialGeneration, &capability.Writer.LeaseID); err != nil {
 		return store.SettingsCapability{}, err
 	}
-	if !validConnectionID(capability.SessionID) || !validPostgresSettingsCapability(store.SettingsCapabilityUpdate{EventSeq: capability.EventSeq, Fingerprint: capability.Fingerprint, EffectiveModelID: capability.EffectiveModelID, EffectivePermissionModeID: capability.EffectivePermissionModeID, Writer: capability.Writer}) || capability.Version < 1 {
+	if effectiveReasoningEffortID.Valid {
+		value := effectiveReasoningEffortID.String
+		capability.EffectiveReasoningEffortID = &value
+	}
+	if !validConnectionID(capability.SessionID) || !validPostgresSettingsCapability(store.SettingsCapabilityUpdate{EventSeq: capability.EventSeq, Fingerprint: capability.Fingerprint, EffectiveModelID: capability.EffectiveModelID, EffectiveReasoningEffortID: capability.EffectiveReasoningEffortID, EffectivePermissionModeID: capability.EffectivePermissionModeID, Writer: capability.Writer}) || capability.Version < 1 {
 		return store.SettingsCapability{}, errors.New("settings capability row is invalid")
 	}
 	return capability, nil
 }
 
 func queryPostgresSettingsCommand(ctx context.Context, querier postgresSettingsQuerier, sessionID, commandID string, lock bool) (store.SettingsCommand, error) {
-	query := `SELECT session_id,cmd_id,request_fingerprint,requested_model_id,requested_permission_mode_id,reservation_version,delivery_deadline,operation_deadline,writer_connection_epoch,writer_credential_generation,writer_lease_id,reserved_capability_event_seq,reserved_fingerprint,reserved_effective_model_id,reserved_effective_permission_mode_id,status,terminal_event_seq FROM session_settings_commands WHERE session_id=$1 AND cmd_id=$2`
+	query := `SELECT session_id,cmd_id,request_fingerprint,requested_model_id,requested_reasoning_effort_id,requested_permission_mode_id,reservation_version,delivery_deadline,operation_deadline,writer_connection_epoch,writer_credential_generation,writer_lease_id,reserved_capability_event_seq,reserved_fingerprint,reserved_effective_model_id,reserved_effective_reasoning_effort_id,reserved_effective_permission_mode_id,status,terminal_event_seq FROM session_settings_commands WHERE session_id=$1 AND cmd_id=$2`
 	if lock {
 		query += ` FOR UPDATE`
 	}
 	var command store.SettingsCommand
-	var modelID, permissionID pgtype.Text
+	var modelID, reasoningEffortID, permissionID, reservedReasoningEffortID pgtype.Text
 	var operationDeadline pgtype.Timestamptz
 	var terminalSeq pgtype.Int8
 	var status string
-	if err := querier.QueryRow(ctx, query, sessionID, commandID).Scan(&command.SessionID, &command.CommandID, &command.RequestFingerprint, &modelID, &permissionID, &command.ReservationVersion, &command.DeliveryDeadline, &operationDeadline, &command.Writer.ConnectionEpoch, &command.Writer.CredentialGeneration, &command.Writer.LeaseID, &command.ReservedCapability.EventSeq, &command.ReservedCapability.Fingerprint, &command.ReservedCapability.EffectiveModelID, &command.ReservedCapability.EffectivePermissionModeID, &status, &terminalSeq); err != nil {
+	if err := querier.QueryRow(ctx, query, sessionID, commandID).Scan(&command.SessionID, &command.CommandID, &command.RequestFingerprint, &modelID, &reasoningEffortID, &permissionID, &command.ReservationVersion, &command.DeliveryDeadline, &operationDeadline, &command.Writer.ConnectionEpoch, &command.Writer.CredentialGeneration, &command.Writer.LeaseID, &command.ReservedCapability.EventSeq, &command.ReservedCapability.Fingerprint, &command.ReservedCapability.EffectiveModelID, &reservedReasoningEffortID, &command.ReservedCapability.EffectivePermissionModeID, &status, &terminalSeq); err != nil {
 		return store.SettingsCommand{}, err
 	}
 	command.Status = store.SettingsCommandStatus(status)
@@ -1660,6 +1680,14 @@ func queryPostgresSettingsCommand(ctx context.Context, querier postgresSettingsQ
 	if modelID.Valid {
 		value := modelID.String
 		command.RequestedModelID = &value
+	}
+	if reasoningEffortID.Valid {
+		value := reasoningEffortID.String
+		command.RequestedReasoningEffortID = &value
+	}
+	if reservedReasoningEffortID.Valid {
+		value := reservedReasoningEffortID.String
+		command.ReservedCapability.EffectiveReasoningEffortID = &value
 	}
 	if permissionID.Valid {
 		value := permissionID.String
@@ -1680,11 +1708,11 @@ func queryPostgresSettingsCommand(ctx context.Context, querier postgresSettingsQ
 }
 
 func validPostgresSettingsRequest(sessionID string, request store.SettingsCommandRequest) bool {
-	return validConnectionID(sessionID) && validPostgresSettingsID(request.CommandID) && validPostgresSettingsFingerprint(request.RequestFingerprint) && (request.RequestedModelID != nil || request.RequestedPermissionModeID != nil) && (request.RequestedModelID == nil || validPostgresSettingsID(*request.RequestedModelID)) && (request.RequestedPermissionModeID == nil || validPostgresSettingsID(*request.RequestedPermissionModeID)) && validPostgresSettingsWriter(request.Writer)
+	return validConnectionID(sessionID) && validPostgresSettingsID(request.CommandID) && validPostgresSettingsFingerprint(request.RequestFingerprint) && (request.RequestedModelID != nil || request.RequestedReasoningEffortID != nil || request.RequestedPermissionModeID != nil) && (request.RequestedModelID == nil || validPostgresSettingsID(*request.RequestedModelID)) && (request.RequestedReasoningEffortID == nil || validPostgresSettingsID(*request.RequestedReasoningEffortID)) && (request.RequestedPermissionModeID == nil || validPostgresSettingsID(*request.RequestedPermissionModeID)) && validPostgresSettingsWriter(request.Writer)
 }
 func validPostgresSettingsCommand(command store.SettingsCommand) bool {
 	terminal := !validPostgresSettingsNonterminal(command.Status)
-	return validPostgresSettingsRequest(command.SessionID, store.SettingsCommandRequest{CommandID: command.CommandID, RequestFingerprint: command.RequestFingerprint, RequestedModelID: command.RequestedModelID, RequestedPermissionModeID: command.RequestedPermissionModeID, Writer: command.Writer}) && command.ReservationVersion > 0 && !command.DeliveryDeadline.IsZero() && validPostgresSettingsStatus(command.Status) && command.ReservedCapability.EventSeq > 0 && validPostgresSettingsFingerprint(command.ReservedCapability.Fingerprint) && validPostgresSettingsID(command.ReservedCapability.EffectiveModelID) && validPostgresSettingsID(command.ReservedCapability.EffectivePermissionModeID) && command.ReservedCapability.Writer == command.Writer && ((terminal && command.TerminalEventSeq != nil) || (!terminal && command.TerminalEventSeq == nil))
+	return validPostgresSettingsRequest(command.SessionID, store.SettingsCommandRequest{CommandID: command.CommandID, RequestFingerprint: command.RequestFingerprint, RequestedModelID: command.RequestedModelID, RequestedReasoningEffortID: command.RequestedReasoningEffortID, RequestedPermissionModeID: command.RequestedPermissionModeID, Writer: command.Writer}) && command.ReservationVersion > 0 && !command.DeliveryDeadline.IsZero() && validPostgresSettingsStatus(command.Status) && command.ReservedCapability.EventSeq > 0 && validPostgresSettingsFingerprint(command.ReservedCapability.Fingerprint) && validPostgresSettingsID(command.ReservedCapability.EffectiveModelID) && (command.ReservedCapability.EffectiveReasoningEffortID == nil || validPostgresSettingsID(*command.ReservedCapability.EffectiveReasoningEffortID)) && validPostgresSettingsID(command.ReservedCapability.EffectivePermissionModeID) && command.ReservedCapability.Writer == command.Writer && ((terminal && command.TerminalEventSeq != nil) || (!terminal && command.TerminalEventSeq == nil))
 }
 func validPostgresSettingsWriter(writer store.SettingsWriter) bool {
 	return writer.ConnectionEpoch > 0 && writer.CredentialGeneration > 0 && writer.LeaseID != "" && len(writer.LeaseID) <= 255
@@ -1729,7 +1757,7 @@ func samePostgresSettingsOptionalID(left, right *string) bool {
 	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
 }
 func samePostgresSettingsCapability(left, right store.SettingsCapability) bool {
-	return left.SessionID == right.SessionID && left.EventSeq == right.EventSeq && left.Fingerprint == right.Fingerprint && left.EffectiveModelID == right.EffectiveModelID && left.EffectivePermissionModeID == right.EffectivePermissionModeID && left.Version == right.Version && left.Writer == right.Writer
+	return left.SessionID == right.SessionID && left.EventSeq == right.EventSeq && left.Fingerprint == right.Fingerprint && left.EffectiveModelID == right.EffectiveModelID && samePostgresSettingsOptionalID(left.EffectiveReasoningEffortID, right.EffectiveReasoningEffortID) && left.EffectivePermissionModeID == right.EffectivePermissionModeID && left.Version == right.Version && left.Writer == right.Writer
 }
 func validPostgresSettingsReason(reason *string) bool {
 	if reason == nil || len(*reason) < 1 || len(*reason) > 64 || (*reason)[0] < 'a' || (*reason)[0] > 'z' {
@@ -1744,11 +1772,11 @@ func validPostgresSettingsReason(reason *string) bool {
 }
 
 func validPostgresSettingsFinalize(sessionID, commandID string, finalize store.SettingsCommandFinalize) bool {
-	return validConnectionID(sessionID) && validPostgresSettingsID(commandID) && finalize.ReservationVersion > 0 && validPostgresSettingsNonterminal(finalize.ExpectedStatus) && validPostgresSettingsTerminal(finalize.Outcome) && validPostgresSettingsCapability(store.SettingsCapabilityUpdate{EventSeq: finalize.EffectiveCapability.EventSeq, Fingerprint: finalize.EffectiveCapability.Fingerprint, EffectiveModelID: finalize.EffectiveCapability.EffectiveModelID, EffectivePermissionModeID: finalize.EffectiveCapability.EffectivePermissionModeID, Writer: finalize.EffectiveCapability.Writer}) && (finalize.EffectiveCapability.SessionID == "" || finalize.EffectiveCapability.SessionID == sessionID)
+	return validConnectionID(sessionID) && validPostgresSettingsID(commandID) && finalize.ReservationVersion > 0 && validPostgresSettingsNonterminal(finalize.ExpectedStatus) && validPostgresSettingsTerminal(finalize.Outcome) && validPostgresSettingsCapability(store.SettingsCapabilityUpdate{EventSeq: finalize.EffectiveCapability.EventSeq, Fingerprint: finalize.EffectiveCapability.Fingerprint, EffectiveModelID: finalize.EffectiveCapability.EffectiveModelID, EffectiveReasoningEffortID: finalize.EffectiveCapability.EffectiveReasoningEffortID, EffectivePermissionModeID: finalize.EffectiveCapability.EffectivePermissionModeID, Writer: finalize.EffectiveCapability.Writer}) && (finalize.EffectiveCapability.SessionID == "" || finalize.EffectiveCapability.SessionID == sessionID)
 }
 func validatePostgresSettingsFinalization(command store.SettingsCommand, capability store.SettingsCapability, finalize store.SettingsCommandFinalize, now time.Time) error {
 	if finalize.Outcome == store.SettingsCommandApplied {
-		if finalize.ReasonCode != nil || (command.RequestedModelID != nil && *command.RequestedModelID != capability.EffectiveModelID) || (command.RequestedPermissionModeID != nil && *command.RequestedPermissionModeID != capability.EffectivePermissionModeID) || (command.RequestedModelID == nil && command.ReservedCapability.EffectiveModelID != capability.EffectiveModelID) || (command.RequestedPermissionModeID == nil && command.ReservedCapability.EffectivePermissionModeID != capability.EffectivePermissionModeID) {
+		if finalize.ReasonCode != nil || (command.RequestedModelID != nil && *command.RequestedModelID != capability.EffectiveModelID) || (command.RequestedReasoningEffortID != nil && (capability.EffectiveReasoningEffortID == nil || *command.RequestedReasoningEffortID != *capability.EffectiveReasoningEffortID)) || (command.RequestedPermissionModeID != nil && *command.RequestedPermissionModeID != capability.EffectivePermissionModeID) || (command.RequestedModelID == nil && command.ReservedCapability.EffectiveModelID != capability.EffectiveModelID) || (command.RequestedReasoningEffortID == nil && !samePostgresSettingsOptionalID(command.ReservedCapability.EffectiveReasoningEffortID, capability.EffectiveReasoningEffortID)) || (command.RequestedPermissionModeID == nil && command.ReservedCapability.EffectivePermissionModeID != capability.EffectivePermissionModeID) {
 			return errors.New("applied settings finalization does not match the request")
 		}
 	} else if !validPostgresSettingsReason(finalize.ReasonCode) {

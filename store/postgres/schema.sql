@@ -143,6 +143,7 @@ CREATE TABLE session_settings_capabilities (
     capability_event_seq BIGINT NOT NULL,
     fingerprint TEXT NOT NULL CHECK (fingerprint ~ '^sha256:[0-9a-f]{64}$'),
     effective_model_id TEXT NOT NULL CHECK (char_length(effective_model_id) BETWEEN 1 AND 128),
+    effective_reasoning_effort_id TEXT CHECK (effective_reasoning_effort_id IS NULL OR char_length(effective_reasoning_effort_id) BETWEEN 1 AND 128),
     effective_permission_mode_id TEXT NOT NULL CHECK (char_length(effective_permission_mode_id) BETWEEN 1 AND 128),
     capability_version BIGINT NOT NULL CHECK (capability_version > 0),
     writer_connection_epoch BIGINT NOT NULL CHECK (writer_connection_epoch > 0),
@@ -157,6 +158,7 @@ CREATE TABLE session_settings_commands (
     cmd_id TEXT NOT NULL CHECK (char_length(cmd_id) BETWEEN 1 AND 256),
     request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
     requested_model_id TEXT CHECK (requested_model_id IS NULL OR char_length(requested_model_id) BETWEEN 1 AND 128),
+    requested_reasoning_effort_id TEXT CHECK (requested_reasoning_effort_id IS NULL OR char_length(requested_reasoning_effort_id) BETWEEN 1 AND 128),
     requested_permission_mode_id TEXT CHECK (requested_permission_mode_id IS NULL OR char_length(requested_permission_mode_id) BETWEEN 1 AND 128),
     reservation_version BIGINT NOT NULL CHECK (reservation_version > 0),
     delivery_deadline TIMESTAMPTZ NOT NULL,
@@ -167,6 +169,7 @@ CREATE TABLE session_settings_commands (
     reserved_capability_event_seq BIGINT NOT NULL,
     reserved_fingerprint TEXT NOT NULL CHECK (reserved_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
     reserved_effective_model_id TEXT NOT NULL CHECK (char_length(reserved_effective_model_id) BETWEEN 1 AND 128),
+    reserved_effective_reasoning_effort_id TEXT CHECK (reserved_effective_reasoning_effort_id IS NULL OR char_length(reserved_effective_reasoning_effort_id) BETWEEN 1 AND 128),
     reserved_effective_permission_mode_id TEXT NOT NULL CHECK (char_length(reserved_effective_permission_mode_id) BETWEEN 1 AND 128),
     status TEXT NOT NULL CHECK (status IN ('delivery_pending', 'pending', 'recovery_pending', 'applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective')),
     terminal_event_seq BIGINT,
@@ -175,7 +178,7 @@ CREATE TABLE session_settings_commands (
     PRIMARY KEY (session_id, cmd_id),
     FOREIGN KEY (session_id, terminal_event_seq) REFERENCES session_events(session_id, seq),
     FOREIGN KEY (session_id, reserved_capability_event_seq) REFERENCES session_events(session_id, seq),
-    CHECK (requested_model_id IS NOT NULL OR requested_permission_mode_id IS NOT NULL),
+    CHECK (requested_model_id IS NOT NULL OR requested_reasoning_effort_id IS NOT NULL OR requested_permission_mode_id IS NOT NULL),
     CHECK ((status = 'delivery_pending' AND operation_deadline IS NULL AND terminal_event_seq IS NULL)
         OR (status IN ('pending', 'recovery_pending') AND operation_deadline IS NOT NULL AND terminal_event_seq IS NULL)
         OR (status IN ('applied', 'rejected', 'timeout', 'unsupported', 'stale_capability', 'outcome_unknown', 'mismatched_effective') AND terminal_event_seq IS NOT NULL)),

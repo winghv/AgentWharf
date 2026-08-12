@@ -19,6 +19,9 @@ const (
 	ProtocolVersion    = 1
 	ProtocolVersionV2  = 2
 	HubProtocolVersion = ProtocolVersionV2
+
+	LegacySettingsCapabilitySchemaVersion = 1
+	SettingsCapabilitySchemaVersion       = 2
 )
 
 var (
@@ -344,9 +347,10 @@ func (*CommandAck) FrameName() FrameName { return FrameCommandAck }
 // SettingsChange is the bounded Client request interpreted by the Hub. It
 // deliberately contains only opaque identifiers, never Provider objects.
 type SettingsChange struct {
-	CapabilityFingerprint     string
-	RequestedModelID          *string
-	RequestedPermissionModeID *string
+	CapabilityFingerprint      string
+	RequestedModelID           *string
+	RequestedReasoningEffortID *string
+	RequestedPermissionModeID  *string
 }
 
 type SettingsCapabilityChoice struct {
@@ -355,28 +359,75 @@ type SettingsCapabilityChoice struct {
 }
 
 type SettingsCapabilityPayload struct {
-	SchemaVersion             int                        `json:"schema_version"`
-	Fingerprint               string                     `json:"fingerprint"`
-	Models                    []SettingsCapabilityChoice `json:"models"`
-	PermissionModes           []SettingsCapabilityChoice `json:"permission_modes"`
-	EffectiveModelID          string                     `json:"effective_model_id"`
-	EffectivePermissionModeID string                     `json:"effective_permission_mode_id"`
-	ModelChange               string                     `json:"model_change"`
-	PermissionChange          string                     `json:"permission_change"`
-	ModelReadOnlyReason       *string                    `json:"model_read_only_reason"`
-	PermissionReadOnlyReason  *string                    `json:"permission_read_only_reason"`
+	SchemaVersion                 int                        `json:"schema_version"`
+	Fingerprint                   string                     `json:"fingerprint"`
+	Models                        []SettingsCapabilityChoice `json:"models"`
+	ReasoningEfforts              []SettingsCapabilityChoice `json:"reasoning_efforts,omitempty"`
+	PermissionModes               []SettingsCapabilityChoice `json:"permission_modes"`
+	EffectiveModelID              string                     `json:"effective_model_id"`
+	EffectiveReasoningEffortID    *string                    `json:"effective_reasoning_effort_id,omitempty"`
+	EffectivePermissionModeID     string                     `json:"effective_permission_mode_id"`
+	ModelChange                   string                     `json:"model_change"`
+	ReasoningEffortChange         string                     `json:"reasoning_effort_change,omitempty"`
+	PermissionChange              string                     `json:"permission_change"`
+	ModelReadOnlyReason           *string                    `json:"model_read_only_reason"`
+	ReasoningEffortReadOnlyReason *string                    `json:"reasoning_effort_read_only_reason,omitempty"`
+	PermissionReadOnlyReason      *string                    `json:"permission_read_only_reason"`
+}
+
+// MarshalJSON keeps the historical schema-v1 event byte shape stable while
+// making every schema-v2 reasoning member explicit, including [] and null for
+// a Provider that does not expose a thought-level control.
+func (p SettingsCapabilityPayload) MarshalJSON() ([]byte, error) {
+	type v1 struct {
+		SchemaVersion             int                        `json:"schema_version"`
+		Fingerprint               string                     `json:"fingerprint"`
+		Models                    []SettingsCapabilityChoice `json:"models"`
+		PermissionModes           []SettingsCapabilityChoice `json:"permission_modes"`
+		EffectiveModelID          string                     `json:"effective_model_id"`
+		EffectivePermissionModeID string                     `json:"effective_permission_mode_id"`
+		ModelChange               string                     `json:"model_change"`
+		PermissionChange          string                     `json:"permission_change"`
+		ModelReadOnlyReason       *string                    `json:"model_read_only_reason"`
+		PermissionReadOnlyReason  *string                    `json:"permission_read_only_reason"`
+	}
+	if p.SchemaVersion == LegacySettingsCapabilitySchemaVersion {
+		return json.Marshal(v1{
+			p.SchemaVersion, p.Fingerprint, p.Models, p.PermissionModes,
+			p.EffectiveModelID, p.EffectivePermissionModeID, p.ModelChange,
+			p.PermissionChange, p.ModelReadOnlyReason, p.PermissionReadOnlyReason,
+		})
+	}
+	type v2 struct {
+		SchemaVersion                 int                        `json:"schema_version"`
+		Fingerprint                   string                     `json:"fingerprint"`
+		Models                        []SettingsCapabilityChoice `json:"models"`
+		ReasoningEfforts              []SettingsCapabilityChoice `json:"reasoning_efforts"`
+		PermissionModes               []SettingsCapabilityChoice `json:"permission_modes"`
+		EffectiveModelID              string                     `json:"effective_model_id"`
+		EffectiveReasoningEffortID    *string                    `json:"effective_reasoning_effort_id"`
+		EffectivePermissionModeID     string                     `json:"effective_permission_mode_id"`
+		ModelChange                   string                     `json:"model_change"`
+		ReasoningEffortChange         string                     `json:"reasoning_effort_change"`
+		PermissionChange              string                     `json:"permission_change"`
+		ModelReadOnlyReason           *string                    `json:"model_read_only_reason"`
+		ReasoningEffortReadOnlyReason *string                    `json:"reasoning_effort_read_only_reason"`
+		PermissionReadOnlyReason      *string                    `json:"permission_read_only_reason"`
+	}
+	return json.Marshal(v2(p))
 }
 
 // SettingsEffectivePayload is the Adapter's bounded result proposal. The Hub
 // resolves it to durable capability metadata before it can finalize a command.
 type SettingsEffectivePayload struct {
-	CommandID                 string
-	RequestFingerprint        string
-	EffectiveFingerprint      string
-	Outcome                   string
-	EffectiveModelID          string
-	EffectivePermissionModeID string
-	ReasonCode                *string
+	CommandID                  string
+	RequestFingerprint         string
+	EffectiveFingerprint       string
+	Outcome                    string
+	EffectiveModelID           string
+	EffectiveReasoningEffortID *string
+	EffectivePermissionModeID  string
+	ReasonCode                 *string
 }
 
 type SettingsDeliveryExecute struct {
@@ -880,11 +931,11 @@ func decodeCommand(data []byte) (Frame, error) {
 // grammar before Hub routing can touch the durable Settings ledger.
 func DecodeSettingsChangePayload(payload json.RawMessage) (SettingsChange, error) {
 	fields, err := strictObject(payload)
-	if err != nil || len(fields) < 2 || len(fields) > 3 {
+	if err != nil || len(fields) < 2 || len(fields) > 4 {
 		return SettingsChange{}, errors.New("invalid settings change payload")
 	}
 	for key := range fields {
-		if key != "capability_fingerprint" && key != "model_id" && key != "permission_mode_id" {
+		if key != "capability_fingerprint" && key != "model_id" && key != "reasoning_effort_id" && key != "permission_mode_id" {
 			return SettingsChange{}, errors.New("invalid settings change payload")
 		}
 	}
@@ -899,6 +950,13 @@ func DecodeSettingsChangePayload(payload json.RawMessage) (SettingsChange, error
 		}
 		change.RequestedModelID = &value
 	}
+	if raw := fields["reasoning_effort_id"]; raw != nil {
+		var value string
+		if json.Unmarshal(raw, &value) != nil || !validSettingsIdentifier(value) {
+			return SettingsChange{}, errors.New("invalid settings reasoning effort id")
+		}
+		change.RequestedReasoningEffortID = &value
+	}
 	if raw := fields["permission_mode_id"]; raw != nil {
 		var value string
 		if json.Unmarshal(raw, &value) != nil || !validSettingsIdentifier(value) {
@@ -906,7 +964,7 @@ func DecodeSettingsChangePayload(payload json.RawMessage) (SettingsChange, error
 		}
 		change.RequestedPermissionModeID = &value
 	}
-	if change.RequestedModelID == nil && change.RequestedPermissionModeID == nil {
+	if change.RequestedModelID == nil && change.RequestedReasoningEffortID == nil && change.RequestedPermissionModeID == nil {
 		return SettingsChange{}, errors.New("settings change requires a requested value")
 	}
 	return change, nil
@@ -916,10 +974,25 @@ func DecodeSettingsChangePayload(payload json.RawMessage) (SettingsChange, error
 // event grammar and recomputes its canonical fingerprint.
 func DecodeSettingsCapabilityPayload(payload json.RawMessage) (SettingsCapabilityPayload, error) {
 	fields, err := strictObject(payload)
-	if err != nil || len(fields) != 10 {
+	if err != nil || fields["schema_version"] == nil {
+		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+	}
+	var schemaVersion int
+	if json.Unmarshal(fields["schema_version"], &schemaVersion) != nil || (schemaVersion != LegacySettingsCapabilitySchemaVersion && schemaVersion != SettingsCapabilitySchemaVersion) {
 		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
 	}
 	allowed := map[string]bool{"schema_version": true, "fingerprint": true, "models": true, "permission_modes": true, "effective_model_id": true, "effective_permission_mode_id": true, "model_change": true, "permission_change": true, "model_read_only_reason": true, "permission_read_only_reason": true}
+	expectedMembers := 10
+	if schemaVersion == SettingsCapabilitySchemaVersion {
+		allowed["reasoning_efforts"] = true
+		allowed["effective_reasoning_effort_id"] = true
+		allowed["reasoning_effort_change"] = true
+		allowed["reasoning_effort_read_only_reason"] = true
+		expectedMembers = 14
+	}
+	if len(fields) != expectedMembers {
+		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+	}
 	for key := range fields {
 		if !allowed[key] {
 			return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
@@ -934,14 +1007,27 @@ func DecodeSettingsCapabilityPayload(payload json.RawMessage) (SettingsCapabilit
 		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
 	}
 	var out SettingsCapabilityPayload
+	out.SchemaVersion = schemaVersion
 	out.Models = models
 	out.PermissionModes = permissionModes
-	if json.Unmarshal(fields["schema_version"], &out.SchemaVersion) != nil || out.SchemaVersion != 1 ||
-		json.Unmarshal(fields["fingerprint"], &out.Fingerprint) != nil || !validSettingsFingerprint(out.Fingerprint) ||
+	if json.Unmarshal(fields["fingerprint"], &out.Fingerprint) != nil || !validSettingsFingerprint(out.Fingerprint) ||
 		json.Unmarshal(fields["effective_model_id"], &out.EffectiveModelID) != nil || json.Unmarshal(fields["effective_permission_mode_id"], &out.EffectivePermissionModeID) != nil ||
 		json.Unmarshal(fields["model_change"], &out.ModelChange) != nil || json.Unmarshal(fields["permission_change"], &out.PermissionChange) != nil ||
 		json.Unmarshal(fields["model_read_only_reason"], &out.ModelReadOnlyReason) != nil || json.Unmarshal(fields["permission_read_only_reason"], &out.PermissionReadOnlyReason) != nil {
 		return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+	}
+	if schemaVersion == SettingsCapabilitySchemaVersion {
+		reasoningEfforts, err := decodeSettingsCapabilityChoices(fields["reasoning_efforts"])
+		if err != nil {
+			return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+		}
+		out.ReasoningEfforts = reasoningEfforts
+		if json.Unmarshal(fields["effective_reasoning_effort_id"], &out.EffectiveReasoningEffortID) != nil ||
+			json.Unmarshal(fields["reasoning_effort_change"], &out.ReasoningEffortChange) != nil ||
+			json.Unmarshal(fields["reasoning_effort_read_only_reason"], &out.ReasoningEffortReadOnlyReason) != nil ||
+			!validReasoningEffortCapability(out) {
+			return SettingsCapabilityPayload{}, errors.New("invalid settings capability payload")
+		}
 	}
 	if !validSettingsChoices(out.Models, 1, 32) || !validSettingsChoices(out.PermissionModes, 1, 16) ||
 		!validSettingsIdentifier(out.EffectiveModelID) || !validSettingsIdentifier(out.EffectivePermissionModeID) ||
@@ -980,10 +1066,10 @@ func decodeSettingsCapabilityChoices(data json.RawMessage) ([]SettingsCapability
 // without allowing the Adapter to select durable outcome metadata itself.
 func DecodeSettingsEffectivePayload(payload json.RawMessage) (SettingsEffectivePayload, error) {
 	fields, err := strictObject(payload)
-	if err != nil || len(fields) != 7 {
+	if err != nil || (len(fields) != 7 && len(fields) != 8) {
 		return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
 	}
-	allowed := map[string]bool{"cmd_id": true, "request_fingerprint": true, "effective_fingerprint": true, "outcome": true, "effective_model_id": true, "effective_permission_mode_id": true, "reason_code": true}
+	allowed := map[string]bool{"cmd_id": true, "request_fingerprint": true, "effective_fingerprint": true, "outcome": true, "effective_model_id": true, "effective_reasoning_effort_id": true, "effective_permission_mode_id": true, "reason_code": true}
 	for key := range fields {
 		if !allowed[key] {
 			return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
@@ -998,6 +1084,11 @@ func DecodeSettingsEffectivePayload(payload json.RawMessage) (SettingsEffectiveP
 		json.Unmarshal(fields["effective_permission_mode_id"], &out.EffectivePermissionModeID) != nil || !validSettingsIdentifier(out.EffectivePermissionModeID) ||
 		json.Unmarshal(fields["reason_code"], &out.ReasonCode) != nil {
 		return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
+	}
+	if raw := fields["effective_reasoning_effort_id"]; raw != nil {
+		if json.Unmarshal(raw, &out.EffectiveReasoningEffortID) != nil || (out.EffectiveReasoningEffortID != nil && !validSettingsIdentifier(*out.EffectiveReasoningEffortID)) {
+			return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
+		}
 	}
 	if (out.Outcome == "applied" && out.ReasonCode != nil) || (out.Outcome != "applied" && !validSettingsReasonPointer(out.ReasonCode)) {
 		return SettingsEffectivePayload{}, errors.New("invalid settings effective payload")
@@ -1122,6 +1213,17 @@ func validSettingsChangeMode(mode string, reason *string, choices int) bool {
 		return choices >= 2 && reason == nil
 	}
 	return mode == "read_only" && reason != nil && len(*reason) >= 1 && len(*reason) <= 64 && validSettingsReason(*reason)
+}
+
+func validReasoningEffortCapability(capability SettingsCapabilityPayload) bool {
+	if capability.ReasoningEffortChange == "unsupported" {
+		return len(capability.ReasoningEfforts) == 0 && capability.EffectiveReasoningEffortID == nil && validSettingsReasonPointer(capability.ReasoningEffortReadOnlyReason)
+	}
+	if !validSettingsChoices(capability.ReasoningEfforts, 1, 16) || capability.EffectiveReasoningEffortID == nil ||
+		!validSettingsIdentifier(*capability.EffectiveReasoningEffortID) || !settingsChoiceContains(capability.ReasoningEfforts, *capability.EffectiveReasoningEffortID) {
+		return false
+	}
+	return validSettingsChangeMode(capability.ReasoningEffortChange, capability.ReasoningEffortReadOnlyReason, len(capability.ReasoningEfforts))
 }
 
 func validSettingsReason(value string) bool {
@@ -1472,6 +1574,13 @@ func validSettingsOutcome(value string) bool {
 	}
 }
 
+// SettingsCapabilityFingerprint returns the canonical fingerprint for a
+// validated capability payload. Callers still need DecodeSettingsCapabilityPayload
+// to validate the complete grammar.
+func SettingsCapabilityFingerprint(capability SettingsCapabilityPayload) string {
+	return settingsCapabilityFingerprint(capability)
+}
+
 func settingsCapabilityFingerprint(capability SettingsCapabilityPayload) string {
 	data := make([]byte, 0, 512)
 	appendString := func(value string) {
@@ -1480,11 +1589,22 @@ func settingsCapabilityFingerprint(capability SettingsCapabilityPayload) string 
 		data = append(data, length[:]...)
 		data = append(data, value...)
 	}
-	data = append(data, []byte("agentwharf.settings-capability.v1")...)
-	data = append(data, 0, 1, byte(len(capability.Models)))
+	version := capability.SchemaVersion
+	if version == 0 {
+		version = LegacySettingsCapabilitySchemaVersion
+	}
+	data = append(data, []byte(fmt.Sprintf("agentwharf.settings-capability.v%d", version))...)
+	data = append(data, 0, byte(version), byte(len(capability.Models)))
 	for _, choice := range capability.Models {
 		appendString(choice.ID)
 		appendString(choice.Label)
+	}
+	if version >= SettingsCapabilitySchemaVersion {
+		data = append(data, byte(len(capability.ReasoningEfforts)))
+		for _, choice := range capability.ReasoningEfforts {
+			appendString(choice.ID)
+			appendString(choice.Label)
+		}
 	}
 	data = append(data, byte(len(capability.PermissionModes)))
 	for _, choice := range capability.PermissionModes {
@@ -1492,21 +1612,40 @@ func settingsCapabilityFingerprint(capability SettingsCapabilityPayload) string 
 		appendString(choice.Label)
 	}
 	appendString(capability.EffectiveModelID)
+	if version >= SettingsCapabilitySchemaVersion {
+		if capability.EffectiveReasoningEffortID == nil {
+			appendString("")
+		} else {
+			appendString(*capability.EffectiveReasoningEffortID)
+		}
+	}
 	appendString(capability.EffectivePermissionModeID)
-	if capability.ModelChange == "allowed" {
-		data = append(data, 1)
-	} else {
-		data = append(data, 0)
+	appendChangeMode := func(mode string) {
+		switch mode {
+		case "allowed":
+			data = append(data, 1)
+		case "unsupported":
+			data = append(data, 2)
+		default:
+			data = append(data, 0)
+		}
 	}
-	if capability.PermissionChange == "allowed" {
-		data = append(data, 1)
-	} else {
-		data = append(data, 0)
+	appendChangeMode(capability.ModelChange)
+	if version >= SettingsCapabilitySchemaVersion {
+		appendChangeMode(capability.ReasoningEffortChange)
 	}
+	appendChangeMode(capability.PermissionChange)
 	if capability.ModelReadOnlyReason == nil {
 		appendString("")
 	} else {
 		appendString(*capability.ModelReadOnlyReason)
+	}
+	if version >= SettingsCapabilitySchemaVersion {
+		if capability.ReasoningEffortReadOnlyReason == nil {
+			appendString("")
+		} else {
+			appendString(*capability.ReasoningEffortReadOnlyReason)
+		}
 	}
 	if capability.PermissionReadOnlyReason == nil {
 		appendString("")
