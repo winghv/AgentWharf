@@ -41,6 +41,28 @@ It also removes the legacy `agentwharf` command from that directory. Set
 `AGENTWHARF_INSTALL_DIR` only when you explicitly want to override the target
 directory.
 
+Recent versions also provide the shorter upgrade flow:
+
+```console
+$ wharf upgrade --check
+$ wharf upgrade
+```
+
+Wharf checks for a newer GitHub release in the background at most once every 24
+hours when an agent command starts. The check has a short timeout, never blocks
+session startup, and only prints an upgrade reminder. Set
+`WHARF_NO_UPDATE_CHECK=1` to disable automatic checks. Upgrades only run after
+the user explicitly invokes `wharf upgrade`.
+
+Managed v2 sessions also renew their short-lived adapter authorization before it
+expires. This keeps a long-running `wharf claude` process and its existing
+Workbench session connected without restarting the provider. Temporary Hub,
+WebSocket, or network interruptions are retried automatically with bounded
+backoff. Wharf resumes the same Session, keeps the same provider process alive,
+and safely retries durable events whose acknowledgement was lost. It exits when
+the user stops it or when the Session authority is explicitly rejected or
+terminated.
+
 Start the agent you want to use:
 
 ```console
