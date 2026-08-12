@@ -2737,12 +2737,13 @@ func (s *Store) RecordProviderStartAdmission(ctx context.Context, request store.
 	return s.WithProviderStartAdmission(ctx, request, nil)
 }
 
-// WithProviderStartAdmission holds the exact Adapter connection and its sole
-// reserved workspace lease until callback proves the Provider crossed its
-// start boundary. The callback receives no Store handle, so it cannot select a
-// workspace or change the durable admission decision.
+// WithProviderStartAdmission holds the exact Adapter connection and writer
+// until callback proves the Provider crossed its start boundary. Attached
+// targets additionally hold their sole reserved workspace lease; standalone
+// bootstrap Sessions have no workspace state to transition.
 func (s *Store) WithProviderStartAdmission(ctx context.Context, request store.ProviderStartAdmission, callback func(context.Context) error) (store.WorkspaceLease, error) {
 	if s == nil || s.db == nil || !validConnectionID(request.SessionID) || request.Writer.LeaseID == "" ||
+		(request.Kind != store.ProviderStartStandalone && request.Kind != store.ProviderStartAttached) ||
 		request.Writer.ConnectionEpoch != request.Admission.ConnectionEpoch || request.Writer.CredentialGeneration != request.Admission.CredentialGeneration {
 		return store.WorkspaceLease{}, errors.New("invalid provider start admission")
 	}
@@ -2754,6 +2755,26 @@ func (s *Store) WithProviderStartAdmission(ctx context.Context, request store.Pr
 	bound := &Store{db: s.db, fenceDB: s.fenceDB, connectionTx: tx}
 	if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
 		return store.WorkspaceLease{}, errors.New("provider start authority lost")
+	}
+	if err := validateLiveSettingsWriter(ctx, tx, request.SessionID, request.Writer); err != nil {
+		return store.WorkspaceLease{}, errors.New("provider start authority lost")
+	}
+	if request.Kind == store.ProviderStartStandalone {
+		if callback != nil {
+			if err := callback(ctx); err != nil {
+				return store.WorkspaceLease{}, fmt.Errorf("provider start callback: %w", err)
+			}
+		}
+		if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
+			return store.WorkspaceLease{}, errors.New("provider start authority lost")
+		}
+		if err := validateLiveSettingsWriter(ctx, tx, request.SessionID, request.Writer); err != nil {
+			return store.WorkspaceLease{}, errors.New("provider start authority lost")
+		}
+		if err := tx.Commit(); err != nil {
+			return store.WorkspaceLease{}, fmt.Errorf("commit provider start admission: %w", err)
+		}
+		return store.WorkspaceLease{}, nil
 	}
 	nowMS, err := sqliteNowMillis(ctx, tx)
 	if err != nil {
@@ -2812,6 +2833,9 @@ WHERE workspace_key=? AND session_id=? AND connection_epoch=? AND credential_gen
 		}
 	}
 	if _, err := bound.ValidateAdapterAdmission(ctx, request.SessionID, request.Admission); err != nil {
+		return store.WorkspaceLease{}, errors.New("provider start authority lost")
+	}
+	if err := validateLiveSettingsWriter(ctx, tx, request.SessionID, request.Writer); err != nil {
 		return store.WorkspaceLease{}, errors.New("provider start authority lost")
 	}
 	lease, err := querySQLiteWorkspaceLease(ctx, tx, key)

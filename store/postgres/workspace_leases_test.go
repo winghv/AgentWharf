@@ -69,8 +69,48 @@ func TestProviderStartAdmissionContract(t *testing.T) {
 				t.Fatalf("AllocateAdapterGrantFence() = %v", err)
 			}
 		}
-		return harness, store.ProviderStartAdmission{SessionID: "ses_workspace", Admission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, GrantFence: fence}, Writer: store.SettingsWriter{ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_provider_start"}}, key
+		return harness, store.ProviderStartAdmission{SessionID: "ses_workspace", Admission: store.AdapterConnectionAdmission{CredentialGeneration: 1, ConnectionEpoch: 1, AcceptedFence: 1, GrantFence: fence}, Writer: store.SettingsWriter{ConnectionEpoch: 1, CredentialGeneration: 1, LeaseID: "lease_provider_start"}, Kind: store.ProviderStartAttached}, key
 	}
+
+	t.Run("admits standalone provider start without workspace state", func(t *testing.T) {
+		harness := newPostgresWorkspaceLeaseHarness(t)
+		if _, err := harness.pool.Exec(context.Background(), `DELETE FROM session_workspace_leases; DELETE FROM session_attachments;`); err != nil {
+			t.Fatalf("remove attached workspace state: %v", err)
+		}
+		connection, err := harness.AcceptAdapterHello(context.Background(), "ses_workspace", store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: "lease_standalone"})
+		if err != nil {
+			t.Fatalf("AcceptAdapterHello() = %v", err)
+		}
+		fence, err := harness.AllocateAdapterGrantFence(context.Background())
+		if err != nil {
+			t.Fatalf("AllocateAdapterGrantFence() = %v", err)
+		}
+		called := false
+		lease, err := harness.WithProviderStartAdmission(context.Background(), store.ProviderStartAdmission{
+			SessionID: "ses_workspace",
+			Admission: store.AdapterConnectionAdmission{CredentialGeneration: connection.ActiveCredentialGeneration, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: fence},
+			Writer:    store.SettingsWriter{ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: "lease_standalone"},
+			Kind:      store.ProviderStartStandalone,
+		}, func(context.Context) error {
+			called = true
+			return nil
+		})
+		if err != nil || !called || lease != (store.WorkspaceLease{}) {
+			t.Fatalf("standalone provider start = %+v, called=%t, err=%v", lease, called, err)
+		}
+	})
+
+	t.Run("rejects an unspecified admission kind", func(t *testing.T) {
+		harness, admission, _ := newAdmission(t)
+		admission.Kind = ""
+		called := false
+		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+			called = true
+			return nil
+		}); err == nil || called {
+			t.Fatalf("unspecified admission kind err=%v, callback=%t", err, called)
+		}
+	})
 
 	t.Run("commits exactly one start receipt", func(t *testing.T) {
 		harness, admission, key := newAdmission(t)
@@ -326,6 +366,9 @@ INSERT INTO session_adapter_connections (
     session_id, connection_epoch, accepted_fence, active_credential_generation,
     credential_generation_high_watermark, active_credential_expires_at
 ) VALUES ('ses_workspace', 1, 1, 1, 1, clock_timestamp() + interval '1 hour');
+INSERT INTO session_settings_live_writers (
+    session_id, connection_epoch, credential_generation, writer_lease_id
+) VALUES ('ses_workspace', 1, 1, 'lease_provider_start');
 INSERT INTO session_attachments (
     attach_id, bootstrap_session_id, target_session_id, status, delivery_state,
     queue_reason, expires_at, blocking_session_id, target_credential_lineage_ref

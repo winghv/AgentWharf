@@ -391,19 +391,30 @@ type AdapterConnectionAuthorityReceiptStore interface {
 	IssueAdapterConnectionAuthorityReceipt(context.Context, string, AdapterConnectionAdmission, SettingsWriter) (ConnectionAuthorityReceipt, error)
 }
 
+type ProviderStartAdmissionKind string
+
+const (
+	ProviderStartStandalone ProviderStartAdmissionKind = "standalone"
+	ProviderStartAttached   ProviderStartAdmissionKind = "attached"
+)
+
 // ProviderStartAdmission is the Hub-derived, exact live writer tuple used to
-// turn one reserved WorkspaceLease into durable start_received. It intentionally
-// excludes Provider configuration, paths, content, and credentials.
+// linearize Provider start. Target credentials also require one reserved
+// WorkspaceLease to become durable start_received; bootstrap credentials do
+// not invent workspace state. It intentionally excludes Provider
+// configuration, paths, content, and credentials.
 type ProviderStartAdmission struct {
 	SessionID   string
 	Admission   AdapterConnectionAdmission
 	Writer      SettingsWriter
+	Kind        ProviderStartAdmissionKind
 	ReAdmission bool
 }
 
-// ProviderStartAdmissionStore linearizes the final connection and workspace
-// checks with the durable start_received transition. Implementations must
-// reject a missing, replaced, revoked, terminal, expired, or quarantined lease.
+// ProviderStartAdmissionStore linearizes the final connection and writer
+// checks with physical Provider start. For ProviderStartAttached,
+// implementations must also reject a missing, replaced, revoked, terminal,
+// expired, or quarantined lease and durably transition it to start_received.
 type ProviderStartAdmissionStore interface {
 	EventStore
 	RecordProviderStartAdmission(context.Context, ProviderStartAdmission) (WorkspaceLease, error)

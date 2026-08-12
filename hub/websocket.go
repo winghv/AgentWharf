@@ -876,18 +876,16 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *managedCon
 func (h *webSocketHandler) resolveAdapterCredentialEvidence(ctx context.Context, bearer, sessionID string, generation int64, credentialExpiresAt time.Time) (auth.SessionCredentialEvidence, error) {
 	if h.sessionCredentialEvidenceResolver != nil {
 		evidence, err := h.sessionCredentialEvidenceResolver.SessionCredentialEvidence(ctx, bearer)
-		if err == nil {
-			if evidence.SessionID != sessionID || evidence.Generation != generation || !evidence.ExpiresAt.Equal(credentialExpiresAt) ||
-				!validAdapterCredentialLineage(evidence.Lineage) {
-				return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
-			}
-			return evidence, nil
+		if err != nil {
+			return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
 		}
+		if evidence.SessionID != sessionID || evidence.Generation != generation || !evidence.ExpiresAt.Equal(credentialExpiresAt) ||
+			!validAdapterCredentialLineage(evidence.Lineage) {
+			return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+		}
+		return evidence, nil
 	}
-	if generation != 1 {
-		return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
-	}
-	return auth.SessionCredentialEvidence{SessionID: sessionID, Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialBootstrapInitial}, Generation: 1}, nil
+	return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
 }
 
 func validAdapterCredentialLineage(lineage auth.SessionCredentialLineage) bool {
@@ -1904,8 +1902,13 @@ func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *ada
 		return adapter.writeFrame(ctx, ack(protocol.ProviderStartRejected, ""))
 	}
 	err := withAdapterAuthorityBudget(ctx, func(admissionCtx context.Context) error {
+		kind := store.ProviderStartAttached
+		if adapter.credentialEvidence.Lineage.Kind == auth.SessionCredentialBootstrapInitial {
+			kind = store.ProviderStartStandalone
+		}
 		_, err := admissions.WithProviderStartAdmission(admissionCtx, store.ProviderStartAdmission{
-			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter, ReAdmission: attempt > 1,
+			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter,
+			Kind: kind, ReAdmission: attempt > 1,
 		}, func(startCtx context.Context) error {
 			prepare := &protocol.ProviderStartPrepare{Attempt: attempt}
 			if legacy {

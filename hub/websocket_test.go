@@ -138,7 +138,16 @@ func TestWebSocketV2ProviderStartUsesStoreLinearizedAdmission(t *testing.T) {
 	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	expiresAt := time.Now().Add(time.Hour).UTC()
+	authenticator := websocketTestAuth{
+		principals:  map[string]auth.Principal{"adapter-token": {Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_1")}}},
+		credentials: map[string]adapterCredentialEvidence{"adapter": {Generation: 1, ExpiresAt: expiresAt}},
+		evidences: map[string]auth.SessionCredentialEvidence{"adapter-token": {
+			SessionID: "ses_1", Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialTargetAttach, AttachID: "att_1", JTI: "jti_1"},
+			Generation: 1, RotationID: "rot_1", RevocationID: "rev_1", ExpiresAt: expiresAt,
+		}},
+	}
+	server := newWebSocketTestServer(t, hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events}), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
 	adapter := dialWebSocket(t, server.URL)
 	defer adapter.Close(websocket.StatusNormalClosure, "")
 	writeAdapterHelloV2(t, adapter, "adapter-token")
@@ -186,6 +195,69 @@ func TestWebSocketV2ProviderStartUsesStoreLinearizedAdmission(t *testing.T) {
 	}
 }
 
+func TestWebSocketV2StandaloneProviderStartNeedsNoWorkspaceLease(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "provider-start-standalone.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	if receipt := readFrame(t, adapter).(*protocol.HelloAck).ConnectionAuthority; receipt == nil {
+		t.Fatal("v2 adapter receipt missing")
+	}
+
+	writeFrame(t, adapter, &protocol.ProviderStart{Attempt: 1})
+	if prepare, ok := readFrame(t, adapter).(*protocol.ProviderStartPrepare); !ok || prepare.Attempt != 1 {
+		t.Fatal("standalone provider start did not enter the Store-held prepare phase")
+	}
+	writeFrame(t, adapter, &protocol.ProviderStartStarted{Attempt: 1})
+	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Attempt != 1 || ack.Status != protocol.ProviderStartAdmitted || ack.RecoveryHandle == "" {
+		t.Fatalf("standalone provider start ack = %+v", ack)
+	}
+}
+
+func TestWebSocketV2AttachedProviderStartRejectsMissingWorkspaceLease(t *testing.T) {
+	ctx := context.Background()
+	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "provider-start-attached-no-lease.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	events := &settingsWebSocketStore{Store: ledger}
+	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().Add(time.Hour).UTC()
+	authenticator := websocketTestAuth{
+		principals:  map[string]auth.Principal{"adapter-token": {Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_1")}}},
+		credentials: map[string]adapterCredentialEvidence{"adapter": {Generation: 1, ExpiresAt: expiresAt}},
+		evidences: map[string]auth.SessionCredentialEvidence{"adapter-token": {
+			SessionID: "ses_1", Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialTargetAttach, AttachID: "att_1", JTI: "jti_1"},
+			Generation: 1, RotationID: "rot_1", RevocationID: "rev_1", ExpiresAt: expiresAt,
+		}},
+	}
+	server := newWebSocketTestServer(t, hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events}), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	if receipt := readFrame(t, adapter).(*protocol.HelloAck).ConnectionAuthority; receipt == nil {
+		t.Fatal("v2 adapter receipt missing")
+	}
+
+	writeFrame(t, adapter, &protocol.ProviderStart{Attempt: 1})
+	if ack, ok := readFrame(t, adapter).(*protocol.ProviderStartAck); !ok || ack.Attempt != 1 || ack.Status != protocol.ProviderStartRejected || ack.RecoveryHandle != "" {
+		t.Fatalf("attached provider start without lease ack = %#v", ack)
+	}
+}
+
 func TestWebSocketV2ProviderStartAcceptsLegacyEmptyFirstChild(t *testing.T) {
 	ctx := context.Background()
 	ledger, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "provider-start-legacy.db"))
@@ -197,7 +269,16 @@ func TestWebSocketV2ProviderStartAcceptsLegacyEmptyFirstChild(t *testing.T) {
 	if _, err := events.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{SessionID: "ses_1", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	expiresAt := time.Now().Add(time.Hour).UTC()
+	authenticator := websocketTestAuth{
+		principals:  map[string]auth.Principal{"adapter-token": {Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_1")}}},
+		credentials: map[string]adapterCredentialEvidence{"adapter": {Generation: 1, ExpiresAt: expiresAt}},
+		evidences: map[string]auth.SessionCredentialEvidence{"adapter-token": {
+			SessionID: "ses_1", Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialTargetAttach, AttachID: "att_1", JTI: "jti_1"},
+			Generation: 1, RotationID: "rot_1", RevocationID: "rev_1", ExpiresAt: expiresAt,
+		}},
+	}
+	server := newWebSocketTestServer(t, hub.NewHandshake(hub.HandshakeConfig{Authenticator: authenticator, EventStore: events}), func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
 	adapter := dialWebSocket(t, server.URL)
 	defer adapter.Close(websocket.StatusNormalClosure, "")
 	writeAdapterHelloV2(t, adapter, "adapter-token")
@@ -2580,6 +2661,34 @@ func TestAdapterDispatchRejectsGenerationAboveOneBeforeRotation(t *testing.T) {
 	}
 }
 
+func TestAdapterDispatchRejectsGenerationOneWhenConfiguredEvidenceResolverFails(t *testing.T) {
+	events := newDispatchFenceStore()
+	before, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().Add(time.Hour).UTC()
+	resolver := websocketTestAuth{
+		principals:  map[string]auth.Principal{"target-token": {Subject: "target", Scopes: []auth.Scope{auth.SessionAdapter("ses_1")}}},
+		credentials: map[string]adapterCredentialEvidence{"target": {Generation: 1, ExpiresAt: expiresAt}},
+		evidences:   map[string]auth.SessionCredentialEvidence{},
+	}
+	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: resolver, EventStore: events})
+	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "target-token")
+	if frame, err := readFrameWithin(adapter, 200*time.Millisecond); err == nil {
+		if _, accepted := frame.(*protocol.HelloAck); accepted {
+			t.Fatal("generation-1 target Adapter received hello.ack after lineage resolution failed")
+		}
+	}
+	after, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil || after.ConnectionEpoch != before.ConnectionEpoch || after.AcceptedFence != before.AcceptedFence {
+		t.Fatalf("failed lineage resolution mutated connection: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
 func TestAdapterDispatchAdmitsVerifiedRotatedCredential(t *testing.T) {
 	events := newDispatchFenceStore()
 	events.mutateConnection(func(connection *store.AdapterConnection) {
@@ -3360,6 +3469,26 @@ func (a websocketTestAuth) AdapterCredential(_ context.Context, _ string, princi
 }
 
 func (a websocketTestAuth) SessionCredentialEvidence(_ context.Context, token string) (auth.SessionCredentialEvidence, error) {
+	if a.evidences == nil {
+		principal, ok := a.principals[token]
+		if !ok {
+			return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+		}
+		credential, ok := a.credentials[principal.Subject]
+		if !ok || credential.Generation != 1 {
+			return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+		}
+		scopes := principal.Scopes
+		for _, scope := range scopes {
+			if scope.Kind == auth.KindSession && scope.Access == auth.AccessAdapter {
+				return auth.SessionCredentialEvidence{
+					SessionID: scope.ID, Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialBootstrapInitial},
+					Generation: credential.Generation, ExpiresAt: credential.ExpiresAt,
+				}, nil
+			}
+		}
+		return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+	}
 	evidence, ok := a.evidences[token]
 	if !ok {
 		return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized

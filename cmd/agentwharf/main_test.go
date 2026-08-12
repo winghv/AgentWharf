@@ -318,7 +318,10 @@ func TestLocalSessionAuthenticatorAcceptsOnlyCurrentLocalSessionBearer(t *testin
 		t.Fatalf("activate credential: %v", err)
 	}
 	base := static.New([]static.Token{{Token: "adapter-token", Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("ses_local")}}})
-	authenticator := localSessionAuthenticator{Authenticator: base, staticAdapterCredential: base.AdapterCredential, sessionCredentialIssuer: issuer, sessionID: "ses_local"}
+	authenticator := localSessionAuthenticator{
+		Authenticator: base, staticAdapterExpiresAt: time.Now().Add(time.Hour).UnixNano(),
+		sessionCredentialIssuer: issuer, sessionID: "ses_local",
+	}
 	principal, err := authenticator.Authenticate(context.Background(), prepared.Bearer)
 	if err != nil || len(principal.Scopes) != 1 || principal.Scopes[0] != auth.SessionAdapter("ses_local") {
 		t.Fatalf("Authenticate(prepared bearer) = %+v, %v", principal, err)
@@ -329,6 +332,23 @@ func TestLocalSessionAuthenticatorAcceptsOnlyCurrentLocalSessionBearer(t *testin
 	generation, expiresAt, initialize, err := authenticator.AdapterCredential(context.Background(), prepared.Bearer, principal, "ses_local")
 	if err != nil || generation != prepared.Generation || expiresAt != prepared.ExpiresAt.UnixNano() || !initialize {
 		t.Fatalf("AdapterCredential() = %d, %d, %t, %v", generation, expiresAt, initialize, err)
+	}
+	evidence, err := authenticator.SessionCredentialEvidence(context.Background(), prepared.Bearer)
+	if err != nil || evidence.SessionID != prepared.SessionID || evidence.Lineage != prepared.Lineage || evidence.Generation != prepared.Generation || !evidence.ExpiresAt.Equal(prepared.ExpiresAt) {
+		t.Fatalf("SessionCredentialEvidence(prepared) = %+v, %v", evidence, err)
+	}
+
+	staticPrincipal, err := authenticator.Authenticate(context.Background(), "adapter-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	staticGeneration, staticExpiresAt, staticInitialize, err := authenticator.AdapterCredential(context.Background(), "adapter-token", staticPrincipal, "ses_local")
+	if err != nil || staticGeneration != 1 || !staticInitialize {
+		t.Fatalf("AdapterCredential(static) = %d, %d, %t, %v", staticGeneration, staticExpiresAt, staticInitialize, err)
+	}
+	staticEvidence, err := authenticator.SessionCredentialEvidence(context.Background(), "adapter-token")
+	if err != nil || staticEvidence.SessionID != "ses_local" || staticEvidence.Lineage.Kind != auth.SessionCredentialBootstrapInitial || staticEvidence.Generation != 1 || staticEvidence.ExpiresAt.UnixNano() != staticExpiresAt {
+		t.Fatalf("SessionCredentialEvidence(static) = %+v, %v", staticEvidence, err)
 	}
 }
 

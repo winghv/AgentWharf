@@ -3098,13 +3098,19 @@ func startServe(ctx context.Context, cfg serveConfig) (*runningServe, error) {
 			Scopes:  []auth.Scope{auth.SessionAdapter(cfg.SessionID)},
 		},
 	})
-	authenticator := localSessionAuthenticator{Authenticator: baseAuthenticator, staticAdapterCredential: baseAuthenticator.AdapterCredential, sessionCredentialIssuer: issuer, sessionID: cfg.SessionID, provider: cfg.Provider}
+	authenticator := localSessionAuthenticator{
+		Authenticator:           baseAuthenticator,
+		staticAdapterExpiresAt:  time.Now().AddDate(10, 0, 0).UnixNano(),
+		sessionCredentialIssuer: issuer,
+		sessionID:               cfg.SessionID,
+		provider:                cfg.Provider,
+	}
 	sessionStore := localSessionStore{Store: eventStore, sessionID: cfg.SessionID}
 	handshake := hub.NewHandshake(hub.HandshakeConfig{
 		Authenticator: authenticator,
 		EventStore:    sessionStore,
 	})
-	webSocketHandler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: sessionStore, SessionCredentialIssuer: issuer, SessionCredentialLifecycle: issuer})
+	webSocketHandler := hub.NewWebSocketHandler(hub.WebSocketConfig{Handshake: handshake, EventStore: sessionStore, SessionCredentialIssuer: issuer, SessionCredentialLifecycle: issuer, SessionCredentialEvidenceResolver: authenticator})
 	server := &http.Server{
 		Handler:           hub.NewObservabilityHandler(cfg.ControlToken, webSocketHandler),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -3188,7 +3194,7 @@ func (r *runningServe) wait() error {
 
 type localSessionAuthenticator struct {
 	auth.Authenticator
-	staticAdapterCredential func(context.Context, string, auth.Principal, string) (int64, int64, bool, error)
+	staticAdapterExpiresAt  int64
 	sessionCredentialIssuer *auth.LocalSessionCredentialIssuer
 	sessionID               string
 	provider                string
