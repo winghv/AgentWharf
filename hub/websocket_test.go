@@ -2661,6 +2661,34 @@ func TestAdapterDispatchRejectsGenerationAboveOneBeforeRotation(t *testing.T) {
 	}
 }
 
+func TestAdapterDispatchRejectsGenerationOneWhenConfiguredEvidenceResolverFails(t *testing.T) {
+	events := newDispatchFenceStore()
+	before, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().Add(time.Hour).UTC()
+	resolver := websocketTestAuth{
+		principals:  map[string]auth.Principal{"target-token": {Subject: "target", Scopes: []auth.Scope{auth.SessionAdapter("ses_1")}}},
+		credentials: map[string]adapterCredentialEvidence{"target": {Generation: 1, ExpiresAt: expiresAt}},
+		evidences:   map[string]auth.SessionCredentialEvidence{},
+	}
+	handshake := hub.NewHandshake(hub.HandshakeConfig{Authenticator: resolver, EventStore: events})
+	server := newWebSocketTestServer(t, handshake, func(cfg *hub.WebSocketConfig) { cfg.EventStore = events })
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHello(t, adapter, "target-token")
+	if frame, err := readFrameWithin(adapter, 200*time.Millisecond); err == nil {
+		if _, accepted := frame.(*protocol.HelloAck); accepted {
+			t.Fatal("generation-1 target Adapter received hello.ack after lineage resolution failed")
+		}
+	}
+	after, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil || after.ConnectionEpoch != before.ConnectionEpoch || after.AcceptedFence != before.AcceptedFence {
+		t.Fatalf("failed lineage resolution mutated connection: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
 func TestAdapterDispatchAdmitsVerifiedRotatedCredential(t *testing.T) {
 	events := newDispatchFenceStore()
 	events.mutateConnection(func(connection *store.AdapterConnection) {
@@ -3441,6 +3469,26 @@ func (a websocketTestAuth) AdapterCredential(_ context.Context, _ string, princi
 }
 
 func (a websocketTestAuth) SessionCredentialEvidence(_ context.Context, token string) (auth.SessionCredentialEvidence, error) {
+	if a.evidences == nil {
+		principal, ok := a.principals[token]
+		if !ok {
+			return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+		}
+		credential, ok := a.credentials[principal.Subject]
+		if !ok || credential.Generation != 1 {
+			return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+		}
+		scopes := principal.Scopes
+		for _, scope := range scopes {
+			if scope.Kind == auth.KindSession && scope.Access == auth.AccessAdapter {
+				return auth.SessionCredentialEvidence{
+					SessionID: scope.ID, Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialBootstrapInitial},
+					Generation: credential.Generation, ExpiresAt: credential.ExpiresAt,
+				}, nil
+			}
+		}
+		return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+	}
 	evidence, ok := a.evidences[token]
 	if !ok {
 		return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized

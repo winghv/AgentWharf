@@ -876,13 +876,14 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *managedCon
 func (h *webSocketHandler) resolveAdapterCredentialEvidence(ctx context.Context, bearer, sessionID string, generation int64, credentialExpiresAt time.Time) (auth.SessionCredentialEvidence, error) {
 	if h.sessionCredentialEvidenceResolver != nil {
 		evidence, err := h.sessionCredentialEvidenceResolver.SessionCredentialEvidence(ctx, bearer)
-		if err == nil {
-			if evidence.SessionID != sessionID || evidence.Generation != generation || !evidence.ExpiresAt.Equal(credentialExpiresAt) ||
-				!validAdapterCredentialLineage(evidence.Lineage) {
-				return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
-			}
-			return evidence, nil
+		if err != nil {
+			return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
 		}
+		if evidence.SessionID != sessionID || evidence.Generation != generation || !evidence.ExpiresAt.Equal(credentialExpiresAt) ||
+			!validAdapterCredentialLineage(evidence.Lineage) {
+			return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
+		}
+		return evidence, nil
 	}
 	if generation != 1 {
 		return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
