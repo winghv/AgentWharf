@@ -20,7 +20,10 @@ import (
 	"nhooyr.io/websocket"
 )
 
-const defaultHandshakeTimeout = 10 * time.Second
+const (
+	defaultHandshakeTimeout       = 10 * time.Second
+	providerStartAdmissionTimeout = 10 * time.Second
+)
 const maxReplayBufferedEvents = 1024
 const maxPendingCommandsPerSession = 64
 const pendingCommandTTL = 10 * time.Minute
@@ -947,6 +950,12 @@ func withAdapterAuthorityBudget(ctx context.Context, effect func(context.Context
 	authorityCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
 	defer cancel()
 	return effect(authorityCtx)
+}
+
+func withProviderStartAdmissionBudget(ctx context.Context, effect func(context.Context) error) error {
+	admissionCtx, cancel := context.WithTimeout(ctx, providerStartAdmissionTimeout)
+	defer cancel()
+	return effect(admissionCtx)
 }
 
 func (h *webSocketHandler) issueConnectionAuthorityReceipt(ctx context.Context, adapter *adapterConnection) (*protocol.ConnectionAuthorityReceipt, error) {
@@ -1883,6 +1892,13 @@ func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *ada
 	if adapter == nil || request == nil || h.events == nil {
 		return errAdapterAuthorityLost
 	}
+	adapter.effectMu.Lock()
+	defer adapter.effectMu.Unlock()
+	if err := withAdapterAuthorityBudget(ctx, func(authorityCtx context.Context) error {
+		return h.validateAdapter(authorityCtx, adapter)
+	}); err != nil {
+		return err
+	}
 	legacy := request.Attempt == 0
 	attempt := request.Attempt
 	if legacy {
@@ -1901,7 +1917,7 @@ func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *ada
 	if !ok {
 		return adapter.writeFrame(ctx, ack(protocol.ProviderStartRejected, ""))
 	}
-	err := withAdapterAuthorityBudget(ctx, func(admissionCtx context.Context) error {
+	err := withProviderStartAdmissionBudget(ctx, func(admissionCtx context.Context) error {
 		kind := store.ProviderStartAttached
 		if adapter.credentialEvidence.Lineage.Kind == auth.SessionCredentialBootstrapInitial {
 			kind = store.ProviderStartStandalone
