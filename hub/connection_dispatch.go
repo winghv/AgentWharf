@@ -165,9 +165,11 @@ func (h *webSocketHandler) watchAdapter(ctx context.Context, adapter *adapterCon
 	ticker := time.NewTicker(adapterAuthorityPollInterval)
 	defer ticker.Stop()
 	for range ticker.C {
+		adapter.effectMu.Lock()
 		checkCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
 		err := h.validateAdapter(checkCtx, adapter)
 		cancel()
+		adapter.effectMu.Unlock()
 		if err != nil || ctx.Err() != nil {
 			return
 		}

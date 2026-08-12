@@ -218,6 +218,10 @@ func TestWebSocketV2StandaloneProviderStartNeedsNoWorkspaceLease(t *testing.T) {
 	if prepare, ok := readFrame(t, adapter).(*protocol.ProviderStartPrepare); !ok || prepare.Attempt != 1 {
 		t.Fatal("standalone provider start did not enter the Store-held prepare phase")
 	}
+	// A real provider process takes longer than the 250ms authority polling
+	// budget to cross its physical start boundary. Provider-start admission has
+	// its own bounded window while retaining the same Store-held authority.
+	time.Sleep(500 * time.Millisecond)
 	writeFrame(t, adapter, &protocol.ProviderStartStarted{Attempt: 1})
 	if ack := readFrame(t, adapter).(*protocol.ProviderStartAck); ack.Attempt != 1 || ack.Status != protocol.ProviderStartAdmitted || ack.RecoveryHandle == "" {
 		t.Fatalf("standalone provider start ack = %+v", ack)
