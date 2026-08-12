@@ -885,10 +885,7 @@ func (h *webSocketHandler) resolveAdapterCredentialEvidence(ctx context.Context,
 		}
 		return evidence, nil
 	}
-	if generation != 1 {
-		return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
-	}
-	return auth.SessionCredentialEvidence{SessionID: sessionID, Lineage: auth.SessionCredentialLineage{Kind: auth.SessionCredentialBootstrapInitial}, Generation: 1}, nil
+	return auth.SessionCredentialEvidence{}, auth.ErrUnauthorized
 }
 
 func validAdapterCredentialLineage(lineage auth.SessionCredentialLineage) bool {
