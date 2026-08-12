@@ -23,6 +23,8 @@ jobs:
 
       - name: Build release assets
         shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
@@ -37,7 +39,7 @@ jobs:
             rm -rf "$work"
             mkdir -p "$work"
             GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags="-s -w" -o "$work/agentwharf" ./cmd/agentwharf
+              go build -trimpath -ldflags="-s -w -X github.com/winghv/agentwharf/internal/buildinfo.Version=$TAG_NAME" -o "$work/agentwharf" ./cmd/agentwharf
             tar -C "$work" -czf "$dist/agentwharf-$os-$arch.tar.gz" agentwharf
           }
 
@@ -48,7 +50,7 @@ jobs:
             rm -rf "$work"
             mkdir -p "$work"
             GOOS=windows GOARCH="$arch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags="-s -w" -o "$work/agentwharf.exe" ./cmd/agentwharf
+              go build -trimpath -ldflags="-s -w -X github.com/winghv/agentwharf/internal/buildinfo.Version=$TAG_NAME" -o "$work/agentwharf.exe" ./cmd/agentwharf
             (cd "$work" && zip -q "$dist/agentwharf-windows-$arch.zip" agentwharf.exe)
           }
 

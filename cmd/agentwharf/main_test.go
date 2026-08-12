@@ -336,7 +336,7 @@ func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	t.Parallel()
 
 	err := run(context.Background(), nil, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini|logout|machine|attention-backfill [options]") {
+	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini|logout|machine|version|upgrade|attention-backfill [options]") {
 		t.Fatalf("run() error = %v, want wharf usage", err)
 	}
 	if strings.Contains(err.Error(), "usage: agentwharf") {
@@ -1661,6 +1661,7 @@ func TestRunWrapV2ReAdmitsEveryRestartedChild(t *testing.T) {
 				return
 			}
 		}
+		<-ctx.Done()
 	}))
 	defer server.Close()
 	_, _ = runWrap(ctx, wrapConfig{HubURL: "ws" + strings.TrimPrefix(server.URL, "http"), SessionID: "ses_v2", Provider: "claude-code", AdapterToken: "adapter-token", Format: "jsonstream", ProtocolVersion: protocol.ProtocolVersionV2, ProviderCommand: []string{os.Args[0], "-test.run=TestProcessSupervisorHelperProcess"}}, nil, io.Discard)
@@ -1747,7 +1748,9 @@ func TestProviderStartAdmissionRetainsOpaqueRecoveryHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
-	admission := newProviderStartAdmission(protocol.ProtocolVersionV2, conn, func(frame protocol.Frame) error {
+	admission := newProviderStartAdmission(protocol.ProtocolVersionV2, func(readCtx context.Context) (protocol.Frame, error) {
+		return readCLIProtocolFrame(readCtx, conn)
+	}, func(frame protocol.Frame) error {
 		return writeFrameToConn(ctx, conn, frame)
 	}, nil)
 	if err := admission.PrepareProcessStart(ctx, 1); err != nil {
@@ -1775,42 +1778,17 @@ func TestProviderStartAdmissionInvalidationClearsRecoveryReference(t *testing.T)
 	}
 }
 
-func TestProviderStartAdmissionWatcherInvalidatesClosedSocket(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	serverConn := make(chan *websocket.Conn, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
-		if err != nil {
-			return
-		}
-		serverConn <- conn
-		<-ctx.Done()
-	}))
-	defer server.Close()
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
-	if err != nil {
-		t.Fatal(err)
+func TestProviderStartAdmissionKeepsRecoveryReferenceAcrossTransportReplacement(t *testing.T) {
+	admission := &providerStartAdmission{
+		read:           func(context.Context) (protocol.Frame, error) { return nil, errors.New("temporary transport failure") },
+		recoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "")
-	admission := &providerStartAdmission{conn: conn, recoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}
-	watchCtx, stop := context.WithCancel(ctx)
-	defer stop()
-	admission.watchLifecycle(watchCtx, stop)
-	select {
-	case peer := <-serverConn:
-		_ = peer.Close(websocket.StatusPolicyViolation, "authority revoked")
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for server connection")
+	if err := admission.VerifyRecoveryStart(context.Background()); err != nil {
+		t.Fatalf("VerifyRecoveryStart() = %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := admission.RecoveryStartHandle(); err != nil {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	if _, err := admission.RecoveryStartHandle(); err != nil {
+		t.Fatalf("temporary transport failure invalidated recovery reference: %v", err)
 	}
-	t.Fatal("closed Hub socket did not invalidate recovery reference")
 }
 
 func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
@@ -2145,10 +2123,13 @@ func TestForwardACPSettingsRevalidatesCapabilityBeforeProviderSideEffect(t *test
 	go func() {
 		done <- forwardHubCommandsToACPProvider(
 			ctx,
-			adapterConn,
+			func(readCtx context.Context) (protocol.Frame, error) {
+				return readCLIProtocolFrame(readCtx, adapterConn)
+			},
 			providerInput,
 			func(frame protocol.Frame) error { return writeFrameToConn(ctx, adapterConn, frame) },
 			func(string) {},
+			nil,
 			"acp_ses_1",
 			3,
 			map[string]acpPendingPermission{},
@@ -2219,6 +2200,63 @@ func TestForwardACPSettingsRevalidatesCapabilityBeforeProviderSideEffect(t *test
 	}
 }
 
+func TestForwardACPCommandReplayReacksWithoutRepeatingProviderSideEffect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	commands := make(chan protocol.Frame, 2)
+	command := &protocol.Command{
+		CommandID: "cmd_replayed", Type: protocol.CommandSessionSend, SessionID: "ses_commands",
+		Payload: []byte(`{"content":[{"kind":"text","text":"only once"}]}`),
+	}
+	commands <- command
+	commands <- command
+	providerInput := &recordingWriteCloser{}
+	acks := make(chan *protocol.CommandAck, 2)
+	done := make(chan error, 1)
+	tracker := newACPSettingsTracker(map[string]any{"configOptions": testACPConfigOptions("balanced", "ask")})
+	var permissionMu sync.Mutex
+	var settingsMu sync.Mutex
+	go func() {
+		done <- forwardHubCommandsToACPProvider(
+			ctx,
+			func(readCtx context.Context) (protocol.Frame, error) {
+				select {
+				case frame := <-commands:
+					return frame, nil
+				case <-readCtx.Done():
+					return nil, readCtx.Err()
+				}
+			},
+			providerInput,
+			func(frame protocol.Frame) error {
+				if ack, ok := frame.(*protocol.CommandAck); ok {
+					acks <- ack
+				}
+				return nil
+			},
+			func(string) {}, nil, "acp_ses_1", 3,
+			map[string]acpPendingPermission{}, &permissionMu, newACPResponseRouter(),
+			tracker, &settingsMu, nil, nil,
+			wrapConfig{ProtocolVersion: protocol.ProtocolVersionV2, SessionID: "ses_commands"},
+		)
+	}()
+	for index := 0; index < 2; index++ {
+		select {
+		case ack := <-acks:
+			if ack.CommandID != command.CommandID || ack.Status != protocol.AckAccepted {
+				t.Fatalf("ack = %+v", ack)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for replay acknowledgement")
+		}
+	}
+	cancel()
+	<-done
+	if count := strings.Count(providerInput.String(), `"method":"session/prompt"`); count != 1 {
+		t.Fatalf("provider prompt count = %d; input=%q", count, providerInput.String())
+	}
+}
+
 func TestForwardACPSettingsRejectsOtherSessionAndMismatchedExecute(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -2253,10 +2291,13 @@ func TestForwardACPSettingsRejectsOtherSessionAndMismatchedExecute(t *testing.T)
 	go func() {
 		done <- forwardHubCommandsToACPProvider(
 			ctx,
-			adapterConn,
+			func(readCtx context.Context) (protocol.Frame, error) {
+				return readCLIProtocolFrame(readCtx, adapterConn)
+			},
 			providerInput,
 			func(frame protocol.Frame) error { return writeFrameToConn(ctx, adapterConn, frame) },
 			func(string) {},
+			nil,
 			"acp_ses_1",
 			3,
 			map[string]acpPendingPermission{},
@@ -2695,6 +2736,9 @@ func readProviderStartFrame(ctx context.Context, conn *websocket.Conn) (protocol
 			return nil, err
 		}
 		if event, ok := frame.(*protocol.Event); ok && event.Type == "session.run.capabilities" {
+			continue
+		}
+		if _, ok := frame.(*protocol.CredentialRotationRequest); ok {
 			continue
 		}
 		return frame, nil
