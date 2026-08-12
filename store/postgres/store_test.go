@@ -1465,15 +1465,15 @@ func TestAdapterConnectionInitializeExactRetry(t *testing.T) {
 func TestAdapterConnectionPreHelloLifecycle(t *testing.T) {
 	ctx := context.Background()
 	harness := newPostgresConnectionHarness(t)
-	refreshInit := store.AdapterConnectionInitialize{SessionID: "ses_refresh", ActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(100 * time.Millisecond).Truncate(time.Microsecond)}
+	refreshInit := store.AdapterConnectionInitialize{SessionID: "ses_refresh", ActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(time.Minute).Truncate(time.Microsecond)}
 	if _, err := harness.InitializeAdapterConnection(ctx, refreshInit); err != nil {
 		t.Fatal(err)
 	}
-	early := store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(time.Minute).Truncate(time.Microsecond)}
+	early := store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: refreshInit.ActiveCredentialExpiresAt.Add(time.Minute)}
 	if _, err := harness.RefreshAdapterCredentialBeforeHello(ctx, refreshInit.SessionID, early); err == nil {
 		t.Fatal("live credential refresh succeeded")
 	}
-	time.Sleep(150 * time.Millisecond)
+	expireAdapterConnectionCredential(t, harness, refreshInit.SessionID)
 	refresh := store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 3, ActiveCredentialExpiresAt: time.Now().Add(time.Minute).Truncate(time.Microsecond)}
 	refreshed, err := harness.RefreshAdapterCredentialBeforeHello(ctx, refreshInit.SessionID, refresh)
 	if err != nil || !refreshed.ActiveCredentialExpiresAt.Equal(refresh.ActiveCredentialExpiresAt) {
@@ -1539,11 +1539,11 @@ func TestAdapterConnectionPreHelloLifecycle(t *testing.T) {
 func TestAdapterConnectionPreHelloLifecycleRollbackAndRaces(t *testing.T) {
 	ctx := context.Background()
 	harness := newPostgresConnectionHarness(t)
-	refreshInit := store.AdapterConnectionInitialize{SessionID: "ses_refresh_rollback", ActiveCredentialGeneration: 6, ActiveCredentialExpiresAt: time.Now().Add(100 * time.Millisecond).Truncate(time.Microsecond)}
+	refreshInit := store.AdapterConnectionInitialize{SessionID: "ses_refresh_rollback", ActiveCredentialGeneration: 6, ActiveCredentialExpiresAt: time.Now().Add(time.Minute).Truncate(time.Microsecond)}
 	if _, err := harness.InitializeAdapterConnection(ctx, refreshInit); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(150 * time.Millisecond)
+	expireAdapterConnectionCredential(t, harness, refreshInit.SessionID)
 	before := mustConnection(t, harness, refreshInit.SessionID)
 	tx, err := harness.pool.Begin(ctx)
 	if err != nil {
@@ -1596,11 +1596,11 @@ func TestAdapterConnectionPreHelloLifecycleRollbackAndRaces(t *testing.T) {
 	if (terminateErr == nil) == (helloErr == nil) {
 		t.Fatalf("terminate/hello race: terminate=%v hello=%v", terminateErr, helloErr)
 	}
-	refreshHelloInit := store.AdapterConnectionInitialize{SessionID: "ses_refresh_hello_race", ActiveCredentialGeneration: 9, ActiveCredentialExpiresAt: time.Now().Add(100 * time.Millisecond).Truncate(time.Microsecond)}
+	refreshHelloInit := store.AdapterConnectionInitialize{SessionID: "ses_refresh_hello_race", ActiveCredentialGeneration: 9, ActiveCredentialExpiresAt: time.Now().Add(time.Minute).Truncate(time.Microsecond)}
 	if _, err := harness.InitializeAdapterConnection(ctx, refreshHelloInit); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(150 * time.Millisecond)
+	expireAdapterConnectionCredential(t, harness, refreshHelloInit.SessionID)
 	refreshHello := store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 9, ActiveCredentialExpiresAt: time.Now().Add(time.Minute).Truncate(time.Microsecond)}
 	start = make(chan struct{})
 	var refreshErr error
@@ -1622,11 +1622,11 @@ func TestAdapterConnectionPreHelloLifecycleRollbackAndRaces(t *testing.T) {
 		t.Fatalf("refresh/hello race: refresh=%v hello=%v", refreshErr, helloErr)
 	}
 
-	refreshTerminateInit := store.AdapterConnectionInitialize{SessionID: "ses_refresh_terminate_race", ActiveCredentialGeneration: 10, ActiveCredentialExpiresAt: time.Now().Add(100 * time.Millisecond).Truncate(time.Microsecond)}
+	refreshTerminateInit := store.AdapterConnectionInitialize{SessionID: "ses_refresh_terminate_race", ActiveCredentialGeneration: 10, ActiveCredentialExpiresAt: time.Now().Add(time.Minute).Truncate(time.Microsecond)}
 	if _, err := harness.InitializeAdapterConnection(ctx, refreshTerminateInit); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(150 * time.Millisecond)
+	expireAdapterConnectionCredential(t, harness, refreshTerminateInit.SessionID)
 	start = make(chan struct{})
 	refreshErr, terminateErr = nil, nil
 	wg.Add(2)
@@ -1647,11 +1647,11 @@ func TestAdapterConnectionPreHelloLifecycleRollbackAndRaces(t *testing.T) {
 		t.Fatalf("refresh/terminate race = %+v, refresh=%v terminate=%v", current, refreshErr, terminateErr)
 	}
 
-	exactInit := store.AdapterConnectionInitialize{SessionID: "ses_exact_race", ActiveCredentialGeneration: 11, ActiveCredentialExpiresAt: time.Now().Add(100 * time.Millisecond).Truncate(time.Microsecond)}
+	exactInit := store.AdapterConnectionInitialize{SessionID: "ses_exact_race", ActiveCredentialGeneration: 11, ActiveCredentialExpiresAt: time.Now().Add(time.Minute).Truncate(time.Microsecond)}
 	if _, err := harness.InitializeAdapterConnection(ctx, exactInit); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(150 * time.Millisecond)
+	expireAdapterConnectionCredential(t, harness, exactInit.SessionID)
 	exact := store.AdapterCredentialPreHelloRefresh{ExpectedActiveCredentialGeneration: 11, ActiveCredentialExpiresAt: time.Now().Add(time.Minute).Truncate(time.Microsecond)}
 	if _, err := harness.RefreshAdapterCredentialBeforeHello(ctx, exactInit.SessionID, exact); err != nil {
 		t.Fatal(err)
@@ -1684,6 +1684,21 @@ func TestAdapterConnectionPreHelloLifecycleRollbackAndRaces(t *testing.T) {
 		if err != nil {
 			t.Fatalf("exact retry race: %v", err)
 		}
+	}
+}
+
+func expireAdapterConnectionCredential(t *testing.T, harness *postgresConnectionHarness, sessionID string) {
+	t.Helper()
+	if _, err := harness.pool.Exec(
+		context.Background(),
+		`UPDATE session_adapter_connections
+		 SET created_at = clock_timestamp() - interval '2 seconds',
+		     active_credential_expires_at = clock_timestamp() - interval '1 second',
+		     updated_at = clock_timestamp()
+		 WHERE session_id = $1`,
+		sessionID,
+	); err != nil {
+		t.Fatalf("expire adapter credential %s: %v", sessionID, err)
 	}
 }
 
