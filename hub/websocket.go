@@ -1904,8 +1904,13 @@ func (h *webSocketHandler) handleProviderStart(ctx context.Context, adapter *ada
 		return adapter.writeFrame(ctx, ack(protocol.ProviderStartRejected, ""))
 	}
 	err := withAdapterAuthorityBudget(ctx, func(admissionCtx context.Context) error {
+		kind := store.ProviderStartAttached
+		if adapter.credentialEvidence.Lineage.Kind == auth.SessionCredentialBootstrapInitial {
+			kind = store.ProviderStartStandalone
+		}
 		_, err := admissions.WithProviderStartAdmission(admissionCtx, store.ProviderStartAdmission{
-			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter, ReAdmission: attempt > 1,
+			SessionID: adapter.sessionID, Admission: adapter.admission, Writer: adapter.settingsWriter,
+			Kind: kind, ReAdmission: attempt > 1,
 		}, func(startCtx context.Context) error {
 			prepare := &protocol.ProviderStartPrepare{Attempt: attempt}
 			if legacy {

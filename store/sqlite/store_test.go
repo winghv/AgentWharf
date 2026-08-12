@@ -1309,8 +1309,53 @@ func TestProviderStartAdmissionLinearizesLiveConnectionAndWorkspaceLease(t *test
 		if err != nil {
 			t.Fatalf("AllocateAdapterGrantFence() = %v", err)
 		}
-		return harness, store.ProviderStartAdmission{SessionID: "ses_workspace", Admission: store.AdapterConnectionAdmission{CredentialGeneration: connection.ActiveCredentialGeneration, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: fence}, Writer: store.SettingsWriter{ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: "lease_provider_start"}}, key
+		return harness, store.ProviderStartAdmission{SessionID: "ses_workspace", Admission: store.AdapterConnectionAdmission{CredentialGeneration: connection.ActiveCredentialGeneration, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: fence}, Writer: store.SettingsWriter{ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: "lease_provider_start"}, Kind: store.ProviderStartAttached}, key
 	}
+
+	t.Run("admits standalone provider start without workspace state", func(t *testing.T) {
+		harness := newSQLiteWorkspaceLeaseHarness(t, filepath.Join(t.TempDir(), "standalone.db"))
+		defer harness.Close()
+		db := openRawSQLite(t, harness.path)
+		if _, err := db.ExecContext(context.Background(), `DELETE FROM session_workspace_leases; DELETE FROM session_attachments;`); err != nil {
+			db.Close()
+			t.Fatalf("remove attached workspace state: %v", err)
+		}
+		db.Close()
+		connection, err := harness.AcceptAdapterHello(context.Background(), "ses_workspace", store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: "lease_standalone"})
+		if err != nil {
+			t.Fatalf("AcceptAdapterHello() = %v", err)
+		}
+		fence, err := harness.AllocateAdapterGrantFence(context.Background())
+		if err != nil {
+			t.Fatalf("AllocateAdapterGrantFence() = %v", err)
+		}
+		called := false
+		lease, err := harness.WithProviderStartAdmission(context.Background(), store.ProviderStartAdmission{
+			SessionID: "ses_workspace",
+			Admission: store.AdapterConnectionAdmission{CredentialGeneration: connection.ActiveCredentialGeneration, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: fence},
+			Writer:    store.SettingsWriter{ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: "lease_standalone"},
+			Kind:      store.ProviderStartStandalone,
+		}, func(context.Context) error {
+			called = true
+			return nil
+		})
+		if err != nil || !called || lease != (store.WorkspaceLease{}) {
+			t.Fatalf("standalone provider start = %+v, called=%t, err=%v", lease, called, err)
+		}
+	})
+
+	t.Run("rejects an unspecified admission kind", func(t *testing.T) {
+		harness, admission, _ := newAdmission(t)
+		defer harness.Close()
+		admission.Kind = ""
+		called := false
+		if _, err := harness.WithProviderStartAdmission(context.Background(), admission, func(context.Context) error {
+			called = true
+			return nil
+		}); err == nil || called {
+			t.Fatalf("unspecified admission kind err=%v, callback=%t", err, called)
+		}
+	})
 
 	t.Run("commits exactly one durable start receipt", func(t *testing.T) {
 		harness, admission, key := newAdmission(t)
