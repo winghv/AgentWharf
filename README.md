@@ -99,6 +99,36 @@ $ wharf claude --pair
 released from Console, the next Wharf run clears the stale local credential and
 prompts you to pair again.
 
+## Auto-Dispatch: Run Tasks From Console Without Touching This Machine
+
+A paired machine can also receive Tasks created in the Console automatically.
+Start the local dispatch daemon:
+
+```console
+$ wharf machine serve
+```
+
+The daemon polls for auto-dispatch claims every 10 seconds (adjustable with
+`--poll-interval`, minimum 1 second), refreshes the machine token before it
+expires, and for each Task it receives: exchanges the claim with the machine
+identity alone, starts the local provider adapter, waits for the adapter to
+reach an interactive state, and delivers the first instruction as the session's
+client. Task creation in the Console then runs end to end with no manual step
+on the machine.
+
+- `--poll-interval SECONDS` — polling cadence (default 10, minimum 1).
+- `--max-concurrent N` — how many Tasks the daemon dispatches in parallel
+  (default 2, FIFO order).
+- `--startup-smoke` — exit after the first successful dispatch; used by the
+  platform's release smoke.
+
+The machine credential file must exist (pair once first). In-flight dispatches
+are persisted under `~/.agentwharf/dispatch/` (mode `0700` directory, `0600`
+files) so a daemon restart resumes the send with the same deterministic command
+id — a resend is acknowledged as a duplicate, never delivered twice. The
+daemon never logs instructions, claim codes, or tokens. Stop the daemon with
+`Ctrl-C`; running adapter sessions are terminated with the daemon process.
+
 ## Why AgentWharf
 
 - **Connect your own machine**: keep your local provider login, quota, and secrets.
