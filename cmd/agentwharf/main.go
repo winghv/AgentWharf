@@ -138,7 +138,10 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		if len(args) == 2 && args[1] == "unlink" {
 			return runMachineLogout(stdout)
 		}
-		return errors.New("usage: wharf machine unlink")
+		if len(args) >= 2 && args[1] == "serve" {
+			return runMachineServeCommand(ctx, args[2:], stdout, stderr)
+		}
+		return errors.New("usage: wharf machine serve|unlink")
 	case "task":
 		return runTaskCommand(ctx, args[1:], stdin, stdout, stderr)
 	case "attention-backfill":
@@ -1246,6 +1249,30 @@ func isTransientCloudAPIStatus(status int) bool {
 	default:
 		return false
 	}
+}
+
+func getCloudAPIJSON(ctx context.Context, client *http.Client, endpoint string, bearerToken string) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("create cloud api request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("get cloud api request: %w", err)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	closeErr := resp.Body.Close()
+	if err != nil {
+		return 0, nil, fmt.Errorf("read cloud api response: %w", err)
+	}
+	if closeErr != nil {
+		return 0, nil, fmt.Errorf("close cloud api response: %w", closeErr)
+	}
+	return resp.StatusCode, data, nil
 }
 
 func waitCloudAPIRetry(ctx context.Context, attempt int) error {

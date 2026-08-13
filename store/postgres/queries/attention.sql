@@ -64,10 +64,11 @@ SET latest_seq = EXCLUDED.latest_seq,
     latest_change_seq = COALESCE(EXCLUDED.latest_change_seq, session_attention_summaries.latest_change_seq),
     last_durable_event_at = EXCLUDED.last_durable_event_at,
     projection_state = CASE
-        WHEN session_attention_summaries.projection_state = 'incomplete' THEN 'incomplete'
+        WHEN session_attention_summaries.projection_state = 'incomplete' AND session_attention_summaries.latest_seq > 1 THEN 'incomplete'
         WHEN EXCLUDED.latest_seq <> session_attention_summaries.latest_seq + 1 THEN 'incomplete'
         WHEN sqlc.arg(projection_incomplete)::BOOLEAN THEN 'incomplete'
         WHEN sqlc.arg(state_observed)::BOOLEAN AND sqlc.narg(event_state) IS NULL THEN 'incomplete'
+        WHEN session_attention_summaries.projection_state = 'incomplete' AND sqlc.arg(state_observed)::BOOLEAN THEN 'complete'
         ELSE session_attention_summaries.projection_state
     END,
     updated_at = statement_timestamp()
