@@ -27,8 +27,11 @@ const (
 	machineServeDefaultMaxConcurrent = 2
 	machineServeSenderRetryInitial   = 2 * time.Second
 	machineServeSenderRetryMax       = 30 * time.Second
+	machineServeSenderAttemptWindow  = 10 * time.Second
 	machineCredentialRefreshLeadTime = 12 * time.Hour
 )
+
+var errNoInteractiveState = errors.New("session never reached an interactive state")
 
 type machineServeConfig struct {
 	PollInterval  time.Duration
@@ -402,8 +405,12 @@ func serveWrapConfig(handoff machineServeDispatch, startupSmoke bool) wrapConfig
 
 // sendFirstInstructionWithRetry delivers the instruction as the Session's
 // client, retrying with bounded backoff while the client credential is valid.
-// The command ID is deterministic per claim, so a crash-resume resend is
-// acknowledged as a duplicate rather than delivered twice.
+// Each attempt is windowed: while the Session is still `starting`, the Hub
+// admits the client hello as attach-only without an event subscription, so a
+// fresh hello after the Adapter turned the Session interactive is what finally
+// receives the ready state (via replay). The command ID is deterministic per
+// claim, so a resend after a lost acknowledgement is a duplicate, never a
+// second delivery.
 func sendFirstInstructionWithRetry(ctx context.Context, handoff machineServeDispatch) error {
 	commandID := handoff.ClaimID + ":command"
 	delay := machineServeSenderRetryInitial
@@ -411,6 +418,9 @@ func sendFirstInstructionWithRetry(ctx context.Context, handoff machineServeDisp
 		err := sendFirstInstruction(ctx, handoff, commandID)
 		if err == nil {
 			return nil
+		}
+		if !errors.Is(err, errNoInteractiveState) {
+			return err
 		}
 		expiresAt, parseErr := time.Parse(time.RFC3339, handoff.ClientExpiresAt)
 		if parseErr != nil || !time.Now().UTC().Before(expiresAt) {
@@ -429,9 +439,11 @@ func sendFirstInstructionWithRetry(ctx context.Context, handoff machineServeDisp
 
 // sendFirstInstruction opens one client connection, waits for the Session to
 // reach an interactive state, sends the instruction, and waits for the
-// acknowledgement.
+// acknowledgement. A single attempt is bounded by the attempt window so a
+// still-`starting` Session (attach-only admission, no event subscription)
+// yields to a fresh hello on the next attempt.
 func sendFirstInstruction(ctx context.Context, handoff machineServeDispatch, commandID string) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, machineServeSenderAttemptWindow)
 	defer cancel()
 	conn, _, err := websocket.Dial(ctx, handoff.HubWSURL, nil)
 	if err != nil {
@@ -449,6 +461,9 @@ func sendFirstInstruction(ctx context.Context, handoff machineServeDispatch, com
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
 		if err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return errNoInteractiveState
+			}
 			return fmt.Errorf("read hub frame: %w", err)
 		}
 		switch typed := frame.(type) {

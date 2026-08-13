@@ -26,7 +26,13 @@ import (
 type serveTestHub struct {
 	Server *httptest.Server
 
+	// silentClientHellos makes the first N client connections receive an
+	// attach-only hello.ack with no event subscription, mirroring the real
+	// Hub's admission while a Session is still `starting`.
+	silentClientHellos int32
+
 	mu          sync.Mutex
+	clientConns int32
 	readyCh     chan struct{}
 	readyOnce   sync.Once
 	commands    []recordedCommand
@@ -119,7 +125,25 @@ func (h *serveTestHub) serveAdapter(ctx context.Context, conn *websocket.Conn, s
 func (h *serveTestHub) serveClient(ctx context.Context, conn *websocket.Conn, hello protocol.Hello, sessionID string) {
 	h.mu.Lock()
 	h.clientHello = append(h.clientHello, hello)
+	connection := h.clientConns
+	h.clientConns++
 	h.mu.Unlock()
+	if connection < h.silentClientHellos {
+		// Attach-only admission while the Session is `starting`: the hello.ack
+		// carries the non-interactive state and no events are subscribed.
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: sessionID, State: "attach_only", Provider: "claude-code"}}}); err != nil {
+			return
+		}
+		for {
+			frame, err := readFrameFromConn(ctx, conn)
+			if err != nil {
+				return
+			}
+			if ping, ok := frame.(*protocol.Ping); ok {
+				_ = writeFrameToConn(ctx, conn, &protocol.Pong{Nonce: ping.Nonce})
+			}
+		}
+	}
 	if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{}}); err != nil {
 		return
 	}
@@ -272,6 +296,41 @@ func TestMachineServeDispatchesAutoClaimEndToEnd(t *testing.T) {
 	}
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read dispatch directory: %v", err)
+	}
+}
+
+func TestMachineServeRetriesWhileSessionIsStarting(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	credentialDir := setupServeTestEnv(t)
+
+	hub := newServeTestHub(t, ctx, "ses_auto")
+	hub.silentClientHellos = 1
+	t.Cleanup(hub.Server.Close)
+	controlPlane, _, exchanges, _ := newServeTestControlPlane(t, "ws"+strings.TrimPrefix(hub.Server.URL, "http"), "ses_auto", 1, false)
+
+	if err := saveMachineCredential(machineCredential{MachineID: "machine_serve", MachineToken: "machine-token", CloudAPIURL: controlPlane.URL, HubWSURL: "ws://unused.invalid", ExpiresAt: time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatalf("save machine credential: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runWithInput(ctx, []string{"machine", "serve", "--poll-interval", "1", "--startup-smoke"}, strings.NewReader(""), &stdout, &stderr); err != nil {
+		t.Fatalf("machine serve starting-session retry: %v stderr=%q", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "auto_dispatch_ok: claim_id=claim_auto session_id=ses_auto") {
+		t.Fatalf("serve retry output = %q stderr=%q", stdout.String(), stderr.String())
+	}
+	commands := hub.recordedCommands()
+	if len(commands) != 1 || commands[0].CommandID != "claim_auto:command" {
+		t.Fatalf("hub commands = %+v, want exactly one first instruction", commands)
+	}
+	if exchanges.Load() != 1 {
+		t.Fatalf("exchanges = %d, want 1", exchanges.Load())
+	}
+	entries, err := os.ReadDir(filepath.Join(credentialDir, "dispatch"))
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("dispatch directory not cleaned: %v", entries)
 	}
 }
 
