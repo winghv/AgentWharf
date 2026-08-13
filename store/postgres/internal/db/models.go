@@ -180,6 +180,7 @@ type SessionSettingsCapability struct {
 	CapabilityEventSeq         int64
 	Fingerprint                string
 	EffectiveModelID           string
+	EffectiveReasoningEffortID pgtype.Text
 	EffectivePermissionModeID  string
 	CapabilityVersion          int64
 	WriterConnectionEpoch      int64
@@ -190,25 +191,27 @@ type SessionSettingsCapability struct {
 }
 
 type SessionSettingsCommand struct {
-	SessionID                         string
-	CmdID                             string
-	RequestFingerprint                string
-	RequestedModelID                  pgtype.Text
-	RequestedPermissionModeID         pgtype.Text
-	ReservationVersion                int64
-	DeliveryDeadline                  pgtype.Timestamptz
-	OperationDeadline                 pgtype.Timestamptz
-	WriterConnectionEpoch             int64
-	WriterCredentialGeneration        int64
-	WriterLeaseID                     string
-	ReservedCapabilityEventSeq        int64
-	ReservedFingerprint               string
-	ReservedEffectiveModelID          string
-	ReservedEffectivePermissionModeID string
-	Status                            string
-	TerminalEventSeq                  pgtype.Int8
-	CreatedAt                         pgtype.Timestamptz
-	UpdatedAt                         pgtype.Timestamptz
+	SessionID                          string
+	CmdID                              string
+	RequestFingerprint                 string
+	RequestedModelID                   pgtype.Text
+	RequestedReasoningEffortID         pgtype.Text
+	RequestedPermissionModeID          pgtype.Text
+	ReservationVersion                 int64
+	DeliveryDeadline                   pgtype.Timestamptz
+	OperationDeadline                  pgtype.Timestamptz
+	WriterConnectionEpoch              int64
+	WriterCredentialGeneration         int64
+	WriterLeaseID                      string
+	ReservedCapabilityEventSeq         int64
+	ReservedFingerprint                string
+	ReservedEffectiveModelID           string
+	ReservedEffectiveReasoningEffortID pgtype.Text
+	ReservedEffectivePermissionModeID  string
+	Status                             string
+	TerminalEventSeq                   pgtype.Int8
+	CreatedAt                          pgtype.Timestamptz
+	UpdatedAt                          pgtype.Timestamptz
 }
 
 type SessionSettingsLiveWriter struct {

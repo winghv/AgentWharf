@@ -1193,6 +1193,29 @@ func TestAttentionProjectionMarksExistingSummaryIncompleteAcrossGap(t *testing.T
 	}
 }
 
+func TestAttentionProjectionRecoversFromNonStateFirstEvent(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_recover_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	attention := postgres.New(pool)
+	ctx := context.Background()
+	// ACP adapters publish capabilities before the first session.state.
+	if _, err := attention.Append(ctx, "ses_attention_recover", []store.PendingEvent{{Type: "session.run.capabilities", Time: time.Now(), Payload: []byte(`{"schema_version":1}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attention.Append(ctx, "ses_attention_recover", []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := attention.AttentionSnapshot(ctx, []string{"ses_attention_recover"})
+	if err != nil || len(summaries) != 1 || summaries[0].LatestSeq != 2 || summaries[0].State != "ready" || summaries[0].StateOfProjection != store.AttentionProjectionComplete {
+		t.Fatalf("attention summary after non-state first event = %+v, %v", summaries, err)
+	}
+}
+
 func TestAttentionProjectionTracksPermissionAndTerminalFence(t *testing.T) {
 	harness := newPostgresProposalHarness(t)
 	ctx := context.Background()
