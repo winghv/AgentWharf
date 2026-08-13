@@ -123,6 +123,10 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		if err != nil {
 			return err
 		}
+		if cfg.StartupSmoke {
+			_, _ = fmt.Fprintln(stdout, "provider_start_smoke_ok: true")
+			return nil
+		}
 		_, _ = fmt.Fprintf(stdout, "wharf %s ended session_id=%s provider=%s\n", args[0], effective.SessionID, effective.Provider)
 		return nil
 	case "logout":
@@ -161,21 +165,28 @@ type machineTaskClaimExchangeResponse struct {
 	} `json:"data"`
 }
 
+const taskClaimUsage = "usage: wharf task claim <claim_id> --code-stdin [--startup-smoke]"
+
 func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) < 2 || args[0] != "claim" {
-		return errors.New("usage: wharf task claim <claim_id> --code-stdin")
+		return errors.New(taskClaimUsage)
 	}
 	claimID := strings.TrimSpace(args[1])
 	if claimID == "" || strings.ContainsAny(claimID, "/\\") {
 		return errors.New("claim unavailable")
 	}
 	codeStdin := false
+	startupSmoke := false
 	for _, arg := range args[2:] {
 		if arg == "--code-stdin" {
 			codeStdin = true
 			continue
 		}
-		return errors.New("usage: wharf task claim <claim_id> --code-stdin")
+		if arg == "--startup-smoke" {
+			startupSmoke = true
+			continue
+		}
+		return errors.New(taskClaimUsage)
 	}
 	if codeStdin && claimInputIsTTY(stdin) {
 		return errors.New("claim code input unavailable")
@@ -238,9 +249,13 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		Format:          "acp",
 		ProviderCommand: defaultProviderCommand(agent),
 		ProtocolVersion: protocol.HubProtocolVersion,
+		StartupSmoke:    startupSmoke,
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if _, err := runWrap(ctx, cfg, strings.NewReader(""), stderr); err == nil {
+			if startupSmoke {
+				_, _ = fmt.Fprintln(stdout, "provider_start_smoke_ok: true")
+			}
 			return nil
 		} else if claimLaunchRequiresReclaim(err) {
 			return errors.New("reclaim required")
@@ -389,6 +404,7 @@ type wrapConfig struct {
 	HealthMarker       string
 	ProviderCredential *core.ProcessCredential
 	ProtocolVersion    int
+	StartupSmoke       bool
 }
 
 type heartbeatConfig struct {
@@ -506,6 +522,7 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL, usually ending in /v1")
 	flags.BoolVar(&useACP, "acp", false, "read ACP JSON frames from stdin")
 	flags.BoolVar(&useJSONStream, "jsonstream", false, "read Claude stream-json lines from stdin")
+	flags.BoolVar(&cfg.StartupSmoke, "startup-smoke", false, "exit successfully after Provider admission and ACP initialization")
 	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", cfg.ProtocolVersion, "Adapter protocol version (1 or 2)")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
@@ -549,6 +566,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	flags.StringVar(&cfg.SecretDir, "secret-dir", cfg.SecretDir, "directory containing injected secret files for masking")
 	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL")
 	flags.BoolVar(&cfg.Pair, "pair", cfg.Pair, "pair this machine with SuperWHV before connecting")
+	flags.BoolVar(&cfg.StartupSmoke, "startup-smoke", false, "exit successfully after Provider admission and ACP initialization")
 	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", protocol.HubProtocolVersion, "Adapter protocol version (1 or 2)")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
@@ -652,6 +670,9 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	case "jsonstream", "acp":
 	default:
 		return wrapConfig{}, fmt.Errorf("unsupported wrap format %q", cfg.Format)
+	}
+	if cfg.StartupSmoke && (cfg.Format != "acp" || len(cfg.ProviderCommand) == 0) {
+		return wrapConfig{}, errors.New("startup smoke requires an ACP provider command")
 	}
 	if !cfg.Pair && !cfg.Managed && cfg.AdapterToken == defaultAdapterToken && !isLoopbackURL(cfg.HubURL) {
 		return wrapConfig{}, errUnsafeDefaultToken
@@ -1620,9 +1641,26 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 			}
 		}
 	}
-	if err := sendACPProviderReadyEvent(runCtx, writeFrame, cfg, providerSessionID, cwd, masker, metrics); err != nil {
+	readyProposalID, err := sendACPProviderReadyEvent(runCtx, writeFrame, cfg, providerSessionID, cwd, masker, metrics)
+	if err != nil {
 		cancel()
 		return err
+	}
+	if cfg.StartupSmoke {
+		if readyProposalID == "" {
+			stopProviderSupervisor(supervisor)
+			return errors.New("startup smoke requires a durable v2 Provider ready proposal")
+		}
+		if err := waitStartupSmokeReceipt(runCtx, connection.read, writeFrame, readyProposalID, "Provider ready"); err != nil {
+			stopProviderSupervisor(supervisor)
+			return err
+		}
+		if err := publishStartupSmokeEnded(runCtx, connection.read, writeFrame, cfg); err != nil {
+			stopProviderSupervisor(supervisor)
+			return err
+		}
+		stopProviderSupervisor(supervisor)
+		return nil
 	}
 
 	outputDone := make(chan error, 1)
@@ -2018,10 +2056,10 @@ func acpProviderReadyPayload(provider string, providerSessionID string, cwd stri
 	})
 }
 
-func sendACPProviderReadyEvent(ctx context.Context, writeFrame func(protocol.Frame) error, cfg wrapConfig, providerSessionID string, cwd string, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
+func sendACPProviderReadyEvent(ctx context.Context, writeFrame func(protocol.Frame) error, cfg wrapConfig, providerSessionID string, cwd string, masker *core.EventMasker, metrics *core.AdapterMetrics) (string, error) {
 	payload, err := acpProviderReadyPayload(cfg.Provider, providerSessionID, cwd)
 	if err != nil {
-		return fmt.Errorf("marshal acp ready event: %w", err)
+		return "", fmt.Errorf("marshal acp ready event: %w", err)
 	}
 	event := protocol.Event{
 		Type:      "session.state",
@@ -2029,15 +2067,61 @@ func sendACPProviderReadyEvent(ctx context.Context, writeFrame func(protocol.Fra
 		Time:      time.Now().UTC().UnixMilli(),
 		Payload:   payload,
 	}
+	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
+		event.ProposalID, err = randomToken()
+		if err != nil {
+			return "", fmt.Errorf("generate acp ready proposal: %w", err)
+		}
+	}
 	event, err = maskEvent(masker, event)
 	if err != nil {
-		return err
+		return "", err
 	}
 	metrics.IncMaskedEvent()
 	if err := writeFrame(&event); err != nil {
-		return fmt.Errorf("send acp ready event: %w", err)
+		return "", fmt.Errorf("send acp ready event: %w", err)
 	}
-	return nil
+	return event.ProposalID, nil
+}
+
+func publishStartupSmokeEnded(ctx context.Context, readFrame func(context.Context) (protocol.Frame, error), writeFrame func(protocol.Frame) error, cfg wrapConfig) error {
+	proposalID, err := randomToken()
+	if err != nil {
+		return fmt.Errorf("generate startup smoke terminal proposal: %w", err)
+	}
+	payload, err := json.Marshal(map[string]any{"state": "ended", "reason": "startup_smoke_complete"})
+	if err != nil {
+		return fmt.Errorf("marshal startup smoke terminal event: %w", err)
+	}
+	if err := writeFrame(&protocol.Event{
+		Type: "session.state", SessionID: cfg.SessionID, Time: time.Now().UTC().UnixMilli(),
+		Payload: payload, ProposalID: proposalID,
+	}); err != nil {
+		return fmt.Errorf("publish startup smoke terminal event: %w", err)
+	}
+	return waitStartupSmokeReceipt(ctx, readFrame, writeFrame, proposalID, "terminal")
+}
+
+func waitStartupSmokeReceipt(ctx context.Context, readFrame func(context.Context) (protocol.Frame, error), writeFrame func(protocol.Frame) error, proposalID string, stage string) error {
+	for {
+		frame, err := readFrame(ctx)
+		if err != nil {
+			return fmt.Errorf("read startup smoke %s receipt: %w", stage, err)
+		}
+		switch typed := frame.(type) {
+		case *protocol.EventReceipt:
+			if typed.ProposalID != proposalID || typed.Status != protocol.EventReceiptAccepted {
+				return fmt.Errorf("startup smoke %s receipt rejected", stage)
+			}
+			return nil
+		case *protocol.Ping:
+			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
+				return fmt.Errorf("send startup smoke pong: %w", err)
+			}
+		case *protocol.Error:
+			return fmt.Errorf("startup smoke %s event rejected: %s", stage, typed.Code)
+		}
+	}
 }
 
 func publishRunControlCapability(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, writeFrame func(protocol.Frame) error) error {
