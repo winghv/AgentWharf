@@ -208,6 +208,108 @@ func TestTaskClaimCodeInputRequiresBoundedNonTTYStdin(t *testing.T) {
 	}
 }
 
+func TestTaskClaimStartupSmokeExchangesClaimAndCrossesProviderLifecycle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	lastStage := "not_connected"
+
+	providerDir := t.TempDir()
+	providerPath := filepath.Join(providerDir, "claude-agent-acp")
+	providerScript := fmt.Sprintf("#!/usr/bin/env bash\nexport AGENTWHARF_ACP_IDLE_HELPER=1\nexec %q\n", os.Args[0])
+	if err := os.WriteFile(providerPath, []byte(providerScript), 0o755); err != nil {
+		t.Fatalf("write provider helper: %v", err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	hubServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastStage = "connected"
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		if _, err := readFrameFromConn(ctx, conn); err != nil {
+			return
+		}
+		lastStage = "hello"
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_claim_smoke", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_claim_smoke", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_claim_smoke", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
+			return
+		}
+		frame, err := readProviderStartFrame(ctx, conn)
+		lastStage = "provider_start"
+		start, ok := frame.(*protocol.ProviderStart)
+		if err != nil || !ok {
+			t.Errorf("provider start = %T %+v, %v", frame, frame, err)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: start.Attempt}); err != nil {
+			return
+		}
+		if _, err := readFrameFromConn(ctx, conn); err != nil {
+			return
+		}
+		lastStage = "provider_started"
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: start.Attempt, Status: protocol.ProviderStartAdmitted, RecoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}); err != nil {
+			return
+		}
+		for {
+			frame, err = readFrameFromConn(ctx, conn)
+			if err != nil {
+				return
+			}
+			event, ok := frame.(*protocol.Event)
+			if ok && event.Type == "session.state" && strings.Contains(string(event.Payload), `"state":"ready"`) {
+				if event.ProposalID == "" {
+					t.Error("Provider ready event missing proposal ID")
+					return
+				}
+				lastStage = "provider_ready"
+				if err := writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 1, Status: protocol.EventReceiptAccepted}); err != nil {
+					return
+				}
+			}
+			if ok && event.Type == "session.state" && event.ProposalID != "" && strings.Contains(string(event.Payload), `"state":"ended"`) {
+				lastStage = "ended"
+				_ = writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 2, Status: protocol.EventReceiptAccepted})
+				return
+			}
+		}
+	}))
+	defer hubServer.Close()
+
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/machine-task-claims/claim_test/exchange" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer machine-token" {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		var request machineTaskClaimExchangeRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.ClaimCode != "claim-secret" {
+			t.Errorf("claim request = %+v, %v", request, err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"data":{"session_id":"ses_claim_smoke","provider":"claude-code","hub_ws_url":%q,"adapter_token":"adapter-token","expires_at":%q}}`, "ws"+strings.TrimPrefix(hubServer.URL, "http"), time.Now().Add(time.Minute).UTC().Format(time.RFC3339))
+	}))
+	defer controlPlane.Close()
+
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+	if err := saveMachineCredential(machineCredential{MachineID: "machine_test", MachineToken: "machine-token", CloudAPIURL: controlPlane.URL, HubWSURL: "ws://unused.invalid", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatalf("save machine credential: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := runWithInput(ctx, []string{"task", "claim", "claim_test", "--code-stdin", "--startup-smoke"}, strings.NewReader("claim-secret\n"), &stdout, &stderr); err != nil {
+		t.Fatalf("task claim startup smoke: %v, stage=%s, stderr=%q", err, lastStage, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "provider_start_smoke_ok: true") {
+		t.Fatalf("task claim startup smoke output = %q", stdout.String())
+	}
+}
+
 func TestClaimLaunchRetryClassifierDistinguishesTransportFailure(t *testing.T) {
 	t.Parallel()
 
@@ -1639,6 +1741,168 @@ func TestRunWrapV2ProviderStopsAfterFinalAdmissionRejection(t *testing.T) {
 	}
 	content, _ := os.ReadFile(marker)
 	t.Fatalf("started provider was not stopped after final rejection: %q", content)
+}
+
+func TestRunWrapV2ACPStartupSmokeCrossesAdmissionAndProviderReady(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	t.Setenv("AGENTWHARF_ACP_IDLE_HELPER", "1")
+	t.Setenv("AGENTWHARF_HUB_URL", "ws://injected.invalid")
+	t.Setenv("AGENTWHARF_SESSION_ID", "ses_startup_smoke")
+	t.Setenv("AGENTWHARF_ADAPTER_TOKEN", "adapter-token")
+
+	lifecycle := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		if _, err := readFrameFromConn(ctx, conn); err != nil {
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: "ses_startup_smoke", Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: "ses_startup_smoke", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_startup_smoke", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
+			return
+		}
+		frame, err := readProviderStartFrame(ctx, conn)
+		start, ok := frame.(*protocol.ProviderStart)
+		if err != nil || !ok || start.Attempt != 1 {
+			t.Errorf("provider start = %T %+v, %v", frame, frame, err)
+			return
+		}
+		lifecycle <- "prepare"
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartPrepare{Attempt: start.Attempt}); err != nil {
+			return
+		}
+		frame, err = readFrameFromConn(ctx, conn)
+		started, ok := frame.(*protocol.ProviderStartStarted)
+		if err != nil || !ok || started.Attempt != start.Attempt {
+			t.Errorf("provider started = %T %+v, %v", frame, frame, err)
+			return
+		}
+		lifecycle <- "started"
+		if err := writeFrameToConn(ctx, conn, &protocol.ProviderStartAck{Attempt: start.Attempt, Status: protocol.ProviderStartAdmitted, RecoveryHandle: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"}); err != nil {
+			return
+		}
+		for {
+			frame, err = readFrameFromConn(ctx, conn)
+			if err != nil {
+				return
+			}
+			event, ok := frame.(*protocol.Event)
+			if ok && event.Type == "session.state" && strings.Contains(string(event.Payload), `"state":"ready"`) {
+				if event.ProposalID == "" {
+					t.Error("Provider ready event missing proposal ID")
+					return
+				}
+				lifecycle <- "provider_ready"
+				if err := writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 1, Status: protocol.EventReceiptAccepted}); err != nil {
+					return
+				}
+				continue
+			}
+			if ok && event.Type == "session.state" && event.ProposalID != "" && strings.Contains(string(event.Payload), `"state":"ended"`) {
+				lifecycle <- "ended"
+				_ = writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 2, Status: protocol.EventReceiptAccepted})
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	var stdout bytes.Buffer
+	err := runWithInput(ctx, []string{
+		"claude",
+		"--hub", "ws" + strings.TrimPrefix(server.URL, "http"),
+		"--session-id", "ses_startup_smoke",
+		"--adapter-token", "adapter-token",
+		"--startup-smoke",
+		"--", os.Args[0],
+	}, nil, &stdout, io.Discard)
+	if err != nil {
+		t.Fatalf("startup smoke error = %v", err)
+	}
+	if !strings.Contains(stdout.String(), "provider_start_smoke_ok: true") {
+		t.Fatalf("startup smoke output = %q", stdout.String())
+	}
+	for _, want := range []string{"prepare", "started", "provider_ready", "ended"} {
+		select {
+		case got := <-lifecycle:
+			if got != want {
+				t.Fatalf("lifecycle = %q, want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for %s", want)
+		}
+	}
+}
+
+func TestPublishStartupSmokeEndedHandlesReceiptAndProtocolResponses(t *testing.T) {
+	t.Parallel()
+	cfg := wrapConfig{SessionID: "ses_startup_smoke_receipts"}
+
+	t.Run("ping then accepted receipt", func(t *testing.T) {
+		var proposalID string
+		var writes []protocol.Frame
+		reads := 0
+		err := publishStartupSmokeEnded(context.Background(), func(context.Context) (protocol.Frame, error) {
+			reads++
+			if reads == 1 {
+				return &protocol.Ping{Nonce: "ping-startup-smoke"}, nil
+			}
+			return &protocol.EventReceipt{ProposalID: proposalID, Status: protocol.EventReceiptAccepted}, nil
+		}, func(frame protocol.Frame) error {
+			writes = append(writes, frame)
+			if event, ok := frame.(*protocol.Event); ok {
+				proposalID = event.ProposalID
+			}
+			return nil
+		}, cfg)
+		if err != nil {
+			t.Fatalf("publishStartupSmokeEnded() error = %v", err)
+		}
+		if len(writes) != 2 {
+			t.Fatalf("writes = %d, want terminal event and pong", len(writes))
+		}
+		pong, ok := writes[1].(*protocol.Pong)
+		if !ok || pong.Nonce != "ping-startup-smoke" {
+			t.Fatalf("pong = %T %+v", writes[1], writes[1])
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		read func(string) (protocol.Frame, error)
+		want string
+	}{
+		{name: "rejected receipt", read: func(proposalID string) (protocol.Frame, error) {
+			return &protocol.EventReceipt{ProposalID: proposalID, Status: protocol.EventReceiptStatus("rejected")}, nil
+		}, want: "receipt rejected"},
+		{name: "mismatched receipt", read: func(string) (protocol.Frame, error) {
+			return &protocol.EventReceipt{ProposalID: "different-proposal", Status: protocol.EventReceiptAccepted}, nil
+		}, want: "receipt rejected"},
+		{name: "hub error", read: func(string) (protocol.Frame, error) {
+			return &protocol.Error{Code: "terminal_rejected"}, nil
+		}, want: "terminal event rejected"},
+		{name: "read failure", read: func(string) (protocol.Frame, error) {
+			return nil, io.EOF
+		}, want: "read startup smoke terminal receipt"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var proposalID string
+			err := publishStartupSmokeEnded(context.Background(), func(context.Context) (protocol.Frame, error) {
+				return test.read(proposalID)
+			}, func(frame protocol.Frame) error {
+				if event, ok := frame.(*protocol.Event); ok {
+					proposalID = event.ProposalID
+				}
+				return nil
+			}, cfg)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("publishStartupSmokeEnded() error = %v, want %q", err, test.want)
+			}
+		})
+	}
 }
 
 func TestRunWrapV2ReAdmitsEveryRestartedChild(t *testing.T) {
