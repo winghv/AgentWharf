@@ -2110,7 +2110,10 @@ func waitStartupSmokeReceipt(ctx context.Context, readFrame func(context.Context
 		}
 		switch typed := frame.(type) {
 		case *protocol.EventReceipt:
-			if typed.ProposalID != proposalID || typed.Status != protocol.EventReceiptAccepted {
+			if typed.ProposalID != proposalID {
+				continue
+			}
+			if typed.Status != protocol.EventReceiptAccepted {
 				return fmt.Errorf("startup smoke %s receipt rejected", stage)
 			}
 			return nil
