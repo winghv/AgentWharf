@@ -1097,6 +1097,23 @@ func TestProposedEventProjectsAttention(t *testing.T) {
 	}
 }
 
+func TestProposedEventProjectsAgentSessionState(t *testing.T) {
+	harness := newPostgresProposalHarness(t)
+	receipt, err := harness.CommitProposedEvent(context.Background(), "ses_proposal_1",
+		store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
+		store.ProposedEventRequest{ProposalID: "proposal_state", Event: store.PendingEvent{Type: "session.state", Time: time.Unix(1, 0), Payload: []byte(`{"state":"ready"}`)}})
+	if err != nil || receipt.Seq != 1 {
+		t.Fatalf("commit proposed state event = %+v, %v", receipt, err)
+	}
+	var status string
+	if err := harness.pool.QueryRow(context.Background(), `SELECT status FROM agent_sessions WHERE id = 'ses_proposal_1'`).Scan(&status); err != nil {
+		t.Fatalf("read agent session status: %v", err)
+	}
+	if status != "ready" {
+		t.Fatalf("proposed session.state did not project: status = %q, want ready", status)
+	}
+}
+
 func TestAttentionProjectionUsesStoreClockAndNeverRepairsIncomplete(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_attention_clock_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))

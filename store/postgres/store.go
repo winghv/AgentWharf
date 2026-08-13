@@ -2029,6 +2029,9 @@ func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, autho
 	if err := projectAttentionEvent(ctx, queries, row.SessionID, row.Seq, projection, storeNow.Time); err != nil {
 		return store.ProposedEventReceipt{}, fmt.Errorf("project proposed attention event seq %d: %w", row.Seq, err)
 	}
+	if err := projectAgentSessionState(ctx, queries, row.SessionID, projection, storeNow.Time); err != nil {
+		return store.ProposedEventReceipt{}, fmt.Errorf("project proposed agent session state seq %d: %w", row.Seq, err)
+	}
 	if projection.terminal {
 		if err := queries.FenceAttentionTerminal(ctx, row.SessionID); err != nil {
 			return store.ProposedEventReceipt{}, fmt.Errorf("fence terminal proposed event seq %d: %w", row.Seq, err)
