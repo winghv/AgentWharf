@@ -258,19 +258,25 @@ func TestTaskClaimStartupSmokeExchangesClaimAndCrossesProviderLifecycle(t *testi
 				return
 			}
 			event, ok := frame.(*protocol.Event)
+			if ok && event.Type == "session.settings.capabilities" && event.ProposalID != "" {
+				if err := writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 1, Status: protocol.EventReceiptAccepted}); err != nil {
+					return
+				}
+				continue
+			}
 			if ok && event.Type == "session.state" && strings.Contains(string(event.Payload), `"state":"ready"`) {
 				if event.ProposalID == "" {
 					t.Error("Provider ready event missing proposal ID")
 					return
 				}
 				lastStage = "provider_ready"
-				if err := writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 1, Status: protocol.EventReceiptAccepted}); err != nil {
+				if err := writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 2, Status: protocol.EventReceiptAccepted}); err != nil {
 					return
 				}
 			}
 			if ok && event.Type == "session.state" && event.ProposalID != "" && strings.Contains(string(event.Payload), `"state":"ended"`) {
 				lastStage = "ended"
-				_ = writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 2, Status: protocol.EventReceiptAccepted})
+				_ = writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 3, Status: protocol.EventReceiptAccepted})
 				return
 			}
 		}
@@ -1870,6 +1876,29 @@ func TestPublishStartupSmokeEndedHandlesReceiptAndProtocolResponses(t *testing.T
 		}
 	})
 
+	t.Run("unrelated accepted receipt then target receipt", func(t *testing.T) {
+		var proposalID string
+		reads := 0
+		err := publishStartupSmokeEnded(context.Background(), func(context.Context) (protocol.Frame, error) {
+			reads++
+			if reads == 1 {
+				return &protocol.EventReceipt{ProposalID: "settings-capability-proposal", Seq: 1, Status: protocol.EventReceiptAccepted}, nil
+			}
+			return &protocol.EventReceipt{ProposalID: proposalID, Seq: 2, Status: protocol.EventReceiptAccepted}, nil
+		}, func(frame protocol.Frame) error {
+			if event, ok := frame.(*protocol.Event); ok {
+				proposalID = event.ProposalID
+			}
+			return nil
+		}, cfg)
+		if err != nil {
+			t.Fatalf("publishStartupSmokeEnded() error = %v", err)
+		}
+		if reads != 2 {
+			t.Fatalf("reads = %d, want unrelated and target receipts", reads)
+		}
+	})
+
 	for _, test := range []struct {
 		name string
 		read func(string) (protocol.Frame, error)
@@ -1878,9 +1907,16 @@ func TestPublishStartupSmokeEndedHandlesReceiptAndProtocolResponses(t *testing.T
 		{name: "rejected receipt", read: func(proposalID string) (protocol.Frame, error) {
 			return &protocol.EventReceipt{ProposalID: proposalID, Status: protocol.EventReceiptStatus("rejected")}, nil
 		}, want: "receipt rejected"},
-		{name: "mismatched receipt", read: func(string) (protocol.Frame, error) {
-			return &protocol.EventReceipt{ProposalID: "different-proposal", Status: protocol.EventReceiptAccepted}, nil
-		}, want: "receipt rejected"},
+		{name: "mismatched receipt then read failure", read: func(string) func(string) (protocol.Frame, error) {
+			reads := 0
+			return func(string) (protocol.Frame, error) {
+				reads++
+				if reads == 1 {
+					return &protocol.EventReceipt{ProposalID: "different-proposal", Status: protocol.EventReceiptAccepted}, nil
+				}
+				return nil, io.EOF
+			}
+		}(""), want: "read startup smoke terminal receipt"},
 		{name: "hub error", read: func(string) (protocol.Frame, error) {
 			return &protocol.Error{Code: "terminal_rejected"}, nil
 		}, want: "terminal event rejected"},
