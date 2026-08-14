@@ -13,12 +13,13 @@ import (
 var errMachineCredentialNotFound = errors.New("machine credential not found")
 
 type machineCredential struct {
-	MachineID    string `json:"machine_id"`
-	MachineToken string `json:"machine_token"`
-	CloudAPIURL  string `json:"cloud_api_url"`
-	HubWSURL     string `json:"hub_ws_url,omitempty"`
-	ExpiresAt    string `json:"expires_at,omitempty"`
-	CreatedAt    string `json:"created_at"`
+	MachineID     string `json:"machine_id"`
+	MachineToken  string `json:"machine_token"`
+	RefreshSecret string `json:"refresh_secret,omitempty"`
+	CloudAPIURL   string `json:"cloud_api_url"`
+	HubWSURL      string `json:"hub_ws_url,omitempty"`
+	ExpiresAt     string `json:"expires_at,omitempty"`
+	CreatedAt     string `json:"created_at"`
 }
 
 func loadMachineCredential() (machineCredential, error) {

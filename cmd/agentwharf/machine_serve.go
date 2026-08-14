@@ -365,6 +365,15 @@ func maybeRefreshMachineCredential(ctx context.Context, client *http.Client, cre
 	if err != nil {
 		return false, err
 	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		// The 24-hour bearer expired while this machine was offline. Recover a
+		// fresh one from the pairing-time refresh secret instead of forcing a
+		// re-pair. recoverMachineCredential persists the new bearer.
+		if _, err := recoverMachineCredential(ctx, client, credential); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 	if status != http.StatusOK {
 		return false, newCloudStatusError("refresh machine token", status, body)
 	}
@@ -381,6 +390,47 @@ func maybeRefreshMachineCredential(ctx context.Context, client *http.Client, cre
 		return false, fmt.Errorf("persist refreshed machine credential: %w", err)
 	}
 	return true, nil
+}
+
+// recoverMachineCredential exchanges the long-lived refresh secret for a fresh
+// machine bearer. It is the offline-recovery path: a machine whose 24-hour
+// bearer expired while it was offline can come back online without re-pairing,
+// because the refresh secret is the pairing-time trust anchor and stays valid
+// until the machine is released.
+func recoverMachineCredential(ctx context.Context, client *http.Client, credential machineCredential) (machineCredential, error) {
+	if strings.TrimSpace(credential.RefreshSecret) == "" {
+		return credential, errors.New("machine refresh secret is unavailable")
+	}
+	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machine-token/recover")
+	if err != nil {
+		return credential, err
+	}
+	status, body, err := postCloudAPIJSON(ctx, client, endpoint, "", machineTokenRecoverRequest{
+		RefreshSecret: credential.RefreshSecret,
+	})
+	if err != nil {
+		return credential, err
+	}
+	if status != http.StatusOK {
+		return credential, newCloudStatusError("recover machine token", status, body)
+	}
+	var envelope machineTokenRefreshEnvelope
+	if err := decodeCloudAPIJSON(body, &envelope); err != nil {
+		return credential, fmt.Errorf("decode recovered machine token: %w", err)
+	}
+	if envelope.Data.MachineToken == "" || envelope.Data.ExpiresAt == "" || envelope.Data.Machine.ID != credential.MachineID {
+		return credential, errors.New("recovered machine token response is incomplete")
+	}
+	credential.MachineToken = envelope.Data.MachineToken
+	credential.ExpiresAt = envelope.Data.ExpiresAt
+	if err := saveMachineCredential(credential); err != nil {
+		return credential, fmt.Errorf("persist recovered machine credential: %w", err)
+	}
+	return credential, nil
+}
+
+type machineTokenRecoverRequest struct {
+	RefreshSecret string `json:"refresh_secret"`
 }
 
 // serveWrapConfig builds the adapter configuration from the exchange handoff,

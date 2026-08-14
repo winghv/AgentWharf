@@ -438,9 +438,10 @@ type machineTokenResponse struct {
 		Machine struct {
 			ID string `json:"id"`
 		} `json:"machine"`
-		MachineToken string `json:"machine_token"`
-		HubWSURL     string `json:"hub_ws_url"`
-		ExpiresAt    string `json:"expires_at"`
+		MachineToken  string `json:"machine_token"`
+		RefreshSecret string `json:"refresh_secret"`
+		HubWSURL      string `json:"hub_ws_url"`
+		ExpiresAt     string `json:"expires_at"`
 	} `json:"data"`
 }
 
@@ -963,6 +964,13 @@ func prepareManagedWrapSession(ctx context.Context, cfg wrapConfig, output io.Wr
 				return applyMachineSession(cfg, session)
 			}
 			if isInvalidMachineCredentialError(err) {
+				// The 24-hour bearer expired while offline. Recover from the
+				// pairing-time refresh secret instead of re-pairing.
+				if recovered, recoverErr := recoverMachineCredential(ctx, client, credential); recoverErr == nil {
+					if session, sessionErr := createMachineSession(ctx, client, cfg.CloudAPIURL, recovered.MachineToken, cfg.Provider); sessionErr == nil {
+						return applyMachineSession(cfg, session)
+					}
+				}
 				if deleteErr := deleteMachineCredential(); deleteErr != nil {
 					return cfg, deleteErr
 				}
@@ -1027,11 +1035,12 @@ func pairWrapSessionWithClient(ctx context.Context, client *http.Client, cfg wra
 		return cfg, err
 	}
 	if err := saveMachineCredential(machineCredential{
-		MachineID:    machineToken.Data.Machine.ID,
-		MachineToken: machineToken.Data.MachineToken,
-		CloudAPIURL:  cfg.CloudAPIURL,
-		HubWSURL:     machineToken.Data.HubWSURL,
-		ExpiresAt:    machineToken.Data.ExpiresAt,
+		MachineID:     machineToken.Data.Machine.ID,
+		MachineToken:  machineToken.Data.MachineToken,
+		RefreshSecret: machineToken.Data.RefreshSecret,
+		CloudAPIURL:   cfg.CloudAPIURL,
+		HubWSURL:      machineToken.Data.HubWSURL,
+		ExpiresAt:     machineToken.Data.ExpiresAt,
 	}); err != nil {
 		return cfg, err
 	}
