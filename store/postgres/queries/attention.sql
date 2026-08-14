@@ -3,7 +3,7 @@ SELECT session_id, latest_seq, state, permission_id, permission_status,
        terminal_outcome, latest_change_seq, blocker_kind, blocker_reason,
        blocker_expires_at, blocking_session_id, blocker_operation,
        summary_version, last_durable_event_at, last_client_command_at,
-       projection_state, created_at, updated_at
+       projection_state, unmappable_event, created_at, updated_at
 FROM session_attention_summaries
 WHERE session_id = ANY(sqlc.arg(session_ids)::TEXT[])
 ORDER BY session_id ASC;
@@ -13,7 +13,7 @@ SELECT session_id, latest_seq, state, permission_id, permission_status,
        terminal_outcome, latest_change_seq, blocker_kind, blocker_reason,
        blocker_expires_at, blocking_session_id, blocker_operation,
        summary_version, last_durable_event_at, last_client_command_at,
-       projection_state, created_at, updated_at
+       projection_state, unmappable_event, created_at, updated_at
 FROM session_attention_summaries
 WHERE session_id > sqlc.arg(after_session_id)::TEXT
   AND EXISTS (
@@ -33,7 +33,7 @@ SELECT clock_timestamp()::TIMESTAMPTZ;
 -- name: UpsertAttentionEvent :exec
 INSERT INTO session_attention_summaries (
     session_id, latest_seq, state, permission_id, permission_status, terminal_outcome,
-    latest_change_seq, last_durable_event_at, projection_state
+    latest_change_seq, last_durable_event_at, projection_state, unmappable_event
 ) VALUES (
     sqlc.arg(session_id), sqlc.arg(latest_seq), COALESCE(sqlc.narg(event_state), 'starting'),
     sqlc.narg(permission_id)::TEXT, CASE WHEN sqlc.narg(permission_id)::TEXT IS NULL THEN NULL ELSE 'pending' END,
@@ -43,7 +43,8 @@ INSERT INTO session_attention_summaries (
         WHEN sqlc.arg(state_observed)::BOOLEAN AND sqlc.narg(event_state) IS NULL THEN 'incomplete'
         WHEN sqlc.narg(event_state) IS NULL THEN 'incomplete'
         ELSE 'complete'
-    END
+    END,
+    sqlc.arg(projection_incomplete)::BOOLEAN
 )
 ON CONFLICT (session_id) DO UPDATE
 SET latest_seq = EXCLUDED.latest_seq,
@@ -63,7 +64,9 @@ SET latest_seq = EXCLUDED.latest_seq,
     terminal_outcome = COALESCE(session_attention_summaries.terminal_outcome, sqlc.narg(terminal_outcome)::TEXT),
     latest_change_seq = COALESCE(EXCLUDED.latest_change_seq, session_attention_summaries.latest_change_seq),
     last_durable_event_at = EXCLUDED.last_durable_event_at,
+    unmappable_event = session_attention_summaries.unmappable_event OR sqlc.arg(projection_incomplete)::BOOLEAN,
     projection_state = CASE
+        WHEN session_attention_summaries.unmappable_event THEN 'incomplete'
         WHEN session_attention_summaries.projection_state = 'incomplete' AND session_attention_summaries.latest_seq > 1 THEN 'incomplete'
         WHEN EXCLUDED.latest_seq <> session_attention_summaries.latest_seq + 1 THEN 'incomplete'
         WHEN sqlc.arg(projection_incomplete)::BOOLEAN THEN 'incomplete'
