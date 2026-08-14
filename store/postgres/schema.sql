@@ -101,6 +101,7 @@ CREATE TABLE session_attention_summaries (
     last_durable_event_at TIMESTAMPTZ,
     last_client_command_at TIMESTAMPTZ,
     projection_state TEXT NOT NULL DEFAULT 'incomplete' CHECK (projection_state IN ('complete', 'incomplete')),
+    unmappable_event BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (latest_change_seq IS NULL OR (latest_change_seq > 0 AND latest_change_seq <= latest_seq)),

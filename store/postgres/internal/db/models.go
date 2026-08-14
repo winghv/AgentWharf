@@ -82,6 +82,7 @@ type SessionAttentionSummary struct {
 	LastDurableEventAt  pgtype.Timestamptz
 	LastClientCommandAt pgtype.Timestamptz
 	ProjectionState     string
+	UnmappableEvent     bool
 	CreatedAt           pgtype.Timestamptz
 	UpdatedAt           pgtype.Timestamptz
 }

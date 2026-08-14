@@ -16,7 +16,7 @@ SELECT session_id, latest_seq, state, permission_id, permission_status,
        terminal_outcome, latest_change_seq, blocker_kind, blocker_reason,
        blocker_expires_at, blocking_session_id, blocker_operation,
        summary_version, last_durable_event_at, last_client_command_at,
-       projection_state, created_at, updated_at
+       projection_state, unmappable_event, created_at, updated_at
 FROM session_attention_summaries
 WHERE session_id = ANY($1::TEXT[])
 ORDER BY session_id ASC
@@ -48,6 +48,7 @@ func (q *Queries) AttentionSnapshot(ctx context.Context, sessionIds []string) ([
 			&i.LastDurableEventAt,
 			&i.LastClientCommandAt,
 			&i.ProjectionState,
+			&i.UnmappableEvent,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -77,7 +78,7 @@ SELECT session_id, latest_seq, state, permission_id, permission_status,
        terminal_outcome, latest_change_seq, blocker_kind, blocker_reason,
        blocker_expires_at, blocking_session_id, blocker_operation,
        summary_version, last_durable_event_at, last_client_command_at,
-       projection_state, created_at, updated_at
+       projection_state, unmappable_event, created_at, updated_at
 FROM session_attention_summaries
 WHERE session_id > $1::TEXT
   AND EXISTS (
@@ -123,6 +124,7 @@ func (q *Queries) AttentionSummaryPage(ctx context.Context, arg AttentionSummary
 			&i.LastDurableEventAt,
 			&i.LastClientCommandAt,
 			&i.ProjectionState,
+			&i.UnmappableEvent,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -151,7 +153,7 @@ func (q *Queries) FenceAttentionTerminal(ctx context.Context, sessionID string) 
 const upsertAttentionEvent = `-- name: UpsertAttentionEvent :exec
 INSERT INTO session_attention_summaries (
     session_id, latest_seq, state, permission_id, permission_status, terminal_outcome,
-    latest_change_seq, last_durable_event_at, projection_state
+    latest_change_seq, last_durable_event_at, projection_state, unmappable_event
 ) VALUES (
     $1, $2, COALESCE($3, 'starting'),
     $4::TEXT, CASE WHEN $4::TEXT IS NULL THEN NULL ELSE 'pending' END,
@@ -161,30 +163,33 @@ INSERT INTO session_attention_summaries (
         WHEN $8::BOOLEAN AND $3 IS NULL THEN 'incomplete'
         WHEN $3 IS NULL THEN 'incomplete'
         ELSE 'complete'
-    END
+    END,
+    $9::BOOLEAN
 )
 ON CONFLICT (session_id) DO UPDATE
 SET latest_seq = EXCLUDED.latest_seq,
     state = COALESCE($3, session_attention_summaries.state),
     permission_id = CASE
-        WHEN NOT $9::BOOLEAN THEN session_attention_summaries.permission_id
+        WHEN NOT $10::BOOLEAN THEN session_attention_summaries.permission_id
         WHEN $4::TEXT IS NOT NULL THEN $4::TEXT
-        WHEN session_attention_summaries.permission_id = $10::TEXT THEN NULL
+        WHEN session_attention_summaries.permission_id = $11::TEXT THEN NULL
         ELSE session_attention_summaries.permission_id
     END,
     permission_status = CASE
-        WHEN NOT $9::BOOLEAN THEN session_attention_summaries.permission_status
+        WHEN NOT $10::BOOLEAN THEN session_attention_summaries.permission_status
         WHEN $4::TEXT IS NOT NULL THEN 'pending'
-        WHEN session_attention_summaries.permission_id = $10::TEXT THEN NULL
+        WHEN session_attention_summaries.permission_id = $11::TEXT THEN NULL
         ELSE session_attention_summaries.permission_status
     END,
     terminal_outcome = COALESCE(session_attention_summaries.terminal_outcome, $5::TEXT),
     latest_change_seq = COALESCE(EXCLUDED.latest_change_seq, session_attention_summaries.latest_change_seq),
     last_durable_event_at = EXCLUDED.last_durable_event_at,
+    unmappable_event = session_attention_summaries.unmappable_event OR $9::BOOLEAN,
     projection_state = CASE
+        WHEN session_attention_summaries.unmappable_event THEN 'incomplete'
         WHEN session_attention_summaries.projection_state = 'incomplete' AND session_attention_summaries.latest_seq > 1 THEN 'incomplete'
         WHEN EXCLUDED.latest_seq <> session_attention_summaries.latest_seq + 1 THEN 'incomplete'
-        WHEN $11::BOOLEAN THEN 'incomplete'
+        WHEN $9::BOOLEAN THEN 'incomplete'
         WHEN $8::BOOLEAN AND $3 IS NULL THEN 'incomplete'
         WHEN session_attention_summaries.projection_state = 'incomplete' AND $8::BOOLEAN THEN 'complete'
         ELSE session_attention_summaries.projection_state
@@ -202,9 +207,9 @@ type UpsertAttentionEventParams struct {
 	LatestChangeSeq      pgtype.Int8
 	EventTime            pgtype.Timestamptz
 	StateObserved        bool
+	ProjectionIncomplete bool
 	PermissionChange     bool
 	PermissionDecisionID pgtype.Text
-	ProjectionIncomplete bool
 }
 
 func (q *Queries) UpsertAttentionEvent(ctx context.Context, arg UpsertAttentionEventParams) error {
@@ -217,9 +222,9 @@ func (q *Queries) UpsertAttentionEvent(ctx context.Context, arg UpsertAttentionE
 		arg.LatestChangeSeq,
 		arg.EventTime,
 		arg.StateObserved,
+		arg.ProjectionIncomplete,
 		arg.PermissionChange,
 		arg.PermissionDecisionID,
-		arg.ProjectionIncomplete,
 	)
 	return err
 }
