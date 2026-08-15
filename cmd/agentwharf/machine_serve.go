@@ -205,7 +205,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				}
 			}
 			if err != nil {
-				_, _ = fmt.Fprintf(stderr, "wharf machine serve: %v\n", err)
+				_, _ = fmt.Fprintln(stderr, machineServePollRetryMessage(err, cfg.PollInterval))
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -244,6 +244,28 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 		case <-poll.C:
 		}
 	}
+}
+
+// isCloudTransportError reports a poll failure caused by the network rather
+// than an application-level (auth/status/decode) rejection.
+func isCloudTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return strings.Contains(text, "get cloud api request:") ||
+		strings.Contains(text, "read cloud api response:") ||
+		strings.Contains(text, "close cloud api response:")
+}
+
+// machineServePollRetryMessage renders a non-fatal poll failure with the retry
+// interval, so a transient network error (e.g. unexpected EOF) reads as
+// "cloud unreachable, will retry" rather than a daemon crash.
+func machineServePollRetryMessage(err error, interval time.Duration) string {
+	if isCloudTransportError(err) {
+		return fmt.Sprintf("wharf machine serve: cloud unreachable (%s); retrying in %s", err, interval)
+	}
+	return fmt.Sprintf("wharf machine serve: %s; retrying in %s", err, interval)
 }
 
 // dispatchClaim exchanges one pending auto claim and runs the dispatch.
