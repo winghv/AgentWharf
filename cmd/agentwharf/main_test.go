@@ -569,6 +569,32 @@ func TestParseAgentEntrypointDefaultsToManagedClaudeSession(t *testing.T) {
 	}
 }
 
+func TestParseAgentEntrypointDefaultsToPairOnly(t *testing.T) {
+	cfg, err := parseAgentEntrypointConfig("claude", nil, io.Discard)
+	if err != nil {
+		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
+	}
+	if !cfg.PairOnly || cfg.Session {
+		t.Fatalf("agent entrypoint config = %+v, want PairOnly=true Session=false", cfg)
+	}
+
+	session, err := parseAgentEntrypointConfig("claude", []string{"--session"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseAgentEntrypointConfig(--session) error = %v", err)
+	}
+	if session.PairOnly || !session.Session {
+		t.Fatalf("agent entrypoint config = %+v, want PairOnly=false Session=true", session)
+	}
+
+	smoke, err := parseAgentEntrypointConfig("claude", []string{"--startup-smoke"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseAgentEntrypointConfig(--startup-smoke) error = %v", err)
+	}
+	if smoke.PairOnly || !smoke.StartupSmoke {
+		t.Fatalf("agent entrypoint config = %+v, want PairOnly=false StartupSmoke=true", smoke)
+	}
+}
+
 func TestParseAgentEntrypointUsesInjectedSessionWithoutPairing(t *testing.T) {
 	t.Setenv("AGENTWHARF_HUB_URL", "wss://hub.superwhv.example/hub")
 	t.Setenv("AGENTWHARF_SESSION_ID", "ses_vm")

@@ -121,6 +121,11 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		if err != nil {
 			return err
 		}
+		if cfg.PairOnly {
+			// User-facing onboarding: pair, start the daemon, and exit. No
+			// interactive Provider session is opened.
+			return runPairOnly(ctx, cfg, stdout, stderr)
+		}
 		effective, err := runWrap(ctx, cfg, stdin, stderr)
 		if !cfg.StartupSmoke {
 			// After pairing (or reusing an existing pairing) plus one session, hand
@@ -416,6 +421,8 @@ type wrapConfig struct {
 	ProviderCredential *core.ProcessCredential
 	ProtocolVersion    int
 	StartupSmoke       bool
+	PairOnly           bool
+	Session            bool
 }
 
 type heartbeatConfig struct {
@@ -564,6 +571,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
 		Managed:         managed,
 		ProviderCommand: defaultProviderCommand(agent),
+		PairOnly:        true,
 	}
 	if cfg.Managed {
 		cfg.CloudAPIURL = envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", defaultManagedCloudAPIURL))
@@ -579,6 +587,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	flags.StringVar(&cfg.CloudAPIURL, "cloud", cfg.CloudAPIURL, "SuperWHV Cloud API base URL")
 	flags.BoolVar(&cfg.Pair, "pair", cfg.Pair, "pair this machine with SuperWHV before connecting")
 	flags.BoolVar(&cfg.StartupSmoke, "startup-smoke", false, "exit successfully after Provider admission and ACP initialization")
+	flags.BoolVar(&cfg.Session, "session", false, "run an interactive agent session after pairing instead of pairing only")
 	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", protocol.HubProtocolVersion, "Adapter protocol version (1 or 2)")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
@@ -591,6 +600,12 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	}
 	if cfg.Managed && cfg.CloudAPIURL == "" {
 		cfg.CloudAPIURL = defaultManagedCloudAPIURL
+	}
+	// Pair-only is the user-facing default: pair, hand off to the background
+	// daemon, and exit. --session and --startup-smoke both need to run a real
+	// Provider session, so they disable the pair-only short-circuit.
+	if cfg.Session || cfg.StartupSmoke {
+		cfg.PairOnly = false
 	}
 	return normalizeWrapConfig(cfg)
 }
@@ -1010,26 +1025,29 @@ func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wra
 	return pairWrapSessionWithClient(ctx, client, cfg, output)
 }
 
-func pairWrapSessionWithClient(ctx context.Context, client *http.Client, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
+// pairMachineCredential performs managed pairing and persists the machine
+// credential, without creating or running a Session. It is shared by the
+// pair-only entrypoint and the session-running wrap flow.
+func pairMachineCredential(ctx context.Context, client *http.Client, cfg wrapConfig, output io.Writer) (machineCredential, error) {
 	createURL, err := cloudAPIEndpoint(cfg.CloudAPIURL, "/machine-pairing-codes")
 	if err != nil {
-		return cfg, err
+		return machineCredential{}, err
 	}
 	var pairing machinePairingCodeResponse
 	status, body, err := postCloudAPIJSONWithRetry(ctx, client, createURL, "", machinePairingCreateRequest{
 		Platform: runtime.GOOS + "-" + runtime.GOARCH,
 	})
 	if err != nil {
-		return cfg, err
+		return machineCredential{}, err
 	}
 	if status != http.StatusCreated {
-		return cfg, newCloudStatusError("create machine pairing code", status, body)
+		return machineCredential{}, newCloudStatusError("create machine pairing code", status, body)
 	}
 	if err := decodeCloudAPIJSON(body, &pairing); err != nil {
-		return cfg, fmt.Errorf("decode machine pairing response: %w", err)
+		return machineCredential{}, fmt.Errorf("decode machine pairing response: %w", err)
 	}
 	if pairing.Data.DeviceCode == "" || pairing.Data.UserCode == "" {
-		return cfg, errors.New("machine pairing response missing codes")
+		return machineCredential{}, errors.New("machine pairing response missing codes")
 	}
 	if output != nil {
 		_, _ = fmt.Fprintf(output, "Pair this machine at %s\ndevice_code: %s\nuser_code: %s\n",
@@ -1040,19 +1058,28 @@ func pairWrapSessionWithClient(ctx context.Context, client *http.Client, cfg wra
 
 	machineToken, err := exchangeMachineToken(ctx, client, cfg.CloudAPIURL, pairing)
 	if err != nil {
-		return cfg, err
+		return machineCredential{}, err
 	}
-	if err := saveMachineCredential(machineCredential{
+	credential := machineCredential{
 		MachineID:     machineToken.Data.Machine.ID,
 		MachineToken:  machineToken.Data.MachineToken,
 		RefreshSecret: machineToken.Data.RefreshSecret,
 		CloudAPIURL:   cfg.CloudAPIURL,
 		HubWSURL:      machineToken.Data.HubWSURL,
 		ExpiresAt:     machineToken.Data.ExpiresAt,
-	}); err != nil {
+	}
+	if err := saveMachineCredential(credential); err != nil {
+		return machineCredential{}, err
+	}
+	return credential, nil
+}
+
+func pairWrapSessionWithClient(ctx context.Context, client *http.Client, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
+	credential, err := pairMachineCredential(ctx, client, cfg, output)
+	if err != nil {
 		return cfg, err
 	}
-	session, err := createMachineSession(ctx, client, cfg.CloudAPIURL, machineToken.Data.MachineToken, cfg.Provider)
+	session, err := createMachineSession(ctx, client, cfg.CloudAPIURL, credential.MachineToken, cfg.Provider)
 	if err != nil {
 		return cfg, err
 	}
@@ -1067,6 +1094,38 @@ func applyMachineSession(cfg wrapConfig, session machineSessionResponse) (wrapCo
 	cfg.HubURL = session.Data.HubWSURL
 	cfg.AdapterToken = session.Data.AdapterToken
 	return cfg, nil
+}
+
+// runPairOnly pairs the machine (or reuses an existing pairing), prints a
+// concise success message, starts the background daemon, and exits. It is the
+// user-facing onboarding flow: pair once here, then manage everything from the
+// Console while wharf serve keeps the machine online.
+func runPairOnly(ctx context.Context, cfg wrapConfig, stdout, stderr io.Writer) error {
+	normalized, err := normalizeWrapConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if !normalized.Managed {
+		normalized.Managed = true
+		if normalized.CloudAPIURL == "" {
+			normalized.CloudAPIURL = defaultManagedCloudAPIURL
+		}
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	credential, err := loadMachineCredential()
+	if err != nil || !sameCloudAPIURL(credential.CloudAPIURL, normalized.CloudAPIURL) {
+		credential, err = pairMachineCredential(ctx, client, normalized, stderr)
+		if err != nil {
+			return err
+		}
+	}
+	if credential.MachineID == "" || credential.MachineToken == "" {
+		return errors.New("pairing did not produce a usable machine credential")
+	}
+	_, _ = fmt.Fprintln(stdout, "Pairing complete. This machine is connected to SuperWHV.")
+	_, _ = fmt.Fprintln(stdout, "The background daemon (wharf serve) is running; you can close this window. Manage tasks from the Console.")
+	ensureBackgroundDaemon(stderr)
+	return nil
 }
 
 func exchangeMachineToken(ctx context.Context, client *http.Client, baseURL string, pairing machinePairingCodeResponse) (machineTokenResponse, error) {
