@@ -345,7 +345,7 @@ func TestRunServeRejectsNonLocalDefaultToken(t *testing.T) {
 	t.Parallel()
 
 	err := run(context.Background(), []string{
-		"serve",
+		"hub",
 		"--addr", "0.0.0.0:0",
 		"--db", filepath.Join(t.TempDir(), "events.db"),
 	}, io.Discard, io.Discard)
@@ -464,7 +464,7 @@ func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	t.Parallel()
 
 	err := run(context.Background(), nil, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|wrap|claude|codex|gemini|logout|machine|version|upgrade|attention-backfill [options]") {
+	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|hub|wrap|claude|codex|gemini|logout|machine|version|upgrade|attention-backfill [options]") {
 		t.Fatalf("run() error = %v, want wharf usage", err)
 	}
 	if strings.Contains(err.Error(), "usage: agentwharf") {

@@ -78,7 +78,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: wharf serve|wrap|claude|codex|gemini|logout|machine|version|upgrade|attention-backfill [options]")
+		return errors.New("usage: wharf serve|hub|wrap|claude|codex|gemini|logout|machine|version|upgrade|attention-backfill [options]")
 	}
 
 	switch args[0] {
@@ -91,6 +91,8 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 	case "upgrade":
 		return runUpgradeCommand(ctx, args[1:], stdin, stdout, stderr)
 	case "serve":
+		return runServeCommand(ctx, args[1:], stdout, stderr)
+	case "hub":
 		cfg, err := parseServeConfig(args[1:], stderr)
 		if err != nil {
 			return err
@@ -99,7 +101,7 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		if err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(stdout, "wharf serve listening on %s\n", running.wsURL)
+		_, _ = fmt.Fprintf(stdout, "wharf hub listening on %s\n", running.wsURL)
 		_, _ = fmt.Fprintf(stdout, "session_id=%s provider=%s\n", cfg.SessionID, cfg.Provider)
 		return running.wait()
 	case "wrap":
@@ -120,6 +122,12 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 			return err
 		}
 		effective, err := runWrap(ctx, cfg, stdin, stderr)
+		if !cfg.StartupSmoke {
+			// After pairing (or reusing an existing pairing) plus one session, hand
+			// off to the background daemon so the machine stays online without a
+			// manual wharf serve. Best-effort: a failed daemon start only prints a hint.
+			ensureBackgroundDaemon(stderr)
+		}
 		if err != nil {
 			return err
 		}
