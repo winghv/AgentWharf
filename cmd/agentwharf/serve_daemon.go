@@ -93,7 +93,7 @@ func ensurePaired() error {
 		return err
 	}
 	if !exists {
-		return errors.New("this machine is not paired yet. Run wharf claude (or wharf codex) first, then wharf serve.")
+		return errors.New("this machine is not paired yet; run wharf claude (or wharf codex) first, then wharf serve")
 	}
 	return nil
 }
