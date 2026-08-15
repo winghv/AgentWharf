@@ -423,6 +423,7 @@ type wrapConfig struct {
 	StartupSmoke       bool
 	PairOnly           bool
 	Session            bool
+	WorkingDirectory   string
 }
 
 type heartbeatConfig struct {
@@ -1712,10 +1713,10 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 		return err
 	}
 
-	cwd, err := os.Getwd()
+	cwd, err := providerWorkingDirectory(cfg.WorkingDirectory)
 	if err != nil {
 		cancel()
-		return fmt.Errorf("get provider cwd: %w", err)
+		return err
 	}
 	if err := writeACPRequest(stdinWriter, 2, "session/new", map[string]any{
 		"cwd":        cwd,
@@ -2328,6 +2329,24 @@ func providerStderr(masker *core.EventMasker) io.Writer {
 type nonClosingWriter struct{ io.Writer }
 
 func (nonClosingWriter) Close() error { return nil }
+
+// providerWorkingDirectory resolves the directory the provider should work in.
+// An empty or "." value keeps the process's own working directory; a relative
+// value is resolved against it so the ACP session/new cwd is always absolute.
+func providerWorkingDirectory(value string) (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get provider cwd: %w", err)
+	}
+	if strings.TrimSpace(value) == "" || value == "." {
+		return cwd, nil
+	}
+	abs, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("resolve provider working directory: %w", err)
+	}
+	return filepath.Clean(abs), nil
+}
 
 // providerProcessCommand keeps the sandbox environment file-path-only. The
 // approved Claude provider bridge reads those paths only for its child process.

@@ -52,6 +52,7 @@ type machineServeDispatch struct {
 	AdapterToken     string `json:"adapter_token"`
 	ClientToken      string `json:"client_token"`
 	FirstInstruction string `json:"first_instruction"`
+	WorkingDirectory string `json:"working_directory"`
 	AdapterExpiresAt string `json:"adapter_expires_at"`
 	ClientExpiresAt  string `json:"client_expires_at"`
 }
@@ -78,6 +79,7 @@ type machineAutoExchangeResponse struct {
 		AdapterToken     string `json:"adapter_token"`
 		ClientToken      string `json:"client_token"`
 		FirstInstruction string `json:"first_instruction"`
+		WorkingDirectory string `json:"working_directory"`
 		Delivery         string `json:"delivery"`
 		ExpiresAt        string `json:"expires_at"`
 	} `json:"data"`
@@ -341,6 +343,7 @@ func exchangeAutoMachineClaim(ctx context.Context, client *http.Client, credenti
 		AdapterToken:     data.AdapterToken,
 		ClientToken:      data.ClientToken,
 		FirstInstruction: data.FirstInstruction,
+		WorkingDirectory: data.WorkingDirectory,
 		AdapterExpiresAt: adapterExpiresAt,
 		ClientExpiresAt:  clientExpiresAt,
 	}, nil
@@ -463,15 +466,16 @@ func serveWrapConfig(handoff machineServeDispatch, startupSmoke bool) wrapConfig
 		agent = "claude"
 	}
 	return wrapConfig{
-		HubURL:          handoff.HubWSURL,
-		SessionID:       handoff.SessionID,
-		Agent:           agent,
-		Provider:        handoff.Provider,
-		AdapterToken:    handoff.AdapterToken,
-		Format:          "acp",
-		ProviderCommand: defaultProviderCommand(agent),
-		ProtocolVersion: protocol.HubProtocolVersion,
-		StartupSmoke:    startupSmoke,
+		HubURL:           handoff.HubWSURL,
+		SessionID:        handoff.SessionID,
+		Agent:            agent,
+		Provider:         handoff.Provider,
+		AdapterToken:     handoff.AdapterToken,
+		Format:           "acp",
+		ProviderCommand:  defaultProviderCommand(agent),
+		ProtocolVersion:  protocol.HubProtocolVersion,
+		StartupSmoke:     startupSmoke,
+		WorkingDirectory: handoff.WorkingDirectory,
 	}
 }
 
