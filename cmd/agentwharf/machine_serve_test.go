@@ -213,7 +213,8 @@ func newServeTestControlPlane(t *testing.T, hubURL, sessionID string, pending in
 				"session_id": sessionID, "provider": "claude-code", "hub_ws_url": hubURL,
 				"adapter_token": "adapter-token", "client_token": "client-token",
 				"first_instruction": "build a login page", "delivery": "auto",
-				"expires_at": time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339Nano),
+				"adapter_expires_at": time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano),
+				"client_expires_at":  time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339Nano),
 			}})
 		case r.URL.Path == "/machine-token/refresh" && r.Method == http.MethodPost:
 			refreshes.Add(1)

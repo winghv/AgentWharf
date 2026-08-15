@@ -22,13 +22,16 @@ import (
 const machineServeUsage = "usage: wharf machine serve [--poll-interval SECONDS] [--max-concurrent N] [--startup-smoke]"
 
 const (
-	machineServeDefaultPollInterval  = 10 * time.Second
-	machineServeMinPollInterval      = time.Second
-	machineServeDefaultMaxConcurrent = 2
-	machineServeSenderRetryInitial   = 2 * time.Second
-	machineServeSenderRetryMax       = 30 * time.Second
-	machineServeSenderAttemptWindow  = 10 * time.Second
-	machineCredentialRefreshLeadTime = 12 * time.Hour
+	machineServeDefaultPollInterval   = 10 * time.Second
+	machineServeMinPollInterval       = time.Second
+	machineServeDefaultMaxConcurrent  = 2
+	machineServeSenderRetryInitial    = 2 * time.Second
+	machineServeSenderRetryMax        = 30 * time.Second
+	machineServeSenderAttemptWindow   = 10 * time.Second
+	machineServeAdapterRestartInitial = 2 * time.Second
+	machineServeAdapterRestartMax     = 30 * time.Second
+	machineServeAdapterRestartLimit   = 5
+	machineCredentialRefreshLeadTime  = 12 * time.Hour
 )
 
 var errNoInteractiveState = errors.New("session never reached an interactive state")
@@ -81,7 +84,8 @@ type machineAutoExchangeResponse struct {
 		FirstInstruction string `json:"first_instruction"`
 		WorkingDirectory string `json:"working_directory"`
 		Delivery         string `json:"delivery"`
-		ExpiresAt        string `json:"expires_at"`
+		AdapterExpiresAt string `json:"adapter_expires_at"`
+		ClientExpiresAt  string `json:"client_expires_at"`
 	} `json:"data"`
 }
 
@@ -162,7 +166,12 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 
 	sem := make(chan struct{}, cfg.MaxConcurrent)
 	var workers sync.WaitGroup
+	var adapters sync.WaitGroup
 	serveCtx, cancel := context.WithCancel(ctx)
+	// Shutdown order: let the dispatch goroutines finish first (they deliver the
+	// first instruction), then cancel to stop the keep-alive goroutines, then wait
+	// for those keep-alive goroutines to exit.
+	defer adapters.Wait()
 	defer cancel()
 	defer workers.Wait()
 
@@ -184,7 +193,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			defer workers.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			dispatchOutcome(serveCtx, cfg, &handoff, stdout, stderr)
+			dispatchOutcome(serveCtx, cfg, &handoff, stdout, stderr, &adapters)
 		}(handoff)
 	}
 
@@ -233,7 +242,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				defer workers.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				dispatchClaim(serveCtx, cfg, client, credential, claim, stdout, stderr)
+				dispatchClaim(serveCtx, cfg, client, credential, claim, stdout, stderr, &adapters)
 			}(claim)
 		}
 		if cfg.StartupSmoke {
@@ -271,7 +280,7 @@ func machineServePollRetryMessage(err error, interval time.Duration) string {
 }
 
 // dispatchClaim exchanges one pending auto claim and runs the dispatch.
-func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, claim machinePendingClaim, stdout, stderr io.Writer) {
+func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, claim machinePendingClaim, stdout, stderr io.Writer, adapters *sync.WaitGroup) {
 	handoff, err := exchangeAutoMachineClaim(ctx, client, credential, claim)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: exchange claim %s: %v\n", claim.ClaimID, err)
@@ -281,34 +290,83 @@ func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Cli
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist dispatch %s: %v\n", claim.ClaimID, err)
 		return
 	}
-	dispatchOutcome(ctx, cfg, handoff, stdout, stderr)
+	dispatchOutcome(ctx, cfg, handoff, stdout, stderr, adapters)
 }
 
-func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer) {
-	adapterDone := make(chan error, 1)
-	adapterCfg := serveWrapConfig(*handoff, cfg.StartupSmoke)
+func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, adapters *sync.WaitGroup) {
+	// Start the adapter keep-alive first so the Session can reach an interactive
+	// state; the first-instruction sender retries until it does. The keep-alive
+	// runs in the background so the semaphore only bounds the dispatch phase, not
+	// the session lifetime.
+	adapters.Add(1)
 	go func() {
-		_, err := runWrap(ctx, adapterCfg, strings.NewReader(""), io.Discard)
-		adapterDone <- err
+		defer adapters.Done()
+		keepAdapterAlive(ctx, cfg, handoff, stdout, stderr)
 	}()
+
 	sendErr := sendFirstInstructionWithRetry(ctx, *handoff)
 	switch {
 	case sendErr == nil:
-		_ = removeMachineDispatch(handoff.ClaimID)
 		_, _ = fmt.Fprintf(stdout, "auto_dispatch_ok: claim_id=%s session_id=%s\n", handoff.ClaimID, handoff.SessionID)
+		if cfg.StartupSmoke {
+			// Smoke is one-shot: the dispatch must not survive a daemon restart.
+			_ = removeMachineDispatch(handoff.ClaimID)
+		}
 	case errors.Is(sendErr, context.Canceled):
 		return
 	default:
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: dispatch %s: %v\n", handoff.ClaimID, sendErr)
 		return
 	}
-	// Surface a fast adapter exit (for example a provider that fails to start)
-	// so the smoke and operators can see it instead of a silent session.
-	select {
-	case err := <-adapterDone:
-		_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended: %v\n", handoff.SessionID, err)
-	case <-time.After(2 * time.Second):
+}
+
+// keepAdapterAlive re-runs the adapter until the daemon stops, the adapter
+// credential expires, or a bounded number of restarts is exhausted. A crash
+// (for example the machine slept and the provider or its Hub socket died) is
+// restarted with backoff; the first instruction is not re-sent.
+func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer) {
+	adapterCfg := serveWrapConfig(*handoff, cfg.StartupSmoke)
+	restarts := 0
+	delay := machineServeAdapterRestartInitial
+	for {
+		done := runAdapter(ctx, adapterCfg)
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-done:
+			if ctx.Err() != nil {
+				return
+			}
+			if cfg.StartupSmoke {
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended: %v\n", handoff.SessionID, err)
+				return
+			}
+			if !dispatchCredentialAlive(*handoff) || restarts >= machineServeAdapterRestartLimit {
+				_ = removeMachineDispatch(handoff.ClaimID)
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended (%v); giving up (restarts=%d)\n", handoff.SessionID, err, restarts)
+				return
+			}
+			restarts++
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended (%v); restarting in %s\n", handoff.SessionID, err, delay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			if delay < machineServeAdapterRestartMax {
+				delay *= 2
+			}
+		}
 	}
+}
+
+func runAdapter(ctx context.Context, cfg wrapConfig) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := runWrap(ctx, cfg, strings.NewReader(""), io.Discard)
+		done <- err
+	}()
+	return done
 }
 
 // exchangeAutoMachineClaim consumes the claim with the machine bearer alone and
@@ -328,11 +386,11 @@ func exchangeAutoMachineClaim(ctx context.Context, client *http.Client, credenti
 	}
 	data := response.Data
 	if data.SessionID == "" || data.HubWSURL == "" || data.AdapterToken == "" || data.ClientToken == "" ||
-		data.FirstInstruction == "" || data.Delivery != "auto" || data.ExpiresAt == "" {
+		data.FirstInstruction == "" || data.Delivery != "auto" || data.AdapterExpiresAt == "" || data.ClientExpiresAt == "" {
 		return nil, errors.New("claim exchange response is incomplete")
 	}
-	adapterExpiresAt := data.ExpiresAt
-	clientExpiresAt := data.ExpiresAt
+	adapterExpiresAt := data.AdapterExpiresAt
+	clientExpiresAt := data.ClientExpiresAt
 	return &machineServeDispatch{
 		ClaimID:          claim.ClaimID,
 		TaskID:           claim.TaskID,
