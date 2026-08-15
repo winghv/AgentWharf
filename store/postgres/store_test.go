@@ -1084,7 +1084,11 @@ BEFORE INSERT ON session_events FOR EACH ROW EXECUTE FUNCTION reject_test_propos
 
 func TestProposedEventProjectsAttention(t *testing.T) {
 	harness := newPostgresProposalHarness(t)
-	before := time.Now()
+	// The projection stamps last_durable_event_at with the Postgres Store clock,
+	// which can lag the test host clock by milliseconds under full-suite load.
+	// A one-minute tolerance keeps the "not the 1970 event time" assertion while
+	// absorbing that skew instead of flaking.
+	before := time.Now().Add(-time.Minute)
 	receipt, err := harness.CommitProposedEvent(context.Background(), "ses_proposal_1",
 		store.CommandAuthority{ConnectionEpoch: 1, CredentialGeneration: 1},
 		store.ProposedEventRequest{ProposalID: "proposal_attention", Event: store.PendingEvent{Type: "session.state", Time: time.Unix(1, 0), Payload: []byte(`{"state":"working"}`)}})
@@ -1123,7 +1127,7 @@ func TestAttentionProjectionUsesStoreClockAndNeverRepairsIncomplete(t *testing.T
 	t.Cleanup(pool.Close)
 	resetSchema(t, pool)
 	events := postgres.New(pool)
-	before := time.Now()
+	before := time.Now().Add(-time.Minute)
 	if _, err := events.Append(context.Background(), "ses_attention_clock", []store.PendingEvent{{Type: "session.state", Time: time.Unix(1, 0), Payload: []byte(`{"state":"ready"}`)}}); err != nil {
 		t.Fatal(err)
 	}
