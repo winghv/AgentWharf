@@ -28,8 +28,19 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	defer cancel()
 
 	writeFrame := func(frame protocol.Frame) error { return connection.write(ctx, frame) }
+	// Reduce the working directory to its basename (like the ACP ready payload)
+	// so the Hub can group the Session by directory without durably storing the
+	// host's full path.
+	cwdBasename := ""
+	if cwd, cwdErr := providerWorkingDirectory(cfg.WorkingDirectory); cwdErr == nil {
+		cwdBasename = cwdEventBasename(cwd)
+	}
 	publishState := func(state string) error {
-		payload, err := json.Marshal(map[string]any{"state": state, "provider": cfg.Provider})
+		body := map[string]any{"state": state, "provider": cfg.Provider}
+		if cwdBasename != "" {
+			body["metadata"] = map[string]any{"cwd": cwdBasename}
+		}
+		payload, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
