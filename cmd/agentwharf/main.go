@@ -564,9 +564,6 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	flags.BoolVar(&useJSONStream, "jsonstream", false, "read Claude stream-json lines from stdin")
 	flags.BoolVar(&cfg.StartupSmoke, "startup-smoke", false, "exit successfully after Provider admission and ACP initialization")
 	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", cfg.ProtocolVersion, "Adapter protocol version (1 or 2)")
-	flags.StringVar(&cfg.LaunchSettings.ModelID, "model", "", "provider-neutral model id to apply at launch")
-	flags.StringVar(&cfg.LaunchSettings.ReasoningEffortID, "reasoning-effort", "", "provider-neutral reasoning effort id to apply at launch")
-	flags.StringVar(&cfg.LaunchSettings.PermissionModeID, "permission-mode", "", "provider-neutral permission mode id to apply at launch")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
 	}
@@ -583,6 +580,39 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	return normalizeWrapConfig(cfg)
 }
 
+// splitAgentEntrypointArgs separates wharf's own entrypoint flags from the
+// passthrough agent arguments. Everything from the first non-wharf token on is
+// forwarded verbatim to the underlying provider command, so
+// `wharf claude --model X` behaves like `claude --model X`.
+func splitAgentEntrypointArgs(args []string) (wharfArgs, agentArgs []string) {
+	valueFlags := map[string]bool{
+		"--hub": true, "--session-id": true, "--provider": true, "--adapter-token": true,
+		"--secret-dir": true, "--cloud": true, "--protocol-version": true,
+	}
+	boolFlags := map[string]bool{
+		"--pair": true, "--startup-smoke": true, "--session": true, "--pair-only": true,
+		"--help": true, "-h": true,
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, _, hasValue := strings.Cut(arg, "=")
+		switch {
+		case boolFlags[name]:
+			wharfArgs = append(wharfArgs, arg)
+		case valueFlags[name]:
+			wharfArgs = append(wharfArgs, arg)
+			if !hasValue && i+1 < len(args) {
+				i++
+				wharfArgs = append(wharfArgs, args[i])
+			}
+		default:
+			agentArgs = append(agentArgs, args[i:]...)
+			return wharfArgs, agentArgs
+		}
+	}
+	return wharfArgs, agentArgs
+}
+
 func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (wrapConfig, error) {
 	managed := !hasInjectedHubSession()
 	cfg := wrapConfig{
@@ -595,11 +625,12 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
 		Managed:         managed,
 		ProviderCommand: defaultProviderCommand(agent),
-		PairOnly:        true,
 	}
 	if cfg.Managed {
 		cfg.CloudAPIURL = envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", defaultManagedCloudAPIURL))
 	}
+
+	wharfArgs, agentArgs := splitAgentEntrypointArgs(args)
 
 	flags := flag.NewFlagSet(agent, flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -612,15 +643,13 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	flags.BoolVar(&cfg.Pair, "pair", cfg.Pair, "pair this machine with SuperWHV before connecting")
 	flags.BoolVar(&cfg.StartupSmoke, "startup-smoke", false, "exit successfully after Provider admission and ACP initialization")
 	flags.BoolVar(&cfg.Session, "session", false, "run an interactive agent session after pairing instead of pairing only")
+	flags.BoolVar(&cfg.PairOnly, "pair-only", cfg.PairOnly, "pair and hand off to the background daemon without running a Session")
 	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", protocol.HubProtocolVersion, "Adapter protocol version (1 or 2)")
-	flags.StringVar(&cfg.LaunchSettings.ModelID, "model", "", "provider-neutral model id to apply at launch")
-	flags.StringVar(&cfg.LaunchSettings.ReasoningEffortID, "reasoning-effort", "", "provider-neutral reasoning effort id to apply at launch")
-	flags.StringVar(&cfg.LaunchSettings.PermissionModeID, "permission-mode", "", "provider-neutral permission mode id to apply at launch")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.Parse(wharfArgs); err != nil {
 		return wrapConfig{}, err
 	}
-	if flags.NArg() > 0 {
-		cfg.ProviderCommand = append([]string(nil), flags.Args()...)
+	if len(agentArgs) > 0 {
+		cfg.ProviderCommand = append(cfg.ProviderCommand, agentArgs...)
 	}
 	if cfg.Pair {
 		cfg.Managed = true
@@ -628,9 +657,10 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	if cfg.Managed && cfg.CloudAPIURL == "" {
 		cfg.CloudAPIURL = defaultManagedCloudAPIURL
 	}
-	// Pair-only is the user-facing default: pair, hand off to the background
-	// daemon, and exit. --session and --startup-smoke both need to run a real
-	// Provider session, so they disable the pair-only short-circuit.
+	// Running a real Provider session is the user-facing default, so
+	// `wharf claude` launches the agent and mirrors it to the Hub. --pair-only
+	// opts back into onboarding pair + daemon handoff, and --session/--startup-smoke
+	// remain compatible no-ops for the pair-only short-circuit.
 	if cfg.Session || cfg.StartupSmoke {
 		cfg.PairOnly = false
 	}

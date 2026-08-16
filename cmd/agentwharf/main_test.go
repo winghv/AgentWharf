@@ -569,13 +569,13 @@ func TestParseAgentEntrypointDefaultsToManagedClaudeSession(t *testing.T) {
 	}
 }
 
-func TestParseAgentEntrypointDefaultsToPairOnly(t *testing.T) {
+func TestParseAgentEntrypointDefaultsToSession(t *testing.T) {
 	cfg, err := parseAgentEntrypointConfig("claude", nil, io.Discard)
 	if err != nil {
 		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
 	}
-	if !cfg.PairOnly || cfg.Session {
-		t.Fatalf("agent entrypoint config = %+v, want PairOnly=true Session=false", cfg)
+	if cfg.PairOnly || cfg.Session {
+		t.Fatalf("agent entrypoint config = %+v, want PairOnly=false Session=false", cfg)
 	}
 
 	session, err := parseAgentEntrypointConfig("claude", []string{"--session"}, io.Discard)
@@ -592,6 +592,14 @@ func TestParseAgentEntrypointDefaultsToPairOnly(t *testing.T) {
 	}
 	if smoke.PairOnly || !smoke.StartupSmoke {
 		t.Fatalf("agent entrypoint config = %+v, want PairOnly=false StartupSmoke=true", smoke)
+	}
+
+	pairOnly, err := parseAgentEntrypointConfig("claude", []string{"--pair-only"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseAgentEntrypointConfig(--pair-only) error = %v", err)
+	}
+	if !pairOnly.PairOnly {
+		t.Fatalf("agent entrypoint config = %+v, want PairOnly=true", pairOnly)
 	}
 }
 

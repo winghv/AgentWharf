@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,22 +64,25 @@ func TestExchangeAutoMachineClaimParsesLaunchSettings(t *testing.T) {
 	}
 }
 
-func TestParseAgentEntrypointConfigParsesLaunchSettingFlags(t *testing.T) {
-	cfg, err := parseAgentEntrypointConfig("claude", []string{"--model", "reasoning", "--reasoning-effort", "high", "--permission-mode", "acceptEdits"}, nil)
+func TestParseAgentEntrypointConfigForwardsAgentArguments(t *testing.T) {
+	cfg, err := parseAgentEntrypointConfig("claude", []string{"--model", "sonnet", "--permission-mode", "acceptEdits"}, nil)
 	if err != nil {
 		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
 	}
-	if cfg.LaunchSettings.ModelID != "reasoning" || cfg.LaunchSettings.ReasoningEffortID != "high" || cfg.LaunchSettings.PermissionModeID != "acceptEdits" {
-		t.Fatalf("launch settings = %+v", cfg.LaunchSettings)
+	if strings.Join(cfg.ProviderCommand, " ") != "claude-agent-acp --model sonnet --permission-mode acceptEdits" {
+		t.Fatalf("provider command = %v", cfg.ProviderCommand)
 	}
 }
 
-func TestParseWrapConfigParsesLaunchSettingFlags(t *testing.T) {
-	cfg, err := parseWrapConfig([]string{"--model", "balanced", "--permission-mode", "default"}, nil)
+func TestParseAgentEntrypointConfigKeepsWharfFlagsBeforeAgentArgs(t *testing.T) {
+	cfg, err := parseAgentEntrypointConfig("codex", []string{"--session", "--model", "gpt-5"}, nil)
 	if err != nil {
-		t.Fatalf("parseWrapConfig() error = %v", err)
+		t.Fatalf("parseAgentEntrypointConfig() error = %v", err)
 	}
-	if cfg.LaunchSettings.ModelID != "balanced" || cfg.LaunchSettings.PermissionModeID != "default" || cfg.LaunchSettings.ReasoningEffortID != "" {
-		t.Fatalf("launch settings = %+v", cfg.LaunchSettings)
+	if cfg.PairOnly || !cfg.Session {
+		t.Fatalf("config = %+v, want Session=true PairOnly=false", cfg)
+	}
+	if strings.Join(cfg.ProviderCommand, " ") != "codex-acp --model gpt-5" {
+		t.Fatalf("provider command = %v", cfg.ProviderCommand)
 	}
 }
