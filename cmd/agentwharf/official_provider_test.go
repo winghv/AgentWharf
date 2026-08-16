@@ -142,3 +142,34 @@ func TestPublishOfficialSettingsCapability(t *testing.T) {
 		t.Fatalf("capability payload is not canonical: %v", err)
 	}
 }
+
+func TestInjectedPromptTrackerDedupes(t *testing.T) {
+	tracker := &injectedPromptTracker{pending: make(map[string]int)}
+	tracker.add("hello")
+	if !tracker.consume("hello") {
+		t.Fatal("consume(hello) = false, want true")
+	}
+	if tracker.consume("hello") {
+		t.Fatal("second consume(hello) = true, want false")
+	}
+	if tracker.consume("other") {
+		t.Fatal("consume(other) = true, want false")
+	}
+}
+
+func TestTranscriptUserText(t *testing.T) {
+	line := transcriptJSON(t, map[string]any{
+		"type": "user", "uuid": "u1",
+		"message": map[string]any{"role": "user", "content": "hello"},
+	})
+	if got := transcriptUserText(line); got != "hello" {
+		t.Fatalf("transcriptUserText = %q, want hello", got)
+	}
+	assistant := transcriptJSON(t, map[string]any{
+		"type": "assistant", "uuid": "a1",
+		"message": map[string]any{"role": "assistant", "content": "hi"},
+	})
+	if got := transcriptUserText(assistant); got != "" {
+		t.Fatalf("transcriptUserText(assistant) = %q, want empty", got)
+	}
+}

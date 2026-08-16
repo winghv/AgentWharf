@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/creack/pty"
@@ -83,13 +84,14 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
 
 	mirrorDone := make(chan error, 1)
+	injected := &injectedPromptTracker{pending: make(map[string]int)}
 	go func() {
-		mirrorDone <- mirrorTranscript(runCtx, cfg, sessionID, writeFrame)
+		mirrorDone <- mirrorTranscript(runCtx, cfg, sessionID, writeFrame, injected)
 	}()
 
 	commandDone := make(chan error, 1)
 	go func() {
-		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, connection, writeFrame, ptmx)
+		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, connection, writeFrame, ptmx, injected)
 	}()
 
 	waitErr := cmd.Wait()
@@ -114,7 +116,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 // instructions into the running official CLI's PTY, so the Hub can drive the
 // same session the user is operating locally. It acks the command after the
 // prompt is written and keeps the proposal/credential machinery healthy.
-func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File) error {
+func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, injected *injectedPromptTracker) error {
 	accepted := newAcceptedCommandSet(2048)
 	for {
 		frame, err := connection.read(ctx)
@@ -165,6 +167,9 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 					return writeErr
 				}
 				continue
+			}
+			if injected != nil {
+				injected.add(text.String())
 			}
 			accepted.Add(typed.CommandID)
 			if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
@@ -221,7 +226,7 @@ func claudeTranscriptPath(cwd, sessionID string) (string, error) {
 	return filepath.Join(configDir, "projects", projectID, sessionID+".jsonl"), nil
 }
 
-func mirrorTranscript(ctx context.Context, cfg wrapConfig, sessionID string, writeFrame func(protocol.Frame) error) error {
+func mirrorTranscript(ctx context.Context, cfg wrapConfig, sessionID string, writeFrame func(protocol.Frame) error, injected *injectedPromptTracker) error {
 	cwd := cfg.WorkingDirectory
 	if cwd == "" {
 		cwd = "."
@@ -258,6 +263,11 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, sessionID string, wri
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			offset += int64(len(scanner.Bytes())) + 1
+			// Skip user messages that were injected from the Hub; they are already
+			// recorded by the Hub itself and would otherwise be mirrored twice.
+			if text := transcriptUserText(scanner.Bytes()); text != "" && injected != nil && injected.consume(text) {
+				continue
+			}
 			events, err := translateTranscriptLine(cfg.SessionID, scanner.Bytes())
 			if err != nil {
 				continue
@@ -405,4 +415,69 @@ func publishOfficialSettingsCapability(writeFrame func(protocol.Frame) error, se
 		return err
 	}
 	return writeFrame(&protocol.Event{Type: "session.settings.capabilities", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload})
+}
+
+// injectedPromptTracker remembers Hub-injected prompts so the transcript mirror
+// can skip the matching user message (which the Hub already recorded) instead of
+// publishing it a second time.
+type injectedPromptTracker struct {
+	mu      sync.Mutex
+	pending map[string]int
+}
+
+func (t *injectedPromptTracker) add(text string) {
+	if t == nil {
+		return
+	}
+	key := strings.TrimSpace(text)
+	if key == "" {
+		return
+	}
+	t.mu.Lock()
+	t.pending[key]++
+	t.mu.Unlock()
+}
+
+func (t *injectedPromptTracker) consume(text string) bool {
+	if t == nil {
+		return false
+	}
+	key := strings.TrimSpace(text)
+	if key == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.pending[key] == 0 {
+		return false
+	}
+	t.pending[key]--
+	if t.pending[key] == 0 {
+		delete(t.pending, key)
+	}
+	return true
+}
+
+// transcriptUserText returns the plain-text body of a user transcript entry, or
+// an empty string when the line is not a plain-text user message.
+func transcriptUserText(line []byte) string {
+	var raw map[string]any
+	if json.Unmarshal(line, &raw) != nil {
+		return ""
+	}
+	if stringFieldFromAny(raw["type"]) != "user" {
+		return ""
+	}
+	message, _ := raw["message"].(map[string]any)
+	if message == nil {
+		return ""
+	}
+	if stringFieldFromAny(message["role"]) != "user" {
+		return ""
+	}
+	text, ok := message["content"].(string)
+	if !ok {
+		return ""
+	}
+	return text
 }
