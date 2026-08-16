@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/winghv/agentwharf/protocol"
 )
@@ -22,9 +25,9 @@ func TestTranslateTranscriptUserMessage(t *testing.T) {
 		"type": "user", "uuid": "u1",
 		"message": map[string]any{"role": "user", "content": "hello"},
 	})
-	events, err := translateTranscriptLine("ses_1", line)
+	events, err := claudeProvider{}.translateLine("ses_1", line)
 	if err != nil {
-		t.Fatalf("translateTranscriptLine() error = %v", err)
+		t.Fatalf("translateLine() error = %v", err)
 	}
 	if len(events) != 1 || events[0].Type != "session.message" {
 		t.Fatalf("events = %+v", events)
@@ -48,9 +51,9 @@ func TestTranslateTranscriptAssistantToolCall(t *testing.T) {
 			map[string]any{"type": "tool_use", "id": "t1", "name": "Bash", "input": map[string]any{"cmd": "ls"}},
 		}},
 	})
-	events, err := translateTranscriptLine("ses_1", line)
+	events, err := claudeProvider{}.translateLine("ses_1", line)
 	if err != nil {
-		t.Fatalf("translateTranscriptLine() error = %v", err)
+		t.Fatalf("translateLine() error = %v", err)
 	}
 	var sawMessage, sawTool bool
 	for _, event := range events {
@@ -78,22 +81,28 @@ func TestTranslateTranscriptSkipsInternalEntries(t *testing.T) {
 		{"type": "summary", "summary": "x", "leafUuid": "u1"},
 		{"type": "system", "uuid": "u1"},
 	} {
-		events, err := translateTranscriptLine("ses_1", transcriptJSON(t, value))
+		events, err := claudeProvider{}.translateLine("ses_1", transcriptJSON(t, value))
 		if err != nil || len(events) != 0 {
-			t.Fatalf("translateTranscriptLine(%v) = %+v, %v", value, events, err)
+			t.Fatalf("translateLine(%v) = %+v, %v", value, events, err)
 		}
 	}
 }
 
-func TestOfficialAgentCommand(t *testing.T) {
-	if got := officialAgentCommand("claude"); got != "claude" {
-		t.Fatalf("officialAgentCommand(claude) = %q", got)
+func TestOfficialProviderForAgent(t *testing.T) {
+	if got := officialProviderForAgent("claude").command(); got != "claude" {
+		t.Fatalf("officialProviderForAgent(claude).command() = %q", got)
 	}
-	if got := officialAgentCommand("claude-code"); got != "claude" {
-		t.Fatalf("officialAgentCommand(claude-code) = %q", got)
+	if got := officialProviderForAgent("claude-code").command(); got != "claude" {
+		t.Fatalf("officialProviderForAgent(claude-code).command() = %q", got)
 	}
-	if got := officialAgentCommand("codex"); got != "codex" {
-		t.Fatalf("officialAgentCommand(codex) = %q", got)
+	if got := officialProviderForAgent("codex").command(); got != "codex" {
+		t.Fatalf("officialProviderForAgent(codex).command() = %q", got)
+	}
+	if got := officialProviderForAgent("gemini").command(); got != "gemini" {
+		t.Fatalf("officialProviderForAgent(gemini).command() = %q", got)
+	}
+	if got := officialProviderForAgent("unknown").command(); got != "unknown" {
+		t.Fatalf("officialProviderForAgent(unknown).command() = %q", got)
 	}
 }
 
@@ -110,17 +119,31 @@ func TestClaudeTranscriptPathUsesProjectSlug(t *testing.T) {
 	}
 }
 
-func TestParseOfficialLaunchArgs(t *testing.T) {
-	model, permission, reasoning := parseOfficialLaunchArgs([]string{
+func TestClaudeLaunchSettings(t *testing.T) {
+	settings := claudeProvider{}.launchSettings([]string{
 		"--model", "sonnet", "--permission-mode", "acceptEdits", "--reasoning-effort", "high",
 	})
-	if model != "sonnet" || permission != "acceptEdits" || reasoning != "high" {
-		t.Fatalf("parsed = (%q, %q, %q)", model, permission, reasoning)
+	if settings.model != "sonnet" || settings.permission != "acceptEdits" || settings.reasoning != "high" {
+		t.Fatalf("parsed = %+v", settings)
 	}
 
-	model, permission, reasoning = parseOfficialLaunchArgs([]string{"--model=opus", "--permission-mode=default"})
-	if model != "opus" || permission != "default" || reasoning != "" {
-		t.Fatalf("parsed = (%q, %q, %q)", model, permission, reasoning)
+	settings = claudeProvider{}.launchSettings([]string{"--model=opus", "--permission-mode=default"})
+	if settings.model != "opus" || settings.permission != "default" || settings.reasoning != "" {
+		t.Fatalf("parsed = %+v", settings)
+	}
+}
+
+func TestCodexLaunchSettings(t *testing.T) {
+	settings := codexProvider{}.launchSettings([]string{
+		"-m", "gpt-5", "-a", "never", "-c", "reasoning_effort=high",
+	})
+	if settings.model != "gpt-5" || settings.permission != "never" || settings.reasoning != "high" {
+		t.Fatalf("parsed = %+v", settings)
+	}
+
+	settings = codexProvider{}.launchSettings([]string{"-s", "read-only", "-c", "approval_policy=on-request"})
+	if settings.permission != "on-request" {
+		t.Fatalf("parsed permission = %+v", settings)
 	}
 }
 
@@ -132,7 +155,8 @@ func TestPublishOfficialSettingsCapability(t *testing.T) {
 		}
 		return nil
 	}
-	if err := publishOfficialSettingsCapability(write, "ses_1", []string{"--model", "sonnet", "--permission-mode", "acceptEdits"}); err != nil {
+	settings := launchSettings{model: "sonnet", permission: "acceptEdits"}
+	if err := publishOfficialSettingsCapability(write, "ses_1", settings); err != nil {
 		t.Fatalf("publishOfficialSettingsCapability() error = %v", err)
 	}
 	if len(frames) != 1 || frames[0].Type != "session.settings.capabilities" {
@@ -162,14 +186,100 @@ func TestTranscriptUserText(t *testing.T) {
 		"type": "user", "uuid": "u1",
 		"message": map[string]any{"role": "user", "content": "hello"},
 	})
-	if got := transcriptUserText(line); got != "hello" {
+	if got := (claudeProvider{}).transcriptUserText(line); got != "hello" {
 		t.Fatalf("transcriptUserText = %q, want hello", got)
 	}
 	assistant := transcriptJSON(t, map[string]any{
 		"type": "assistant", "uuid": "a1",
 		"message": map[string]any{"role": "assistant", "content": "hi"},
 	})
-	if got := transcriptUserText(assistant); got != "" {
+	if got := (claudeProvider{}).transcriptUserText(assistant); got != "" {
 		t.Fatalf("transcriptUserText(assistant) = %q, want empty", got)
+	}
+}
+
+func TestCodexTranslateLine(t *testing.T) {
+	user := transcriptJSON(t, map[string]any{
+		"timestamp": "2025-01-01T00:00:00Z",
+		"type":      "event_msg",
+		"payload":   map[string]any{"type": "user_message", "message": "hello"},
+	})
+	events, err := codexProvider{}.translateLine("ses_1", user)
+	if err != nil || len(events) != 1 || events[0].Type != "session.message" {
+		t.Fatalf("user events = %+v, %v", events, err)
+	}
+
+	commentary := transcriptJSON(t, map[string]any{
+		"type":    "event_msg",
+		"payload": map[string]any{"type": "agent_message", "phase": "commentary", "message": "thinking"},
+	})
+	events, err = codexProvider{}.translateLine("ses_1", commentary)
+	if err != nil || len(events) != 0 {
+		t.Fatalf("commentary events = %+v, %v", events, err)
+	}
+
+	agent := transcriptJSON(t, map[string]any{
+		"type":    "event_msg",
+		"payload": map[string]any{"type": "agent_message", "message": "done"},
+	})
+	events, err = codexProvider{}.translateLine("ses_1", agent)
+	if err != nil || len(events) != 1 || events[0].Type != "session.message" {
+		t.Fatalf("agent events = %+v, %v", events, err)
+	}
+
+	tool := transcriptJSON(t, map[string]any{
+		"type":    "response_item",
+		"payload": map[string]any{"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{}"},
+	})
+	events, err = codexProvider{}.translateLine("ses_1", tool)
+	if err != nil || len(events) != 1 || events[0].Type != "session.tool_call" {
+		t.Fatalf("tool events = %+v, %v", events, err)
+	}
+}
+
+func TestCodexTranscriptUserText(t *testing.T) {
+	user := transcriptJSON(t, map[string]any{
+		"type":    "event_msg",
+		"payload": map[string]any{"type": "user_message", "message": "hello"},
+	})
+	if got := (codexProvider{}).transcriptUserText(user); got != "hello" {
+		t.Fatalf("codex transcriptUserText = %q, want hello", got)
+	}
+	sessionMeta := transcriptJSON(t, map[string]any{
+		"type":    "session_meta",
+		"payload": map[string]any{"session_id": "s1"},
+	})
+	if got := (codexProvider{}).transcriptUserText(sessionMeta); got != "" {
+		t.Fatalf("codex transcriptUserText(session_meta) = %q, want empty", got)
+	}
+}
+
+func TestNewestCodexRollout(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "2025", "01", "02")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(sub, "rollout-old.jsonl")
+	recent := filepath.Join(sub, "rollout-recent.jsonl")
+	for _, p := range []string{old, recent} {
+		if err := os.WriteFile(p, []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(old, base, base); err != nil {
+		t.Fatal(err)
+	}
+	recentTime := base.Add(30 * time.Minute)
+	if err := os.Chtimes(recent, recentTime, recentTime); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := newestCodexRollout(dir, base.Add(-time.Minute))
+	if err != nil || !found {
+		t.Fatalf("newestCodexRollout = %q, %t, %v", got, found, err)
+	}
+	if got != recent {
+		t.Fatalf("got %q, want %q", got, recent)
 	}
 }

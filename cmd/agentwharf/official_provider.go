@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,12 +19,15 @@ import (
 	"golang.org/x/term"
 )
 
-// runOfficialProvider launches the native claude/codex CLI in the user's
-// terminal (the official interactive TUI) and mirrors its session transcript to
-// the Hub. It is used only for interactive wharf claude / wharf codex.
+// runOfficialProvider launches the native agent CLI in the user's terminal (the
+// official interactive TUI) and mirrors its session transcript to the Hub. It is
+// used only for interactive wharf claude / wharf codex. The agent-specific half
+// is provided by an agentProvider module (see agent_provider.go).
 func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubConnection, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	provider := officialProviderForAgent(cfg.Agent)
 
 	writeFrame := func(frame protocol.Frame) error { return connection.write(ctx, frame) }
 	// Reduce the working directory to its basename (like the ACP ready payload)
@@ -52,15 +54,15 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	}
 
 	sessionID := newSessionUUID()
-	command := officialAgentCommand(cfg.Agent)
 	args := append([]string{}, cfg.ProviderCommand[1:]...)
-	args = append(args, "--session-id", sessionID)
+	args = append(args, provider.sessionArgs(sessionID)...)
 
-	cmd := exec.CommandContext(ctx, command, args...)
+	launchTime := time.Now()
+	cmd := exec.CommandContext(ctx, provider.command(), args...)
 	cmd.Dir = cfg.WorkingDirectory
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		return fmt.Errorf("start official agent %s: %w", command, err)
+		return fmt.Errorf("start official agent %s: %w", provider.command(), err)
 	}
 	defer ptmx.Close()
 
@@ -87,7 +89,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	// Publish a read-only settings capability from the launch args so the Hub
 	// can display the model, permission, and reasoning for this Session.
 	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
-		_ = publishOfficialSettingsCapability(writeFrame, cfg.SessionID, cfg.ProviderCommand[1:])
+		_ = publishOfficialSettingsCapability(writeFrame, cfg.SessionID, provider.launchSettings(cfg.ProviderCommand[1:]))
 	}
 
 	// CLI output to the terminal, terminal input to the CLI.
@@ -97,7 +99,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	mirrorDone := make(chan error, 1)
 	injected := &injectedPromptTracker{pending: make(map[string]int)}
 	go func() {
-		mirrorDone <- mirrorTranscript(runCtx, cfg, sessionID, writeFrame, injected)
+		mirrorDone <- mirrorTranscript(runCtx, cfg, provider, sessionID, launchTime, writeFrame, injected)
 	}()
 
 	commandDone := make(chan error, 1)
@@ -192,19 +194,6 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 	}
 }
 
-func officialAgentCommand(agent string) string {
-	switch agent {
-	case "claude", "claude-code":
-		return "claude"
-	case "codex":
-		return "codex"
-	case "gemini":
-		return "gemini"
-	default:
-		return agent
-	}
-}
-
 func newSessionUUID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -215,34 +204,11 @@ func newSessionUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func claudeTranscriptPath(cwd, sessionID string) (string, error) {
-	abs, err := filepath.Abs(cwd)
-	if err != nil {
-		return "", err
-	}
-	projectID := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
-			return r
-		}
-		return '-'
-	}, abs)
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
-	if configDir == "" {
-		configDir = filepath.Join(home, ".claude")
-	}
-	return filepath.Join(configDir, "projects", projectID, sessionID+".jsonl"), nil
-}
-
-func mirrorTranscript(ctx context.Context, cfg wrapConfig, sessionID string, writeFrame func(protocol.Frame) error, injected *injectedPromptTracker) error {
-	cwd := cfg.WorkingDirectory
-	if cwd == "" {
-		cwd = "."
-	}
-	path, err := claudeTranscriptPath(cwd, sessionID)
+// mirrorTranscript tails the agent's transcript file and publishes new messages
+// to the Hub. The provider resolves the transcript path and translates lines;
+// the tailing, prompt dedup, and publish loop are shared.
+func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvider, sessionID string, launchTime time.Time, writeFrame func(protocol.Frame) error, injected *injectedPromptTracker) error {
+	path, err := provider.transcriptPath(ctx, cfg, sessionID, launchTime)
 	if err != nil {
 		return err
 	}
@@ -276,10 +242,10 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, sessionID string, wri
 			offset += int64(len(scanner.Bytes())) + 1
 			// Skip user messages that were injected from the Hub; they are already
 			// recorded by the Hub itself and would otherwise be mirrored twice.
-			if text := transcriptUserText(scanner.Bytes()); text != "" && injected != nil && injected.consume(text) {
+			if text := provider.transcriptUserText(scanner.Bytes()); text != "" && injected != nil && injected.consume(text) {
 				continue
 			}
-			events, err := translateTranscriptLine(cfg.SessionID, scanner.Bytes())
+			events, err := provider.translateLine(cfg.SessionID, scanner.Bytes())
 			if err != nil {
 				continue
 			}
@@ -297,51 +263,6 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, sessionID string, wri
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
-}
-
-func translateTranscriptLine(sessionID string, line []byte) ([]protocol.Event, error) {
-	var raw map[string]any
-	if err := json.Unmarshal(line, &raw); err != nil {
-		return nil, err
-	}
-	entryType := stringFieldFromAny(raw["type"])
-	if entryType != "user" && entryType != "assistant" {
-		return nil, nil
-	}
-	entryID := stringFieldFromAny(raw["uuid"])
-	message, _ := raw["message"].(map[string]any)
-	if message == nil {
-		return nil, nil
-	}
-	role := stringFieldFromAny(message["role"])
-	content := message["content"]
-
-	events := make([]protocol.Event, 0, 4)
-	if text, ok := content.(string); ok {
-		if text != "" {
-			events = append(events, transcriptMessageEvent(sessionID, entryID, role, text))
-		}
-		return events, nil
-	}
-	blocks, _ := content.([]any)
-	for _, item := range blocks {
-		block, _ := item.(map[string]any)
-		if block == nil {
-			continue
-		}
-		switch stringFieldFromAny(block["type"]) {
-		case "text":
-			if text := stringFieldFromAny(block["text"]); text != "" {
-				events = append(events, transcriptMessageEvent(sessionID, entryID, role, text))
-			}
-		case "tool_use":
-			id := stringFieldFromAny(block["id"])
-			name := stringFieldFromAny(block["name"])
-			input, _ := json.Marshal(block["input"])
-			events = append(events, transcriptToolCallEvent(sessionID, id, "start", name, input))
-		}
-	}
-	return events, nil
 }
 
 func transcriptMessageEvent(sessionID, messageID, role, text string) protocol.Event {
@@ -363,38 +284,11 @@ func transcriptToolCallEvent(sessionID, toolCallID, phase, name string, input []
 	return protocol.Event{Type: "session.tool_call", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload}
 }
 
-// parseOfficialLaunchArgs extracts model/permission/reasoning from the
-// passthrough agent arguments (e.g. --model sonnet --permission-mode acceptEdits).
-func parseOfficialLaunchArgs(args []string) (model, permission, reasoning string) {
-	for i := 0; i < len(args); i++ {
-		name, value, hasValue := strings.Cut(args[i], "=")
-		nextValue := func() string {
-			if hasValue {
-				return value
-			}
-			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-				i++
-				return args[i]
-			}
-			return ""
-		}
-		switch name {
-		case "--model", "-m":
-			model = nextValue()
-		case "--permission-mode":
-			permission = nextValue()
-		case "--reasoning-effort", "--effort":
-			reasoning = nextValue()
-		}
-	}
-	return model, permission, reasoning
-}
-
 // publishOfficialSettingsCapability publishes a read-only settings capability
 // reflecting the launch args so the Hub can display the model, permission, and
 // reasoning even though the official CLI has no mutable ACP controls.
-func publishOfficialSettingsCapability(writeFrame func(protocol.Frame) error, sessionID string, args []string) error {
-	model, permission, reasoning := parseOfficialLaunchArgs(args)
+func publishOfficialSettingsCapability(writeFrame func(protocol.Frame) error, sessionID string, settings launchSettings) error {
+	model, permission, reasoning := settings.model, settings.permission, settings.reasoning
 	if model == "" {
 		model = "default"
 	}
@@ -467,28 +361,4 @@ func (t *injectedPromptTracker) consume(text string) bool {
 		delete(t.pending, key)
 	}
 	return true
-}
-
-// transcriptUserText returns the plain-text body of a user transcript entry, or
-// an empty string when the line is not a plain-text user message.
-func transcriptUserText(line []byte) string {
-	var raw map[string]any
-	if json.Unmarshal(line, &raw) != nil {
-		return ""
-	}
-	if stringFieldFromAny(raw["type"]) != "user" {
-		return ""
-	}
-	message, _ := raw["message"].(map[string]any)
-	if message == nil {
-		return ""
-	}
-	if stringFieldFromAny(message["role"]) != "user" {
-		return ""
-	}
-	text, ok := message["content"].(string)
-	if !ok {
-		return ""
-	}
-	return text
 }
