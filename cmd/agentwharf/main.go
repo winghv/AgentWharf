@@ -444,6 +444,8 @@ type wrapConfig struct {
 	WorkingDirectory   string
 	LaunchSettings     wrapLaunchSettings
 	Stderr             io.Writer
+	Stdin              io.Reader
+	Interactive        bool
 }
 
 type heartbeatConfig struct {
@@ -897,6 +899,15 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	}
 	if pairOutput != nil {
 		cfg.Stderr = pairOutput
+	}
+	// A character-device stdin means a real terminal: run an interactive local
+	// renderer plus input reader so the user operates the agent inline while the
+	// Hub mirrors the same Session. Piped/daemon stdin stays headless.
+	if file, ok := stdin.(*os.File); ok {
+		if info, err := file.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
+			cfg.Interactive = true
+			cfg.Stdin = stdin
+		}
 	}
 	if err := validateProviderCommand(cfg); err != nil {
 		return cfg, err
@@ -1839,6 +1850,40 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 	responses := newACPResponseRouter()
 	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
 	rotation := newCredentialRotationManager(runCtx, authority, writeFrame, connection.credentials, connection.currentAuthority)
+
+	// Interactive terminals render the same translated events locally and read
+	// the user's inline prompts/permissions, while the Hub keeps mirroring.
+	var terminal *localTerminal
+	if cfg.Interactive {
+		terminal = newLocalTerminal(cfg.Stderr, pendingPermissions, &permissionMu, nil, nil)
+		terminal.promptOut = func(text string) error {
+			payload, err := json.Marshal(map[string]any{"content": []map[string]string{{"kind": "text", "text": text}}})
+			if err != nil {
+				return err
+			}
+			prompt, err := acpPromptFromSessionSend(payload)
+			if err != nil {
+				return err
+			}
+			return writeACPRequest(stdinWriter, terminal.nextPromptID(), "session/prompt", map[string]any{
+				"sessionId": providerSessionID,
+				"prompt":    prompt,
+			})
+		}
+		terminal.permissionOut = func(requestID, decision string) error {
+			payload, err := json.Marshal(map[string]any{"request_id": requestID, "decision": decision})
+			if err != nil {
+				return err
+			}
+			pending, result, err := acpPermissionResult(payload, pendingPermissions, &permissionMu)
+			if err != nil {
+				return err
+			}
+			return writeACPResult(stdinWriter, pending.RPCID, result)
+		}
+		go terminal.readInput(runCtx, cfg.Stdin)
+	}
+
 	go func() {
 		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, responses, func(line []byte, sourceSequence uint64) error {
 			trackACPPermissionRequest(line, pendingPermissions, &permissionMu)
@@ -1853,6 +1898,9 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 			}
 			return nil
 		}, func(event protocol.Event) error {
+			if terminal != nil {
+				terminal.render(event)
+			}
 			masked, err := maskEvent(masker, event)
 			if err != nil {
 				return err
