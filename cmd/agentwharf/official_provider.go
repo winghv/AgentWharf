@@ -6,14 +6,17 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/winghv/agentwharf/adapter/core"
 	"github.com/winghv/agentwharf/protocol"
+	"golang.org/x/term"
 )
 
 // runOfficialProvider launches the native claude/codex CLI in the user's
@@ -29,27 +32,6 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 		return writeFrame(&protocol.Event{Type: "session.state", SessionID: cfg.SessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload})
 	}
 
-	readerDone := make(chan error, 1)
-	go func() {
-		for {
-			frame, err := connection.read(ctx)
-			if err != nil {
-				readerDone <- ignoreContextError(err)
-				return
-			}
-			switch typed := frame.(type) {
-			case *protocol.Ping:
-				if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
-					readerDone <- err
-					return
-				}
-			case *protocol.Error:
-				readerDone <- fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
-				return
-			}
-		}
-	}()
-
 	if err := publishState("starting"); err != nil {
 		return err
 	}
@@ -60,12 +42,17 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	args = append(args, "--session-id", sessionID)
 
 	cmd := exec.CommandContext(ctx, command, args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	cmd.Dir = cfg.WorkingDirectory
-	if err := cmd.Start(); err != nil {
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
 		return fmt.Errorf("start official agent %s: %w", command, err)
+	}
+	defer ptmx.Close()
+
+	// Raw mode so the official TUI keeps single-key interaction through our PTY.
+	oldState, rawErr := term.MakeRaw(int(os.Stdin.Fd()))
+	if rawErr == nil {
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
 	if err := publishState("ready"); err != nil {
@@ -74,9 +61,18 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 		return err
 	}
 
+	// CLI output to the terminal, terminal input to the CLI.
+	go func() { _, _ = io.Copy(os.Stdout, ptmx) }()
+	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
+
 	mirrorDone := make(chan error, 1)
 	go func() {
 		mirrorDone <- mirrorTranscript(ctx, cfg, sessionID, writeFrame)
+	}()
+
+	commandDone := make(chan error, 1)
+	go func() {
+		commandDone <- forwardHubCommandsToOfficialCLI(ctx, connection, writeFrame, ptmx)
 	}()
 
 	waitErr := cmd.Wait()
@@ -87,8 +83,75 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	case <-mirrorDone:
 	case <-ctx.Done():
 	}
-	_ = ignoreContextError(<-readerDone)
+	select {
+	case <-commandDone:
+	case <-ctx.Done():
+	}
 	return nil
+}
+
+// forwardHubCommandsToOfficialCLI reads Hub frames and injects session.send
+// instructions into the running official CLI's PTY, so the Hub can drive the
+// same session the user is operating locally. It acks the command after the
+// prompt is written and keeps the proposal/credential machinery healthy.
+func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File) error {
+	accepted := newAcceptedCommandSet(2048)
+	for {
+		frame, err := connection.read(ctx)
+		if err != nil {
+			return ignoreContextError(err)
+		}
+		switch typed := frame.(type) {
+		case *protocol.Ping:
+			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
+				return err
+			}
+		case *protocol.Command:
+			if accepted.Contains(typed.CommandID) {
+				if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
+					return err
+				}
+				continue
+			}
+			if typed.Type != protocol.CommandSessionSend {
+				if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: "unsupported"}); err != nil {
+					return err
+				}
+				continue
+			}
+			prompt, err := acpPromptFromSessionSend(typed.Payload)
+			if err != nil {
+				if writeErr := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: err.Error()}); writeErr != nil {
+					return writeErr
+				}
+				continue
+			}
+			var text strings.Builder
+			for _, part := range prompt {
+				if t, ok := part["text"].(string); ok {
+					text.WriteString(t)
+				}
+			}
+			if text.Len() == 0 {
+				if writeErr := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: "empty prompt"}); writeErr != nil {
+					return writeErr
+				}
+				continue
+			}
+			if _, err := ptmx.Write([]byte(text.String() + "\n")); err != nil {
+				if writeErr := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: err.Error()}); writeErr != nil {
+					return writeErr
+				}
+				continue
+			}
+			accepted.Add(typed.CommandID)
+			if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
+				return err
+			}
+		case *protocol.Error:
+			return fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
+		}
+	}
 }
 
 func officialAgentCommand(agent string) string {
