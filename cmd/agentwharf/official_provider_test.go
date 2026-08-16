@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/winghv/agentwharf/protocol"
 )
 
 func transcriptJSON(t *testing.T, value map[string]any) []byte {
@@ -105,5 +107,38 @@ func TestClaudeTranscriptPathUsesProjectSlug(t *testing.T) {
 	}
 	if !strings.Contains(path, "-Users-me-proj") {
 		t.Fatalf("path = %q, want project slug", path)
+	}
+}
+
+func TestParseOfficialLaunchArgs(t *testing.T) {
+	model, permission, reasoning := parseOfficialLaunchArgs([]string{
+		"--model", "sonnet", "--permission-mode", "acceptEdits", "--reasoning-effort", "high",
+	})
+	if model != "sonnet" || permission != "acceptEdits" || reasoning != "high" {
+		t.Fatalf("parsed = (%q, %q, %q)", model, permission, reasoning)
+	}
+
+	model, permission, reasoning = parseOfficialLaunchArgs([]string{"--model=opus", "--permission-mode=default"})
+	if model != "opus" || permission != "default" || reasoning != "" {
+		t.Fatalf("parsed = (%q, %q, %q)", model, permission, reasoning)
+	}
+}
+
+func TestPublishOfficialSettingsCapability(t *testing.T) {
+	var frames []protocol.Event
+	write := func(frame protocol.Frame) error {
+		if event, ok := frame.(*protocol.Event); ok {
+			frames = append(frames, *event)
+		}
+		return nil
+	}
+	if err := publishOfficialSettingsCapability(write, "ses_1", []string{"--model", "sonnet", "--permission-mode", "acceptEdits"}); err != nil {
+		t.Fatalf("publishOfficialSettingsCapability() error = %v", err)
+	}
+	if len(frames) != 1 || frames[0].Type != "session.settings.capabilities" {
+		t.Fatalf("frames = %+v", frames)
+	}
+	if _, err := protocol.DecodeSettingsCapabilityPayload(frames[0].Payload); err != nil {
+		t.Fatalf("capability payload is not canonical: %v", err)
 	}
 }

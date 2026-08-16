@@ -82,6 +82,12 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 		return err
 	}
 
+	// Publish a read-only settings capability from the launch args so the Hub
+	// can display the model, permission, and reasoning for this Session.
+	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
+		_ = publishOfficialSettingsCapability(writeFrame, cfg.SessionID, cfg.ProviderCommand[1:])
+	}
+
 	// CLI output to the terminal, terminal input to the CLI.
 	go func() { _, _ = io.Copy(os.Stdout, ptmx) }()
 	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
@@ -344,4 +350,69 @@ func transcriptToolCallEvent(sessionID, toolCallID, phase, name string, input []
 		"input":        json.RawMessage(input),
 	})
 	return protocol.Event{Type: "session.tool_call", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload}
+}
+
+// parseOfficialLaunchArgs extracts model/permission/reasoning from the
+// passthrough agent arguments (e.g. --model sonnet --permission-mode acceptEdits).
+func parseOfficialLaunchArgs(args []string) (model, permission, reasoning string) {
+	for i := 0; i < len(args); i++ {
+		name, value, hasValue := strings.Cut(args[i], "=")
+		nextValue := func() string {
+			if hasValue {
+				return value
+			}
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				return args[i]
+			}
+			return ""
+		}
+		switch name {
+		case "--model", "-m":
+			model = nextValue()
+		case "--permission-mode":
+			permission = nextValue()
+		case "--reasoning-effort", "--effort":
+			reasoning = nextValue()
+		}
+	}
+	return model, permission, reasoning
+}
+
+// publishOfficialSettingsCapability publishes a read-only settings capability
+// reflecting the launch args so the Hub can display the model, permission, and
+// reasoning even though the official CLI has no mutable ACP controls.
+func publishOfficialSettingsCapability(writeFrame func(protocol.Frame) error, sessionID string, args []string) error {
+	model, permission, reasoning := parseOfficialLaunchArgs(args)
+	if model == "" {
+		model = "default"
+	}
+	if permission == "" {
+		permission = "default"
+	}
+	capability := protocol.SettingsCapabilityPayload{
+		SchemaVersion:                 protocol.SettingsCapabilitySchemaVersion,
+		Models:                        []protocol.SettingsCapabilityChoice{{ID: model, Label: model}},
+		PermissionModes:               []protocol.SettingsCapabilityChoice{{ID: permission, Label: permission}},
+		EffectiveModelID:              model,
+		EffectivePermissionModeID:     permission,
+		ModelChange:                   "read_only",
+		ReasoningEffortChange:         "unsupported",
+		PermissionChange:              "read_only",
+		ModelReadOnlyReason:           stringPointer("official_cli"),
+		ReasoningEffortReadOnlyReason: stringPointer("provider_unsupported"),
+		PermissionReadOnlyReason:      stringPointer("official_cli"),
+	}
+	if reasoning != "" {
+		capability.ReasoningEfforts = []protocol.SettingsCapabilityChoice{{ID: reasoning, Label: reasoning}}
+		capability.EffectiveReasoningEffortID = stringPointer(reasoning)
+		capability.ReasoningEffortChange = "read_only"
+		capability.ReasoningEffortReadOnlyReason = stringPointer("official_cli")
+	}
+	capability.Fingerprint = protocol.SettingsCapabilityFingerprint(capability)
+	payload, err := json.Marshal(capability)
+	if err != nil {
+		return err
+	}
+	return writeFrame(&protocol.Event{Type: "session.settings.capabilities", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload})
 }
