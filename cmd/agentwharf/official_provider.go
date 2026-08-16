@@ -9,8 +9,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -23,6 +25,9 @@ import (
 // terminal (the official interactive TUI) and mirrors its session transcript to
 // the Hub. It is used only for interactive wharf claude / wharf codex.
 func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubConnection, masker *core.EventMasker, metrics *core.AdapterMetrics) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	writeFrame := func(frame protocol.Frame) error { return connection.write(ctx, frame) }
 	publishState := func(state string) error {
 		payload, err := json.Marshal(map[string]any{"state": state, "provider": cfg.Provider})
@@ -49,6 +54,22 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	}
 	defer ptmx.Close()
 
+	// Match the PTY to the user's terminal so the official TUI adapts its
+	// layout, then keep it in sync on window resize.
+	if width, height, sizeErr := term.GetSize(int(os.Stdin.Fd())); sizeErr == nil {
+		_ = pty.Setsize(ptmx, &pty.Winsize{Rows: uint16(height), Cols: uint16(width)})
+	}
+	resizeCh := make(chan os.Signal, 1)
+	signal.Notify(resizeCh, syscall.SIGWINCH)
+	defer signal.Stop(resizeCh)
+	go func() {
+		for range resizeCh {
+			if width, height, sizeErr := term.GetSize(int(os.Stdin.Fd())); sizeErr == nil {
+				_ = pty.Setsize(ptmx, &pty.Winsize{Rows: uint16(height), Cols: uint16(width)})
+			}
+		}
+	}()
+
 	// Raw mode so the official TUI keeps single-key interaction through our PTY.
 	oldState, rawErr := term.MakeRaw(int(os.Stdin.Fd()))
 	if rawErr == nil {
@@ -67,15 +88,18 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 
 	mirrorDone := make(chan error, 1)
 	go func() {
-		mirrorDone <- mirrorTranscript(ctx, cfg, sessionID, writeFrame)
+		mirrorDone <- mirrorTranscript(runCtx, cfg, sessionID, writeFrame)
 	}()
 
 	commandDone := make(chan error, 1)
 	go func() {
-		commandDone <- forwardHubCommandsToOfficialCLI(ctx, connection, writeFrame, ptmx)
+		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, connection, writeFrame, ptmx)
 	}()
 
 	waitErr := cmd.Wait()
+	// The official CLI has exited: stop the mirror/command loops so this returns
+	// promptly instead of hanging on their blocking reads/polls.
+	cancel()
 	_ = publishState("ended")
 	_ = ignoreContextError(waitErr)
 
@@ -138,7 +162,9 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 				}
 				continue
 			}
-			if _, err := ptmx.Write([]byte(text.String() + "\n")); err != nil {
+			// Enter is 0x0D in raw mode; 0x0A is the newline key, so sending \n
+			// only inserts a line break without submitting the prompt.
+			if _, err := ptmx.Write([]byte(text.String() + "\r")); err != nil {
 				if writeErr := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: err.Error()}); writeErr != nil {
 					return writeErr
 				}
