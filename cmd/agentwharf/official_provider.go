@@ -9,10 +9,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -59,16 +57,8 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	if width, height, sizeErr := term.GetSize(int(os.Stdin.Fd())); sizeErr == nil {
 		_ = pty.Setsize(ptmx, &pty.Winsize{Rows: uint16(height), Cols: uint16(width)})
 	}
-	resizeCh := make(chan os.Signal, 1)
-	signal.Notify(resizeCh, syscall.SIGWINCH)
-	defer signal.Stop(resizeCh)
-	go func() {
-		for range resizeCh {
-			if width, height, sizeErr := term.GetSize(int(os.Stdin.Fd())); sizeErr == nil {
-				_ = pty.Setsize(ptmx, &pty.Winsize{Rows: uint16(height), Cols: uint16(width)})
-			}
-		}
-	}()
+	stopResize := watchTerminalResize(ptmx)
+	defer stopResize()
 
 	// Raw mode so the official TUI keeps single-key interaction through our PTY.
 	oldState, rawErr := term.MakeRaw(int(os.Stdin.Fd()))
