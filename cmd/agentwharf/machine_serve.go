@@ -46,18 +46,21 @@ type machineServeConfig struct {
 // claim exchange. It carries only this machine's own session credentials and
 // the instruction; it is never logged and never leaves the machine.
 type machineServeDispatch struct {
-	ClaimID          string `json:"claim_id"`
-	TaskID           string `json:"task_id"`
-	RunID            string `json:"run_id"`
-	SessionID        string `json:"session_id"`
-	Provider         string `json:"provider"`
-	HubWSURL         string `json:"hub_ws_url"`
-	AdapterToken     string `json:"adapter_token"`
-	ClientToken      string `json:"client_token"`
-	FirstInstruction string `json:"first_instruction"`
-	WorkingDirectory string `json:"working_directory"`
-	AdapterExpiresAt string `json:"adapter_expires_at"`
-	ClientExpiresAt  string `json:"client_expires_at"`
+	ClaimID           string `json:"claim_id"`
+	TaskID            string `json:"task_id"`
+	RunID             string `json:"run_id"`
+	SessionID         string `json:"session_id"`
+	Provider          string `json:"provider"`
+	HubWSURL          string `json:"hub_ws_url"`
+	AdapterToken      string `json:"adapter_token"`
+	ClientToken       string `json:"client_token"`
+	FirstInstruction  string `json:"first_instruction"`
+	WorkingDirectory  string `json:"working_directory"`
+	ModelID           string `json:"model_id"`
+	ReasoningEffortID string `json:"reasoning_effort_id"`
+	PermissionModeID  string `json:"permission_mode_id"`
+	AdapterExpiresAt  string `json:"adapter_expires_at"`
+	ClientExpiresAt   string `json:"client_expires_at"`
 }
 
 type machinePendingClaim struct {
@@ -76,16 +79,19 @@ type machinePendingClaimsResponse struct {
 
 type machineAutoExchangeResponse struct {
 	Data struct {
-		SessionID        string `json:"session_id"`
-		Provider         string `json:"provider"`
-		HubWSURL         string `json:"hub_ws_url"`
-		AdapterToken     string `json:"adapter_token"`
-		ClientToken      string `json:"client_token"`
-		FirstInstruction string `json:"first_instruction"`
-		WorkingDirectory string `json:"working_directory"`
-		Delivery         string `json:"delivery"`
-		AdapterExpiresAt string `json:"adapter_expires_at"`
-		ClientExpiresAt  string `json:"client_expires_at"`
+		SessionID         string `json:"session_id"`
+		Provider          string `json:"provider"`
+		HubWSURL          string `json:"hub_ws_url"`
+		AdapterToken      string `json:"adapter_token"`
+		ClientToken       string `json:"client_token"`
+		FirstInstruction  string `json:"first_instruction"`
+		WorkingDirectory  string `json:"working_directory"`
+		ModelID           string `json:"model_id"`
+		ReasoningEffortID string `json:"reasoning_effort_id"`
+		PermissionModeID  string `json:"permission_mode_id"`
+		Delivery          string `json:"delivery"`
+		AdapterExpiresAt  string `json:"adapter_expires_at"`
+		ClientExpiresAt   string `json:"client_expires_at"`
 	} `json:"data"`
 }
 
@@ -329,7 +335,7 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 	restarts := 0
 	delay := machineServeAdapterRestartInitial
 	for {
-		done := runAdapter(ctx, adapterCfg)
+		done := runAdapter(ctx, adapterCfg, stderr)
 		select {
 		case <-ctx.Done():
 			return
@@ -360,10 +366,10 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 	}
 }
 
-func runAdapter(ctx context.Context, cfg wrapConfig) <-chan error {
+func runAdapter(ctx context.Context, cfg wrapConfig, stderr io.Writer) <-chan error {
 	done := make(chan error, 1)
 	go func() {
-		_, err := runWrap(ctx, cfg, strings.NewReader(""), io.Discard)
+		_, err := runWrap(ctx, cfg, strings.NewReader(""), stderr)
 		done <- err
 	}()
 	return done
@@ -392,18 +398,21 @@ func exchangeAutoMachineClaim(ctx context.Context, client *http.Client, credenti
 	adapterExpiresAt := data.AdapterExpiresAt
 	clientExpiresAt := data.ClientExpiresAt
 	return &machineServeDispatch{
-		ClaimID:          claim.ClaimID,
-		TaskID:           claim.TaskID,
-		RunID:            claim.RunID,
-		SessionID:        data.SessionID,
-		Provider:         data.Provider,
-		HubWSURL:         data.HubWSURL,
-		AdapterToken:     data.AdapterToken,
-		ClientToken:      data.ClientToken,
-		FirstInstruction: data.FirstInstruction,
-		WorkingDirectory: data.WorkingDirectory,
-		AdapterExpiresAt: adapterExpiresAt,
-		ClientExpiresAt:  clientExpiresAt,
+		ClaimID:           claim.ClaimID,
+		TaskID:            claim.TaskID,
+		RunID:             claim.RunID,
+		SessionID:         data.SessionID,
+		Provider:          data.Provider,
+		HubWSURL:          data.HubWSURL,
+		AdapterToken:      data.AdapterToken,
+		ClientToken:       data.ClientToken,
+		FirstInstruction:  data.FirstInstruction,
+		WorkingDirectory:  data.WorkingDirectory,
+		ModelID:           data.ModelID,
+		ReasoningEffortID: data.ReasoningEffortID,
+		PermissionModeID:  data.PermissionModeID,
+		AdapterExpiresAt:  adapterExpiresAt,
+		ClientExpiresAt:   clientExpiresAt,
 	}, nil
 }
 
@@ -534,6 +543,7 @@ func serveWrapConfig(handoff machineServeDispatch, startupSmoke bool) wrapConfig
 		ProtocolVersion:  protocol.HubProtocolVersion,
 		StartupSmoke:     startupSmoke,
 		WorkingDirectory: handoff.WorkingDirectory,
+		LaunchSettings:   wrapLaunchSettings{ModelID: handoff.ModelID, ReasoningEffortID: handoff.ReasoningEffortID, PermissionModeID: handoff.PermissionModeID},
 	}
 }
 

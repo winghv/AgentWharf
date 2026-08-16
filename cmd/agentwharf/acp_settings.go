@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -826,6 +827,105 @@ func reconcileACPSettingsExecution(execution acpSettingsExecution, current acpSe
 		execution.ReasonCode = stringPointer("provider_mismatched_effective")
 	}
 	return execution
+}
+
+// applyACPLaunchSettings applies the requested launch settings to the freshly
+// created ACP session before the Adapter publishes its initial capability and
+// marks the Provider ready. It is best-effort: each requested value is validated
+// against the advertised capability and any unsupported, unavailable, or
+// provider-rejected value falls back to the provider default with a warning
+// instead of failing the launch. The tracker is updated from the authoritative
+// set_config_option readback so the subsequently published capability reflects
+// the effective settings.
+func applyACPLaunchSettings(ctx context.Context, tracker *acpSettingsTracker, providerSessionID string, stdin io.Writer, scanner *bufio.Scanner, settings wrapLaunchSettings, warn io.Writer) {
+	if tracker == nil || stdin == nil || scanner == nil || !settings.requested() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, acpSettingsOperationTimeout)
+	defer cancel()
+
+	state, available := tracker.Current()
+	if !available {
+		warnLaunchSettingSkipped(warn, "settings", "", "provider capability unavailable")
+		return
+	}
+
+	type launchMutation struct {
+		kind     string
+		value    string
+		configID string
+	}
+	var mutations []launchMutation
+	request := func(kind, value, configID string, allowed, contains, matches bool) {
+		if value == "" {
+			return
+		}
+		if !allowed {
+			warnLaunchSettingSkipped(warn, kind, value, "provider_read_only")
+			return
+		}
+		if !contains {
+			warnLaunchSettingSkipped(warn, kind, value, "settings_unavailable")
+			return
+		}
+		if matches {
+			return
+		}
+		if configID == "" {
+			warnLaunchSettingSkipped(warn, kind, value, "settings_unavailable")
+			return
+		}
+		mutations = append(mutations, launchMutation{kind: kind, value: value, configID: configID})
+	}
+
+	request(acpModelCategory, settings.ModelID, state.ModelConfigID,
+		state.Capability.ModelChange == "allowed", settingsChoiceContains(state.Capability.Models, settings.ModelID),
+		settings.ModelID == state.Capability.EffectiveModelID)
+	request(acpReasoningCategory, settings.ReasoningEffortID, state.ReasoningConfigID,
+		state.Capability.ReasoningEffortChange == "allowed", settingsChoiceContains(state.Capability.ReasoningEfforts, settings.ReasoningEffortID),
+		state.Capability.EffectiveReasoningEffortID != nil && settings.ReasoningEffortID == *state.Capability.EffectiveReasoningEffortID)
+	request(acpPermissionCategory, settings.PermissionModeID, state.PermissionConfigID,
+		state.Capability.PermissionChange == "allowed", settingsChoiceContains(state.Capability.PermissionModes, settings.PermissionModeID),
+		settings.PermissionModeID == state.Capability.EffectivePermissionModeID)
+
+	var nextID int64
+	var sequence uint64
+	for _, mutation := range mutations {
+		if err := ctx.Err(); err != nil {
+			warnLaunchSettingSkipped(warn, mutation.kind, mutation.value, err.Error())
+			return
+		}
+		nextID++
+		if err := writeACPRequest(stdin, nextID, acpSetConfigOptionMethod, map[string]any{
+			"sessionId": providerSessionID,
+			"configId":  mutation.configID,
+			"value":     mutation.value,
+		}); err != nil {
+			warnLaunchSettingSkipped(warn, mutation.kind, mutation.value, err.Error())
+			return
+		}
+		result, err := readACPResponse(ctx, scanner, nextID)
+		if err != nil {
+			warnLaunchSettingSkipped(warn, mutation.kind, mutation.value, err.Error())
+			return
+		}
+		sequence++
+		if _, _, err := tracker.UpdateFromResult(result, sequence); err != nil {
+			warnLaunchSettingSkipped(warn, mutation.kind, mutation.value, err.Error())
+			return
+		}
+	}
+}
+
+func warnLaunchSettingSkipped(warn io.Writer, kind, value, reason string) {
+	if warn == nil {
+		return
+	}
+	if value != "" {
+		_, _ = fmt.Fprintf(warn, "wharf: launch setting %s=%s was not applied: %s\n", kind, value, reason)
+		return
+	}
+	_, _ = fmt.Fprintf(warn, "wharf: launch settings were not applied: %s\n", reason)
 }
 
 func publishACPSettingsCapability(writeFrame func(protocol.Frame) error, sessionID string, state acpSettingsState) error {

@@ -580,3 +580,94 @@ func testACPSettingsResponse(id any, model, mode string) []byte {
 	})
 	return []byte(strings.TrimSpace(string(encoded)))
 }
+
+func TestApplyACPLaunchSettingsAppliesModelReasoningPermission(t *testing.T) {
+	tracker := newACPSettingsTracker(map[string]any{"configOptions": testACPConfigOptions("balanced", "ask", "medium")})
+	if _, ok := tracker.Current(); !ok {
+		t.Fatal("settings capability unavailable")
+	}
+	reqReader, reqWriter := io.Pipe()
+	defer reqReader.Close()
+	defer reqWriter.Close()
+	respReader, respWriter := io.Pipe()
+	defer respReader.Close()
+	defer respWriter.Close()
+	scanner := bufio.NewScanner(respReader)
+
+	providerDone := make(chan error, 1)
+	go func() {
+		reqScanner := bufio.NewScanner(reqReader)
+		model, mode, reasoning := "balanced", "ask", "medium"
+		for i := 0; i < 3; i++ {
+			request := readACPSettingsTestRequest(reqScanner)
+			if request == nil {
+				providerDone <- errors.New("provider received no request")
+				return
+			}
+			params, _ := request["params"].(map[string]any)
+			configID := stringFieldFromAny(params["configId"])
+			value := stringFieldFromAny(params["value"])
+			switch configID {
+			case "model":
+				model = value
+			case "mode":
+				mode = value
+			case "reasoning_effort":
+				reasoning = value
+			default:
+				providerDone <- fmt.Errorf("unexpected config id %q", configID)
+				return
+			}
+			encoded, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0", "id": request["id"],
+				"result": map[string]any{"configOptions": testACPConfigOptions(model, mode, reasoning)},
+			})
+			if err != nil {
+				providerDone <- err
+				return
+			}
+			if _, err := respWriter.Write(append(encoded, '\n')); err != nil {
+				providerDone <- err
+				return
+			}
+		}
+		providerDone <- nil
+	}()
+
+	var warnings strings.Builder
+	applyACPLaunchSettings(context.Background(), tracker, "acp_ses_1", reqWriter, scanner, wrapLaunchSettings{
+		ModelID: "reasoning", ReasoningEffortID: "high", PermissionModeID: "workspace",
+	}, &warnings)
+
+	if err := <-providerDone; err != nil {
+		t.Fatal(err)
+	}
+	if warnings.Len() != 0 {
+		t.Fatalf("unexpected warnings: %s", warnings.String())
+	}
+	applied, ok := tracker.Current()
+	if !ok {
+		t.Fatal("tracker lost capability after launch settings")
+	}
+	if applied.Capability.EffectiveModelID != "reasoning" ||
+		applied.Capability.EffectivePermissionModeID != "workspace" ||
+		applied.Capability.EffectiveReasoningEffortID == nil || *applied.Capability.EffectiveReasoningEffortID != "high" {
+		t.Fatalf("applied capability = %+v", applied.Capability)
+	}
+}
+
+func TestApplyACPLaunchSettingsWarnsAndSkipsUnsupportedValues(t *testing.T) {
+	tracker := newACPSettingsTracker(map[string]any{"configOptions": testACPConfigOptions("balanced", "ask")})
+	var warnings strings.Builder
+	applyACPLaunchSettings(context.Background(), tracker, "acp_ses_1", io.Discard, bufio.NewScanner(strings.NewReader("")), wrapLaunchSettings{
+		ModelID: "nonexistent", ReasoningEffortID: "high",
+	}, &warnings)
+	text := warnings.String()
+	if !strings.Contains(text, "model=nonexistent") || !strings.Contains(text, "reasoning_effort=high") {
+		t.Fatalf("warnings = %q", text)
+	}
+	state, ok := tracker.Current()
+	if !ok || state.Capability.EffectiveModelID != "balanced" {
+		t.Fatalf("tracker state changed without a valid mutation: %+v ok=%v", state.Capability, ok)
+	}
+}

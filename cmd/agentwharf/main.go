@@ -170,12 +170,15 @@ type machineTaskClaimExchangeRequest struct {
 
 type machineTaskClaimExchangeResponse struct {
 	Data struct {
-		SessionID    string `json:"session_id"`
-		Provider     string `json:"provider"`
-		HubWSURL     string `json:"hub_ws_url"`
-		AdapterToken string `json:"adapter_token"`
-		ExpiresAt    string `json:"expires_at"`
-		Session      struct {
+		SessionID         string `json:"session_id"`
+		Provider          string `json:"provider"`
+		HubWSURL          string `json:"hub_ws_url"`
+		AdapterToken      string `json:"adapter_token"`
+		ExpiresAt         string `json:"expires_at"`
+		ModelID           string `json:"model_id"`
+		ReasoningEffortID string `json:"reasoning_effort_id"`
+		PermissionModeID  string `json:"permission_mode_id"`
+		Session           struct {
 			Provider string `json:"provider"`
 		} `json:"session"`
 	} `json:"data"`
@@ -266,6 +269,7 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		ProviderCommand: defaultProviderCommand(agent),
 		ProtocolVersion: protocol.HubProtocolVersion,
 		StartupSmoke:    startupSmoke,
+		LaunchSettings:  wrapLaunchSettings{ModelID: handoff.Data.ModelID, ReasoningEffortID: handoff.Data.ReasoningEffortID, PermissionModeID: handoff.Data.PermissionModeID},
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if _, err := runWrap(ctx, cfg, strings.NewReader(""), stderr); err == nil {
@@ -404,6 +408,20 @@ type serveConfig struct {
 	SessionCredentialSignerKeyVersion int64
 }
 
+// wrapLaunchSettings carries the provider-neutral launch settings (model,
+// reasoning effort, permission mode) requested for a Session. All fields are
+// optional; empty means "provider default". Values are validated against the
+// ACP config-option capability before any provider mutation.
+type wrapLaunchSettings struct {
+	ModelID           string
+	ReasoningEffortID string
+	PermissionModeID  string
+}
+
+func (s wrapLaunchSettings) requested() bool {
+	return s.ModelID != "" || s.ReasoningEffortID != "" || s.PermissionModeID != ""
+}
+
 type wrapConfig struct {
 	HubURL             string
 	SessionID          string
@@ -424,6 +442,8 @@ type wrapConfig struct {
 	PairOnly           bool
 	Session            bool
 	WorkingDirectory   string
+	LaunchSettings     wrapLaunchSettings
+	Stderr             io.Writer
 }
 
 type heartbeatConfig struct {
@@ -544,6 +564,9 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	flags.BoolVar(&useJSONStream, "jsonstream", false, "read Claude stream-json lines from stdin")
 	flags.BoolVar(&cfg.StartupSmoke, "startup-smoke", false, "exit successfully after Provider admission and ACP initialization")
 	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", cfg.ProtocolVersion, "Adapter protocol version (1 or 2)")
+	flags.StringVar(&cfg.LaunchSettings.ModelID, "model", "", "provider-neutral model id to apply at launch")
+	flags.StringVar(&cfg.LaunchSettings.ReasoningEffortID, "reasoning-effort", "", "provider-neutral reasoning effort id to apply at launch")
+	flags.StringVar(&cfg.LaunchSettings.PermissionModeID, "permission-mode", "", "provider-neutral permission mode id to apply at launch")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
 	}
@@ -590,6 +613,9 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 	flags.BoolVar(&cfg.StartupSmoke, "startup-smoke", false, "exit successfully after Provider admission and ACP initialization")
 	flags.BoolVar(&cfg.Session, "session", false, "run an interactive agent session after pairing instead of pairing only")
 	flags.IntVar(&cfg.ProtocolVersion, "protocol-version", protocol.HubProtocolVersion, "Adapter protocol version (1 or 2)")
+	flags.StringVar(&cfg.LaunchSettings.ModelID, "model", "", "provider-neutral model id to apply at launch")
+	flags.StringVar(&cfg.LaunchSettings.ReasoningEffortID, "reasoning-effort", "", "provider-neutral reasoning effort id to apply at launch")
+	flags.StringVar(&cfg.LaunchSettings.PermissionModeID, "permission-mode", "", "provider-neutral permission mode id to apply at launch")
 	if err := flags.Parse(args); err != nil {
 		return wrapConfig{}, err
 	}
@@ -726,6 +752,9 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 		cfg.HealthMarker = marker
 		cfg.ProviderCredential = &core.ProcessCredential{UID: uint32(uid), GID: uint32(gid)}
 	}
+	if cfg.Stderr == nil {
+		cfg.Stderr = io.Discard
+	}
 	return cfg, nil
 }
 
@@ -835,6 +864,9 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	}
 	if stdin == nil {
 		stdin = io.Reader(os.Stdin)
+	}
+	if pairOutput != nil {
+		cfg.Stderr = pairOutput
 	}
 	if err := validateProviderCommand(cfg); err != nil {
 		return cfg, err
@@ -1736,6 +1768,9 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 		return errors.New("acp session/new response missing sessionId")
 	}
 	settingsTracker := newACPSettingsTracker(sessionResult)
+	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 && cfg.LaunchSettings.requested() {
+		applyACPLaunchSettings(runCtx, settingsTracker, providerSessionID, stdinWriter, scanner, cfg.LaunchSettings, cfg.Stderr)
+	}
 	var settingsMu sync.Mutex
 	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
 		if state, ok := settingsTracker.Current(); ok {
