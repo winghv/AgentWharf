@@ -165,6 +165,15 @@ func TestPublishOfficialSettingsCapability(t *testing.T) {
 	if _, err := protocol.DecodeSettingsCapabilityPayload(frames[0].Payload); err != nil {
 		t.Fatalf("capability payload is not canonical: %v", err)
 	}
+	var wire struct {
+		ReasoningEfforts []json.RawMessage `json:"reasoning_efforts"`
+	}
+	if err := json.Unmarshal(frames[0].Payload, &wire); err != nil {
+		t.Fatalf("decode capability wire payload: %v", err)
+	}
+	if wire.ReasoningEfforts == nil {
+		t.Fatalf("reasoning_efforts = null, want []")
+	}
 }
 
 func TestInjectedPromptTrackerDedupes(t *testing.T) {

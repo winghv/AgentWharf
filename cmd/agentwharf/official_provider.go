@@ -298,6 +298,7 @@ func publishOfficialSettingsCapability(writeFrame func(protocol.Frame) error, se
 	capability := protocol.SettingsCapabilityPayload{
 		SchemaVersion:                 protocol.SettingsCapabilitySchemaVersion,
 		Models:                        []protocol.SettingsCapabilityChoice{{ID: model, Label: model}},
+		ReasoningEfforts:              []protocol.SettingsCapabilityChoice{},
 		PermissionModes:               []protocol.SettingsCapabilityChoice{{ID: permission, Label: permission}},
 		EffectiveModelID:              model,
 		EffectivePermissionModeID:     permission,
