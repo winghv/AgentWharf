@@ -129,8 +129,41 @@ func translateCodexEventMsg(sessionID string, payload map[string]any) ([]protoco
 		if text := stringFieldFromAny(payload["message"]); text != "" {
 			return []protocol.Event{transcriptMessageEvent(sessionID, "", "agent", text)}, nil
 		}
+	case "item_completed":
+		// Newer Codex releases wrap user/agent messages in item_completed
+		// instead of emitting the legacy user_message/agent_message payloads.
+		item, _ := payload["item"].(map[string]any)
+		text := codexItemText(item)
+		switch stringFieldFromAny(item["type"]) {
+		case "UserMessage":
+			if text != "" {
+				return []protocol.Event{transcriptMessageEvent(sessionID, "", "user", text)}, nil
+			}
+		case "AgentMessage":
+			if text != "" {
+				return []protocol.Event{transcriptMessageEvent(sessionID, "", "agent", text)}, nil
+			}
+		}
 	}
 	return nil, nil
+}
+
+func codexItemText(item map[string]any) string {
+	if item == nil {
+		return ""
+	}
+	if text := stringFieldFromAny(item["text"]); text != "" {
+		return text
+	}
+	content, _ := item["content"].([]any)
+	var parts []string
+	for _, entry := range content {
+		block, _ := entry.(map[string]any)
+		if text := stringFieldFromAny(block["text"]); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "")
 }
 
 func translateCodexResponseItem(sessionID string, payload map[string]any) ([]protocol.Event, error) {
@@ -192,8 +225,17 @@ func (codexProvider) transcriptUserText(line []byte) string {
 		return ""
 	}
 	payload, _ := raw["payload"].(map[string]any)
-	if payload == nil || stringFieldFromAny(payload["type"]) != "user_message" {
+	if payload == nil {
 		return ""
 	}
-	return stringFieldFromAny(payload["message"])
+	switch stringFieldFromAny(payload["type"]) {
+	case "user_message":
+		return stringFieldFromAny(payload["message"])
+	case "item_completed":
+		item, _ := payload["item"].(map[string]any)
+		if stringFieldFromAny(item["type"]) == "UserMessage" {
+			return codexItemText(item)
+		}
+	}
+	return ""
 }

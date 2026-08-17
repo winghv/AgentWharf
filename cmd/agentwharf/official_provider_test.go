@@ -218,6 +218,33 @@ func TestCodexTranslateLine(t *testing.T) {
 		t.Fatalf("user events = %+v, %v", events, err)
 	}
 
+	currentUser := transcriptJSON(t, map[string]any{
+		"type": "event_msg",
+		"payload": map[string]any{"type": "item_completed", "item": map[string]any{
+			"type":    "UserMessage",
+			"content": []any{map[string]any{"type": "text", "text": "current hello"}},
+		}},
+	})
+	events, err = codexProvider{}.translateLine("ses_1", currentUser)
+	if err != nil || len(events) != 1 || events[0].Type != "session.message" {
+		t.Fatalf("current user events = %+v, %v", events, err)
+	}
+	if got := (codexProvider{}).transcriptUserText(currentUser); got != "current hello" {
+		t.Fatalf("current codex transcriptUserText = %q", got)
+	}
+
+	currentAgent := transcriptJSON(t, map[string]any{
+		"type": "event_msg",
+		"payload": map[string]any{"type": "item_completed", "item": map[string]any{
+			"type":    "AgentMessage",
+			"content": []any{map[string]any{"type": "Text", "text": "current done"}},
+		}},
+	})
+	events, err = codexProvider{}.translateLine("ses_1", currentAgent)
+	if err != nil || len(events) != 1 || events[0].Type != "session.message" {
+		t.Fatalf("current agent events = %+v, %v", events, err)
+	}
+
 	commentary := transcriptJSON(t, map[string]any{
 		"type":    "event_msg",
 		"payload": map[string]any{"type": "agent_message", "phase": "commentary", "message": "thinking"},
