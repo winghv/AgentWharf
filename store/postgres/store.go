@@ -1002,12 +1002,21 @@ func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID str
 		if err := validatePostgresRunControlPreState(ctx, tx, sessionID, store.RunControlRequest{Operation: reservation.Operation, PreControlState: reservation.PreControlState, PreControlStateSeq: reservation.PreControlStateSeq}); err != nil {
 			return store.RunControlReservation{}, err
 		}
+		state := "ready"
+		terminal := false
 		payload := `{"state":"ready"}`
 		if reservation.Operation == store.RunControlStop {
+			state = "ended"
+			terminal = true
 			payload = `{"state":"ended","reason":"user_stop"}`
 		}
 		if _, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.state", []byte(payload), now); err != nil {
 			return store.RunControlReservation{}, err
+		}
+		if _, err := queries.ProjectAgentSessionState(ctx, db.ProjectAgentSessionStateParams{
+			Status: state, Terminal: terminal, ObservedAt: pgtype.Timestamptz{Time: now, Valid: true}, SessionID: sessionID,
+		}); err != nil {
+			return store.RunControlReservation{}, fmt.Errorf("project run-control session state: %w", err)
 		}
 	}
 	completionState := (*string)(nil)

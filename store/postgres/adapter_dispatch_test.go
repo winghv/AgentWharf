@@ -108,6 +108,71 @@ func TestAppendAdapterReadyProjectsSessionAdmissionState(t *testing.T) {
 	}
 }
 
+func TestCompletedStopProjectsAgentSessionEndedInFinalizationTransaction(t *testing.T) {
+	harness := newPostgresConnectionHarness(t)
+	ctx := context.Background()
+	const sessionID = "ses_run_control_stop_projection"
+	const leaseID = "lease_run_control_stop_projection"
+	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id, provider, status, started_at) VALUES ($1, 'claude-code', 'starting', clock_timestamp())`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: sessionID, ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := harness.AcceptAdapterHello(ctx, sessionID, store.AdapterHello{CredentialGeneration: 1, WriterLeaseID: leaseID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := store.SettingsWriter{ConnectionEpoch: connection.ConnectionEpoch, CredentialGeneration: connection.ActiveCredentialGeneration, LeaseID: leaseID}
+	grant, err := harness.AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateSeq, err := harness.AppendAdapterEvents(ctx, sessionID, store.AdapterConnectionAdmission{
+		CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grant,
+	}, []store.PendingEvent{{Type: "session.state", Time: time.Now(), Payload: []byte(`{"state":"ready"}`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err = harness.AllocateAdapterGrantFence(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilitySeq, err := harness.AppendAdapterEvents(ctx, sessionID, store.AdapterConnectionAdmission{
+		CredentialGeneration: 1, ConnectionEpoch: connection.ConnectionEpoch, AcceptedFence: connection.AcceptedFence, GrantFence: grant,
+	}, []store.PendingEvent{{Type: "session.run.capabilities", Time: time.Now(), Payload: []byte(`{"schema_version":1,"interrupt_supported":true,"stop_supported":true}`)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.PublishRunControlCapability(ctx, sessionID, store.RunControlCapabilityUpdate{
+		EventSeq: capabilitySeq, InterruptSupported: true, StopSupported: true, Writer: writer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reserved, err := harness.RunControlReserve(ctx, sessionID, store.RunControlRequest{
+		CommandID: "cmd_stop_projection", Operation: store.RunControlStop,
+		PreControlState: "ready", PreControlStateSeq: stateSeq, Writer: writer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.RunControlFinalize(ctx, sessionID, "cmd_stop_projection", store.RunControlFinalize{
+		ReservationVersion: reserved.Reservation.ReservationVersion, Outcome: store.RunControlCompleted, Writer: &writer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var endedAt *time.Time
+	if err := harness.pool.QueryRow(ctx, `SELECT status, ended_at FROM agent_sessions WHERE id=$1`, sessionID).Scan(&status, &endedAt); err != nil {
+		t.Fatal(err)
+	}
+	if status != "ended" || endedAt == nil {
+		t.Fatalf("run-control session projection = status %q ended_at %v, want ended/non-nil", status, endedAt)
+	}
+}
+
 func TestAppendAdapterEventsCommitsTerminalAttentionAndFencesAuthority(t *testing.T) {
 	for _, event := range []struct {
 		name    string
