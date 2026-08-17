@@ -2300,10 +2300,14 @@ func publishStartupSmokeEnded(ctx context.Context, readFrame func(context.Contex
 }
 
 func waitStartupSmokeReceipt(ctx context.Context, readFrame func(context.Context) (protocol.Frame, error), writeFrame func(protocol.Frame) error, proposalID string, stage string) error {
+	return waitEventReceipt(ctx, readFrame, writeFrame, proposalID, "startup smoke "+stage)
+}
+
+func waitEventReceipt(ctx context.Context, readFrame func(context.Context) (protocol.Frame, error), writeFrame func(protocol.Frame) error, proposalID string, label string) error {
 	for {
 		frame, err := readFrame(ctx)
 		if err != nil {
-			return fmt.Errorf("read startup smoke %s receipt: %w", stage, err)
+			return fmt.Errorf("read %s receipt: %w", label, err)
 		}
 		switch typed := frame.(type) {
 		case *protocol.EventReceipt:
@@ -2311,15 +2315,15 @@ func waitStartupSmokeReceipt(ctx context.Context, readFrame func(context.Context
 				continue
 			}
 			if typed.Status != protocol.EventReceiptAccepted {
-				return fmt.Errorf("startup smoke %s receipt rejected", stage)
+				return fmt.Errorf("%s receipt rejected", label)
 			}
 			return nil
 		case *protocol.Ping:
 			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
-				return fmt.Errorf("send startup smoke pong: %w", err)
+				return fmt.Errorf("send %s pong: %w", label, err)
 			}
 		case *protocol.Error:
-			return fmt.Errorf("startup smoke %s event rejected: %s", stage, typed.Code)
+			return fmt.Errorf("%s event rejected: %s", label, typed.Code)
 		}
 	}
 }
@@ -2352,7 +2356,7 @@ func newRunControlCapabilityEvent(cfg wrapConfig) (*protocol.Event, error) {
 	}, nil
 }
 
-func handleProviderRunControl(ctx context.Context, command *protocol.Command, supervisor *core.ProcessSupervisor, writeFrame func(protocol.Frame) error, cfg wrapConfig, stop bool) error {
+func handleProviderRunControl(ctx context.Context, command *protocol.Command, supervisor *core.ProcessSupervisor, readFrame func(context.Context) (protocol.Frame, error), writeFrame func(protocol.Frame) error, cfg wrapConfig, stop bool) error {
 	if command == nil || supervisor == nil {
 		return errors.New("run-control provider is unavailable")
 	}
@@ -2370,11 +2374,11 @@ func handleProviderRunControl(ctx context.Context, command *protocol.Command, su
 	} else {
 		operationErr = supervisor.Interrupt(ctx)
 	}
-	return acknowledgeRunControl(ctx, command, writeFrame, cfg, operation, completionState, operationErr)
+	return acknowledgeRunControl(ctx, command, readFrame, writeFrame, cfg, operation, completionState, operationErr)
 }
 
-func acknowledgeRunControl(ctx context.Context, command *protocol.Command, writeFrame func(protocol.Frame) error, cfg wrapConfig, operation, completionState string, operationErr error) error {
-	if command == nil || writeFrame == nil {
+func acknowledgeRunControl(ctx context.Context, command *protocol.Command, readFrame func(context.Context) (protocol.Frame, error), writeFrame func(protocol.Frame) error, cfg wrapConfig, operation, completionState string, operationErr error) error {
+	if command == nil || readFrame == nil || writeFrame == nil {
 		return errors.New("run-control acknowledgement is unavailable")
 	}
 	if err := writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted}); err != nil {
@@ -2414,6 +2418,9 @@ func acknowledgeRunControl(ctx context.Context, command *protocol.Command, write
 		Time: time.Now().UTC().UnixMilli(), Payload: payload, ProposalID: proposalID,
 	}); err != nil {
 		return fmt.Errorf("publish run-control outcome %s: %w", command.CommandID, err)
+	}
+	if err := waitEventReceipt(ctx, readFrame, writeFrame, proposalID, "run-control outcome "+command.CommandID); err != nil {
+		return err
 	}
 	return nil
 }
@@ -2694,7 +2701,7 @@ func forwardHubCommandsToProvider(ctx context.Context, readFrame func(context.Co
 				continue
 			}
 			if typed.Type == protocol.CommandSessionInterrupt || typed.Type == protocol.CommandSessionStop {
-				return handleProviderRunControl(ctx, typed, supervisor, writeFrame, cfg, typed.Type == protocol.CommandSessionStop)
+				return handleProviderRunControl(ctx, typed, supervisor, readFrame, writeFrame, cfg, typed.Type == protocol.CommandSessionStop)
 			}
 			if err := writeProviderCommand(stdin, typed); err != nil {
 				return err
@@ -2801,7 +2808,7 @@ func forwardHubCommandsToACPProvider(ctx context.Context, readFrame func(context
 				}
 				nextID++
 				accepted.Add(typed.CommandID)
-				if err := acknowledgeRunControl(ctx, typed, writeFrame, cfg, "interrupt", "ready", nil); err != nil {
+				if err := acknowledgeRunControl(ctx, typed, readFrame, writeFrame, cfg, "interrupt", "ready", nil); err != nil {
 					return err
 				}
 			case protocol.CommandSessionSend:
@@ -2879,7 +2886,7 @@ func forwardHubCommandsToACPProvider(ctx context.Context, readFrame func(context
 					return fmt.Errorf("ack acp settings command %s: %w", typed.CommandID, err)
 				}
 			case protocol.CommandSessionStop:
-				if err := handleProviderRunControl(ctx, typed, supervisor, writeFrame, cfg, true); err != nil {
+				if err := handleProviderRunControl(ctx, typed, supervisor, readFrame, writeFrame, cfg, true); err != nil {
 					return err
 				}
 				return nil

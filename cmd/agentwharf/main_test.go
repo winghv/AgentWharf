@@ -2047,11 +2047,18 @@ func TestRunControlCapabilityAndOutcomeProposalsAreCanonical(t *testing.T) {
 		frames = append(frames, frame)
 		return nil
 	}
+	read := func(context.Context) (protocol.Frame, error) {
+		outcome, ok := frames[len(frames)-1].(*protocol.Event)
+		if !ok {
+			return nil, errors.New("run-control outcome proposal is missing")
+		}
+		return &protocol.EventReceipt{ProposalID: outcome.ProposalID, Seq: 2, Status: protocol.EventReceiptAccepted}, nil
+	}
 	if err := publishRunControlCapability(context.Background(), nil, cfg, write); err != nil {
 		t.Fatalf("publishRunControlCapability() error = %v", err)
 	}
 	command := &protocol.Command{CommandID: "cmd_run_control_1", Type: protocol.CommandSessionInterrupt, SessionID: cfg.SessionID}
-	if err := acknowledgeRunControl(context.Background(), command, write, cfg, "interrupt", "ready", nil); err != nil {
+	if err := acknowledgeRunControl(context.Background(), command, read, write, cfg, "interrupt", "ready", nil); err != nil {
 		t.Fatalf("acknowledgeRunControl() error = %v", err)
 	}
 	if len(frames) != 3 {
