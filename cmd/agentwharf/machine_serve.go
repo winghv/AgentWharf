@@ -347,8 +347,13 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended: %v\n", handoff.SessionID, err)
 				return
 			}
-			if !dispatchCredentialAlive(*handoff) || restarts >= machineServeAdapterRestartLimit {
+			credentialAlive := dispatchCredentialAlive(*handoff)
+			if !machineServeAdapterShouldRestart(err, credentialAlive, restarts) {
 				_ = removeMachineDispatch(handoff.ClaimID)
+				if err == nil {
+					_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended normally; not restarting\n", handoff.SessionID)
+					return
+				}
 				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended (%v); giving up (restarts=%d)\n", handoff.SessionID, err, restarts)
 				return
 			}
@@ -364,6 +369,10 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 			}
 		}
 	}
+}
+
+func machineServeAdapterShouldRestart(err error, credentialAlive bool, restarts int) bool {
+	return err != nil && credentialAlive && restarts < machineServeAdapterRestartLimit
 }
 
 func runAdapter(ctx context.Context, cfg wrapConfig, stderr io.Writer) <-chan error {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -198,7 +199,7 @@ func newServeTestControlPlane(t *testing.T, hubURL, sessionID string, pending in
 			if pendingPolls.Load() <= pending {
 				claims = append(claims, map[string]any{
 					"claim_id": "claim_auto", "task_id": "task_auto", "run_id": "run_auto", "session_id": sessionID,
-					"provider": "claude-code",
+					"provider":   "claude-code",
 					"created_at": time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano),
 					"expires_at": time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339Nano),
 				})
@@ -222,9 +223,9 @@ func newServeTestControlPlane(t *testing.T, hubURL, sessionID string, pending in
 				t.Errorf("refresh authorization = %q", authorization)
 			}
 			writeTestJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
-				"machine": map[string]any{"id": "machine_serve"},
+				"machine":       map[string]any{"id": "machine_serve"},
 				"machine_token": "refreshed-machine-token",
-				"expires_at": time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano),
+				"expires_at":    time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano),
 			}})
 		default:
 			http.NotFound(w, r)
@@ -376,6 +377,21 @@ func TestMachineServeResumesPersistedHandoff(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dispatchDir, "claim_auto.json")); !os.IsNotExist(err) {
 		t.Fatalf("handoff file must be removed after dispatch, stat err=%v", err)
+	}
+}
+
+func TestMachineServeRestartsOnlyFailedAdapters(t *testing.T) {
+	if machineServeAdapterShouldRestart(nil, true, 0) {
+		t.Fatal("clean adapter exit must remain terminal")
+	}
+	if !machineServeAdapterShouldRestart(errors.New("transport failed"), true, 0) {
+		t.Fatal("failed adapter with live credential should restart")
+	}
+	if machineServeAdapterShouldRestart(errors.New("transport failed"), false, 0) {
+		t.Fatal("expired adapter credential must not restart")
+	}
+	if machineServeAdapterShouldRestart(errors.New("transport failed"), true, machineServeAdapterRestartLimit) {
+		t.Fatal("adapter at restart limit must not restart")
 	}
 }
 
