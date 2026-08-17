@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -96,6 +97,99 @@ func TestHubConnectionReconnectsSameSessionAndReplaysUnconfirmedProposal(t *test
 	}
 	if pending := connection.proposals(); len(pending) != 0 {
 		t.Fatalf("pending proposals = %#v", pending)
+	}
+}
+
+func TestHubConnectionPublishesFreshRegisteredCapabilityAfterReconnect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	connections := 0
+	proposalIDs := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		frame, err := readFrameFromConn(ctx, conn)
+		hello, ok := frame.(*protocol.Hello)
+		if err != nil || !ok || hello.SessionID != "ses_capability_reconnect" {
+			t.Errorf("hello = %T %+v, %v", frame, frame, err)
+			return
+		}
+		mu.Lock()
+		connections++
+		connectionNumber := connections
+		mu.Unlock()
+		if err := writeFrameToConn(ctx, conn, reconnectHelloAck("ses_capability_reconnect", int64(connectionNumber), 1)); err != nil {
+			return
+		}
+		frame, err = readFrameFromConn(ctx, conn)
+		event, ok := frame.(*protocol.Event)
+		if err != nil || !ok || event.Type != "session.run.capabilities" || event.ProposalID == "" {
+			t.Errorf("capability = %T %+v, %v", frame, frame, err)
+			return
+		}
+		proposalIDs <- event.ProposalID
+		if err := writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: int64(connectionNumber), Status: protocol.EventReceiptAccepted}); err != nil {
+			return
+		}
+		if connectionNumber == 1 {
+			_ = conn.Close(websocket.StatusGoingAway, "replace writer")
+			return
+		}
+		_ = writeFrameToConn(ctx, conn, &protocol.Ping{Nonce: "capability-restored"})
+	}))
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	initial, _, err := websocket.Dial(ctx, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFrameToConn(ctx, initial, &protocol.Hello{ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleAdapter, Token: "token-1", SessionID: "ses_capability_reconnect", Provider: "claude-code"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readFrameFromConn(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	connection := newHubConnection(wrapConfig{HubURL: url, SessionID: "ses_capability_reconnect", Provider: "claude-code", AdapterToken: "token-1", ProtocolVersion: protocol.ProtocolVersionV2}, initial, reconnectAuthority("ses_capability_reconnect", 1, 1))
+	defer connection.close()
+	reconnectCount := 0
+	remove := connection.setReconnectProposalFactory("run-control", func() (*protocol.Event, error) {
+		reconnectCount++
+		return &protocol.Event{
+			Type: "session.run.capabilities", SessionID: "ses_capability_reconnect",
+			Time: time.Now().UnixMilli(), ProposalID: fmt.Sprintf("capability-reconnect-%d", reconnectCount),
+			Payload: []byte(`{"schema_version":1,"interrupt_supported":true,"stop_supported":true}`),
+		}, nil
+	})
+	defer remove()
+	if err := connection.write(ctx, &protocol.Event{
+		Type: "session.run.capabilities", SessionID: "ses_capability_reconnect",
+		Time: time.Now().UnixMilli(), ProposalID: "capability-initial",
+		Payload: []byte(`{"schema_version":1,"interrupt_supported":true,"stop_supported":true}`),
+	}); err != nil {
+		t.Fatalf("write initial capability: %v", err)
+	}
+	for {
+		frame, err := connection.read(ctx)
+		if err != nil {
+			t.Fatalf("read after capability reconnect: %v", err)
+		}
+		if _, ok := frame.(*protocol.EventReceipt); ok {
+			continue
+		}
+		if ping, ok := frame.(*protocol.Ping); !ok || ping.Nonce != "capability-restored" {
+			t.Fatalf("frame after capability reconnect = %#v", frame)
+		}
+		break
+	}
+	first, second := <-proposalIDs, <-proposalIDs
+	if first != "capability-initial" || second == first || second != "capability-reconnect-1" {
+		t.Fatalf("capability proposal ids = %q, %q", first, second)
 	}
 }
 

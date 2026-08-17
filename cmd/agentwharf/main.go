@@ -1617,6 +1617,10 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, connection *hubConnect
 			return err
 		}
 	}
+	removeReconnectRunControl := connection.setReconnectProposalFactory("run-control", func() (*protocol.Event, error) {
+		return newRunControlCapabilityEvent(cfg)
+	})
+	defer removeReconnectRunControl()
 	if err := publishRunControlCapability(runCtx, nil, cfg, writeFrame); err != nil {
 		cancel()
 		stopProviderSupervisor(supervisor)
@@ -1765,6 +1769,10 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 			return err
 		}
 	}
+	removeReconnectRunControl := connection.setReconnectProposalFactory("run-control", func() (*protocol.Event, error) {
+		return newRunControlCapabilityEvent(cfg)
+	})
+	defer removeReconnectRunControl()
 	if err := publishRunControlCapability(runCtx, nil, cfg, writeFrame); err != nil {
 		cancel()
 		stopProviderSupervisor(supervisor)
@@ -2317,23 +2325,31 @@ func waitStartupSmokeReceipt(ctx context.Context, readFrame func(context.Context
 }
 
 func publishRunControlCapability(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, writeFrame func(protocol.Frame) error) error {
+	event, err := newRunControlCapabilityEvent(cfg)
+	if err != nil || event == nil {
+		return err
+	}
+	return writeFrame(event)
+}
+
+func newRunControlCapabilityEvent(cfg wrapConfig) (*protocol.Event, error) {
 	if cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
-		return nil
+		return nil, nil
 	}
 	proposalID, err := randomToken()
 	if err != nil {
-		return fmt.Errorf("generate run-control capability proposal: %w", err)
+		return nil, fmt.Errorf("generate run-control capability proposal: %w", err)
 	}
 	payload, err := json.Marshal(protocol.RunControlCapabilityPayload{
 		SchemaVersion: 1, InterruptSupported: true, StopSupported: true,
 	})
 	if err != nil {
-		return fmt.Errorf("marshal run-control capability: %w", err)
+		return nil, fmt.Errorf("marshal run-control capability: %w", err)
 	}
-	return writeFrame(&protocol.Event{
+	return &protocol.Event{
 		Type: "session.run.capabilities", SessionID: cfg.SessionID,
 		Time: time.Now().UTC().UnixMilli(), Payload: payload, ProposalID: proposalID,
-	})
+	}, nil
 }
 
 func handleProviderRunControl(ctx context.Context, command *protocol.Command, supervisor *core.ProcessSupervisor, writeFrame func(protocol.Frame) error, cfg wrapConfig, stop bool) error {

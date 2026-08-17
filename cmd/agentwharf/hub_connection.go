@@ -133,14 +133,52 @@ type hubConnection struct {
 
 	authorityMu sync.RWMutex
 	authority   *protocol.ConnectionAuthorityReceipt
+
+	reconnectProposalMu        sync.RWMutex
+	reconnectProposalFactories map[string]func() (*protocol.Event, error)
 }
 
 func newHubConnection(cfg wrapConfig, conn *websocket.Conn, authority *protocol.ConnectionAuthorityReceipt) *hubConnection {
 	return &hubConnection{
 		cfg: cfg, conn: conn, authority: cloneConnectionAuthority(authority),
-		credentials: newAdapterCredentialSet(cfg.AdapterToken, authority),
-		pending:     make(map[string]*protocol.Event),
+		credentials:                newAdapterCredentialSet(cfg.AdapterToken, authority),
+		pending:                    make(map[string]*protocol.Event),
+		reconnectProposalFactories: make(map[string]func() (*protocol.Event, error)),
 	}
+}
+
+func (c *hubConnection) setReconnectProposalFactory(key string, factory func() (*protocol.Event, error)) func() {
+	if c == nil || key == "" || factory == nil {
+		return func() {}
+	}
+	c.reconnectProposalMu.Lock()
+	c.reconnectProposalFactories[key] = factory
+	c.reconnectProposalMu.Unlock()
+	return func() {
+		c.reconnectProposalMu.Lock()
+		delete(c.reconnectProposalFactories, key)
+		c.reconnectProposalMu.Unlock()
+	}
+}
+
+func (c *hubConnection) freshReconnectProposals() ([]*protocol.Event, error) {
+	c.reconnectProposalMu.RLock()
+	factories := make([]func() (*protocol.Event, error), 0, len(c.reconnectProposalFactories))
+	for _, factory := range c.reconnectProposalFactories {
+		factories = append(factories, factory)
+	}
+	c.reconnectProposalMu.RUnlock()
+	result := make([]*protocol.Event, 0, len(factories))
+	for _, factory := range factories {
+		event, err := factory()
+		if err != nil {
+			return nil, err
+		}
+		if event != nil {
+			result = append(result, event)
+		}
+	}
+	return result, nil
 }
 
 func cloneConnectionAuthority(authority *protocol.ConnectionAuthorityReceipt) *protocol.ConnectionAuthorityReceipt {
@@ -312,6 +350,30 @@ func (c *hubConnection) reconnect(ctx context.Context, failed *websocket.Conn) e
 					}
 					c.connMu.Unlock()
 					break
+				}
+			}
+			if c.current() == conn {
+				proposals, err := c.freshReconnectProposals()
+				if err != nil {
+					_ = conn.Close(websocket.StatusGoingAway, "reconnect proposal creation failed")
+					c.connMu.Lock()
+					if c.conn == conn {
+						c.conn = nil
+					}
+					c.connMu.Unlock()
+					continue
+				}
+				for _, proposal := range proposals {
+					c.trackProposal(proposal)
+					if err := writeCLIProtocolFrame(ctx, conn, proposal); err != nil {
+						_ = conn.Close(websocket.StatusGoingAway, "reconnect proposal publish failed")
+						c.connMu.Lock()
+						if c.conn == conn {
+							c.conn = nil
+						}
+						c.connMu.Unlock()
+						break
+					}
 				}
 			}
 			if c.current() == conn {
