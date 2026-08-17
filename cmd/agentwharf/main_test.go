@@ -1786,6 +1786,13 @@ func TestRunWrapV2ProviderStopsAfterFinalAdmissionRejection(t *testing.T) {
 func TestRunWrapV2ACPStartupSmokeCrossesAdmissionAndProviderReady(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	providerDir := t.TempDir()
+	providerPath := filepath.Join(providerDir, "claude-agent-acp")
+	providerScript := fmt.Sprintf("#!/usr/bin/env bash\nexport AGENTWHARF_ACP_IDLE_HELPER=1\nexec %q\n", os.Args[0])
+	if err := os.WriteFile(providerPath, []byte(providerScript), 0o755); err != nil {
+		t.Fatalf("write provider helper: %v", err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AGENTWHARF_ACP_IDLE_HELPER", "1")
 	t.Setenv("AGENTWHARF_HUB_URL", "ws://injected.invalid")
 	t.Setenv("AGENTWHARF_SESSION_ID", "ses_startup_smoke")
