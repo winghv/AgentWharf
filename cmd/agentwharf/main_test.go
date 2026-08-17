@@ -2507,6 +2507,7 @@ func TestForwardACPSettingsRevalidatesCapabilityBeforeProviderSideEffect(t *test
 			&settingsMu,
 			nil,
 			nil,
+			nil,
 			wrapConfig{ProtocolVersion: protocol.ProtocolVersionV2, SessionID: "ses_settings"},
 		)
 	}()
@@ -2604,7 +2605,7 @@ func TestForwardACPCommandReplayReacksWithoutRepeatingProviderSideEffect(t *test
 			},
 			func(string) {}, nil, "acp_ses_1", 3,
 			map[string]acpPendingPermission{}, &permissionMu, newACPResponseRouter(),
-			tracker, &settingsMu, nil, nil,
+			tracker, &settingsMu, nil, nil, nil,
 			wrapConfig{ProtocolVersion: protocol.ProtocolVersionV2, SessionID: "ses_commands"},
 		)
 	}()
@@ -2673,6 +2674,7 @@ func TestForwardACPSettingsRejectsOtherSessionAndMismatchedExecute(t *testing.T)
 			responses,
 			tracker,
 			&settingsMu,
+			nil,
 			nil,
 			nil,
 			wrapConfig{ProtocolVersion: protocol.ProtocolVersionV2, SessionID: "ses_settings"},

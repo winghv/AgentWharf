@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -1636,22 +1637,34 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, connection *hubConnect
 			return writeFrame(&masked)
 		})
 	}()
+	var stopInProgress atomic.Bool
 	go func() {
-		commandDone <- forwardHubCommandsToProvider(runCtx, connection.read, stdinWriter, writeFrame, observePong, rotation, startAdmission, supervisor, cfg)
+		commandDone <- forwardHubCommandsToProvider(runCtx, connection.read, stdinWriter, writeFrame, observePong, rotation, startAdmission, supervisor, &stopInProgress, cfg)
 	}()
 
+	commandFinished := false
+	var commandErr error
 	var processErr error
 	var outputErr error
 	processFinished := false
 	outputFinished := false
 	for {
 		if processFinished && outputFinished {
-			cancel()
-			_ = stdinWriter.Close()
-			if processErr != nil {
-				return processErr
+			if stopInProgress.Load() && !commandFinished {
+				// A successful Stop closes Provider stdout before its durable outcome
+				// receipt arrives. Keep the Adapter transport alive until the command
+				// goroutine confirms that Hub persistence completed.
+			} else {
+				cancel()
+				_ = stdinWriter.Close()
+				if processErr != nil {
+					return processErr
+				}
+				if outputErr != nil {
+					return outputErr
+				}
+				return commandErr
 			}
-			return outputErr
 		}
 		select {
 		case err := <-processDone:
@@ -1662,6 +1675,8 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, connection *hubConnect
 			outputFinished = true
 			outputErr = ignoreContextError(err)
 		case err := <-commandDone:
+			commandFinished = true
+			commandErr = ignoreContextError(err)
 			if err != nil {
 				cancel()
 				stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1889,22 +1904,33 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 			return writeFrame(&masked)
 		})
 	}()
+	var stopInProgress atomic.Bool
 	go func() {
-		commandDone <- forwardHubCommandsToACPProvider(runCtx, connection.read, stdinWriter, writeFrame, observePong, rotation, providerSessionID, 3, pendingPermissions, &permissionMu, responses, settingsTracker, &settingsMu, startAdmission, supervisor, cfg)
+		commandDone <- forwardHubCommandsToACPProvider(runCtx, connection.read, stdinWriter, writeFrame, observePong, rotation, providerSessionID, 3, pendingPermissions, &permissionMu, responses, settingsTracker, &settingsMu, startAdmission, supervisor, &stopInProgress, cfg)
 	}()
 
+	commandFinished := false
+	var commandErr error
 	processFinished := false
 	outputFinished := false
 	var processErr error
 	var outputErr error
 	for {
 		if processFinished && outputFinished {
-			cancel()
-			_ = stdinWriter.Close()
-			if processErr != nil {
-				return processErr
+			if stopInProgress.Load() && !commandFinished {
+				// Wait for the Stop outcome receipt before allowing a clean Provider
+				// exit to tear down the Adapter transport.
+			} else {
+				cancel()
+				_ = stdinWriter.Close()
+				if processErr != nil {
+					return processErr
+				}
+				if outputErr != nil {
+					return outputErr
+				}
+				return commandErr
 			}
-			return outputErr
 		}
 		select {
 		case err := <-processDone:
@@ -1920,6 +1946,8 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 				return outputErr
 			}
 		case err := <-commandDone:
+			commandFinished = true
+			commandErr = ignoreContextError(err)
 			if err != nil {
 				cancel()
 				stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -2356,7 +2384,7 @@ func newRunControlCapabilityEvent(cfg wrapConfig) (*protocol.Event, error) {
 	}, nil
 }
 
-func handleProviderRunControl(ctx context.Context, command *protocol.Command, supervisor *core.ProcessSupervisor, readFrame func(context.Context) (protocol.Frame, error), writeFrame func(protocol.Frame) error, cfg wrapConfig, stop bool) error {
+func handleProviderRunControl(ctx context.Context, command *protocol.Command, supervisor *core.ProcessSupervisor, readFrame func(context.Context) (protocol.Frame, error), writeFrame func(protocol.Frame) error, stopInProgress *atomic.Bool, cfg wrapConfig, stop bool) error {
 	if command == nil || supervisor == nil {
 		return errors.New("run-control provider is unavailable")
 	}
@@ -2368,6 +2396,9 @@ func handleProviderRunControl(ctx context.Context, command *protocol.Command, su
 	}
 	var operationErr error
 	if stop {
+		if stopInProgress != nil {
+			stopInProgress.Store(true)
+		}
 		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		operationErr = supervisor.Stop(stopCtx)
 		cancel()
@@ -2419,7 +2450,9 @@ func acknowledgeRunControl(ctx context.Context, command *protocol.Command, readF
 	}); err != nil {
 		return fmt.Errorf("publish run-control outcome %s: %w", command.CommandID, err)
 	}
-	if err := waitEventReceipt(ctx, readFrame, writeFrame, proposalID, "run-control outcome "+command.CommandID); err != nil {
+	receiptCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := waitEventReceipt(receiptCtx, readFrame, writeFrame, proposalID, "run-control outcome "+command.CommandID); err != nil {
 		return err
 	}
 	return nil
@@ -2671,7 +2704,7 @@ func translateWrapLine(cfg wrapConfig, line []byte) ([]protocol.Event, error) {
 	}
 }
 
-func forwardHubCommandsToProvider(ctx context.Context, readFrame func(context.Context) (protocol.Frame, error), stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), rotation *credentialRotationManager, startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, cfg wrapConfig) error {
+func forwardHubCommandsToProvider(ctx context.Context, readFrame func(context.Context) (protocol.Frame, error), stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), rotation *credentialRotationManager, startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, stopInProgress *atomic.Bool, cfg wrapConfig) error {
 	defer stdin.Close()
 	accepted := newAcceptedCommandSet(2048)
 	for {
@@ -2701,7 +2734,7 @@ func forwardHubCommandsToProvider(ctx context.Context, readFrame func(context.Co
 				continue
 			}
 			if typed.Type == protocol.CommandSessionInterrupt || typed.Type == protocol.CommandSessionStop {
-				return handleProviderRunControl(ctx, typed, supervisor, readFrame, writeFrame, cfg, typed.Type == protocol.CommandSessionStop)
+				return handleProviderRunControl(ctx, typed, supervisor, readFrame, writeFrame, stopInProgress, cfg, typed.Type == protocol.CommandSessionStop)
 			}
 			if err := writeProviderCommand(stdin, typed); err != nil {
 				return err
@@ -2771,7 +2804,7 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 	return nil
 }
 
-func forwardHubCommandsToACPProvider(ctx context.Context, readFrame func(context.Context) (protocol.Frame, error), stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), rotation *credentialRotationManager, providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex, responses *acpResponseRouter, settingsTracker *acpSettingsTracker, settingsMu *sync.Mutex, startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, cfg wrapConfig) error {
+func forwardHubCommandsToACPProvider(ctx context.Context, readFrame func(context.Context) (protocol.Frame, error), stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), rotation *credentialRotationManager, providerSessionID string, nextID int64, pendingPermissions map[string]acpPendingPermission, permissionMu *sync.Mutex, responses *acpResponseRouter, settingsTracker *acpSettingsTracker, settingsMu *sync.Mutex, startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, stopInProgress *atomic.Bool, cfg wrapConfig) error {
 	defer stdin.Close()
 	var pendingSettings *acpSettingsReservation
 	accepted := newAcceptedCommandSet(2048)
@@ -2886,7 +2919,7 @@ func forwardHubCommandsToACPProvider(ctx context.Context, readFrame func(context
 					return fmt.Errorf("ack acp settings command %s: %w", typed.CommandID, err)
 				}
 			case protocol.CommandSessionStop:
-				if err := handleProviderRunControl(ctx, typed, supervisor, readFrame, writeFrame, cfg, true); err != nil {
+				if err := handleProviderRunControl(ctx, typed, supervisor, readFrame, writeFrame, stopInProgress, cfg, true); err != nil {
 					return err
 				}
 				return nil
