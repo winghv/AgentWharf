@@ -447,6 +447,11 @@ type wrapConfig struct {
 	Stderr             io.Writer
 	Stdin              io.Reader
 	Interactive        bool
+	// ProviderSessionID enables ACP session/load during machine recovery.
+	// OnProviderSession receives the opaque provider id after a successful
+	// session/new or session/load and must only persist it locally.
+	ProviderSessionID string
+	OnProviderSession func(string)
 }
 
 type heartbeatConfig struct {
@@ -1823,22 +1828,45 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 		cancel()
 		return err
 	}
-	if err := writeACPRequest(stdinWriter, 2, "session/new", map[string]any{
-		"cwd":        cwd,
-		"mcpServers": []any{},
-	}); err != nil {
+	sessionMethod := "session/new"
+	sessionParams := map[string]any{"cwd": cwd, "mcpServers": []any{}}
+	if strings.TrimSpace(cfg.ProviderSessionID) != "" {
+		sessionMethod = "session/load"
+		sessionParams["sessionId"] = cfg.ProviderSessionID
+	}
+	if err := writeACPRequest(stdinWriter, 2, sessionMethod, sessionParams); err != nil {
 		cancel()
 		return err
 	}
 	sessionResult, err := readACPResponse(runCtx, scanner, 2)
 	if err != nil {
-		cancel()
-		return err
+		if sessionMethod != "session/load" {
+			cancel()
+			return err
+		}
+		// A provider may not implement loadSession, or the opaque id may have
+		// expired. Consume that error and start a fresh provider context while
+		// keeping the same Hub Session and durable transcript.
+		if cfg.Stderr != nil {
+			_, _ = fmt.Fprintf(cfg.Stderr, "agentwharf: provider session load failed; starting a new provider context\n")
+		}
+		if err := writeACPRequest(stdinWriter, 3, "session/new", map[string]any{"cwd": cwd, "mcpServers": []any{}}); err != nil {
+			cancel()
+			return err
+		}
+		sessionResult, err = readACPResponse(runCtx, scanner, 3)
+		if err != nil {
+			cancel()
+			return err
+		}
 	}
 	providerSessionID := stringFieldFromAny(sessionResult["sessionId"])
 	if providerSessionID == "" {
 		cancel()
 		return errors.New("acp session/new response missing sessionId")
+	}
+	if cfg.OnProviderSession != nil {
+		cfg.OnProviderSession(providerSessionID)
 	}
 	settingsTracker := newACPSettingsTracker(sessionResult)
 	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 && cfg.LaunchSettings.requested() {

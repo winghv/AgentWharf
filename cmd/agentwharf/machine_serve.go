@@ -59,6 +59,7 @@ type machineServeDispatch struct {
 	ModelID           string `json:"model_id"`
 	ReasoningEffortID string `json:"reasoning_effort_id"`
 	PermissionModeID  string `json:"permission_mode_id"`
+	ProviderSessionID string `json:"provider_session_id,omitempty"`
 	AdapterExpiresAt  string `json:"adapter_expires_at"`
 	ClientExpiresAt   string `json:"client_expires_at"`
 }
@@ -75,6 +76,28 @@ type machinePendingClaim struct {
 
 type machinePendingClaimsResponse struct {
 	Data []machinePendingClaim `json:"data"`
+}
+
+type machineRecoverableSession struct {
+	SessionID string `json:"session_id"`
+	Provider  string `json:"provider"`
+	Status    string `json:"status"`
+}
+
+type machineRecoverableSessionsResponse struct {
+	Data []machineRecoverableSession `json:"data"`
+}
+
+type machineSessionRecoveryResponse struct {
+	Data struct {
+		Session struct {
+			ID       string `json:"id"`
+			Provider string `json:"provider"`
+		} `json:"session"`
+		HubWSURL     string `json:"hub_ws_url"`
+		AdapterToken string `json:"adapter_token"`
+		ExpiresAt    string `json:"expires_at"`
+	} `json:"data"`
 }
 
 type machineAutoExchangeResponse struct {
@@ -173,6 +196,8 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	sem := make(chan struct{}, cfg.MaxConcurrent)
 	var workers sync.WaitGroup
 	var adapters sync.WaitGroup
+	var recoveryMu sync.Mutex
+	recoveryActive := make(map[string]bool)
 	serveCtx, cancel := context.WithCancel(ctx)
 	// Shutdown order: let the dispatch goroutines finish first (they deliver the
 	// first instruction), then cancel to stop the keep-alive goroutines, then wait
@@ -195,6 +220,9 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			continue
 		}
 		workers.Add(1)
+		recoveryMu.Lock()
+		recoveryActive[handoff.SessionID] = true
+		recoveryMu.Unlock()
 		go func(handoff machineServeDispatch) {
 			defer workers.Done()
 			sem <- struct{}{}
@@ -250,6 +278,30 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				defer func() { <-sem }()
 				dispatchClaim(serveCtx, cfg, client, credential, claim, stdout, stderr, &adapters)
 			}(claim)
+		}
+		// Recover Sessions created by an older local `wharf claude` invocation or
+		// whose persisted handoff expired. The Hub remains authoritative: it only
+		// lists a Session after its adapter heartbeat has gone stale.
+		recoverable, recoverErr := listRecoverableMachineSessions(ctx, client, credential)
+		if recoverErr == nil {
+			for _, session := range recoverable {
+				if session.SessionID == "" {
+					continue
+				}
+				recoveryMu.Lock()
+				if recoveryActive[session.SessionID] {
+					recoveryMu.Unlock()
+					continue
+				}
+				recoveryActive[session.SessionID] = true
+				recoveryMu.Unlock()
+				workers.Add(1)
+				go func(session machineRecoverableSession) {
+					defer workers.Done()
+					defer func() { recoveryMu.Lock(); delete(recoveryActive, session.SessionID); recoveryMu.Unlock() }()
+					dispatchRecovery(serveCtx, cfg, client, credential, session, stdout, stderr, &adapters)
+				}(session)
+			}
 		}
 		if cfg.StartupSmoke {
 			// One dispatch is enough for the smoke; the caller times the run.
@@ -332,6 +384,17 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 // restarted with backoff; the first instruction is not re-sent.
 func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer) {
 	adapterCfg := serveWrapConfig(*handoff, cfg.StartupSmoke)
+	adapterCfg.Stderr = stderr
+	adapterCfg.ProviderSessionID = handoff.ProviderSessionID
+	adapterCfg.OnProviderSession = func(id string) {
+		if strings.TrimSpace(id) == "" || handoff.ProviderSessionID == id {
+			return
+		}
+		handoff.ProviderSessionID = id
+		if err := saveMachineDispatch(*handoff); err != nil {
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist provider session %s: %v\n", handoff.SessionID, err)
+		}
+	}
 	restarts := 0
 	delay := machineServeAdapterRestartInitial
 	for {
@@ -448,6 +511,66 @@ func listPendingMachineClaims(ctx context.Context, client *http.Client, credenti
 		return nil, false, fmt.Errorf("decode pending claims: %w", err)
 	}
 	return response.Data, false, nil
+}
+
+func listRecoverableMachineSessions(ctx context.Context, client *http.Client, credential machineCredential) ([]machineRecoverableSession, error) {
+	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machine-sessions/recoverable")
+	if err != nil {
+		return nil, err
+	}
+	status, body, err := getCloudAPIJSON(ctx, client, endpoint, credential.MachineToken)
+	if err != nil {
+		return nil, err
+	}
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return nil, newCloudStatusError("list recoverable machine sessions", status, body)
+	}
+	var response machineRecoverableSessionsResponse
+	if err := decodeCloudAPIJSON(body, &response); err != nil {
+		return nil, fmt.Errorf("decode recoverable machine sessions: %w", err)
+	}
+	return response.Data, nil
+}
+
+func recoverMachineSession(ctx context.Context, client *http.Client, credential machineCredential, session machineRecoverableSession) (*machineServeDispatch, error) {
+	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machine-sessions/"+url.PathEscape(session.SessionID)+"/recover")
+	if err != nil {
+		return nil, err
+	}
+	status, body, err := postCloudAPIJSON(ctx, client, endpoint, credential.MachineToken, struct{}{})
+	if err != nil || status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return nil, errors.New("session recovery unavailable")
+	}
+	var response machineSessionRecoveryResponse
+	if err := decodeCloudAPIJSON(body, &response); err != nil {
+		return nil, fmt.Errorf("decode session recovery: %w", err)
+	}
+	if response.Data.Session.ID == "" || response.Data.HubWSURL == "" || response.Data.AdapterToken == "" || response.Data.ExpiresAt == "" {
+		return nil, errors.New("session recovery response is incomplete")
+	}
+	return &machineServeDispatch{
+		ClaimID:          "recovery:" + response.Data.Session.ID,
+		SessionID:        response.Data.Session.ID,
+		Provider:         response.Data.Session.Provider,
+		HubWSURL:         response.Data.HubWSURL,
+		AdapterToken:     response.Data.AdapterToken,
+		AdapterExpiresAt: response.Data.ExpiresAt,
+	}, nil
+}
+
+func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, session machineRecoverableSession, stdout, stderr io.Writer, adapters *sync.WaitGroup) {
+	handoff, err := recoverMachineSession(ctx, client, credential, session)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "wharf machine serve: recover session %s: %v\n", session.SessionID, err)
+		return
+	}
+	if err := saveMachineDispatch(*handoff); err != nil {
+		_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist recovery %s: %v\n", session.SessionID, err)
+		return
+	}
+	adapters.Add(1)
+	defer adapters.Done()
+	keepAdapterAlive(ctx, cfg, handoff, stdout, stderr)
 }
 
 // maybeRefreshMachineCredential refreshes the machine bearer when it is within

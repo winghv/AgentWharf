@@ -2247,6 +2247,115 @@ func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	}
 }
 
+func TestRunWrapACPProviderRecoversProviderSession(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		mode          string
+		wantSessionID string
+		wantFallback  bool
+	}{
+		{name: "load", mode: "load", wantSessionID: "acp_ses_existing"},
+		{name: "fallback", mode: "fallback", wantSessionID: "acp_ses_fresh", wantFallback: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			t.Setenv("AGENTWHARF_ACP_RECOVERY_HELPER", tc.mode)
+
+			running, err := startServe(ctx, serveConfig{
+				Addr:         "127.0.0.1:0",
+				DBPath:       filepath.Join(t.TempDir(), "events.db"),
+				SessionID:    "ses_recovery",
+				Provider:     "claude-code",
+				ControlToken: "control-token",
+				AdapterToken: "adapter-token",
+			})
+			if err != nil {
+				t.Fatalf("startServe() error = %v", err)
+			}
+			defer func() {
+				cancel()
+				if err := running.wait(); err != nil && !errors.Is(err, context.Canceled) {
+					t.Fatalf("serve wait error = %v", err)
+				}
+			}()
+
+			client, _, err := websocket.Dial(ctx, running.wsURL, nil)
+			if err != nil {
+				t.Fatalf("dial client: %v", err)
+			}
+			defer client.Close(websocket.StatusNormalClosure, "")
+			writeFrame(t, client, &protocol.Hello{
+				ProtocolVersion: protocol.ProtocolVersion,
+				Role:            protocol.RoleClient,
+				Token:           "control-token",
+				Subscriptions:   []protocol.Subscription{{SessionID: "ses_recovery"}},
+			})
+			_ = readFrame(t, client).(*protocol.HelloAck)
+
+			var stderr bytes.Buffer
+			providerSession := make(chan string, 1)
+			runDone := make(chan error, 1)
+			go func() {
+				_, err := runWrap(ctx, wrapConfig{
+					HubURL:            running.wsURL,
+					SessionID:         "ses_recovery",
+					Agent:             "claude",
+					Provider:          "claude-code",
+					AdapterToken:      "adapter-token",
+					Format:            "acp",
+					ProtocolVersion:   protocol.ProtocolVersionV2,
+					ProviderCommand:   []string{os.Args[0]},
+					ProviderSessionID: "acp_ses_existing",
+					OnProviderSession: func(id string) { providerSession <- id },
+					Stderr:            &stderr,
+				}, nil, nil)
+				runDone <- err
+			}()
+
+			var ready *protocol.Event
+			for ready == nil {
+				frame, err := readFrameFromConn(ctx, client)
+				if err != nil {
+					select {
+					case runErr := <-runDone:
+						t.Fatalf("read frame: %v; runWrap() error = %v; stderr=%q", err, runErr, stderr.String())
+					default:
+						t.Fatalf("read frame: %v; stderr=%q", err, stderr.String())
+					}
+				}
+				event, ok := frame.(*protocol.Event)
+				if !ok {
+					continue
+				}
+				if event.Type == "session.state" {
+					ready = event
+				}
+			}
+			payload := payloadObject(t, ready.Payload)
+			if ready.Type != "session.state" || payload["provider_session_id"] != tc.wantSessionID {
+				t.Fatalf("ready event = %+v payload=%+v", ready, payload)
+			}
+			select {
+			case got := <-providerSession:
+				if got != tc.wantSessionID {
+					t.Fatalf("OnProviderSession() = %q, want %q", got, tc.wantSessionID)
+				}
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for provider session callback")
+			}
+			if got := strings.Contains(stderr.String(), "provider session load failed"); got != tc.wantFallback {
+				t.Fatalf("fallback warning present = %v, want %v; stderr=%q", got, tc.wantFallback, stderr.String())
+			}
+
+			cancel()
+			if err := <-runDone; err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("runWrap() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestRunWrapACPProviderAppliesV2SettingsAndPublishesReadback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -3145,6 +3254,10 @@ func TestMain(m *testing.M) {
 		runWrapACPProviderHelper()
 		return
 	}
+	if os.Getenv("AGENTWHARF_ACP_RECOVERY_HELPER") != "" {
+		runWrapACPRecoveryProviderHelper()
+		return
+	}
 	if os.Getenv("AGENTWHARF_ACP_CREDENTIAL_HELPER") == "1" {
 		runWrapACPCredentialProviderHelper()
 		return
@@ -3274,6 +3387,34 @@ func runWrapACPProviderHelper() {
 	os.Exit(0)
 }
 
+func runWrapACPRecoveryProviderHelper() {
+	scanner := bufio.NewScanner(os.Stdin)
+	init := readACPRequest(scanner)
+	if init["method"] != "initialize" {
+		os.Exit(60)
+	}
+	writeACPResponse(init["id"], map[string]any{"protocolVersion": 1})
+
+	load := readACPRequest(scanner)
+	params, _ := load["params"].(map[string]any)
+	if load["method"] != "session/load" || params["sessionId"] != "acp_ses_existing" {
+		os.Exit(61)
+	}
+	if os.Getenv("AGENTWHARF_ACP_RECOVERY_HELPER") == "fallback" {
+		writeACPError(load["id"], -32601, "session/load unsupported")
+		fresh := readACPRequest(scanner)
+		if fresh["method"] != "session/new" {
+			os.Exit(62)
+		}
+		writeACPResponse(fresh["id"], map[string]any{"sessionId": "acp_ses_fresh"})
+	} else {
+		writeACPResponse(load["id"], map[string]any{"sessionId": "acp_ses_existing"})
+	}
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
 func runWrapACPCredentialProviderHelper() {
 	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != os.Getenv("AGENTWHARF_EXPECTED_AUTH_TOKEN") ||
 		os.Getenv("ANTHROPIC_BASE_URL") != os.Getenv("AGENTWHARF_EXPECTED_BASE_URL") ||
@@ -3334,6 +3475,18 @@ func writeACPResponse(id any, result map[string]any) {
 		os.Exit(22)
 	}
 	fmt.Fprintln(os.Stdout, string(encoded))
+}
+
+func writeACPError(id any, code int, message string) {
+	encoded, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error":   map[string]any{"code": code, "message": message},
+	})
+	if err != nil {
+		os.Exit(23)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, string(encoded))
 }
 
 func writeACPConfigUpdate(model, mode string, reasoning ...string) {
