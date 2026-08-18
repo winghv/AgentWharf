@@ -221,15 +221,20 @@ func (c *hubConnection) write(ctx context.Context, frame protocol.Frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	if event, ok := frame.(*protocol.Event); ok && c.cfg.ProtocolVersion == protocol.ProtocolVersionV2 && !isCLIEventEphemeral(event.Type) {
-		if event.ProposalID == "" {
+	if event, ok := frame.(*protocol.Event); ok {
+		if c.cfg.ProtocolVersion == protocol.ProtocolVersionV2 && !isCLIEventEphemeral(event.Type) && event.ProposalID == "" {
 			proposalID, err := randomToken()
 			if err != nil {
 				return fmt.Errorf("generate event proposal id: %w", err)
 			}
 			event.ProposalID = proposalID
 		}
-		c.trackProposal(event)
+		if err := validateHubEventFrame(event); err != nil {
+			return err
+		}
+		if c.cfg.ProtocolVersion == protocol.ProtocolVersionV2 && !isCLIEventEphemeral(event.Type) {
+			c.trackProposal(event)
+		}
 	}
 	for {
 		conn := c.current()
@@ -246,6 +251,20 @@ func (c *hubConnection) write(ctx context.Context, frame protocol.Frame) error {
 			return err
 		}
 	}
+}
+
+func validateHubEventFrame(event *protocol.Event) error {
+	if event == nil {
+		return errors.New("event is nil")
+	}
+	encoded, err := protocol.Encode(event)
+	if err != nil {
+		return fmt.Errorf("encode event: %w", err)
+	}
+	if len(encoded) > protocol.MaxWebSocketFrameBytes {
+		return fmt.Errorf("event frame exceeds %d byte limit: %d bytes", protocol.MaxWebSocketFrameBytes, len(encoded))
+	}
+	return nil
 }
 
 func (c *hubConnection) read(ctx context.Context) (protocol.Frame, error) {

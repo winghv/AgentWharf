@@ -43,6 +43,36 @@ func TestTranslateTranscriptUserMessage(t *testing.T) {
 	}
 }
 
+func TestTranslateTranscriptSplitsLargeMessage(t *testing.T) {
+	text := strings.Repeat("大输出🙂 ", 20000)
+	line := transcriptJSON(t, map[string]any{
+		"type": "assistant", "uuid": "a-large",
+		"message": map[string]any{"role": "assistant", "content": text},
+	})
+	events, err := claudeProvider{}.translateLine("ses_1", line)
+	if err != nil {
+		t.Fatalf("translateLine() error = %v", err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("events = %d, want split output", len(events))
+	}
+	var rebuilt strings.Builder
+	for _, event := range events {
+		if event.Type != "session.message" || len(event.Payload) > protocol.MaxEventPayloadBytes {
+			t.Fatalf("event = type:%s payload_bytes:%d", event.Type, len(event.Payload))
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		content := payload["content"].([]any)
+		rebuilt.WriteString(content[0].(map[string]any)["text"].(string))
+	}
+	if rebuilt.String() != text {
+		t.Fatalf("rebuilt text differs: got %d bytes, want %d", rebuilt.Len(), len(text))
+	}
+}
+
 func TestTranslateTranscriptAssistantToolCall(t *testing.T) {
 	line := transcriptJSON(t, map[string]any{
 		"type": "assistant", "uuid": "a1",

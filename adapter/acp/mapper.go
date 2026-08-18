@@ -22,7 +22,12 @@ var (
 	ErrInvalidACPEvent = errors.New("invalid acp event")
 )
 
-const maxToolOutputPreviewBytes = 4096
+const (
+	maxToolOutputPreviewBytes = 4096
+	// Leave room for the protocol envelope within Hub's 64 KiB WebSocket limit.
+	maxMessagePayloadBytes = protocol.MaxEventPayloadBytes - 4*1024
+	maxTextChunkBytes      = 8 * 1024
+)
 
 type Config struct {
 	SessionID string
@@ -191,11 +196,13 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		if text == "" {
 			return nil
 		}
-		return []protocol.Event{m.event("agent.activity", map[string]any{
-			"kind":                "thinking",
-			"text":                text,
-			"provider_session_id": providerSessionID,
-		})}
+		return splitMessageEvents(text, maxMessagePayloadBytes, func(part string) protocol.Event {
+			return m.event("agent.activity", map[string]any{
+				"kind":                "thinking",
+				"text":                part,
+				"provider_session_id": providerSessionID,
+			})
+		})
 	case "agent_message_chunk", "prompt_response":
 		text := updateText(update)
 		if text == "" {
@@ -205,7 +212,7 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		if messageID == "" {
 			messageID = providerSessionID
 		}
-		return []protocol.Event{m.messageEvent(messageID, text)}
+		return m.messageEvents(messageID, text)
 	case "tool_use", "tool_call":
 		return m.toolCallEvents(update, false)
 	case "tool_call_update", "tool_result":
@@ -533,6 +540,46 @@ func (m *Mapper) event(eventType string, payload map[string]any) protocol.Event 
 		Time:      m.now().UTC().UnixMilli(),
 		Payload:   encoded,
 	}
+}
+
+func (m *Mapper) messageEvents(messageID string, text string) []protocol.Event {
+	return splitMessageEvents(text, maxMessagePayloadBytes, func(part string) protocol.Event {
+		return m.messageEvent(messageID, part)
+	})
+}
+
+func splitMessageEvents(text string, maxPayloadBytes int, event func(string) protocol.Event) []protocol.Event {
+	if text == "" || maxPayloadBytes < 1 || event == nil {
+		return nil
+	}
+	remaining := text
+	result := make([]protocol.Event, 0, 1)
+	for len(remaining) > 0 {
+		end := len(remaining)
+		if end > maxTextChunkBytes {
+			end = maxTextChunkBytes
+		}
+		end = utf8PrefixEnd(remaining, end)
+		if end == 0 {
+			end = 1
+		}
+		for end > 1 && len(event(remaining[:end]).Payload) > maxPayloadBytes {
+			end = utf8PrefixEnd(remaining, end/2)
+		}
+		result = append(result, event(remaining[:end]))
+		remaining = remaining[end:]
+	}
+	return result
+}
+
+func utf8PrefixEnd(text string, end int) int {
+	if end >= len(text) {
+		return len(text)
+	}
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return end
 }
 
 func updateObjects(raw map[string]any, key string) []map[string]any {

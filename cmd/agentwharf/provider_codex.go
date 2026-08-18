@@ -119,7 +119,7 @@ func translateCodexEventMsg(sessionID string, payload map[string]any) ([]protoco
 	switch stringFieldFromAny(payload["type"]) {
 	case "user_message":
 		if text := stringFieldFromAny(payload["message"]); text != "" {
-			return []protocol.Event{transcriptMessageEvent(sessionID, "", "user", text)}, nil
+			return transcriptMessageEvents(sessionID, "", "user", text), nil
 		}
 	case "agent_message":
 		// Commentary is the agent's internal status narration, not its reply.
@@ -127,7 +127,7 @@ func translateCodexEventMsg(sessionID string, payload map[string]any) ([]protoco
 			return nil, nil
 		}
 		if text := stringFieldFromAny(payload["message"]); text != "" {
-			return []protocol.Event{transcriptMessageEvent(sessionID, "", "agent", text)}, nil
+			return transcriptMessageEvents(sessionID, "", "agent", text), nil
 		}
 	case "item_completed":
 		// Newer Codex releases wrap user/agent messages in item_completed
@@ -137,11 +137,11 @@ func translateCodexEventMsg(sessionID string, payload map[string]any) ([]protoco
 		switch stringFieldFromAny(item["type"]) {
 		case "UserMessage":
 			if text != "" {
-				return []protocol.Event{transcriptMessageEvent(sessionID, "", "user", text)}, nil
+				return transcriptMessageEvents(sessionID, "", "user", text), nil
 			}
 		case "AgentMessage":
 			if text != "" {
-				return []protocol.Event{transcriptMessageEvent(sessionID, "", "agent", text)}, nil
+				return transcriptMessageEvents(sessionID, "", "agent", text), nil
 			}
 		}
 	}

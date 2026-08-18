@@ -131,6 +131,45 @@ func TestMapperSupportsJSONRPCSessionUpdateEnvelope(t *testing.T) {
 	}
 }
 
+func TestMapperSplitsLargeMessageChunksWithinEventLimit(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code"})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+	text := strings.Repeat("大输出🙂 ", 20000)
+	line, err := json.Marshal(map[string]any{
+		"type":   "session/update",
+		"update": map[string]any{"type": "agent_message_chunk", "text": text},
+	})
+	if err != nil {
+		t.Fatalf("marshal update: %v", err)
+	}
+	events, err := mapper.MapLine(line)
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("events = %d, want split output", len(events))
+	}
+	var rebuilt strings.Builder
+	for _, event := range events {
+		if event.Type != "session.message" || len(event.Payload) > protocol.MaxEventPayloadBytes {
+			t.Fatalf("event = type:%s payload_bytes:%d", event.Type, len(event.Payload))
+		}
+		payload := payloadMap(t, event)
+		content, ok := payload["content"].([]any)
+		if !ok || len(content) != 1 {
+			t.Fatalf("content = %+v", payload["content"])
+		}
+		rebuilt.WriteString(content[0].(map[string]any)["text"].(string))
+	}
+	if rebuilt.String() != text {
+		t.Fatalf("rebuilt text differs: got %d bytes, want %d", rebuilt.Len(), len(text))
+	}
+}
+
 func TestMapperMapsJSONRPCSessionNewResponseToReady(t *testing.T) {
 	t.Parallel()
 

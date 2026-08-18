@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gws "github.com/gorilla/websocket"
+	"github.com/winghv/agentwharf/protocol"
 	"nhooyr.io/websocket"
 )
 
@@ -17,7 +18,7 @@ type managedConn struct {
 	writeMu sync.Mutex
 }
 
-const hubWebSocketReadLimit = 64 << 10
+const hubWebSocketReadLimit = protocol.MaxWebSocketFrameBytes
 
 func acceptManagedConn(w http.ResponseWriter, r *http.Request) (*managedConn, error) {
 	raw, err := (&gws.Upgrader{EnableCompression: false}).Upgrade(w, r, nil)

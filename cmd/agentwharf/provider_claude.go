@@ -72,7 +72,7 @@ func (claudeProvider) translateLine(sessionID string, line []byte) ([]protocol.E
 	events := make([]protocol.Event, 0, 4)
 	if text, ok := content.(string); ok {
 		if text != "" {
-			events = append(events, transcriptMessageEvent(sessionID, entryID, role, text))
+			events = append(events, transcriptMessageEvents(sessionID, entryID, role, text)...)
 		}
 		return events, nil
 	}
@@ -85,7 +85,7 @@ func (claudeProvider) translateLine(sessionID string, line []byte) ([]protocol.E
 		switch stringFieldFromAny(block["type"]) {
 		case "text":
 			if text := stringFieldFromAny(block["text"]); text != "" {
-				events = append(events, transcriptMessageEvent(sessionID, entryID, role, text))
+				events = append(events, transcriptMessageEvents(sessionID, entryID, role, text)...)
 			}
 		case "tool_use":
 			id := stringFieldFromAny(block["id"])

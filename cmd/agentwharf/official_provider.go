@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 	"github.com/winghv/agentwharf/adapter/core"
@@ -272,6 +273,46 @@ func transcriptMessageEvent(sessionID, messageID, role, text string) protocol.Ev
 		"content":    []map[string]string{{"kind": "text", "text": text}},
 	})
 	return protocol.Event{Type: "session.message", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload}
+}
+
+func transcriptMessageEvents(sessionID, messageID, role, text string) []protocol.Event {
+	return splitTranscriptMessageEvents(text, protocol.MaxEventPayloadBytes-4*1024, func(part string) protocol.Event {
+		return transcriptMessageEvent(sessionID, messageID, role, part)
+	})
+}
+
+func splitTranscriptMessageEvents(text string, maxPayloadBytes int, event func(string) protocol.Event) []protocol.Event {
+	if text == "" || maxPayloadBytes < 1 || event == nil {
+		return nil
+	}
+	remaining := text
+	result := make([]protocol.Event, 0, 1)
+	for len(remaining) > 0 {
+		end := len(remaining)
+		if end > 8*1024 {
+			end = 8 * 1024
+		}
+		end = transcriptUTF8PrefixEnd(remaining, end)
+		if end == 0 {
+			end = 1
+		}
+		for end > 1 && len(event(remaining[:end]).Payload) > maxPayloadBytes {
+			end = transcriptUTF8PrefixEnd(remaining, end/2)
+		}
+		result = append(result, event(remaining[:end]))
+		remaining = remaining[end:]
+	}
+	return result
+}
+
+func transcriptUTF8PrefixEnd(text string, end int) int {
+	if end >= len(text) {
+		return len(text)
+	}
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return end
 }
 
 func transcriptToolCallEvent(sessionID, toolCallID, phase, name string, input []byte) protocol.Event {

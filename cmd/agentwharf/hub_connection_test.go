@@ -100,6 +100,26 @@ func TestHubConnectionReconnectsSameSessionAndReplaysUnconfirmedProposal(t *test
 	}
 }
 
+func TestHubConnectionRejectsOversizedEventFrameBeforeTracking(t *testing.T) {
+	event := &protocol.Event{
+		Type:       "session.message",
+		SessionID:  "ses_oversized",
+		ProposalID: "proposal_oversized",
+		Time:       time.Now().UnixMilli(),
+		Payload:    []byte(fmt.Sprintf(`{"role":"agent","text":%q}`, strings.Repeat("x", protocol.MaxWebSocketFrameBytes))),
+	}
+	connection := &hubConnection{
+		cfg:     wrapConfig{ProtocolVersion: protocol.ProtocolVersionV2},
+		pending: make(map[string]*protocol.Event),
+	}
+	if err := connection.write(context.Background(), event); err == nil {
+		t.Fatal("write() accepted an oversized event")
+	}
+	if pending := connection.proposals(); len(pending) != 0 {
+		t.Fatalf("oversized event entered replay queue: %#v", pending)
+	}
+}
+
 func TestHubConnectionPublishesFreshRegisteredCapabilityAfterReconnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -59,7 +59,11 @@ const (
 )
 
 const (
-	HistoryPageMaxLimit          = 100
+	HistoryPageMaxLimit = 100
+	// MaxWebSocketFrameBytes is the Hub transport's hard inbound frame limit.
+	// Event payloads must stay below this value because the frame envelope also
+	// carries type, session, proposal, and timestamp fields.
+	MaxWebSocketFrameBytes       = 64 * 1024
 	MaxEventPayloadBytes         = 64 * 1024
 	MaxAttachGrantBytes          = 64 * 1024
 	MinTargetJoinNonceBytes      = 32

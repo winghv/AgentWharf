@@ -2864,9 +2864,14 @@ func (h *webSocketHandler) broadcastEvent(ctx context.Context, ev protocol.Event
 		cancel()
 		if err != nil {
 			h.unregisterClient(client)
+			// A failed live write means the transport is no longer usable. Keep
+			// the socket lifecycle consistent with the subscription membership so
+			// the browser observes close and its reconnect loop can resume.
+			reason := "live event delivery failed"
 			if errors.Is(err, errReplayBufferOverflow) {
-				_ = client.close(websocket.StatusPolicyViolation, "replay buffer overflow")
+				reason = "replay buffer overflow"
 			}
+			_ = client.close(websocket.StatusPolicyViolation, reason)
 		}
 	}
 	h.broadcastAttentionUpdate(ctx, ev.SessionID)
