@@ -464,7 +464,7 @@ func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	t.Parallel()
 
 	err := run(context.Background(), nil, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|hub|wrap|claude|codex|gemini|logout|machine|version|upgrade|attention-backfill [options]") {
+	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|hub|wrap|claude|codex|gemini|logout|version|upgrade|attention-backfill [options]") {
 		t.Fatalf("run() error = %v, want wharf usage", err)
 	}
 	if strings.Contains(err.Error(), "usage: agentwharf") {
@@ -1402,7 +1402,7 @@ func TestRunLogoutRemovesMachineCredential(t *testing.T) {
 	}
 
 	stdout.Reset()
-	if err := runWithInput(context.Background(), []string{"machine", "unlink"}, nil, stdout, io.Discard); err != nil {
+	if err := runWithInput(context.Background(), []string{"logout"}, nil, stdout, io.Discard); err != nil {
 		t.Fatalf("run machine unlink error = %v", err)
 	}
 	if !strings.Contains(stdout.String(), "no local machine pairing found") {

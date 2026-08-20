@@ -19,7 +19,7 @@ import (
 	"nhooyr.io/websocket"
 )
 
-const machineServeUsage = "usage: wharf machine serve [--poll-interval SECONDS] [--max-concurrent N] [--startup-smoke]"
+const machineServeUsage = "usage: wharf serve --foreground [--poll-interval SECONDS] [--max-concurrent N] [--startup-smoke]"
 
 const (
 	machineServeDefaultPollInterval   = 10 * time.Second
@@ -126,14 +126,6 @@ type machineTokenRefreshEnvelope struct {
 		MachineToken string `json:"machine_token"`
 		ExpiresAt    string `json:"expires_at"`
 	} `json:"data"`
-}
-
-func runMachineServeCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	cfg, err := parseMachineServeConfig(args, stderr)
-	if err != nil {
-		return err
-	}
-	return runMachineServe(ctx, cfg, stdout, stderr)
 }
 
 func parseMachineServeConfig(args []string, stderr io.Writer) (machineServeConfig, error) {

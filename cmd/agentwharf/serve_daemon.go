@@ -116,12 +116,13 @@ func runServeCommand(ctx context.Context, args []string, stdout, stderr io.Write
 		}
 		return statusDaemon(stdout)
 	case foregroundFlag:
-		if len(args) != 1 {
-			return errors.New("usage: wharf serve --foreground")
+		cfg, err := parseMachineServeConfig(args[1:], stderr)
+		if err != nil {
+			return err
 		}
-		return runForegroundServe(ctx, stdout, stderr)
+		return runForegroundServe(ctx, cfg, stdout, stderr)
 	case "-h", "--help":
-		_, _ = fmt.Fprintln(stderr, "usage: wharf serve [--foreground] | wharf serve stop | wharf serve status")
+		_, _ = fmt.Fprintln(stderr, "usage: wharf serve [--foreground] [--poll-interval SECONDS] [--max-concurrent N] [--startup-smoke] | wharf serve stop | wharf serve status")
 		return errors.New("help requested")
 	default:
 		return fmt.Errorf("unknown wharf serve argument %q", args[0])
@@ -130,7 +131,7 @@ func runServeCommand(ctx context.Context, args []string, stdout, stderr io.Write
 
 // runForegroundServe runs the machine daemon in the foreground, recording its
 // pid so wharf serve stop/status still work while it is attached.
-func runForegroundServe(ctx context.Context, stdout, stderr io.Writer) error {
+func runForegroundServe(ctx context.Context, cfg machineServeConfig, stdout, stderr io.Writer) error {
 	if err := ensurePaired(); err != nil {
 		return err
 	}
@@ -138,10 +139,7 @@ func runForegroundServe(ctx context.Context, stdout, stderr io.Writer) error {
 		return fmt.Errorf("record wharf serve pid: %w", err)
 	}
 	defer removeDaemonPID()
-	return runMachineServe(ctx, machineServeConfig{
-		PollInterval:  machineServeDefaultPollInterval,
-		MaxConcurrent: machineServeDefaultMaxConcurrent,
-	}, stdout, stderr)
+	return runMachineServe(ctx, cfg, stdout, stderr)
 }
 
 // startBackgroundServe re-executes the daemon detached from the terminal so it

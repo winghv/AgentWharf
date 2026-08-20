@@ -377,6 +377,7 @@ export interface HistoryPageOptions {
 
 type EventHandler = (event: AgentWharfEvent) => void
 type ErrorHandler = (error: Error | ErrorFrame) => void
+type ConnectHandler = () => void
 type DeliveryStateHandler = (state: CommandDeliveryState) => void
 type SettingsCapabilityHandler = (update: SettingsCapabilityUpdate) => void
 type SettingsEffectiveHandler = (update: SettingsEffectiveUpdate) => void
@@ -428,6 +429,7 @@ export class AgentWharfClient {
   private readonly cursors = new Map<string, number>()
   private readonly eventHandlers = new Set<EventHandler>()
   private readonly errorHandlers = new Set<ErrorHandler>()
+  private readonly connectHandlers = new Set<ConnectHandler>()
   private readonly deliveryStateHandlers = new Set<DeliveryStateHandler>()
   private readonly settingsCapabilityHandlers = new Set<SettingsCapabilityHandler>()
   private readonly settingsEffectiveHandlers = new Set<SettingsEffectiveHandler>()
@@ -500,6 +502,12 @@ export class AgentWharfClient {
   onError(handler: ErrorHandler): () => void {
     this.errorHandlers.add(handler)
     return () => this.errorHandlers.delete(handler)
+  }
+
+  /** Fires after every successful handshake, including silent reconnects. */
+  onConnect(handler: ConnectHandler): () => void {
+    this.connectHandlers.add(handler)
+    return () => this.connectHandlers.delete(handler)
   }
 
   onDeliveryState(handler: DeliveryStateHandler): () => void {
@@ -741,6 +749,7 @@ export class AgentWharfClient {
             this.handshakeReady = true
             this.lastHelloAck = ack
             this.reconnectDelayMs = this.reconnect?.initialDelayMs ?? 0
+            this.emitConnect()
             resolve(ack)
             return
           }
@@ -912,6 +921,12 @@ export class AgentWharfClient {
   private emitError(error: Error | ErrorFrame): void {
     for (const handler of this.errorHandlers) {
       handler(error)
+    }
+  }
+
+  private emitConnect(): void {
+    for (const handler of this.connectHandlers) {
+      handler()
     }
   }
 

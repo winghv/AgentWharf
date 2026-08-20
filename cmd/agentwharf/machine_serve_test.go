@@ -270,7 +270,7 @@ func TestMachineServeDispatchesAutoClaimEndToEnd(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	if err := runWithInput(ctx, []string{"machine", "serve", "--poll-interval", "1", "--startup-smoke"}, strings.NewReader(""), &stdout, &stderr); err != nil {
+	if err := runWithInput(ctx, []string{"serve", "--foreground", "--poll-interval", "1", "--startup-smoke"}, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("machine serve: %v stderr=%q", err, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "auto_dispatch_ok: claim_id=claim_auto session_id=ses_auto") {
@@ -317,7 +317,7 @@ func TestMachineServeRetriesWhileSessionIsStarting(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	if err := runWithInput(ctx, []string{"machine", "serve", "--poll-interval", "1", "--startup-smoke"}, strings.NewReader(""), &stdout, &stderr); err != nil {
+	if err := runWithInput(ctx, []string{"serve", "--foreground", "--poll-interval", "1", "--startup-smoke"}, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("machine serve starting-session retry: %v stderr=%q", err, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "auto_dispatch_ok: claim_id=claim_auto session_id=ses_auto") {
@@ -362,7 +362,7 @@ func TestMachineServeResumesPersistedHandoff(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	if err := runWithInput(ctx, []string{"machine", "serve", "--poll-interval", "1", "--startup-smoke"}, strings.NewReader(""), &stdout, &stderr); err != nil {
+	if err := runWithInput(ctx, []string{"serve", "--foreground", "--poll-interval", "1", "--startup-smoke"}, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("machine serve resume: %v stderr=%q", err, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "auto_dispatch_ok: claim_id=claim_auto session_id=ses_auto") {
@@ -410,7 +410,7 @@ func TestMachineServeRefreshesRejectedMachineCredential(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	if err := runWithInput(ctx, []string{"machine", "serve", "--poll-interval", "1"}, strings.NewReader(""), &stdout, &stderr); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) && !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+	if err := runWithInput(ctx, []string{"serve", "--foreground", "--poll-interval", "1"}, strings.NewReader(""), &stdout, &stderr); err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) && !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
 		t.Fatalf("machine serve refresh: %v stderr=%q", err, stderr.String())
 	}
 	if refreshes.Load() < 1 {

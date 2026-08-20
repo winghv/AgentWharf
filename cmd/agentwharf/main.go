@@ -79,7 +79,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: wharf serve|hub|wrap|claude|codex|gemini|logout|machine|version|upgrade|attention-backfill [options]")
+		return errors.New("usage: wharf serve|hub|wrap|claude|codex|gemini|logout|version|upgrade|attention-backfill [options]")
 	}
 
 	switch args[0] {
@@ -148,14 +148,6 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 			return fmt.Errorf("unexpected logout arguments: %v", args[1:])
 		}
 		return runMachineLogout(stdout)
-	case "machine":
-		if len(args) == 2 && args[1] == "unlink" {
-			return runMachineLogout(stdout)
-		}
-		if len(args) >= 2 && args[1] == "serve" {
-			return runMachineServeCommand(ctx, args[2:], stdout, stderr)
-		}
-		return errors.New("usage: wharf machine serve|unlink")
 	case "task":
 		return runTaskCommand(ctx, args[1:], stdin, stdout, stderr)
 	case "attention-backfill":
