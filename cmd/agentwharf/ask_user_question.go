@@ -63,7 +63,7 @@ func askUserQuestionOptionIndex(options []askUserQuestionOption, label string) i
 // correctly; multi-question prompts assume each Enter advances to the next
 // question, which may differ across claude versions.
 func askUserQuestionKeystrokes(questions []askUserQuestion, answers map[string]string) []byte {
-	const down = "[B"
+	const down = "\x1b[B"
 	var out []byte
 	for _, question := range questions {
 		label := answers[question.Question]
