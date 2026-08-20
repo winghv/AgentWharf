@@ -33,6 +33,13 @@ const adapterEventBatchWindow = 50 * time.Millisecond
 const adapterEventBatchMaxEvents = 64
 const credentialRotationTTL = 15 * time.Minute
 
+// clientEventWriteTimeout bounds a single live-event write to a client. It is
+// intentionally much longer than adapterAuthorityPollInterval: client fanout
+// (browser tabs and Own Machine connections) must tolerate network latency and
+// a momentarily-slow reader without being force-closed. Only a genuinely broken
+// transport should hit this deadline.
+const clientEventWriteTimeout = 30 * time.Second
+
 var errReplayBufferOverflow = errors.New("replay buffer overflow")
 var (
 	errRotationActivated       = errors.New("adapter credential rotation activated")
@@ -2859,7 +2866,7 @@ func (h *webSocketHandler) broadcastEvent(ctx context.Context, ev protocol.Event
 		if ev.Seq == nil {
 			out.Type = h.selectEphemeralVariant(client.protocolVersion, ev.Type)
 		}
-		writeCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+		writeCtx, cancel := context.WithTimeout(ctx, clientEventWriteTimeout)
 		err := client.sendLiveEvent(writeCtx, out)
 		cancel()
 		if err != nil {
@@ -2929,7 +2936,7 @@ func (h *webSocketHandler) broadcastAttentionUpdateToPeer(ctx context.Context, p
 	if attentionFrameUnchanged(frame, subscription.sent) {
 		return
 	}
-	writeCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+	writeCtx, cancel := context.WithTimeout(ctx, clientEventWriteTimeout)
 	err = peer.writeFrame(writeCtx, frame)
 	cancel()
 	if err != nil {
