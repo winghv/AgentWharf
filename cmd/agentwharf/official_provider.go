@@ -99,13 +99,14 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 
 	mirrorDone := make(chan error, 1)
 	injected := &injectedPromptTracker{pending: make(map[string]int)}
+	questions := newQuestionCache()
 	go func() {
-		mirrorDone <- mirrorTranscript(runCtx, cfg, provider, sessionID, launchTime, writeFrame, injected)
+		mirrorDone <- mirrorTranscript(runCtx, cfg, provider, sessionID, launchTime, writeFrame, injected, questions)
 	}()
 
 	commandDone := make(chan error, 1)
 	go func() {
-		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, connection, writeFrame, ptmx, injected)
+		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, connection, writeFrame, ptmx, injected, questions)
 	}()
 
 	waitErr := cmd.Wait()
@@ -130,7 +131,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 // instructions into the running official CLI's PTY, so the Hub can drive the
 // same session the user is operating locally. It acks the command after the
 // prompt is written and keeps the proposal/credential machinery healthy.
-func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, injected *injectedPromptTracker) error {
+func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, injected *injectedPromptTracker, questions *questionCache) error {
 	accepted := newAcceptedCommandSet(2048)
 	for {
 		frame, err := connection.read(ctx)
@@ -144,6 +145,19 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 			}
 		case *protocol.Command:
 			if accepted.Contains(typed.CommandID) {
+				if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
+					return err
+				}
+				continue
+			}
+			if typed.Type == protocol.CommandPermissionRespond {
+				if err := forwardQuestionAnswer(ptmx, questions, typed.Payload); err != nil {
+					if writeErr := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: err.Error()}); writeErr != nil {
+						return writeErr
+					}
+					continue
+				}
+				accepted.Add(typed.CommandID)
 				if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
 					return err
 				}
@@ -195,6 +209,41 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 	}
 }
 
+// forwardQuestionAnswer injects an AskUserQuestion answer into the claude PTY.
+// It looks up the cached questions by the permission request_id, then writes the
+// down-arrow/Enter keystrokes for the selected options.
+//
+// UNTESTED against the live claude TUI: the exact navigation may differ across
+// claude versions.
+func forwardQuestionAnswer(ptmx *os.File, questions *questionCache, payload json.RawMessage) error {
+	var req struct {
+		RequestID string            `json:"request_id"`
+		Decision  string            `json:"decision"`
+		Answers   map[string]string `json:"answers"`
+	}
+	if json.Unmarshal(payload, &req) != nil {
+		return fmt.Errorf("invalid permission.respond payload")
+	}
+	// Deny/empty answers are a no-op: there is nothing to inject.
+	if req.Decision != "approve" || len(req.Answers) == 0 {
+		return nil
+	}
+	toolCallID := strings.TrimPrefix(req.RequestID, "question:")
+	if toolCallID == "" {
+		return fmt.Errorf("missing question request id")
+	}
+	qs := questions.Get(toolCallID)
+	if len(qs) == 0 {
+		return fmt.Errorf("question context not found")
+	}
+	keystrokes := askUserQuestionKeystrokes(qs, req.Answers)
+	if len(keystrokes) == 0 {
+		return nil
+	}
+	_, err := ptmx.Write(keystrokes)
+	return err
+}
+
 func newSessionUUID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -208,7 +257,7 @@ func newSessionUUID() string {
 // mirrorTranscript tails the agent's transcript file and publishes new messages
 // to the Hub. The provider resolves the transcript path and translates lines;
 // the tailing, prompt dedup, and publish loop are shared.
-func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvider, sessionID string, launchTime time.Time, writeFrame func(protocol.Frame) error, injected *injectedPromptTracker) error {
+func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvider, sessionID string, launchTime time.Time, writeFrame func(protocol.Frame) error, injected *injectedPromptTracker, questions *questionCache) error {
 	path, err := provider.transcriptPath(ctx, cfg, sessionID, launchTime)
 	if err != nil {
 		return err
@@ -251,6 +300,7 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 				continue
 			}
 			for _, event := range events {
+				cacheAskUserQuestionEvent(questions, &event)
 				if err := writeFrame(&event); err != nil {
 					file.Close()
 					return err

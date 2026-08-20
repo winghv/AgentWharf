@@ -224,6 +224,24 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 	}
 }
 
+func isACPAskUserQuestion(name string) bool {
+	switch name {
+	case "AskUserQuestion", "ask_user_question", "askUserQuestion":
+		return true
+	default:
+		return false
+	}
+}
+
+func acpQuestionItems(input any) any {
+	if object, ok := input.(map[string]any); ok {
+		if questions, ok := object["questions"]; ok {
+			return questions
+		}
+	}
+	return []any{}
+}
+
 func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol.Event {
 	toolCallID := firstString(update, "tool_call_id", "toolCallId", "tool_use_id", "toolUseId", "id")
 	if toolCallID == "" {
@@ -233,13 +251,24 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 	status := firstString(update, "status", "phase")
 	if !isUpdate || status == "pending" || status == "in_progress" || status == "start" {
 		input := objectOrNil(firstAny(update, "rawInput", "raw_input", "input"))
-		return []protocol.Event{m.event("session.tool_call", map[string]any{
+		name := firstString(update, "name", "kind", "title")
+		events := []protocol.Event{m.event("session.tool_call", map[string]any{
 			"tool_call_id": toolCallID,
 			"phase":        "start",
-			"name":         firstString(update, "name", "kind", "title"),
+			"name":         name,
 			"input":        input,
 			"result":       nil,
 		})}
+		if isACPAskUserQuestion(name) {
+			events = append(events, m.event("permission.request", map[string]any{
+				"request_id": "question:" + toolCallID,
+				"action":     "ask_user_question",
+				"risk_level": "low",
+				"summary":    "Agent asks a question",
+				"detail":     map[string]any{"questions": acpQuestionItems(input)},
+			}))
+		}
+		return events
 	}
 
 	resultStatus := ""
