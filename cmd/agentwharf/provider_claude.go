@@ -92,9 +92,43 @@ func (claudeProvider) translateLine(sessionID string, line []byte) ([]protocol.E
 			name := stringFieldFromAny(block["name"])
 			input, _ := json.Marshal(block["input"])
 			events = append(events, transcriptToolCallEvent(sessionID, id, "start", name, input))
+			if isAskUserQuestionTool(name) {
+				events = append(events, transcriptQuestionPermissionRequest(sessionID, id, input))
+			}
+		case "tool_result":
+			toolUseID := stringFieldFromAny(block["tool_use_id"])
+			if toolUseID == "" {
+				continue
+			}
+			content, isError := toolResultContent(block)
+			events = append(events, transcriptToolResultEvent(sessionID, toolUseID, "", content, isError))
 		}
 	}
 	return events, nil
+}
+
+// toolResultContent extracts the text content and error flag from a claude
+// transcript tool_result block. Content may be a plain string or an array of
+// content blocks.
+func toolResultContent(block map[string]any) ([]byte, bool) {
+	isError := block["is_error"] == true
+	switch content := block["content"].(type) {
+	case string:
+		return []byte(content), isError
+	case []any:
+		var parts []string
+		for _, item := range content {
+			if textBlock, ok := item.(map[string]any); ok {
+				if text, ok := textBlock["text"].(string); ok && text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return []byte(strings.Join(parts, "\n")), isError
+	default:
+		encoded, _ := json.Marshal(block["content"])
+		return encoded, isError
+	}
 }
 
 // launchSettings parses Claude Code's --model / --permission-mode /
