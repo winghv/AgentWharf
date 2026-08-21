@@ -235,6 +235,17 @@ func TestTranscriptUserText(t *testing.T) {
 	if got := (claudeProvider{}).transcriptUserText(assistant); got != "" {
 		t.Fatalf("transcriptUserText(assistant) = %q, want empty", got)
 	}
+	blocks := transcriptJSON(t, map[string]any{
+		"type": "user", "uuid": "u2",
+		"message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "modern "},
+			map[string]any{"type": "image", "source": "ignored"},
+			map[string]any{"type": "text", "text": "prompt"},
+		}},
+	})
+	if got := (claudeProvider{}).transcriptUserText(blocks); got != "modern prompt" {
+		t.Fatalf("transcriptUserText(blocks) = %q, want modern prompt", got)
+	}
 }
 
 func TestCodexTranslateLine(t *testing.T) {

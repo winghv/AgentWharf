@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,19 +39,23 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	if cwd, cwdErr := providerWorkingDirectory(cfg.WorkingDirectory); cwdErr == nil {
 		cwdBasename = cwdEventBasename(cwd)
 	}
-	publishState := func(state string) error {
+	publishState := func(state string) (string, error) {
 		body := map[string]any{"state": state, "provider": cfg.Provider}
 		if cwdBasename != "" {
 			body["metadata"] = map[string]any{"cwd": cwdBasename}
 		}
 		payload, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return "", err
 		}
-		return writeFrame(&protocol.Event{Type: "session.state", SessionID: cfg.SessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload})
+		event := &protocol.Event{Type: "session.state", SessionID: cfg.SessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload}
+		if err := writeFrame(event); err != nil {
+			return "", err
+		}
+		return event.ProposalID, nil
 	}
 
-	if err := publishState("starting"); err != nil {
+	if _, err := publishState("starting"); err != nil {
 		return err
 	}
 
@@ -81,7 +86,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
-	if err := publishState("ready"); err != nil {
+	if _, err := publishState("ready"); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return err
@@ -111,10 +116,10 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 
 	waitErr := cmd.Wait()
 	// The official CLI has exited: stop the mirror/command loops so this returns
-	// promptly instead of hanging on their blocking reads/polls.
+	// promptly instead of hanging on their blocking reads/polls. Wait for the
+	// command reader to release the Hub socket before reading the terminal-state
+	// receipt on this goroutine.
 	cancel()
-	_ = publishState("ended")
-	_ = ignoreContextError(waitErr)
 
 	select {
 	case <-mirrorDone:
@@ -124,6 +129,21 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	case <-commandDone:
 	case <-ctx.Done():
 	}
+	proposalID, err := publishState("ended")
+	if err != nil {
+		return fmt.Errorf("publish official agent terminal state: %w", err)
+	}
+	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
+		if proposalID == "" {
+			return errors.New("official agent terminal state is missing a proposal ID")
+		}
+		receiptCtx, receiptCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer receiptCancel()
+		if err := waitEventReceipt(receiptCtx, connection.read, writeFrame, proposalID, "official agent terminal state"); err != nil {
+			return err
+		}
+	}
+	_ = ignoreContextError(waitErr)
 	return nil
 }
 

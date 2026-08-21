@@ -172,6 +172,19 @@ func (claudeProvider) transcriptUserText(line []byte) string {
 	if message == nil || stringFieldFromAny(message["role"]) != "user" {
 		return ""
 	}
-	text, _ := message["content"].(string)
-	return text
+	switch content := message["content"].(type) {
+	case string:
+		return content
+	case []any:
+		var text strings.Builder
+		for _, item := range content {
+			block, _ := item.(map[string]any)
+			if block != nil && stringFieldFromAny(block["type"]) == "text" {
+				text.WriteString(stringFieldFromAny(block["text"]))
+			}
+		}
+		return text.String()
+	default:
+		return ""
+	}
 }
