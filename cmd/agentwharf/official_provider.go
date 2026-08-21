@@ -210,14 +210,21 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 			}
 			// Enter is 0x0D in raw mode; 0x0A is the newline key, so sending \n
 			// only inserts a line break without submitting the prompt.
-			if _, err := ptmx.Write([]byte(text.String() + "\r")); err != nil {
+			promptText := text.String()
+			if injected != nil {
+				// Register before writing: Claude can append its transcript entry
+				// immediately, otherwise the mirror may publish the first prompt
+				// before the tracker is updated.
+				injected.add(promptText)
+			}
+			if _, err := ptmx.Write([]byte(promptText + "\r")); err != nil {
+				if injected != nil {
+					injected.remove(promptText)
+				}
 				if writeErr := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: err.Error()}); writeErr != nil {
 					return writeErr
 				}
 				continue
-			}
-			if injected != nil {
-				injected.add(text.String())
 			}
 			accepted.Add(typed.CommandID)
 			if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
@@ -453,6 +460,23 @@ func (t *injectedPromptTracker) add(text string) {
 	t.mu.Lock()
 	t.pending[key]++
 	t.mu.Unlock()
+}
+
+func (t *injectedPromptTracker) remove(text string) {
+	if t == nil {
+		return
+	}
+	key := strings.TrimSpace(text)
+	if key == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.pending[key] <= 1 {
+		delete(t.pending, key)
+		return
+	}
+	t.pending[key]--
 }
 
 func (t *injectedPromptTracker) consume(text string) bool {

@@ -926,6 +926,12 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		if err != nil {
 			return cfg, err
 		}
+		// Keep the machine task consumer alive while an interactive TUI is
+		// running. Starting it only after runWrap returns leaves Console-created
+		// auto claims in `starting` until the local CLI exits.
+		if !cfg.StartupSmoke && !cfg.PairOnly {
+			ensureBackgroundDaemon(cfg.Stderr)
+		}
 	} else if cfg.Pair {
 		cfg, err = pairWrapSession(ctx, cfg, pairOutput)
 		if err != nil {

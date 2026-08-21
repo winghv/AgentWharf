@@ -220,6 +220,15 @@ func TestInjectedPromptTrackerDedupes(t *testing.T) {
 	}
 }
 
+func TestInjectedPromptTrackerRemovesFailedWrite(t *testing.T) {
+	tracker := &injectedPromptTracker{pending: make(map[string]int)}
+	tracker.add("hello")
+	tracker.remove("hello")
+	if tracker.consume("hello") {
+		t.Fatal("consume(hello) = true after remove, want false")
+	}
+}
+
 func TestTranscriptUserText(t *testing.T) {
 	line := transcriptJSON(t, map[string]any{
 		"type": "user", "uuid": "u1",
