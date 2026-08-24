@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -297,8 +298,8 @@ func TestConfirmOfficialCLIPromptRetriesAfterIdleMiss(t *testing.T) {
 	if tracker.hasPending("wake up") {
 		t.Fatal("prompt still pending after delayed consume")
 	}
-	if !strings.Contains(buf.String(), "wake up\r") {
-		t.Fatalf("retry write = %q, want prompt resubmit", buf.String())
+	if !strings.Contains(buf.String(), "\x1b[200~wake up\x1b[201~\r") {
+		t.Fatalf("retry write = %q, want bracketed-paste resubmit", buf.String())
 	}
 	if !strings.Contains(buf.String(), "\x1b") || !strings.Contains(buf.String(), "\x15") {
 		t.Fatalf("retry write = %q, want ESC and Ctrl+U wakeup", buf.String())
@@ -321,10 +322,65 @@ func TestConfirmOfficialCLIPromptPublishesMissWhenTUIIgnoresPrompt(t *testing.T)
 	if !ok || event.Type != "session.message" || event.SessionID != "ses_1" {
 		t.Fatalf("frame = %#v", frames[0])
 	}
-	if !strings.Contains(string(event.Payload), "did not accept this instruction") {
+	if !strings.Contains(string(event.Payload), "did not accept this instruction") && !strings.Contains(string(event.Payload), "没有收下") {
 		t.Fatalf("payload = %s", event.Payload)
 	}
+	if strings.Count(buf.String(), "\x1b[200~ignored\x1b[201~\r") != 2 {
+		t.Fatalf("retry writes = %q, want two bracketed-paste resubmits", buf.String())
+	}
 }
+
+func TestWriteOfficialCLIPromptUsesBracketedPaste(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeOfficialCLIPrompt(&buf, "你好"); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != "\x1b[200~你好\x1b[201~\r" {
+		t.Fatalf("write = %q", buf.String())
+	}
+}
+
+func TestCopyLockedSerializesWithConcurrentWriter(t *testing.T) {
+	pr, pw := io.Pipe()
+	var mu sync.Mutex
+	var dst bytes.Buffer
+	var dstMu sync.Mutex
+	writer := writerFunc(func(p []byte) (int, error) {
+		dstMu.Lock()
+		n, err := dst.Write(p)
+		dstMu.Unlock()
+		return n, err
+	})
+	done := make(chan error, 1)
+	go func() { done <- copyLocked(writer, pr, &mu) }()
+	mu.Lock()
+	if _, err := writer.Write([]byte("HUB")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pw.Write([]byte("local")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	dstMu.Lock()
+	if dst.String() != "HUB" {
+		t.Fatalf("interleaved write = %q, want HUB while lock held", dst.String())
+	}
+	dstMu.Unlock()
+	mu.Unlock()
+	if err := pw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil && err != io.EOF {
+		t.Fatalf("copyLocked: %v", err)
+	}
+	if dst.String() != "HUBlocal" {
+		t.Fatalf("copied = %q, want HUBlocal", dst.String())
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
 
 func TestTranscriptUserText(t *testing.T) {
 	line := transcriptJSON(t, map[string]any{

@@ -98,9 +98,11 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 		_ = publishOfficialSettingsCapability(writeFrame, cfg.SessionID, provider.launchSettings(cfg.ProviderCommand[1:]))
 	}
 
-	// CLI output to the terminal, terminal input to the CLI.
+	// CLI output to the terminal. Local keystrokes and Hub injects share ptyMu
+	// so an idle recap or mouse-tracking burst cannot splice into a prompt.
+	var ptyMu sync.Mutex
 	go func() { _, _ = io.Copy(os.Stdout, ptmx) }()
-	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
+	go func() { _ = copyLocked(ptmx, os.Stdin, &ptyMu) }()
 
 	mirrorDone := make(chan error, 1)
 	injected := &injectedPromptTracker{pending: make(map[string]int)}
@@ -111,7 +113,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 
 	commandDone := make(chan error, 1)
 	go func() {
-		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, connection, writeFrame, ptmx, injected, questions)
+		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, connection, writeFrame, ptmx, &ptyMu, injected, questions)
 	}()
 
 	waitErr := cmd.Wait()
@@ -151,9 +153,11 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 // instructions into the running official CLI's PTY, so the Hub can drive the
 // same session the user is operating locally. It acks the command after the
 // prompt is written and keeps the proposal/credential machinery healthy.
-func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, injected *injectedPromptTracker, questions *questionCache) error {
+func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, ptyMu *sync.Mutex, injected *injectedPromptTracker, questions *questionCache) error {
 	accepted := newAcceptedCommandSet(2048)
-	var ptyMu sync.Mutex
+	if ptyMu == nil {
+		ptyMu = &sync.Mutex{}
+	}
 	for {
 		frame, err := connection.read(ctx)
 		if err != nil {
@@ -222,7 +226,7 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 				injected.add(promptText)
 			}
 			ptyMu.Lock()
-			_, err = ptmx.Write([]byte(promptText + "\r"))
+			err = writeOfficialCLIPrompt(ptmx, promptText)
 			ptyMu.Unlock()
 			if err != nil {
 				if injected != nil {
@@ -240,7 +244,7 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 			// After a long idle the TUI may be on a recap/pager, so the first
 			// write lands but is not submitted. Confirm via transcript without
 			// blocking Ping handling on this loop.
-			go confirmOfficialCLIPrompt(ctx, ptmx, &ptyMu, typed.SessionID, promptText, injected, writeFrame, defaultOfficialPromptInjection)
+			go confirmOfficialCLIPrompt(ctx, ptmx, ptyMu, typed.SessionID, promptText, injected, writeFrame, defaultOfficialPromptInjection)
 		case *protocol.Error:
 			return fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
 		}
@@ -601,44 +605,82 @@ type officialPromptInjection struct {
 }
 
 var defaultOfficialPromptInjection = officialPromptInjection{
-	firstWait: 1500 * time.Millisecond,
-	retryWait: 3 * time.Second,
-	wakePause: 50 * time.Millisecond,
+	firstWait: 2500 * time.Millisecond,
+	retryWait: 4 * time.Second,
+	wakePause: 80 * time.Millisecond,
 }
 
 // confirmOfficialCLIPrompt watches the transcript mirror for the Hub-injected
 // user line. If the idle Claude TUI swallowed the first Enter (recap/pager),
-// it dismisses the overlay, resubmits, and publishes a visible miss instead of
-// leaving the workbench looking connected with no Agent turn.
+// it dismisses the overlay, resubmits twice, and publishes a visible miss
+// instead of leaving the workbench looking connected with no Agent turn.
 func confirmOfficialCLIPrompt(ctx context.Context, ptmx io.Writer, ptyMu *sync.Mutex, sessionID, promptText string, injected *injectedPromptTracker, writeFrame func(protocol.Frame) error, timing officialPromptInjection) {
 	if waitInjectedPromptGone(ctx, injected, promptText, timing.firstWait) {
 		return
 	}
-	if ptyMu != nil {
-		ptyMu.Lock()
-	}
-	stillPending := injected.hasPending(promptText)
-	if stillPending {
-		if err := wakeOfficialCLIComposer(ptmx, timing.wakePause); err != nil {
-			if ptyMu != nil {
-				ptyMu.Unlock()
+	for range 2 {
+		if ptyMu != nil {
+			ptyMu.Lock()
+		}
+		stillPending := injected.hasPending(promptText)
+		if stillPending {
+			if err := wakeOfficialCLIComposer(ptmx, timing.wakePause); err != nil {
+				if ptyMu != nil {
+					ptyMu.Unlock()
+				}
+				return
 			}
+			if err := writeOfficialCLIPrompt(ptmx, promptText); err != nil {
+				if ptyMu != nil {
+					ptyMu.Unlock()
+				}
+				return
+			}
+		}
+		if ptyMu != nil {
+			ptyMu.Unlock()
+		}
+		if !stillPending || waitInjectedPromptGone(ctx, injected, promptText, timing.retryWait) {
 			return
 		}
-		if _, err := ptmx.Write([]byte(promptText + "\r")); err != nil {
-			if ptyMu != nil {
-				ptyMu.Unlock()
-			}
-			return
-		}
-	}
-	if ptyMu != nil {
-		ptyMu.Unlock()
-	}
-	if !stillPending || waitInjectedPromptGone(ctx, injected, promptText, timing.retryWait) {
-		return
 	}
 	_ = publishOfficialInjectionMiss(writeFrame, sessionID)
+}
+
+func copyLocked(dst io.Writer, src io.Reader, mu *sync.Mutex) error {
+	if dst == nil || src == nil {
+		return errors.New("official cli pty copy is unavailable")
+	}
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if mu != nil {
+				mu.Lock()
+			}
+			_, writeErr := dst.Write(buf[:n])
+			if mu != nil {
+				mu.Unlock()
+			}
+			if writeErr != nil {
+				return writeErr
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
+func writeOfficialCLIPrompt(w io.Writer, promptText string) error {
+	if w == nil {
+		return errors.New("official cli pty is unavailable")
+	}
+	_, err := io.WriteString(w, "\x1b[200~"+promptText+"\x1b[201~\r")
+	return err
 }
 
 func waitInjectedPromptGone(ctx context.Context, injected *injectedPromptTracker, text string, timeout time.Duration) bool {
@@ -696,7 +738,7 @@ func publishOfficialInjectionMiss(writeFrame func(protocol.Frame) error, session
 		"role":       "agent",
 		"content": []map[string]string{{
 			"kind": "text",
-			"text": "The local Agent terminal did not accept this instruction after idle. Click that terminal, press Enter, then resend from the workbench.",
+			"text": "The local Agent terminal did not accept this instruction after idle. Click that terminal, press Enter, then resend from the workbench. 本机 Agent 终端空闲后没有收下这条指令。请点一下那个终端窗口，按一次 Enter，再从工作台重发。",
 		}},
 	})
 	if err != nil {
