@@ -377,19 +377,11 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer) {
 	adapterCfg := serveWrapConfig(*handoff, cfg.StartupSmoke)
 	adapterCfg.Stderr = stderr
-	adapterCfg.ProviderSessionID = handoff.ProviderSessionID
-	adapterCfg.OnProviderSession = func(id string) {
-		if strings.TrimSpace(id) == "" || handoff.ProviderSessionID == id {
-			return
-		}
-		handoff.ProviderSessionID = id
-		if err := saveMachineDispatch(*handoff); err != nil {
-			_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist provider session %s: %v\n", handoff.SessionID, err)
-		}
-	}
+	adapterCfg.OnProviderSession = rememberProviderSession(handoff, &adapterCfg, stderr)
 	restarts := 0
 	delay := machineServeAdapterRestartInitial
 	for {
+		adapterCfg.ProviderSessionID = handoff.ProviderSessionID
 		done := runAdapter(ctx, adapterCfg, stderr)
 		select {
 		case <-ctx.Done():
@@ -657,17 +649,40 @@ func serveWrapConfig(handoff machineServeDispatch, startupSmoke bool) wrapConfig
 		agent = "claude"
 	}
 	return wrapConfig{
-		HubURL:           handoff.HubWSURL,
-		SessionID:        handoff.SessionID,
-		Agent:            agent,
-		Provider:         handoff.Provider,
-		AdapterToken:     handoff.AdapterToken,
-		Format:           "acp",
-		ProviderCommand:  defaultProviderCommand(agent),
-		ProtocolVersion:  protocol.HubProtocolVersion,
-		StartupSmoke:     startupSmoke,
-		WorkingDirectory: handoff.WorkingDirectory,
-		LaunchSettings:   wrapLaunchSettings{ModelID: handoff.ModelID, ReasoningEffortID: handoff.ReasoningEffortID, PermissionModeID: handoff.PermissionModeID},
+		HubURL:            handoff.HubWSURL,
+		SessionID:         handoff.SessionID,
+		Agent:             agent,
+		Provider:          handoff.Provider,
+		AdapterToken:      handoff.AdapterToken,
+		Format:            "acp",
+		ProviderCommand:   defaultProviderCommand(agent),
+		ProtocolVersion:   protocol.HubProtocolVersion,
+		StartupSmoke:      startupSmoke,
+		WorkingDirectory:  handoff.WorkingDirectory,
+		ProviderSessionID: handoff.ProviderSessionID,
+		LaunchSettings:    wrapLaunchSettings{ModelID: handoff.ModelID, ReasoningEffortID: handoff.ReasoningEffortID, PermissionModeID: handoff.PermissionModeID},
+	}
+}
+
+// rememberProviderSession writes the opaque ACP session id into the in-memory
+// wrap config and the durable dispatch file. The restart loop reads
+// adapterCfg.ProviderSessionID, so skipping this update would start a fresh
+// provider context after a crash and drop Claude/Codex conversation state
+// while the Hub transcript still looks complete.
+func rememberProviderSession(handoff *machineServeDispatch, adapterCfg *wrapConfig, stderr io.Writer) func(string) {
+	return func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" || adapterCfg == nil || handoff == nil {
+			return
+		}
+		adapterCfg.ProviderSessionID = id
+		if handoff.ProviderSessionID == id {
+			return
+		}
+		handoff.ProviderSessionID = id
+		if err := saveMachineDispatch(*handoff); err != nil && stderr != nil {
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist provider session %s: %v\n", handoff.SessionID, err)
+		}
 	}
 }
 

@@ -1871,6 +1871,19 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 		applyACPLaunchSettings(runCtx, settingsTracker, providerSessionID, stdinWriter, scanner, cfg.LaunchSettings, cfg.Stderr)
 	}
 	var settingsMu sync.Mutex
+	removeReconnectSettings := connection.setReconnectProposalFactory("settings", func() (*protocol.Event, error) {
+		if cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
+			return nil, nil
+		}
+		settingsMu.Lock()
+		state, ok := settingsTracker.Current()
+		settingsMu.Unlock()
+		if !ok {
+			return nil, nil
+		}
+		return newACPSettingsCapabilityEvent(cfg.SessionID, state)
+	})
+	defer removeReconnectSettings()
 	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
 		if state, ok := settingsTracker.Current(); ok {
 			if err := publishACPSettingsCapability(writeFrame, cfg.SessionID, state); err != nil {

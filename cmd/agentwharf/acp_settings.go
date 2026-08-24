@@ -929,24 +929,35 @@ func warnLaunchSettingSkipped(warn io.Writer, kind, value, reason string) {
 }
 
 func publishACPSettingsCapability(writeFrame func(protocol.Frame) error, sessionID string, state acpSettingsState) error {
-	if writeFrame == nil || sessionID == "" {
+	event, err := newACPSettingsCapabilityEvent(sessionID, state)
+	if err != nil {
+		return err
+	}
+	if writeFrame == nil || event == nil {
 		return errors.New("settings capability publisher is unavailable")
+	}
+	return writeFrame(event)
+}
+
+func newACPSettingsCapabilityEvent(sessionID string, state acpSettingsState) (*protocol.Event, error) {
+	if sessionID == "" {
+		return nil, errors.New("settings capability publisher is unavailable")
 	}
 	payload, err := json.Marshal(state.Capability)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := protocol.DecodeSettingsCapabilityPayload(payload); err != nil {
-		return err
+		return nil, err
 	}
 	proposalID, err := randomToken()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return writeFrame(&protocol.Event{
+	return &protocol.Event{
 		Type: "session.settings.capabilities", SessionID: sessionID,
 		Time: time.Now().UTC().UnixMilli(), Payload: payload, ProposalID: proposalID,
-	})
+	}, nil
 }
 
 func publishACPSettingsEffective(writeFrame func(protocol.Frame) error, sessionID string, reservation acpSettingsReservation, execution acpSettingsExecution) error {

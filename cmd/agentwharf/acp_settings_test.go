@@ -16,6 +16,23 @@ import (
 	"github.com/winghv/agentwharf/protocol"
 )
 
+func TestNewACPSettingsCapabilityEventIsDurableProposal(t *testing.T) {
+	state, err := acpSettingsStateFromConfigOptions(testACPConfigOptions("balanced", "ask"))
+	if err != nil {
+		t.Fatalf("acpSettingsStateFromConfigOptions() error = %v", err)
+	}
+	event, err := newACPSettingsCapabilityEvent("ses_1", state)
+	if err != nil {
+		t.Fatalf("newACPSettingsCapabilityEvent() error = %v", err)
+	}
+	if event == nil || event.Type != "session.settings.capabilities" || event.SessionID != "ses_1" || event.ProposalID == "" {
+		t.Fatalf("event = %+v", event)
+	}
+	if _, err := protocol.DecodeSettingsCapabilityPayload(event.Payload); err != nil {
+		t.Fatalf("capability payload: %v", err)
+	}
+}
+
 func TestACPSettingsStateUsesCanonicalProviderReadback(t *testing.T) {
 	state, err := acpSettingsStateFromConfigOptions(testACPConfigOptions("balanced", "ask"))
 	if err != nil {

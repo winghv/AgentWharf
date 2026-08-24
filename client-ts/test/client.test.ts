@@ -11,6 +11,48 @@ import {
   type WebSocketFactory,
 } from '../src/index.js'
 
+test('hydrates settings capability from historical events skipped by lastSeq replay', () => {
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws',
+    token: 'control-token',
+    sessions: [{ sessionId: 'ses_1', lastSeq: 40 }],
+    reconnect: false,
+  })
+  const fingerprint = `sha256:${'ab'.repeat(32)}`
+  client.hydrateFromEvents([
+    {
+      frame: 'event',
+      type: 'session.message',
+      session_id: 'ses_1',
+      seq: 41,
+      time: 1,
+      payload: { role: 'user' },
+    },
+    {
+      frame: 'event',
+      type: 'session.settings.capabilities',
+      session_id: 'ses_1',
+      seq: 2,
+      time: 1,
+      payload: {
+        schema_version: 1,
+        fingerprint,
+        models: [{ id: 'balanced', label: 'Balanced' }],
+        permission_modes: [{ id: 'ask', label: 'Ask first' }],
+        effective_model_id: 'balanced',
+        effective_permission_mode_id: 'ask',
+        model_change: 'allowed',
+        permission_change: 'allowed',
+        model_read_only_reason: null,
+        permission_read_only_reason: null,
+      },
+    },
+  ])
+  const update = client.settingsCapability('ses_1')
+  assert.equal(update?.capability.effectiveModelId, 'balanced')
+  assert.equal(update?.seq, 2)
+})
+
 test('encodes and decodes protocol frames', () => {
   const hello: HelloFrame = {
     frame: 'hello',

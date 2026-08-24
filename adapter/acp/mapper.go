@@ -124,11 +124,34 @@ func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protoc
 	case "session/request_permission":
 		return m.mapSessionPermissionRequest(raw, providerSessionID)
 	default:
+		if event := m.jsonRPCErrorEvent(raw); event != nil {
+			return []protocol.Event{*event}
+		}
 		if responseSessionID := sessionIDFromResponse(raw); responseSessionID != "" {
 			return []protocol.Event{m.stateEvent("ready", responseSessionID, copyWithout(raw, "type", "method", "session_id", "sessionId"))}
 		}
 		return m.mapUpdate(raw, providerSessionID)
 	}
+}
+
+// jsonRPCErrorEvent turns an unmatched Provider JSON-RPC error into a visible
+// Agent message. session/prompt failures otherwise vanish: the Adapter already
+// acked the Hub command, and error responses have no sessionId so they never
+// became session.state or session.message.
+func (m *Mapper) jsonRPCErrorEvent(raw map[string]any) *protocol.Event {
+	if _, ok := raw["id"]; !ok || raw["method"] != nil {
+		return nil
+	}
+	errObj := objectField(raw, "error")
+	if errObj == nil {
+		return nil
+	}
+	message := firstString(errObj, "message")
+	if message == "" {
+		message = "unknown error"
+	}
+	event := m.messageEvent("acp-rpc-error", "The Agent could not complete this turn: "+message)
+	return &event
 }
 
 func (m *Mapper) mapSessionUpdate(raw map[string]any, providerSessionID string) []protocol.Event {

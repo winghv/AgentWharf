@@ -27,6 +27,37 @@ func TestServeWrapConfigCarriesLaunchSettings(t *testing.T) {
 	}
 }
 
+func TestRememberProviderSessionUpdatesWrapConfigForRestart(t *testing.T) {
+	setupServeTestEnv(t)
+	handoff := machineServeDispatch{
+		ClaimID: "claim_1", SessionID: "session_1", Provider: "claude-code",
+		HubWSURL: "wss://hub.example/ws", AdapterToken: "adapter", ClientToken: "client",
+		AdapterExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
+		ClientExpiresAt:  time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
+	}
+	cfg := serveWrapConfig(handoff, false)
+	remember := rememberProviderSession(&handoff, &cfg, nil)
+	remember("acp_ses_1")
+	if cfg.ProviderSessionID != "acp_ses_1" {
+		t.Fatalf("wrap config provider session = %q, want acp_ses_1 so the next restart uses session/load", cfg.ProviderSessionID)
+	}
+	if handoff.ProviderSessionID != "acp_ses_1" {
+		t.Fatalf("handoff provider session = %q, want acp_ses_1", handoff.ProviderSessionID)
+	}
+	loaded, err := loadMachineDispatches()
+	if err != nil {
+		t.Fatalf("load persisted dispatch: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].ProviderSessionID != "acp_ses_1" {
+		t.Fatalf("persisted provider session = %+v, want acp_ses_1", loaded)
+	}
+	cfg.ProviderSessionID = ""
+	remember("acp_ses_1")
+	if cfg.ProviderSessionID != "acp_ses_1" {
+		t.Fatalf("restart copy of wrap config provider session = %q, want acp_ses_1", cfg.ProviderSessionID)
+	}
+}
+
 func TestExchangeAutoMachineClaimParsesLaunchSettings(t *testing.T) {
 	now := time.Now().UTC()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -196,7 +196,9 @@ func TestMapperMapsJSONRPCSessionNewResponseToReady(t *testing.T) {
 func TestMapperDoesNotTreatJSONRPCErrorAsReady(t *testing.T) {
 	t.Parallel()
 
-	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code"})
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code", Now: func() time.Time {
+		return time.UnixMilli(1700000000456)
+	}})
 	if err != nil {
 		t.Fatalf("NewMapper() error = %v", err)
 	}
@@ -204,8 +206,22 @@ func TestMapperDoesNotTreatJSONRPCErrorAsReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MapLine() error = %v", err)
 	}
-	if len(events) != 0 {
-		t.Fatalf("events = %+v, want no ready state for error", events)
+	if len(events) != 1 {
+		t.Fatalf("events = %+v, want one agent message for the prompt error", events)
+	}
+	assertEvent(t, events[0], "session.message")
+	payload := payloadMap(t, events[0])
+	if payload["role"] != "agent" {
+		t.Fatalf("error message role = %+v, want agent", payload)
+	}
+	content, _ := payload["content"].([]any)
+	if len(content) == 0 {
+		t.Fatalf("error message content = %+v", payload["content"])
+	}
+	part, _ := content[0].(map[string]any)
+	text, _ := part["text"].(string)
+	if !strings.Contains(text, "session failed") {
+		t.Fatalf("error message text = %q, want the Provider error", text)
 	}
 }
 

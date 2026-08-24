@@ -535,6 +535,23 @@ export class AgentWharfClient {
     return update === undefined ? undefined : cloneSettingsCapabilityUpdate(update)
   }
 
+  /**
+   * Apply capability snapshots from history. Hub replay starts after lastSeq,
+   * so a reconnecting Console otherwise misses the early
+   * session.settings.capabilities event and shows "settings not confirmed"
+   * while the Session is still live.
+   */
+  hydrateFromEvents(events: AgentWharfEvent[]): void {
+    const ordered = [...events].sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
+    for (const event of ordered) {
+      try {
+        this.updateSettingsFromEvent(event)
+      } catch {
+        continue
+      }
+    }
+  }
+
   settingsEffective(commandId: string): SettingsEffectiveUpdate | undefined {
     const update = this.settingsEffectives.get(commandId)
     return update === undefined ? undefined : cloneSettingsEffectiveUpdate(update)
