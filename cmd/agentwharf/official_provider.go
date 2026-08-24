@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -96,6 +97,15 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	// can display the model, permission, and reasoning for this Session.
 	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 {
 		_ = publishOfficialSettingsCapability(writeFrame, cfg.SessionID, provider.launchSettings(cfg.ProviderCommand[1:]))
+		removeReconnectRunControl := connection.setReconnectProposalFactory("official-run-control", func() (*protocol.Event, error) {
+			return newOfficialRunControlCapabilityEvent(cfg)
+		})
+		defer removeReconnectRunControl()
+		if err := publishOfficialRunControlCapability(cfg, writeFrame); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return fmt.Errorf("publish official agent run-control capability: %w", err)
+		}
 	}
 
 	// CLI output to the terminal. Local keystrokes and Hub injects share ptyMu
@@ -112,8 +122,9 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	}()
 
 	commandDone := make(chan error, 1)
+	var stopInProgress atomic.Bool
 	go func() {
-		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, connection, writeFrame, ptmx, &ptyMu, injected, questions)
+		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, cfg, connection, writeFrame, ptmx, &ptyMu, cmd.Process, &stopInProgress, injected, questions)
 	}()
 
 	waitErr := cmd.Wait()
@@ -127,9 +138,18 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	case <-mirrorDone:
 	case <-ctx.Done():
 	}
+	var commandErr error
 	select {
-	case <-commandDone:
+	case commandErr = <-commandDone:
 	case <-ctx.Done():
+	}
+	if stopInProgress.Load() {
+		if commandErr != nil {
+			return fmt.Errorf("finalize official agent stop: %w", commandErr)
+		}
+		// The Hub atomically appends nonterminal -> ended before accepting the
+		// completed stop outcome. Do not publish a second terminal state here.
+		return nil
 	}
 	proposalID, err := publishState("ended")
 	if err != nil {
@@ -153,7 +173,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 // instructions into the running official CLI's PTY, so the Hub can drive the
 // same session the user is operating locally. It acks the command after the
 // prompt is written and keeps the proposal/credential machinery healthy.
-func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, ptyMu *sync.Mutex, injected *injectedPromptTracker, questions *questionCache) error {
+func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, ptyMu *sync.Mutex, process *os.Process, stopInProgress *atomic.Bool, injected *injectedPromptTracker, questions *questionCache) error {
 	accepted := newAcceptedCommandSet(2048)
 	if ptyMu == nil {
 		ptyMu = &sync.Mutex{}
@@ -174,6 +194,9 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 					return err
 				}
 				continue
+			}
+			if typed.Type == protocol.CommandSessionStop {
+				return stopOfficialCLI(typed, connection.read, writeFrame, cfg, process, stopInProgress)
 			}
 			if typed.Type == protocol.CommandPermissionRespond {
 				ptyMu.Lock()
@@ -249,6 +272,61 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 			return fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
 		}
 	}
+}
+
+// publishOfficialRunControlCapability describes the operations the interactive
+// Claude/Codex wrapper can actually complete. Unlike the ACP bridge it cannot
+// safely interrupt an arbitrary in-flight turn, but an explicit stop can end
+// the child CLI process for the archive workflow.
+func publishOfficialRunControlCapability(cfg wrapConfig, writeFrame func(protocol.Frame) error) error {
+	event, err := newOfficialRunControlCapabilityEvent(cfg)
+	if err != nil || event == nil {
+		return err
+	}
+	return writeFrame(event)
+}
+
+func newOfficialRunControlCapabilityEvent(cfg wrapConfig) (*protocol.Event, error) {
+	if cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
+		return nil, nil
+	}
+	proposalID, err := randomToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate official run-control capability proposal: %w", err)
+	}
+	payload, err := json.Marshal(protocol.RunControlCapabilityPayload{
+		SchemaVersion: 1, InterruptSupported: false, StopSupported: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal official run-control capability: %w", err)
+	}
+	return &protocol.Event{
+		Type: "session.run.capabilities", SessionID: cfg.SessionID,
+		Time: time.Now().UTC().UnixMilli(), Payload: payload, ProposalID: proposalID,
+	}, nil
+}
+
+// stopOfficialCLI is called only after the user explicitly confirms an
+// archive. Killing the immediate official CLI child is the interactive
+// equivalent of the ACP supervisor stop: cmd.Wait then publishes session.ended
+// and the archive caller polls that authoritative state before archiving.
+func stopOfficialCLI(command *protocol.Command, readFrame func(context.Context) (protocol.Frame, error), writeFrame func(protocol.Frame) error, cfg wrapConfig, process *os.Process, stopInProgress *atomic.Bool) error {
+	if process == nil {
+		return errors.New("official agent process is unavailable")
+	}
+	err := process.Kill()
+	if errors.Is(err, os.ErrProcessDone) {
+		err = nil
+	}
+	if err == nil && stopInProgress != nil {
+		stopInProgress.Store(true)
+	}
+	// cmd.Wait() returns as soon as Kill lands and cancels the normal provider
+	// loop. The stop receipt still needs a bounded independent context so the
+	// Hub sees the accepted outcome before the terminal state is published.
+	receiptCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return acknowledgeRunControl(receiptCtx, command, readFrame, writeFrame, cfg, "stop", "ended", err)
 }
 
 // forwardQuestionAnswer injects an AskUserQuestion answer into the claude PTY.

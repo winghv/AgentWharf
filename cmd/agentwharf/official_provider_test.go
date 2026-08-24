@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -242,6 +244,89 @@ func TestPublishOfficialSettingsCapability(t *testing.T) {
 	if wire.ReasoningEfforts == nil {
 		t.Fatalf("reasoning_efforts = null, want []")
 	}
+}
+
+func TestPublishOfficialRunControlCapabilityIsStopOnly(t *testing.T) {
+	frames := make([]protocol.Frame, 0, 1)
+	if err := publishOfficialRunControlCapability(wrapConfig{
+		ProtocolVersion: protocol.ProtocolVersionV2,
+		SessionID:       "ses_official_control",
+	}, func(frame protocol.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	}); err != nil {
+		t.Fatalf("publishOfficialRunControlCapability() error = %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("frames = %d, want 1", len(frames))
+	}
+	event, ok := frames[0].(*protocol.Event)
+	if !ok || event.Type != "session.run.capabilities" || event.ProposalID == "" {
+		t.Fatalf("capability frame = %#v", frames[0])
+	}
+	capability, err := protocol.DecodeRunControlCapabilityPayload(event.Payload)
+	if err != nil {
+		t.Fatalf("decode capability: %v", err)
+	}
+	if capability.InterruptSupported || !capability.StopSupported {
+		t.Fatalf("capability = %+v, want stop only", capability)
+	}
+}
+
+func TestStopOfficialCLIReportsEndedOutcome(t *testing.T) {
+	child := exec.Command(os.Args[0], "-test.run=^TestOfficialStopHelperProcess$")
+	child.Env = append(os.Environ(), "AGENTWHARF_OFFICIAL_STOP_HELPER=1")
+	if err := child.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	frames := make([]protocol.Frame, 0, 2)
+	write := func(frame protocol.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	}
+	read := func(context.Context) (protocol.Frame, error) {
+		outcome, ok := frames[len(frames)-1].(*protocol.Event)
+		if !ok {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return &protocol.EventReceipt{ProposalID: outcome.ProposalID, Seq: 1, Status: protocol.EventReceiptAccepted}, nil
+	}
+	command := &protocol.Command{CommandID: "cmd_official_stop", Type: protocol.CommandSessionStop, SessionID: "ses_official_stop"}
+	var stopInProgress atomic.Bool
+	if err := stopOfficialCLI(command, read, write, wrapConfig{
+		ProtocolVersion: protocol.ProtocolVersionV2,
+		SessionID:       command.SessionID,
+	}, child.Process, &stopInProgress); err != nil {
+		t.Fatalf("stopOfficialCLI() error = %v", err)
+	}
+	_ = child.Wait()
+	if !stopInProgress.Load() {
+		t.Fatal("stop should be recorded after the child process is terminated")
+	}
+	if len(frames) != 2 {
+		t.Fatalf("frames = %d, want ack and outcome", len(frames))
+	}
+	if ack, ok := frames[0].(*protocol.CommandAck); !ok || ack.CommandID != command.CommandID || ack.Status != protocol.AckAccepted {
+		t.Fatalf("ack = %#v", frames[0])
+	}
+	outcome, ok := frames[1].(*protocol.Event)
+	if !ok || outcome.Type != "session.run.outcome" {
+		t.Fatalf("outcome = %#v", frames[1])
+	}
+	decoded, err := protocol.DecodeRunControlOutcomePayload(outcome.Payload)
+	if err != nil {
+		t.Fatalf("decode outcome: %v", err)
+	}
+	if decoded.CommandID != command.CommandID || decoded.Operation != "stop" || decoded.Outcome != "completed" || decoded.CompletionState == nil || *decoded.CompletionState != "ended" {
+		t.Fatalf("outcome = %+v", decoded)
+	}
+}
+
+func TestOfficialStopHelperProcess(t *testing.T) {
+	if os.Getenv("AGENTWHARF_OFFICIAL_STOP_HELPER") != "1" {
+		return
+	}
+	select {}
 }
 
 func TestInjectedPromptTrackerDedupes(t *testing.T) {
