@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -226,6 +229,66 @@ func TestInjectedPromptTrackerRemovesFailedWrite(t *testing.T) {
 	tracker.remove("hello")
 	if tracker.consume("hello") {
 		t.Fatal("consume(hello) = true after remove, want false")
+	}
+}
+
+func TestInjectedPromptTrackerHasPending(t *testing.T) {
+	tracker := &injectedPromptTracker{pending: make(map[string]int)}
+	if tracker.hasPending("hello") {
+		t.Fatal("hasPending on empty tracker")
+	}
+	tracker.add("hello")
+	if !tracker.hasPending("hello") {
+		t.Fatal("hasPending after add = false")
+	}
+	tracker.consume("hello")
+	if tracker.hasPending("hello") {
+		t.Fatal("hasPending after consume = true")
+	}
+}
+
+func TestConfirmOfficialCLIPromptRetriesAfterIdleMiss(t *testing.T) {
+	tracker := &injectedPromptTracker{pending: make(map[string]int)}
+	tracker.add("wake up")
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		tracker.consume("wake up")
+	}()
+	confirmOfficialCLIPrompt(context.Background(), &buf, &mu, "ses_1", "wake up", tracker, func(protocol.Frame) error {
+		t.Fatal("unexpected miss event")
+		return nil
+	}, officialPromptInjection{firstWait: 30 * time.Millisecond, retryWait: 200 * time.Millisecond, wakePause: 0})
+	if tracker.hasPending("wake up") {
+		t.Fatal("prompt still pending after delayed consume")
+	}
+	if !strings.Contains(buf.String(), "wake up\r") {
+		t.Fatalf("retry write = %q, want prompt resubmit", buf.String())
+	}
+	if !strings.Contains(buf.String(), "\x1b") || !strings.Contains(buf.String(), "\x15") {
+		t.Fatalf("retry write = %q, want ESC and Ctrl+U wakeup", buf.String())
+	}
+}
+
+func TestConfirmOfficialCLIPromptPublishesMissWhenTUIIgnoresPrompt(t *testing.T) {
+	tracker := &injectedPromptTracker{pending: make(map[string]int)}
+	tracker.add("ignored")
+	var buf bytes.Buffer
+	var frames []protocol.Frame
+	confirmOfficialCLIPrompt(context.Background(), &buf, nil, "ses_1", "ignored", tracker, func(frame protocol.Frame) error {
+		frames = append(frames, frame)
+		return nil
+	}, officialPromptInjection{firstWait: 20 * time.Millisecond, retryWait: 20 * time.Millisecond, wakePause: 0})
+	if len(frames) != 1 {
+		t.Fatalf("frames = %#v, want one miss message", frames)
+	}
+	event, ok := frames[0].(*protocol.Event)
+	if !ok || event.Type != "session.message" || event.SessionID != "ses_1" {
+		t.Fatalf("frame = %#v", frames[0])
+	}
+	if !strings.Contains(string(event.Payload), "did not accept this instruction") {
+		t.Fatalf("payload = %s", event.Payload)
 	}
 }
 

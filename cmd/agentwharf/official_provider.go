@@ -153,6 +153,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 // prompt is written and keeps the proposal/credential machinery healthy.
 func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, injected *injectedPromptTracker, questions *questionCache) error {
 	accepted := newAcceptedCommandSet(2048)
+	var ptyMu sync.Mutex
 	for {
 		frame, err := connection.read(ctx)
 		if err != nil {
@@ -171,7 +172,10 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 				continue
 			}
 			if typed.Type == protocol.CommandPermissionRespond {
-				if err := forwardQuestionAnswer(ptmx, questions, typed.Payload); err != nil {
+				ptyMu.Lock()
+				err := forwardQuestionAnswer(ptmx, questions, typed.Payload)
+				ptyMu.Unlock()
+				if err != nil {
 					if writeErr := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckRejected, Reason: err.Error()}); writeErr != nil {
 						return writeErr
 					}
@@ -217,7 +221,10 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 				// before the tracker is updated.
 				injected.add(promptText)
 			}
-			if _, err := ptmx.Write([]byte(promptText + "\r")); err != nil {
+			ptyMu.Lock()
+			_, err = ptmx.Write([]byte(promptText + "\r"))
+			ptyMu.Unlock()
+			if err != nil {
 				if injected != nil {
 					injected.remove(promptText)
 				}
@@ -230,6 +237,10 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, connection *hubConnect
 			if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
 				return err
 			}
+			// After a long idle the TUI may be on a recap/pager, so the first
+			// write lands but is not submitted. Confirm via transcript without
+			// blocking Ping handling on this loop.
+			go confirmOfficialCLIPrompt(ctx, ptmx, &ptyMu, typed.SessionID, promptText, injected, writeFrame, defaultOfficialPromptInjection)
 		case *protocol.Error:
 			return fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
 		}
@@ -497,4 +508,131 @@ func (t *injectedPromptTracker) consume(text string) bool {
 		delete(t.pending, key)
 	}
 	return true
+}
+
+func (t *injectedPromptTracker) hasPending(text string) bool {
+	if t == nil {
+		return false
+	}
+	key := strings.TrimSpace(text)
+	if key == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.pending[key] > 0
+}
+
+type officialPromptInjection struct {
+	firstWait time.Duration
+	retryWait time.Duration
+	wakePause time.Duration
+}
+
+var defaultOfficialPromptInjection = officialPromptInjection{
+	firstWait: 1500 * time.Millisecond,
+	retryWait: 3 * time.Second,
+	wakePause: 50 * time.Millisecond,
+}
+
+// confirmOfficialCLIPrompt watches the transcript mirror for the Hub-injected
+// user line. If the idle Claude TUI swallowed the first Enter (recap/pager),
+// it dismisses the overlay, resubmits, and publishes a visible miss instead of
+// leaving the workbench looking connected with no Agent turn.
+func confirmOfficialCLIPrompt(ctx context.Context, ptmx io.Writer, ptyMu *sync.Mutex, sessionID, promptText string, injected *injectedPromptTracker, writeFrame func(protocol.Frame) error, timing officialPromptInjection) {
+	if waitInjectedPromptGone(ctx, injected, promptText, timing.firstWait) {
+		return
+	}
+	if ptyMu != nil {
+		ptyMu.Lock()
+	}
+	stillPending := injected.hasPending(promptText)
+	if stillPending {
+		if err := wakeOfficialCLIComposer(ptmx, timing.wakePause); err != nil {
+			if ptyMu != nil {
+				ptyMu.Unlock()
+			}
+			return
+		}
+		if _, err := ptmx.Write([]byte(promptText + "\r")); err != nil {
+			if ptyMu != nil {
+				ptyMu.Unlock()
+			}
+			return
+		}
+	}
+	if ptyMu != nil {
+		ptyMu.Unlock()
+	}
+	if !stillPending || waitInjectedPromptGone(ctx, injected, promptText, timing.retryWait) {
+		return
+	}
+	_ = publishOfficialInjectionMiss(writeFrame, sessionID)
+}
+
+func waitInjectedPromptGone(ctx context.Context, injected *injectedPromptTracker, text string, timeout time.Duration) bool {
+	if injected == nil || !injected.hasPending(text) {
+		return true
+	}
+	if timeout <= 0 {
+		return !injected.hasPending(text)
+	}
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return !injected.hasPending(text)
+		case <-ticker.C:
+			if !injected.hasPending(text) {
+				return true
+			}
+			if !time.Now().Before(deadline) {
+				return !injected.hasPending(text)
+			}
+		}
+	}
+}
+
+func wakeOfficialCLIComposer(w io.Writer, pause time.Duration) error {
+	if w == nil {
+		return errors.New("official cli pty is unavailable")
+	}
+	if _, err := w.Write([]byte{0x1b}); err != nil {
+		return err
+	}
+	if pause > 0 {
+		timer := time.NewTimer(pause)
+		<-timer.C
+	}
+	if _, err := w.Write([]byte{0x15}); err != nil {
+		return err
+	}
+	if pause > 0 {
+		timer := time.NewTimer(pause)
+		<-timer.C
+	}
+	return nil
+}
+
+func publishOfficialInjectionMiss(writeFrame func(protocol.Frame) error, sessionID string) error {
+	if writeFrame == nil || sessionID == "" {
+		return errors.New("official injection miss publisher is unavailable")
+	}
+	payload, err := json.Marshal(map[string]any{
+		"message_id": "official-idle-miss",
+		"role":       "agent",
+		"content": []map[string]string{{
+			"kind": "text",
+			"text": "The local Agent terminal did not accept this instruction after idle. Click that terminal, press Enter, then resend from the workbench.",
+		}},
+	})
+	if err != nil {
+		return err
+	}
+	return writeFrame(&protocol.Event{
+		Type: "session.message", SessionID: sessionID,
+		Time: time.Now().UTC().UnixMilli(), Payload: payload,
+	})
 }
