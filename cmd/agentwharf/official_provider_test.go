@@ -152,6 +152,40 @@ func TestClaudeTranscriptPathUsesProjectSlug(t *testing.T) {
 	}
 }
 
+func TestResetTranscriptOffsetIfRewritten(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ses.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Repeat("a", 200)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	offset, err := resetTranscriptOffsetIfRewritten(path, 200)
+	if err != nil || offset != 200 {
+		t.Fatalf("offset = %d, err = %v, want unchanged 200", offset, err)
+	}
+	if err := os.WriteFile(path, []byte("short\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	offset, err = resetTranscriptOffsetIfRewritten(path, 200)
+	if err != nil || offset != 0 {
+		t.Fatalf("offset = %d, err = %v, want 0 after shrink", offset, err)
+	}
+}
+
+func TestAlreadyMirroredTranscriptLineSkipsRewindDuplicates(t *testing.T) {
+	seen := make(map[string]struct{})
+	first := []byte(`{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":"hi"}}`)
+	if alreadyMirroredTranscriptLine(seen, first) {
+		t.Fatal("first line should be new")
+	}
+	if !alreadyMirroredTranscriptLine(seen, first) {
+		t.Fatal("same uuid should be skipped after rewind")
+	}
+	second := []byte(`{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":"later"}}`)
+	if alreadyMirroredTranscriptLine(seen, second) {
+		t.Fatal("new uuid should not be skipped")
+	}
+}
+
 func TestClaudeLaunchSettings(t *testing.T) {
 	settings := claudeProvider{}.launchSettings([]string{
 		"--model", "sonnet", "--permission-mode", "acceptEdits", "--reasoning-effort", "high",

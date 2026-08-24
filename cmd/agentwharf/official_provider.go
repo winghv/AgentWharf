@@ -315,9 +315,33 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 	}
 
 	var offset int64
+	seen := make(map[string]struct{})
 	for {
+		nextOffset, err := resetTranscriptOffsetIfRewritten(path, offset)
+		if err != nil {
+			if os.IsNotExist(err) {
+				offset = 0
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(300 * time.Millisecond):
+				}
+				continue
+			}
+			return err
+		}
+		offset = nextOffset
 		file, err := os.Open(path)
 		if err != nil {
+			if os.IsNotExist(err) {
+				offset = 0
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(300 * time.Millisecond):
+				}
+				continue
+			}
 			return err
 		}
 		if _, err := file.Seek(offset, 0); err != nil {
@@ -327,13 +351,17 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 		scanner := bufio.NewScanner(file)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
-			offset += int64(len(scanner.Bytes())) + 1
-			// Skip user messages that were injected from the Hub; they are already
-			// recorded by the Hub itself and would otherwise be mirrored twice.
-			if text := provider.transcriptUserText(scanner.Bytes()); text != "" && injected != nil && injected.consume(text) {
+			line := scanner.Bytes()
+			offset += int64(len(line)) + 1
+			if alreadyMirroredTranscriptLine(seen, line) {
 				continue
 			}
-			events, err := provider.translateLine(cfg.SessionID, scanner.Bytes())
+			// Skip user messages that were injected from the Hub; they are already
+			// recorded by the Hub itself and would otherwise be mirrored twice.
+			if text := provider.transcriptUserText(line); text != "" && injected != nil && injected.consume(text) {
+				continue
+			}
+			events, err := provider.translateLine(cfg.SessionID, line)
 			if err != nil {
 				continue
 			}
@@ -352,6 +380,49 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
+}
+
+// resetTranscriptOffsetIfRewritten rewinds when Claude compact/recap replaces or
+// shortens the jsonl. Seeking past the new size would make the mirror idle
+// forever while the TUI keeps talking.
+func resetTranscriptOffsetIfRewritten(path string, offset int64) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return offset, err
+	}
+	if info.Size() < offset {
+		return 0, nil
+	}
+	return offset, nil
+}
+
+func transcriptLineID(line []byte) string {
+	var raw map[string]any
+	if json.Unmarshal(line, &raw) != nil {
+		return strings.TrimSpace(string(line))
+	}
+	if id := stringFieldFromAny(raw["uuid"]); id != "" {
+		return id
+	}
+	if id := stringFieldFromAny(raw["id"]); id != "" {
+		return id
+	}
+	return strings.TrimSpace(string(line))
+}
+
+func alreadyMirroredTranscriptLine(seen map[string]struct{}, line []byte) bool {
+	if seen == nil {
+		return false
+	}
+	id := transcriptLineID(line)
+	if id == "" {
+		return false
+	}
+	if _, ok := seen[id]; ok {
+		return true
+	}
+	seen[id] = struct{}{}
+	return false
 }
 
 func transcriptMessageEvent(sessionID, messageID, role, text string) protocol.Event {
