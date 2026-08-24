@@ -174,6 +174,45 @@ func TestResetTranscriptOffsetIfRewritten(t *testing.T) {
 	}
 }
 
+func TestResetTranscriptTailCursorIfRewrittenDetectsSameSizeReplacement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ses.jsonl")
+	if err := os.WriteFile(path, []byte("first transcript line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := transcriptTailCursorAt(path, int64(len("first transcript line\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("other transcript line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, err := resetTranscriptTailCursorIfRewritten(path, cursor)
+	if err != nil || next.offset != 0 {
+		t.Fatalf("cursor = %+v, err = %v, want rewind after same-size replacement", next, err)
+	}
+}
+
+func TestResetTranscriptTailCursorIfRewrittenKeepsAppendCursor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ses.jsonl")
+	first := "first transcript line\n"
+	if err := os.WriteFile(path, []byte(first), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := transcriptTailCursorAt(path, int64(len(first)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(first+"appended transcript line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, err := resetTranscriptTailCursorIfRewritten(path, cursor)
+	if err != nil || next.offset != cursor.offset {
+		t.Fatalf("cursor = %+v, err = %v, want append cursor %d", next, err, cursor.offset)
+	}
+}
+
 func TestAlreadyMirroredTranscriptLineSkipsRewindDuplicates(t *testing.T) {
 	seen := make(map[string]struct{})
 	first := []byte(`{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":"hi"}}`)

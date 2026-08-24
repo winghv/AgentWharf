@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -396,13 +397,13 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 		}
 	}
 
-	var offset int64
+	cursor := transcriptTailCursor{}
 	seen := make(map[string]struct{})
 	for {
-		nextOffset, err := resetTranscriptOffsetIfRewritten(path, offset)
+		nextCursor, err := resetTranscriptTailCursorIfRewritten(path, cursor)
 		if err != nil {
 			if os.IsNotExist(err) {
-				offset = 0
+				cursor = transcriptTailCursor{}
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -412,11 +413,11 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 			}
 			return err
 		}
-		offset = nextOffset
+		cursor = nextCursor
 		file, err := os.Open(path)
 		if err != nil {
 			if os.IsNotExist(err) {
-				offset = 0
+				cursor = transcriptTailCursor{}
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -426,7 +427,7 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 			}
 			return err
 		}
-		if _, err := file.Seek(offset, 0); err != nil {
+		if _, err := file.Seek(cursor.offset, 0); err != nil {
 			file.Close()
 			return err
 		}
@@ -434,7 +435,7 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Bytes()
-			offset += int64(len(line)) + 1
+			cursor.offset += int64(len(line)) + 1
 			if alreadyMirroredTranscriptLine(seen, line) {
 				continue
 			}
@@ -456,12 +457,92 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 			}
 		}
 		file.Close()
+		cursor, err = transcriptTailCursorAt(path, cursor.offset)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
+}
+
+// transcriptTailCursor identifies the already mirrored prefix without storing
+// transcript content. Claude compaction can atomically replace its JSONL with
+// a same-size (or larger) file, which a size-only tailer cannot distinguish
+// from an append.
+type transcriptTailCursor struct {
+	offset    int64
+	fileInfo  os.FileInfo
+	anchor    [sha256.Size]byte
+	hasAnchor bool
+}
+
+const transcriptTailAnchorBytes int64 = 4096
+
+func resetTranscriptTailCursorIfRewritten(path string, cursor transcriptTailCursor) (transcriptTailCursor, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return cursor, err
+	}
+	if info.Size() < cursor.offset || (cursor.fileInfo != nil && !os.SameFile(cursor.fileInfo, info)) {
+		return transcriptTailCursor{fileInfo: info}, nil
+	}
+	if cursor.hasAnchor {
+		anchor, err := transcriptTailAnchor(path, cursor.offset)
+		if err != nil {
+			return cursor, err
+		}
+		if anchor != cursor.anchor {
+			return transcriptTailCursor{fileInfo: info}, nil
+		}
+	}
+	cursor.fileInfo = info
+	return cursor, nil
+}
+
+func transcriptTailCursorAt(path string, offset int64) (transcriptTailCursor, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return transcriptTailCursor{}, err
+	}
+	cursor := transcriptTailCursor{offset: offset, fileInfo: info}
+	if offset == 0 {
+		return cursor, nil
+	}
+	anchor, err := transcriptTailAnchor(path, offset)
+	if err != nil {
+		return transcriptTailCursor{}, err
+	}
+	cursor.anchor = anchor
+	cursor.hasAnchor = true
+	return cursor, nil
+}
+
+func transcriptTailAnchor(path string, offset int64) ([sha256.Size]byte, error) {
+	var empty [sha256.Size]byte
+	if offset <= 0 {
+		return empty, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return empty, err
+	}
+	defer file.Close()
+	start := offset - transcriptTailAnchorBytes
+	if start < 0 {
+		start = 0
+	}
+	if _, err := file.Seek(start, 0); err != nil {
+		return empty, err
+	}
+	data := make([]byte, offset-start)
+	if _, err := io.ReadFull(file, data); err != nil {
+		return empty, err
+	}
+	return sha256.Sum256(data), nil
 }
 
 // resetTranscriptOffsetIfRewritten rewinds when Claude compact/recap replaces or
