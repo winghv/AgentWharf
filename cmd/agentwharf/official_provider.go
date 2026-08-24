@@ -118,6 +118,8 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	mirrorDone := make(chan error, 1)
 	injected := &injectedPromptTracker{pending: make(map[string]int)}
 	questions := newQuestionCache()
+	heartbeats := &officialHeartbeatPongRouter{}
+	go superviseOfficialAdapterHeartbeat(runCtx, cfg.Heartbeat, connection, writeFrame, heartbeats)
 	go func() {
 		mirrorDone <- mirrorTranscript(runCtx, cfg, provider, sessionID, launchTime, writeFrame, injected, questions)
 	}()
@@ -125,7 +127,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	commandDone := make(chan error, 1)
 	var stopInProgress atomic.Bool
 	go func() {
-		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, cfg, connection, writeFrame, ptmx, &ptyMu, cmd.Process, &stopInProgress, injected, questions)
+		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, cfg, connection, writeFrame, ptmx, &ptyMu, cmd.Process, &stopInProgress, injected, questions, heartbeats.observe)
 	}()
 
 	waitErr := cmd.Wait()
@@ -174,7 +176,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 // instructions into the running official CLI's PTY, so the Hub can drive the
 // same session the user is operating locally. It acks the command after the
 // prompt is written and keeps the proposal/credential machinery healthy.
-func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, ptyMu *sync.Mutex, process *os.Process, stopInProgress *atomic.Bool, injected *injectedPromptTracker, questions *questionCache) error {
+func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, ptyMu *sync.Mutex, process *os.Process, stopInProgress *atomic.Bool, injected *injectedPromptTracker, questions *questionCache, observePong func(string)) error {
 	accepted := newAcceptedCommandSet(2048)
 	if ptyMu == nil {
 		ptyMu = &sync.Mutex{}
@@ -188,6 +190,10 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connec
 		case *protocol.Ping:
 			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
 				return err
+			}
+		case *protocol.Pong:
+			if observePong != nil {
+				observePong(typed.Nonce)
 			}
 		case *protocol.Command:
 			if accepted.Contains(typed.CommandID) {
@@ -271,6 +277,60 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connec
 			go confirmOfficialCLIPrompt(ctx, ptmx, ptyMu, typed.SessionID, promptText, injected, writeFrame, defaultOfficialPromptInjection)
 		case *protocol.Error:
 			return fmt.Errorf("hub error %s: %s", typed.Code, typed.Message)
+		}
+	}
+}
+
+// officialHeartbeatPongRouter lets the command reader feed Pongs to the
+// currently running heartbeat. A missed Pong closes only the Hub transport;
+// hubConnection then resumes it without interrupting the user's local Claude
+// process or terminal.
+type officialHeartbeatPongRouter struct {
+	mu       sync.RWMutex
+	observer func(string)
+}
+
+func (r *officialHeartbeatPongRouter) set(observer func(string)) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.observer = observer
+	r.mu.Unlock()
+}
+
+func (r *officialHeartbeatPongRouter) observe(nonce string) {
+	if r == nil {
+		return
+	}
+	r.mu.RLock()
+	observer := r.observer
+	r.mu.RUnlock()
+	if observer != nil {
+		observer(nonce)
+	}
+}
+
+func superviseOfficialAdapterHeartbeat(ctx context.Context, cfg heartbeatConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, pongs *officialHeartbeatPongRouter) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		done, observe := startAdapterHeartbeat(ctx, cfg, writeFrame)
+		pongs.set(observe)
+		select {
+		case <-ctx.Done():
+			return
+		case err, ok := <-done:
+			if !ok || err == nil {
+				return
+			}
+			// A half-open WebSocket can accept a write forever. Closing this
+			// transport wakes connection.read, which performs the normal resume
+			// handshake and replays fresh capabilities.
+			if connection != nil {
+				connection.close()
+			}
 		}
 	}
 }

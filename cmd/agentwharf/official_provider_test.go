@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/winghv/agentwharf/protocol"
+	"nhooyr.io/websocket"
 )
 
 func transcriptJSON(t *testing.T, value map[string]any) []byte {
@@ -139,6 +142,48 @@ func TestOfficialProviderForAgent(t *testing.T) {
 	}
 	if got := officialProviderForAgent("unknown").command(); got != "unknown" {
 		t.Fatalf("officialProviderForAgent(unknown).command() = %q", got)
+	}
+}
+
+func TestSuperviseOfficialAdapterHeartbeatClosesTimedOutTransport(t *testing.T) {
+	accepted := make(chan *websocket.Conn, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		accepted <- conn
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("server did not accept adapter transport")
+	}
+
+	connection := newHubConnection(wrapConfig{}, conn, nil)
+	go superviseOfficialAdapterHeartbeat(ctx, heartbeatConfig{
+		Interval: time.Millisecond,
+		Timeout:  10 * time.Millisecond,
+	}, connection, func(protocol.Frame) error {
+		return nil
+	}, &officialHeartbeatPongRouter{})
+
+	deadline := time.Now().Add(time.Second)
+	for connection.current() != nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if connection.current() != nil {
+		t.Fatal("timed-out official heartbeat did not close the Hub transport")
 	}
 }
 
