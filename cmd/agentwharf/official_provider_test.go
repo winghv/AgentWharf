@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -184,6 +185,133 @@ func TestSuperviseOfficialAdapterHeartbeatClosesTimedOutTransport(t *testing.T) 
 	}
 	if connection.current() != nil {
 		t.Fatal("timed-out official heartbeat did not close the Hub transport")
+	}
+}
+
+func TestOfficialProviderRotatesCredentialBeforeReconnect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverDone := make(chan error, 1)
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+
+		frame, err := readFrameFromConn(ctx, conn)
+		hello, ok := frame.(*protocol.Hello)
+		if err != nil || !ok {
+			serverDone <- fmt.Errorf("read hello: %T %v", frame, err)
+			return
+		}
+		connectionNumber := connections.Add(1)
+		if connectionNumber == 1 {
+			if hello.Token != "old-token" || hello.Resume {
+				serverDone <- fmt.Errorf("initial hello = %+v", hello)
+				return
+			}
+			if err := writeFrameToConn(ctx, conn, reconnectHelloAck("ses_official", 1, 1)); err != nil {
+				serverDone <- err
+				return
+			}
+			credential := &protocol.CredentialRotationCredential{
+				SessionID: "ses_official", RotationID: "rot_official", Generation: 2,
+				Credential: "new-token", ExpiresAt: time.Now().Add(15 * time.Minute).UnixMilli(),
+			}
+			if err := writeFrameToConn(ctx, conn, credential); err != nil {
+				serverDone <- err
+				return
+			}
+			frame, err = readFrameFromConn(ctx, conn)
+			possession, ok := frame.(*protocol.CredentialRotationPossession)
+			if err != nil || !ok || possession.RotationID != "rot_official" {
+				serverDone <- fmt.Errorf("rotation possession = %T %+v, %v", frame, frame, err)
+				return
+			}
+			if err := writeFrameToConn(ctx, conn, &protocol.CredentialRotationActivation{
+				RotationID: "rot_official", Generation: 2, ConnectionEpoch: 2, AcceptedFence: 2,
+			}); err != nil {
+				serverDone <- err
+				return
+			}
+			_ = conn.Close(websocket.StatusGoingAway, "verify rotated reconnect")
+			return
+		}
+
+		if hello.Token != "new-token" || !hello.Resume {
+			serverDone <- fmt.Errorf("reconnect hello = %+v", hello)
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, reconnectHelloAck("ses_official", 3, 2)); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := writeFrameToConn(ctx, conn, &protocol.Ping{Nonce: "rotated-reconnect"}); err != nil {
+			serverDone <- err
+			return
+		}
+		frame, err = readFrameFromConn(ctx, conn)
+		pong, ok := frame.(*protocol.Pong)
+		if err != nil || !ok || pong.Nonce != "rotated-reconnect" {
+			serverDone <- fmt.Errorf("reconnect pong = %T %+v, %v", frame, frame, err)
+			return
+		}
+		serverDone <- nil
+	}))
+	defer server.Close()
+
+	hubURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	initial, _, err := websocket.Dial(ctx, hubURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFrameToConn(ctx, initial, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleAdapter,
+		Token: "old-token", SessionID: "ses_official", Provider: "claude-code",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := readFrameFromConn(ctx, initial)
+	ack, ok := frame.(*protocol.HelloAck)
+	if err != nil || !ok {
+		t.Fatalf("initial ack = %T %+v, %v", frame, frame, err)
+	}
+	cfg := wrapConfig{
+		HubURL: hubURL, SessionID: "ses_official", Provider: "claude-code",
+		AdapterToken: "old-token", ProtocolVersion: protocol.ProtocolVersionV2,
+	}
+	connection := newHubConnection(cfg, initial, ack.ConnectionAuthority)
+	defer connection.close()
+	writeFrame := func(frame protocol.Frame) error { return connection.write(ctx, frame) }
+	rotation := newCredentialRotationManager(ctx, ack.ConnectionAuthority, writeFrame, connection.credentials, connection.currentAuthority)
+	rotation.mu.Lock()
+	rotation.pending = "rot_official"
+	rotation.mu.Unlock()
+
+	commandDone := make(chan error, 1)
+	go func() {
+		commandDone <- forwardHubCommandsToOfficialCLI(ctx, cfg, connection, writeFrame, nil, nil, nil, &atomic.Bool{}, nil, nil, nil, rotation)
+	}()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	cancel()
+	select {
+	case err := <-commandDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("official command loop did not stop")
 	}
 }
 

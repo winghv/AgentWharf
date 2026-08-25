@@ -119,6 +119,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	injected := &injectedPromptTracker{pending: make(map[string]int)}
 	questions := newQuestionCache()
 	heartbeats := &officialHeartbeatPongRouter{}
+	rotation := newCredentialRotationManager(runCtx, connection.currentAuthority(), writeFrame, connection.credentials, connection.currentAuthority)
 	go superviseOfficialAdapterHeartbeat(runCtx, cfg.Heartbeat, connection, writeFrame, heartbeats)
 	go func() {
 		mirrorDone <- mirrorTranscript(runCtx, cfg, provider, sessionID, launchTime, writeFrame, injected, questions)
@@ -127,7 +128,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	commandDone := make(chan error, 1)
 	var stopInProgress atomic.Bool
 	go func() {
-		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, cfg, connection, writeFrame, ptmx, &ptyMu, cmd.Process, &stopInProgress, injected, questions, heartbeats.observe)
+		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, cfg, connection, writeFrame, ptmx, &ptyMu, cmd.Process, &stopInProgress, injected, questions, heartbeats.observe, rotation)
 	}()
 
 	waitErr := cmd.Wait()
@@ -176,7 +177,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 // instructions into the running official CLI's PTY, so the Hub can drive the
 // same session the user is operating locally. It acks the command after the
 // prompt is written and keeps the proposal/credential machinery healthy.
-func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, ptyMu *sync.Mutex, process *os.Process, stopInProgress *atomic.Bool, injected *injectedPromptTracker, questions *questionCache, observePong func(string)) error {
+func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, ptyMu *sync.Mutex, process *os.Process, stopInProgress *atomic.Bool, injected *injectedPromptTracker, questions *questionCache, observePong func(string), rotation *credentialRotationManager) error {
 	accepted := newAcceptedCommandSet(2048)
 	if ptyMu == nil {
 		ptyMu = &sync.Mutex{}
@@ -187,6 +188,15 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connec
 			return ignoreContextError(err)
 		}
 		switch typed := frame.(type) {
+		case *protocol.CredentialRotationCredential:
+			rotation.recordCredentialExpiry(typed)
+			if err := rotation.handle(ctx, typed); err != nil {
+				return err
+			}
+		case *protocol.CredentialRotationActivation:
+			if err := rotation.handle(ctx, typed); err != nil {
+				return err
+			}
 		case *protocol.Ping:
 			if err := writeFrame(&protocol.Pong{Nonce: typed.Nonce}); err != nil {
 				return err
