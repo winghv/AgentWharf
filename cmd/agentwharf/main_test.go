@@ -2226,8 +2226,13 @@ func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 
 	ackSeen := false
 	replySeen := false
-	for deadline := time.Now().Add(4 * time.Second); time.Now().Before(deadline) && (!ackSeen || !replySeen); {
-		frame := readFrame(t, client)
+	readCtx, readCancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer readCancel()
+	for !ackSeen || !replySeen {
+		frame, err := readFrameFromConn(readCtx, client)
+		if err != nil {
+			t.Fatalf("read prompt acknowledgement: %v", err)
+		}
 		switch typed := frame.(type) {
 		case *protocol.CommandAck:
 			if typed.CommandID == "cmd_acp_prompt" && typed.Status == protocol.AckAccepted {
@@ -2242,7 +2247,8 @@ func TestRunWrapACPProviderCommandSendsSessionPrompt(t *testing.T) {
 	if !ackSeen || !replySeen {
 		t.Fatalf("ackSeen=%v replySeen=%v", ackSeen, replySeen)
 	}
-	if err := <-runDone; err != nil {
+	cancel()
+	if err := <-runDone; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("run wrap error = %v", err)
 	}
 }
@@ -3384,6 +3390,8 @@ func runWrapACPProviderHelper() {
 
 	fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","messageId":"resp_1","content":{"type":"text","text":"acp saw ping"}}}}`)
 	writeACPResponse(prompt["id"], map[string]any{"stopReason": "end_turn"})
+	for scanner.Scan() {
+	}
 	os.Exit(0)
 }
 

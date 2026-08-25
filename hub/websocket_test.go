@@ -811,9 +811,8 @@ func TestWebSocketServerDeliversCommittedPendingCommandAfterAdapterReconnect(t *
 		t.Logf("durable pending status before assertion: %q", status)
 		t.Fatalf("durable reconnect command = %#v, want reconstructed session.send", frame)
 	}
-	// A peer can consume the frame between its successful socket write and the
-	// following durable resolution. Wait for the terminal ledger state rather
-	// than treating that valid in-flight observation as a delivery failure.
+	writeFrame(t, adapter, &protocol.CommandAck{CommandID: "cmd_reconnect", Status: protocol.AckAccepted})
+	// Durable completion is only permitted after the adapter confirms receipt.
 	deadline := time.Now().Add(time.Second)
 	var status store.PendingCommandStatus
 	for {
@@ -1842,6 +1841,13 @@ func TestWebSocketServerPersistsAndRoutesClientSessionSend(t *testing.T) {
 		string(routed.Payload) != `{"content":[{"kind":"text","text":"Continue"}]}` {
 		t.Fatalf("routed command = %+v payload=%s", routed, string(routed.Payload))
 	}
+	events.mu.Lock()
+	status := events.pending["ses_1\x00cmd_send_1"].Status
+	events.mu.Unlock()
+	if status != store.PendingCommandReceived {
+		t.Fatalf("pending command after Hub write = %q, want received", status)
+	}
+	writeFrame(t, adapter, &protocol.CommandAck{CommandID: "cmd_send_1", Status: protocol.AckAccepted})
 
 	ack := readCommandAckFor(t, client, "cmd_send_1")
 	if ack.Status != protocol.AckAccepted || ack.Reason != "" {
@@ -2134,6 +2140,7 @@ func TestWebSocketServerDeduplicatesAcceptedClientCommands(t *testing.T) {
 	if first.CommandID != "cmd_duplicate" {
 		t.Fatalf("first routed command = %+v", first)
 	}
+	writeFrame(t, adapter, &protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted})
 	if ack := readCommandAckFor(t, client, command.CommandID); ack.Status != protocol.AckAccepted {
 		t.Fatalf("first ack = %+v", ack)
 	}
@@ -2173,6 +2180,11 @@ func TestWebSocketServerReportsAcceptedClientCommandActivity(t *testing.T) {
 		SessionID: "ses_1",
 		Payload:   json.RawMessage(`{"content":[{"kind":"text","text":"hello"}]}`),
 	})
+	command := readFrame(t, adapter).(*protocol.Command)
+	if command.CommandID != "cmd_activity" {
+		t.Fatalf("activity command = %+v", command)
+	}
+	writeFrame(t, adapter, &protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted})
 	ack := readCommandAckFor(t, client, "cmd_activity")
 	if ack.Status != protocol.AckAccepted {
 		t.Fatalf("ack = %+v", ack)
@@ -2271,17 +2283,8 @@ func TestWebSocketServerBuffersSessionSendUntilAdapterReconnects(t *testing.T) {
 	})
 
 	ack := readCommandAckFor(t, client, "cmd_buffered")
-	if ack.Status != protocol.AckAccepted {
+	if ack.Status != protocol.AckRejected || ack.Reason != "adapter_offline" {
 		t.Fatalf("client ack = %+v", ack)
-	}
-
-	adapter := dialWebSocket(t, server.URL)
-	defer adapter.Close(websocket.StatusNormalClosure, "")
-	writeAdapterHello(t, adapter, "adapter-token")
-	_ = readFrame(t, adapter).(*protocol.HelloAck)
-	routed := readFrame(t, adapter).(*protocol.Command)
-	if routed.CommandID != "cmd_buffered" || routed.Type != protocol.CommandSessionSend {
-		t.Fatalf("buffered command = %+v", routed)
 	}
 }
 
@@ -4075,8 +4078,32 @@ func (f *fakeEventStore) seedPending(command store.PendingCommand) {
 	f.pending[command.SessionID+"\x00"+command.CommandID] = command
 }
 
-func (f *fakeEventStore) CommitPendingCommand(context.Context, string, store.CommandAuthority, store.PendingEvent, store.PendingCommandRequest) (store.PendingCommandCommit, error) {
-	return store.PendingCommandCommit{}, errors.New("test fake does not commit pending commands")
+func (f *fakeEventStore) CommitPendingCommand(_ context.Context, sessionID string, authority store.CommandAuthority, event store.PendingEvent, request store.PendingCommandRequest) (store.PendingCommandCommit, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	connection, ok := f.connections[sessionID]
+	if !ok || authority.ConnectionEpoch != connection.ConnectionEpoch || authority.CredentialGeneration != connection.ActiveCredentialGeneration ||
+		connection.RevokedAt != nil || connection.TerminalAt != nil || !connection.ActiveCredentialExpiresAt.After(time.Now()) {
+		return store.PendingCommandCommit{}, errors.New("pending command authority lost")
+	}
+	if request.CommandID == "" || request.Type != "session.send" || !request.ExpiresAt.After(time.Now()) || event.Type != "session.message" || len(event.Payload) == 0 || !json.Valid(event.Payload) {
+		return store.PendingCommandCommit{}, errors.New("invalid pending command")
+	}
+	key := sessionID + "\x00" + request.CommandID
+	if existing, ok := f.pending[key]; ok {
+		return store.PendingCommandCommit{Command: existing, Duplicate: true}, nil
+	}
+	if f.appendErr != nil {
+		return store.PendingCommandCommit{}, f.appendErr
+	}
+	seq := f.latest[sessionID] + 1
+	pendingEvent := store.PendingEvent{Type: event.Type, Time: event.Time, Payload: append([]byte(nil), event.Payload...)}
+	f.appendCalls = append(f.appendCalls, appendCall{sessionID: sessionID, events: []store.PendingEvent{pendingEvent}})
+	f.events[sessionID] = append(f.events[sessionID], store.Event{SessionID: sessionID, Seq: seq, Type: event.Type, Time: event.Time, Payload: append(json.RawMessage(nil), event.Payload...)})
+	f.latest[sessionID] = seq
+	command := store.PendingCommand{SessionID: sessionID, CommandID: request.CommandID, Type: request.Type, EventSeq: seq, Status: store.PendingCommandPending, ExpiresAt: request.ExpiresAt}
+	f.pending[key] = command
+	return store.PendingCommandCommit{Command: command}, nil
 }
 
 func (f *fakeEventStore) AdapterConnection(_ context.Context, sessionID string) (store.AdapterConnection, error) {

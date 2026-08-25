@@ -27,6 +27,7 @@ const (
 const maxReplayBufferedEvents = 1024
 const maxPendingCommandsPerSession = 64
 const pendingCommandTTL = 10 * time.Minute
+const pendingCommandAckTimeout = 30 * time.Second
 const maxAcceptedCommandIDs = 4096
 const maxDecisionRequestIDs = 4096
 const adapterEventBatchWindow = 50 * time.Millisecond
@@ -125,6 +126,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		acceptedCommands:                  make(map[string]struct{}),
 		decisions:                         make(map[string]struct{}),
 		settingsClients:                   make(map[string]*clientConnection),
+		pendingCommandClients:             make(map[string]*pendingCommandClient),
 		settingsCapabilities:              make(map[string]store.SettingsCapability),
 		fileReferenceCapabilities:         make(map[string]fileReferenceCapability),
 		runControlClients:                 make(map[string]*clientConnection),
@@ -205,6 +207,7 @@ type webSocketHandler struct {
 	decisions                 map[string]struct{}
 	decisionOrder             []string
 	settingsClients           map[string]*clientConnection
+	pendingCommandClients     map[string]*pendingCommandClient
 	settingsCapabilities      map[string]store.SettingsCapability
 	fileReferenceCapabilities map[string]fileReferenceCapability
 	runControlClients         map[string]*clientConnection
@@ -213,6 +216,13 @@ type webSocketHandler struct {
 	pendingTargetJoins        map[string]*pendingTargetJoin
 	pendingTargetJoinByAttach map[string]*pendingTargetJoin
 	pendingTargetJoinTimer    func(time.Duration, func()) *time.Timer
+}
+
+type pendingCommandClient struct {
+	adapter   *adapterConnection
+	peer      *clientConnection
+	commandID string
+	timer     *time.Timer
 }
 
 type attentionSubscription struct {
@@ -1113,6 +1123,7 @@ func (h *webSocketHandler) removeAttentionMembershipLocked(peer *clientConnectio
 }
 
 func (h *webSocketHandler) unregisterAdapter(adapter *adapterConnection) {
+	go h.rejectPendingCommandDeliveries(adapter, "adapter_delivery_failed")
 	_, unlock := h.lockAdapterAdmission(adapter.sessionID)
 	defer unlock()
 	h.removeAdapter(adapter)
@@ -1979,6 +1990,9 @@ func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter 
 	if client := h.runControlClient(key); client != nil {
 		return h.handleRunControlCommandAck(ctx, adapter, ack, key, client)
 	}
+	if client := h.pendingCommandClient(key); client != nil {
+		return h.handlePendingCommandAck(ctx, adapter, ack, key, client)
+	}
 	client := h.settingsClient(key)
 	if client == nil {
 		return errors.New("adapter acknowledgement has no settings reservation")
@@ -2022,6 +2036,40 @@ func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter 
 	}
 	h.removeSettingsClient(key)
 	return writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckAccepted, "")
+}
+
+func (h *webSocketHandler) handlePendingCommandAck(ctx context.Context, adapter *adapterConnection, ack *protocol.CommandAck, key string, client *pendingCommandClient) error {
+	if client.adapter != adapter || ack.Status != protocol.AckAccepted || ack.Reason != "" || h.settingsCurrentAdapter(adapter.sessionID) != adapter {
+		h.takePendingCommandClient(key)
+		h.resolvePendingCommandUnknown(adapter.sessionID, ack.CommandID)
+		h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		return errors.New("pending command delivery acknowledgement is rejected")
+	}
+	ledger, ok := h.events.(store.CommandLedgerStore)
+	if !ok {
+		h.takePendingCommandClient(key)
+		h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckRejected, "internal_error")
+		return errors.New("pending command ledger is not configured")
+	}
+	authority := store.CommandAuthority{ConnectionEpoch: adapter.admission.ConnectionEpoch, CredentialGeneration: adapter.admission.CredentialGeneration}
+	if _, err := ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, ack.CommandID, store.PendingCommandCompleted); err != nil {
+		h.takePendingCommandClient(key)
+		h.resolvePendingCommandUnknown(adapter.sessionID, ack.CommandID)
+		h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		return fmt.Errorf("resolve acknowledged pending command: %w", err)
+	}
+	h.takePendingCommandClient(key)
+	h.commandMu.Lock()
+	h.markCommandAcceptedLocked(ack.CommandID)
+	h.commandMu.Unlock()
+	return h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckAccepted, "")
+}
+
+func (h *webSocketHandler) writePendingCommandAck(ctx context.Context, peer *clientConnection, commandID string, status protocol.AckStatus, reason string) error {
+	if peer == nil {
+		return nil
+	}
+	return writeClientCommandAck(ctx, peer, nil, commandID, status, reason)
 }
 
 func (h *webSocketHandler) handleRunControlCommandAck(ctx context.Context, adapter *adapterConnection, ack *protocol.CommandAck, key string, client *clientConnection) error {
@@ -2189,6 +2237,85 @@ func (h *webSocketHandler) removeRunControlClient(key string) {
 	h.commandMu.Unlock()
 }
 
+func (h *webSocketHandler) pendingCommandClient(key string) *pendingCommandClient {
+	h.commandMu.Lock()
+	defer h.commandMu.Unlock()
+	return h.pendingCommandClients[key]
+}
+
+func (h *webSocketHandler) takePendingCommandClient(key string) *pendingCommandClient {
+	h.commandMu.Lock()
+	defer h.commandMu.Unlock()
+	client := h.pendingCommandClients[key]
+	if client != nil {
+		delete(h.pendingCommandClients, key)
+		if client.timer != nil {
+			client.timer.Stop()
+		}
+	}
+	return client
+}
+
+func (h *webSocketHandler) addPendingCommandClient(key string, adapter *adapterConnection, peer *clientConnection, commandID string) {
+	client := &pendingCommandClient{adapter: adapter, peer: peer, commandID: commandID}
+	client.timer = time.AfterFunc(time.Hour, func() {
+		h.expirePendingCommandClient(key)
+	})
+	client.timer.Stop()
+	h.commandMu.Lock()
+	h.pendingCommandClients[key] = client
+	h.commandMu.Unlock()
+	client.timer.Reset(pendingCommandAckTimeout)
+}
+
+func (h *webSocketHandler) expirePendingCommandClient(key string) {
+	client := h.takePendingCommandClient(key)
+	if client == nil {
+		return
+	}
+	h.resolvePendingCommandUnknown(client.adapter.sessionID, client.commandID)
+	h.unregisterAdapter(client.adapter)
+	client.adapter.close()
+	if client.peer != nil {
+		_ = writeClientCommandAck(context.Background(), client.peer, nil, client.commandID, protocol.AckRejected, "adapter_delivery_timeout")
+	}
+}
+
+func (h *webSocketHandler) rejectPendingCommandDeliveries(adapter *adapterConnection, reason string) {
+	if adapter == nil {
+		return
+	}
+	h.commandMu.Lock()
+	clients := make([]*pendingCommandClient, 0)
+	for key, client := range h.pendingCommandClients {
+		if client.adapter != adapter {
+			continue
+		}
+		delete(h.pendingCommandClients, key)
+		if client.timer != nil {
+			client.timer.Stop()
+		}
+		clients = append(clients, client)
+	}
+	h.commandMu.Unlock()
+	for _, client := range clients {
+		h.resolvePendingCommandUnknown(adapter.sessionID, client.commandID)
+		if client.peer != nil {
+			_ = writeClientCommandAck(context.Background(), client.peer, nil, client.commandID, protocol.AckRejected, reason)
+		}
+	}
+}
+
+func (h *webSocketHandler) resolvePendingCommandUnknown(sessionID, commandID string) {
+	ledger, ok := h.events.(store.CommandLedgerStore)
+	if !ok || sessionID == "" || commandID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pendingCommandAckTimeout)
+	defer cancel()
+	_, _ = ledger.ResolvePendingCommandUnknown(ctx, sessionID, commandID)
+}
+
 func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *managedConn, peer *clientConnection, accepted AcceptedPeer, cmd *protocol.Command) error {
 	if err := validateClientCommand(cmd); err != nil {
 		_ = writeCommandAck(ctx, conn, commandID(cmd), protocol.AckRejected, "invalid_command")
@@ -2235,6 +2362,9 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 		}
 		if fileReferences.HasReferences {
 			return h.handleFileReferenceSend(ctx, conn, peer, accepted, cmd, fileReferences)
+		}
+		if ledger, ok := h.events.(store.CommandLedgerStore); ok {
+			return h.handleDurableSessionSend(ctx, conn, peer, cmd, ledger)
 		}
 	}
 
@@ -2294,6 +2424,79 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 	if err := writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckAccepted, ""); err != nil {
 		return err
 	}
+	return nil
+}
+
+// handleDurableSessionSend makes the adapter acknowledgement, rather than a
+// successful Hub WebSocket write, the delivery boundary for an ordinary user
+// message. A received ledger row is never replayed after reconnect because
+// the local provider may already have consumed the prompt.
+func (h *webSocketHandler) handleDurableSessionSend(ctx context.Context, conn *managedConn, peer *clientConnection, cmd *protocol.Command, ledger store.CommandLedgerStore) error {
+	adapter := h.settingsCurrentAdapter(cmd.SessionID)
+	if adapter == nil {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_offline")
+		return errors.New("session adapter is offline")
+	}
+
+	h.commandMu.Lock()
+	if _, duplicate := h.acceptedCommands[cmd.CommandID]; duplicate {
+		h.commandMu.Unlock()
+		return writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckDuplicate, "")
+	}
+	h.commandMu.Unlock()
+
+	eventType, payload, err := commandEventPayload(cmd)
+	if err != nil {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "invalid_command")
+		return err
+	}
+	eventTime := time.Now().UTC()
+	authority := store.CommandAuthority{ConnectionEpoch: adapter.admission.ConnectionEpoch, CredentialGeneration: adapter.admission.CredentialGeneration}
+	var persisted *protocol.Event
+	var commit store.PendingCommandCommit
+	err = h.withSessionPublication(ctx, cmd.SessionID, func() error {
+		var commitErr error
+		commit, commitErr = ledger.CommitPendingCommand(ctx, cmd.SessionID, authority, store.PendingEvent{Type: eventType, Time: eventTime, Payload: payload}, store.PendingCommandRequest{
+			CommandID: cmd.CommandID, Type: string(cmd.Type), ExpiresAt: eventTime.Add(pendingCommandAckTimeout - time.Second),
+		})
+		if commitErr != nil || commit.Duplicate {
+			return commitErr
+		}
+		seq := commit.Command.EventSeq
+		persisted = &protocol.Event{Type: eventType, SessionID: cmd.SessionID, Seq: &seq, Time: eventTime.UnixMilli(), Payload: clonePayload(payload)}
+		h.broadcastEvent(ctx, *persisted)
+		return nil
+	})
+	if err != nil {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "persist_failed")
+		return fmt.Errorf("commit durable session send: %w", err)
+	}
+	if commit.Duplicate {
+		return writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckDuplicate, "")
+	}
+
+	claim, err := ledger.ClaimPendingCommand(ctx, cmd.SessionID, authority, cmd.CommandID)
+	if err != nil || !claim.Claimed || claim.Command.Status != store.PendingCommandReceived {
+		h.resolvePendingCommandUnknown(cmd.SessionID, cmd.CommandID)
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		if err == nil {
+			err = errors.New("durable command claim was not acquired")
+		}
+		return fmt.Errorf("claim durable session send: %w", err)
+	}
+
+	key := settingsCommandKey(cmd.SessionID, cmd.CommandID)
+	h.addPendingCommandClient(key, adapter, peer, cmd.CommandID)
+	routed := cloneCommand(cmd)
+	if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
+		h.takePendingCommandClient(key)
+		h.resolvePendingCommandUnknown(cmd.SessionID, cmd.CommandID)
+		h.unregisterAdapter(adapter)
+		adapter.close()
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_delivery_failed")
+		return fmt.Errorf("deliver durable session send: %w", err)
+	}
+	h.observeCommandActivity(ctx, commandActivity(cmd, persisted))
 	return nil
 }
 
@@ -2716,8 +2919,6 @@ func (h *webSocketHandler) hasAdapter(sessionID string) bool {
 }
 
 func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *adapterConnection) error {
-	h.commandMu.Lock()
-	defer h.commandMu.Unlock()
 	if ledger, ok := h.events.(store.CommandLedgerStore); ok {
 		authority := store.CommandAuthority{
 			ConnectionEpoch:      adapter.admission.ConnectionEpoch,
@@ -2748,18 +2949,19 @@ func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *
 				}
 				continue
 			}
+			key := settingsCommandKey(adapter.sessionID, command.CommandID)
+			h.addPendingCommandClient(key, adapter, nil, command.CommandID)
 			if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
+				h.takePendingCommandClient(key)
 				_, _ = ledger.ResolvePendingCommandUnknown(ctx, adapter.sessionID, command.CommandID)
 				h.unregisterAdapter(adapter)
 				return fmt.Errorf("deliver durable pending command %s: %w", command.CommandID, err)
 			}
-			if _, err := ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, command.CommandID, store.PendingCommandCompleted); err != nil {
-				_, _ = ledger.ResolvePendingCommandUnknown(ctx, adapter.sessionID, command.CommandID)
-				return fmt.Errorf("resolve delivered durable command %s: %w", command.CommandID, err)
-			}
 		}
 	}
 
+	h.commandMu.Lock()
+	defer h.commandMu.Unlock()
 	now := time.Now().UTC()
 	pending := h.pendingCommands[adapter.sessionID]
 	remaining := pending[:0]
