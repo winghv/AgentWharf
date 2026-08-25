@@ -2720,6 +2720,25 @@ func TestAdapterDispatchAdmitsVerifiedRotatedCredential(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerRejectsRotationWithoutCredentialLifecycle(t *testing.T) {
+	events := newDispatchFenceStore()
+	server := newWebSocketTestServer(t, testHandshakeWithStore(events), func(cfg *hub.WebSocketConfig) {
+		cfg.EventStore = events
+	})
+	adapter := dialWebSocket(t, server.URL)
+	defer adapter.Close(websocket.StatusNormalClosure, "")
+	writeAdapterHelloV2(t, adapter, "adapter-token")
+	_ = readFrame(t, adapter).(*protocol.HelloAck)
+	writeFrame(t, adapter, &protocol.CredentialRotationRequest{RotationID: "rot_missing_lifecycle"})
+	if rejected, ok := readFrame(t, adapter).(*protocol.Error); !ok || rejected.Code != "credential_rotation_rejected" {
+		t.Fatalf("missing lifecycle response = %+v", rejected)
+	}
+	connection, err := events.AdapterConnection(context.Background(), "ses_1")
+	if err != nil || connection.PendingCredentialGeneration != nil || connection.RotationID != nil {
+		t.Fatalf("missing lifecycle changed connection = %+v, %v", connection, err)
+	}
+}
+
 func TestWebSocketServerRotatesAdapterCredentialAfterExactPossession(t *testing.T) {
 	events := newDispatchFenceStore()
 	issuer := &recordingSessionCredentialIssuer{}

@@ -546,7 +546,11 @@ func (h *webSocketHandler) readLoop(ctx context.Context, conn *managedConn, acce
 
 func (h *webSocketHandler) handleCredentialRotationRequest(ctx context.Context, adapter *adapterConnection, request *protocol.CredentialRotationRequest) error {
 	if adapter == nil || request == nil || request.RotationID == "" || h.adapterAuthority == nil || h.sessionCredentialLifecycle == nil {
-		return errors.New("invalid credential rotation request")
+		err := errors.New("invalid credential rotation request")
+		if adapter != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "credential_rotation_rejected", Message: "credential rotation rejected"})
+		}
+		return err
 	}
 	err := h.withAdapterEffect(ctx, adapter, func() error {
 		connection, err := h.adapterAuthority.store.AdapterConnection(ctx, adapter.sessionID)
