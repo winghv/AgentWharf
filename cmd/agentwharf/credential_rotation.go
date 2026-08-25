@@ -10,68 +10,99 @@ import (
 	"github.com/winghv/agentwharf/protocol"
 )
 
-const credentialRotationLeadTime = 5 * time.Minute
+const (
+	credentialRotationLeadTime      = 5 * time.Minute
+	credentialRotationRetryInterval = 10 * time.Second
+)
 
 type credentialRotationManager struct {
-	mu          sync.Mutex
-	session     string
-	epoch       int64
-	expires     time.Time
-	pending     string
-	pendingGen  int64
-	write       func(protocol.Frame) error
-	credentials *adapterCredentialSet
-	authority   func() *protocol.ConnectionAuthorityReceipt
+	mu            sync.Mutex
+	session       string
+	epoch         int64
+	expires       time.Time
+	pending       string
+	pendingGen    int64
+	lastRequestAt time.Time
+	write         func(protocol.Frame) error
+	credentials   *adapterCredentialSet
+	authority     func() *protocol.ConnectionAuthorityReceipt
+	leadTime      time.Duration
+	retryInterval time.Duration
 }
 
 func newCredentialRotationManager(ctx context.Context, authority *protocol.ConnectionAuthorityReceipt, write func(protocol.Frame) error, credentials *adapterCredentialSet, currentAuthority func() *protocol.ConnectionAuthorityReceipt) *credentialRotationManager {
 	if authority == nil || authority.SessionID == "" || authority.ConnectionEpoch < 1 || authority.ExpiresAt <= 0 || write == nil {
 		return nil
 	}
-	m := &credentialRotationManager{session: authority.SessionID, epoch: authority.ConnectionEpoch, expires: time.UnixMilli(authority.ExpiresAt), write: write, credentials: credentials, authority: currentAuthority}
+	m := &credentialRotationManager{
+		session: authority.SessionID, epoch: authority.ConnectionEpoch,
+		expires: time.UnixMilli(authority.ExpiresAt), write: write,
+		credentials: credentials, authority: currentAuthority,
+		leadTime: credentialRotationLeadTime, retryInterval: credentialRotationRetryInterval,
+	}
 	go m.run(ctx)
 	return m
 }
 
 func (m *credentialRotationManager) run(ctx context.Context) {
+	ticker := time.NewTicker(m.rotationRetryInterval())
+	defer ticker.Stop()
 	for {
-		m.refreshAuthority()
-		m.mu.Lock()
-		wait := time.Until(m.expires.Add(-credentialRotationLeadTime))
-		if wait < time.Second {
-			wait = time.Second
-		}
-		m.mu.Unlock()
-		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return
-		case <-timer.C:
+		case <-ticker.C:
+			_ = m.requestIfDue(time.Now())
 		}
-		m.mu.Lock()
-		if m.pending != "" || time.Until(m.expires) <= 0 {
-			m.mu.Unlock()
-			continue
-		}
-		rotationID, err := randomToken()
+	}
+}
+
+// requestIfDue resends the same request until the Hub advances authority. The
+// request is idempotent, and retaining its ID lets a lost credential or
+// activation frame converge without allowing the original bearer to expire.
+func (m *credentialRotationManager) requestIfDue(now time.Time) error {
+	if m == nil {
+		return nil
+	}
+	m.refreshAuthority()
+	m.mu.Lock()
+	if !now.Before(m.expires) || now.Before(m.expires.Add(-m.rotationLeadTime())) {
+		m.mu.Unlock()
+		return nil
+	}
+	if !m.lastRequestAt.IsZero() && now.Sub(m.lastRequestAt) < m.rotationRetryInterval() {
+		m.mu.Unlock()
+		return nil
+	}
+	rotationID := m.pending
+	if rotationID == "" {
+		var err error
+		rotationID, err = randomToken()
 		if err != nil {
 			m.mu.Unlock()
-			continue
+			return err
 		}
 		m.pending = rotationID
 		m.pendingGen = 0
-		write := m.write
-		m.mu.Unlock()
-		if err := write(&protocol.CredentialRotationRequest{RotationID: rotationID}); err != nil {
-			m.mu.Lock()
-			if m.pending == rotationID {
-				m.pending = ""
-				m.pendingGen = 0
-			}
-			m.mu.Unlock()
-		}
 	}
+	m.lastRequestAt = now
+	write := m.write
+	m.mu.Unlock()
+	return write(&protocol.CredentialRotationRequest{RotationID: rotationID})
+}
+
+func (m *credentialRotationManager) rotationLeadTime() time.Duration {
+	if m.leadTime > 0 {
+		return m.leadTime
+	}
+	return credentialRotationLeadTime
+}
+
+func (m *credentialRotationManager) rotationRetryInterval() time.Duration {
+	if m.retryInterval > 0 {
+		return m.retryInterval
+	}
+	return credentialRotationRetryInterval
 }
 
 func (m *credentialRotationManager) handle(ctx context.Context, frame protocol.Frame) error {
@@ -124,6 +155,7 @@ func (m *credentialRotationManager) handleActivation(activation *protocol.Creden
 	// Keep the old expiry only until the next credential frame updates it.
 	m.pending = ""
 	m.pendingGen = 0
+	m.lastRequestAt = time.Time{}
 	if m.credentials != nil {
 		m.credentials.activate(activation.Generation)
 	}
@@ -156,10 +188,12 @@ func (m *credentialRotationManager) refreshAuthority() {
 	if m.pending != "" && m.pendingGen > 0 && authority.CredentialGeneration >= m.pendingGen {
 		m.pending = ""
 		m.pendingGen = 0
+		m.lastRequestAt = time.Time{}
 	}
 	if m.pending != "" && m.pendingGen > 0 && m.credentials != nil && m.credentials.pendingGeneration() != m.pendingGen {
 		m.pending = ""
 		m.pendingGen = 0
+		m.lastRequestAt = time.Time{}
 	}
 	if expires := time.UnixMilli(authority.ExpiresAt); expires.After(time.Now()) {
 		m.expires = expires

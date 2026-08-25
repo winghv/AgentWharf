@@ -214,12 +214,24 @@ func TestOfficialProviderRotatesCredentialBeforeReconnect(t *testing.T) {
 				serverDone <- fmt.Errorf("initial hello = %+v", hello)
 				return
 			}
-			if err := writeFrameToConn(ctx, conn, reconnectHelloAck("ses_official", 1, 1)); err != nil {
+			ack := reconnectHelloAck("ses_official", 1, 1)
+			ack.ConnectionAuthority.ExpiresAt = time.Now().Add(4 * time.Minute).UnixMilli()
+			if err := writeFrameToConn(ctx, conn, ack); err != nil {
 				serverDone <- err
 				return
 			}
+			if err := writeFrameToConn(ctx, conn, &protocol.Pong{Nonce: "rotation-heartbeat"}); err != nil {
+				serverDone <- err
+				return
+			}
+			frame, err = readFrameFromConn(ctx, conn)
+			request, ok := frame.(*protocol.CredentialRotationRequest)
+			if err != nil || !ok || request.RotationID == "" {
+				serverDone <- fmt.Errorf("rotation request = %T %+v, %v", frame, frame, err)
+				return
+			}
 			credential := &protocol.CredentialRotationCredential{
-				SessionID: "ses_official", RotationID: "rot_official", Generation: 2,
+				SessionID: "ses_official", RotationID: request.RotationID, Generation: 2,
 				Credential: "new-token", ExpiresAt: time.Now().Add(15 * time.Minute).UnixMilli(),
 			}
 			if err := writeFrameToConn(ctx, conn, credential); err != nil {
@@ -228,12 +240,12 @@ func TestOfficialProviderRotatesCredentialBeforeReconnect(t *testing.T) {
 			}
 			frame, err = readFrameFromConn(ctx, conn)
 			possession, ok := frame.(*protocol.CredentialRotationPossession)
-			if err != nil || !ok || possession.RotationID != "rot_official" {
+			if err != nil || !ok || possession.RotationID != request.RotationID {
 				serverDone <- fmt.Errorf("rotation possession = %T %+v, %v", frame, frame, err)
 				return
 			}
 			if err := writeFrameToConn(ctx, conn, &protocol.CredentialRotationActivation{
-				RotationID: "rot_official", Generation: 2, ConnectionEpoch: 2, AcceptedFence: 2,
+				RotationID: request.RotationID, Generation: 2, ConnectionEpoch: 2, AcceptedFence: 2,
 			}); err != nil {
 				serverDone <- err
 				return
@@ -288,9 +300,6 @@ func TestOfficialProviderRotatesCredentialBeforeReconnect(t *testing.T) {
 	defer connection.close()
 	writeFrame := func(frame protocol.Frame) error { return connection.write(ctx, frame) }
 	rotation := newCredentialRotationManager(ctx, ack.ConnectionAuthority, writeFrame, connection.credentials, connection.currentAuthority)
-	rotation.mu.Lock()
-	rotation.pending = "rot_official"
-	rotation.mu.Unlock()
 
 	commandDone := make(chan error, 1)
 	go func() {

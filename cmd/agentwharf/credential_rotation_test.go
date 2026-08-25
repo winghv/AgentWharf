@@ -88,7 +88,69 @@ func TestCredentialRotationManagerRetriesAfterPendingCredentialWasNotActivated(t
 	m.refreshAuthority()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.pending != "" || m.pendingGen != 0 {
-		t.Fatalf("abandoned rotation remains pending: %q generation=%d", m.pending, m.pendingGen)
+	if m.pending != "" || m.pendingGen != 0 || !m.lastRequestAt.IsZero() {
+		t.Fatalf("abandoned rotation remains pending: %q generation=%d requested=%v", m.pending, m.pendingGen, m.lastRequestAt)
+	}
+}
+
+func TestCredentialRotationManagerRequestsAndRetriesBeforeExpiry(t *testing.T) {
+	now := time.Now()
+	frames := make(chan protocol.Frame, 3)
+	m := &credentialRotationManager{
+		session: "ses_1", epoch: 1, expires: now.Add(time.Minute),
+		write:    func(frame protocol.Frame) error { frames <- frame; return nil },
+		leadTime: 2 * time.Minute, retryInterval: 10 * time.Second,
+	}
+
+	if err := m.requestIfDue(now); err != nil {
+		t.Fatal(err)
+	}
+	first, ok := (<-frames).(*protocol.CredentialRotationRequest)
+	if !ok || first.RotationID == "" {
+		t.Fatalf("first request = %#v", first)
+	}
+	if err := m.requestIfDue(now.Add(9 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-frames:
+		t.Fatalf("request retried too early: %#v", frame)
+	default:
+	}
+	if err := m.requestIfDue(now.Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	second, ok := (<-frames).(*protocol.CredentialRotationRequest)
+	if !ok || second.RotationID != first.RotationID {
+		t.Fatalf("retry request = %#v, want rotation %q", second, first.RotationID)
+	}
+}
+
+func TestCredentialRotationManagerRunSchedulesRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	frames := make(chan protocol.Frame, 2)
+	m := &credentialRotationManager{
+		session: "ses_1", epoch: 1, expires: time.Now().Add(time.Minute),
+		write:    func(frame protocol.Frame) error { frames <- frame; return nil },
+		leadTime: 2 * time.Minute, retryInterval: time.Millisecond,
+	}
+	go m.run(ctx)
+
+	var first *protocol.CredentialRotationRequest
+	select {
+	case frame := <-frames:
+		first, _ = frame.(*protocol.CredentialRotationRequest)
+	case <-time.After(time.Second):
+		t.Fatal("rotation request was not scheduled")
+	}
+	select {
+	case frame := <-frames:
+		second, ok := frame.(*protocol.CredentialRotationRequest)
+		if !ok || first == nil || second.RotationID != first.RotationID {
+			t.Fatalf("scheduled retry = %#v, first = %#v", second, first)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rotation request was not retried")
 	}
 }

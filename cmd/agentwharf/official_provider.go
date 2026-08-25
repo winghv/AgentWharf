@@ -205,6 +205,12 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connec
 			if observePong != nil {
 				observePong(typed.Nonce)
 			}
+			// The live heartbeat is an independent trigger for credential upkeep.
+			// This keeps an interactive Session recoverable even if a timer wakeup
+			// or the first idempotent rotation request was not delivered.
+			if err := rotation.requestIfDue(time.Now()); err != nil {
+				return err
+			}
 		case *protocol.Command:
 			if accepted.Contains(typed.CommandID) {
 				if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
