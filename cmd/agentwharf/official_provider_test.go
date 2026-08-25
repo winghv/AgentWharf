@@ -354,7 +354,7 @@ func TestRunOfficialProviderBootstrapsCredentialRotation(t *testing.T) {
 			return
 		}
 		ack := reconnectHelloAck("ses_official_runtime", 1, 1)
-		ack.ConnectionAuthority.ExpiresAt = time.Now().Add(15 * time.Minute).UnixMilli()
+		ack.ConnectionAuthority.ExpiresAt = time.Now().Add(-time.Minute).UnixMilli()
 		if err := writeFrameToConn(ctx, conn, ack); err != nil {
 			serverErr <- err
 			return

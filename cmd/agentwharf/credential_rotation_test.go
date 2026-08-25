@@ -97,7 +97,7 @@ func TestCredentialRotationManagerBootstrapsAndRetriesBeforeExpiry(t *testing.T)
 	now := time.Now()
 	frames := make(chan protocol.Frame, 3)
 	m := &credentialRotationManager{
-		session: "ses_1", epoch: 1, expires: now.Add(15 * time.Minute),
+		session: "ses_1", epoch: 1, expires: now.Add(-time.Minute),
 		write:    func(frame protocol.Frame) error { frames <- frame; return nil },
 		leadTime: 5 * time.Minute, retryInterval: 10 * time.Second,
 	}

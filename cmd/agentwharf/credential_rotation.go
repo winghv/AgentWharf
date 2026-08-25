@@ -67,13 +67,11 @@ func (m *credentialRotationManager) requestIfDue(now time.Time) error {
 	}
 	m.refreshAuthority()
 	m.mu.Lock()
-	if !now.Before(m.expires) {
-		m.mu.Unlock()
-		return nil
-	}
-	if m.bootstrapDone && now.Before(m.expires.Add(-m.rotationLeadTime())) {
-		m.mu.Unlock()
-		return nil
+	if m.bootstrapDone {
+		if !now.Before(m.expires) || now.Before(m.expires.Add(-m.rotationLeadTime())) {
+			m.mu.Unlock()
+			return nil
+		}
 	}
 	if !m.lastRequestAt.IsZero() && now.Sub(m.lastRequestAt) < m.rotationRetryInterval() {
 		m.mu.Unlock()
