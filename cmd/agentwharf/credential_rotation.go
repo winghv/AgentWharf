@@ -23,6 +23,7 @@ type credentialRotationManager struct {
 	pending       string
 	pendingGen    int64
 	lastRequestAt time.Time
+	bootstrapDone bool
 	write         func(protocol.Frame) error
 	credentials   *adapterCredentialSet
 	authority     func() *protocol.ConnectionAuthorityReceipt
@@ -57,16 +58,20 @@ func (m *credentialRotationManager) run(ctx context.Context) {
 	}
 }
 
-// requestIfDue resends the same request until the Hub advances authority. The
-// request is idempotent, and retaining its ID lets a lost credential or
-// activation frame converge without allowing the original bearer to expire.
+// requestIfDue bootstraps one rotation after admission, then renews inside the
+// expiry window. It resends the same idempotent request until the Hub advances
+// authority, so a lost credential or activation frame can still converge.
 func (m *credentialRotationManager) requestIfDue(now time.Time) error {
 	if m == nil {
 		return nil
 	}
 	m.refreshAuthority()
 	m.mu.Lock()
-	if !now.Before(m.expires) || now.Before(m.expires.Add(-m.rotationLeadTime())) {
+	if !now.Before(m.expires) {
+		m.mu.Unlock()
+		return nil
+	}
+	if m.bootstrapDone && now.Before(m.expires.Add(-m.rotationLeadTime())) {
 		m.mu.Unlock()
 		return nil
 	}
@@ -156,6 +161,7 @@ func (m *credentialRotationManager) handleActivation(activation *protocol.Creden
 	m.pending = ""
 	m.pendingGen = 0
 	m.lastRequestAt = time.Time{}
+	m.bootstrapDone = true
 	if m.credentials != nil {
 		m.credentials.activate(activation.Generation)
 	}
@@ -189,6 +195,7 @@ func (m *credentialRotationManager) refreshAuthority() {
 		m.pending = ""
 		m.pendingGen = 0
 		m.lastRequestAt = time.Time{}
+		m.bootstrapDone = true
 	}
 	if m.pending != "" && m.pendingGen > 0 && m.credentials != nil && m.credentials.pendingGeneration() != m.pendingGen {
 		m.pending = ""

@@ -112,15 +112,24 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	// CLI output to the terminal. Local keystrokes and Hub injects share ptyMu
 	// so an idle recap or mouse-tracking burst cannot splice into a prompt.
 	var ptyMu sync.Mutex
+	providerInput := io.Reader(os.Stdin)
+	if cfg.Stdin != nil {
+		providerInput = cfg.Stdin
+	}
 	go func() { _, _ = io.Copy(os.Stdout, ptmx) }()
-	go func() { _ = copyLocked(ptmx, os.Stdin, &ptyMu) }()
+	go func() { _ = copyLocked(ptmx, providerInput, &ptyMu) }()
 
 	mirrorDone := make(chan error, 1)
 	injected := &injectedPromptTracker{pending: make(map[string]int)}
 	questions := newQuestionCache()
 	heartbeats := &officialHeartbeatPongRouter{}
 	rotation := newCredentialRotationManager(runCtx, connection.currentAuthority(), writeFrame, connection.credentials, connection.currentAuthority)
-	go superviseOfficialAdapterHeartbeat(runCtx, cfg.Heartbeat, connection, writeFrame, heartbeats)
+	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 && rotation == nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return errors.New("official agent credential rotation authority is unavailable")
+	}
+	go superviseOfficialAdapterHeartbeat(runCtx, cfg.Heartbeat, connection, writeFrame, heartbeats, rotation)
 	go func() {
 		mirrorDone <- mirrorTranscript(runCtx, cfg, provider, sessionID, launchTime, writeFrame, injected, questions)
 	}()
@@ -327,12 +336,16 @@ func (r *officialHeartbeatPongRouter) observe(nonce string) {
 	}
 }
 
-func superviseOfficialAdapterHeartbeat(ctx context.Context, cfg heartbeatConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, pongs *officialHeartbeatPongRouter) {
+func superviseOfficialAdapterHeartbeat(ctx context.Context, cfg heartbeatConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, pongs *officialHeartbeatPongRouter, rotation *credentialRotationManager) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		done, observe := startAdapterHeartbeat(ctx, cfg, writeFrame)
+		var onPingSent func()
+		if rotation != nil {
+			onPingSent = func() { _ = rotation.requestIfDue(time.Now()) }
+		}
+		done, observe := startAdapterHeartbeat(ctx, cfg, writeFrame, onPingSent)
 		pongs.set(observe)
 		select {
 		case <-ctx.Done():

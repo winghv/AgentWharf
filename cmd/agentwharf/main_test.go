@@ -3055,7 +3055,7 @@ func TestAdapterHeartbeatTimesOutWithoutPong(t *testing.T) {
 		Timeout:  10 * time.Millisecond,
 	}, func(protocol.Frame) error {
 		return nil
-	})
+	}, nil)
 
 	select {
 	case err := <-done:

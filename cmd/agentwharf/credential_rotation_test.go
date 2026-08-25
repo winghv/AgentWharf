@@ -36,8 +36,8 @@ func TestCredentialRotationManagerCompletesInPlace(t *testing.T) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.pending != "" || m.epoch != 4 || !m.expires.Equal(time.UnixMilli(credential.ExpiresAt)) {
-		t.Fatalf("manager state = pending:%q epoch:%d expires:%v", m.pending, m.epoch, m.expires)
+	if m.pending != "" || m.epoch != 4 || !m.bootstrapDone || !m.expires.Equal(time.UnixMilli(credential.ExpiresAt)) {
+		t.Fatalf("manager state = pending:%q epoch:%d bootstrap:%t expires:%v", m.pending, m.epoch, m.bootstrapDone, m.expires)
 	}
 	if candidates := credentials.candidates(); len(candidates) == 0 || candidates[0] != "opaque" {
 		t.Fatalf("credential candidates = %#v", candidates)
@@ -93,13 +93,13 @@ func TestCredentialRotationManagerRetriesAfterPendingCredentialWasNotActivated(t
 	}
 }
 
-func TestCredentialRotationManagerRequestsAndRetriesBeforeExpiry(t *testing.T) {
+func TestCredentialRotationManagerBootstrapsAndRetriesBeforeExpiry(t *testing.T) {
 	now := time.Now()
 	frames := make(chan protocol.Frame, 3)
 	m := &credentialRotationManager{
-		session: "ses_1", epoch: 1, expires: now.Add(time.Minute),
+		session: "ses_1", epoch: 1, expires: now.Add(15 * time.Minute),
 		write:    func(frame protocol.Frame) error { frames <- frame; return nil },
-		leadTime: 2 * time.Minute, retryInterval: 10 * time.Second,
+		leadTime: 5 * time.Minute, retryInterval: 10 * time.Second,
 	}
 
 	if err := m.requestIfDue(now); err != nil {

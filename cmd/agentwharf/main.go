@@ -1597,8 +1597,10 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, connection *hubConnect
 	processDone := make(chan error, 1)
 	outputDone := make(chan error, 1)
 	commandDone := make(chan error, 1)
-	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
 	rotation := newCredentialRotationManager(runCtx, authority, writeFrame, connection.credentials, connection.currentAuthority)
+	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame, func() {
+		_ = rotation.requestIfDue(time.Now())
+	})
 	startSupervisor := func() {
 		go func() {
 			err := supervisor.Run(runCtx)
@@ -1919,8 +1921,10 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 	var permissionMu sync.Mutex
 	pendingPermissions := make(map[string]acpPendingPermission)
 	responses := newACPResponseRouter()
-	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame)
 	rotation := newCredentialRotationManager(runCtx, authority, writeFrame, connection.credentials, connection.currentAuthority)
+	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame, func() {
+		_ = rotation.requestIfDue(time.Now())
+	})
 	go func() {
 		outputDone <- streamACPProviderOutput(runCtx, cfg, scanner, responses, func(line []byte, sourceSequence uint64) error {
 			trackACPPermissionRequest(line, pendingPermissions, &permissionMu)
@@ -3368,7 +3372,7 @@ func ignoreContextError(err error) error {
 	return err
 }
 
-func startAdapterHeartbeat(ctx context.Context, cfg heartbeatConfig, writeFrame func(protocol.Frame) error) (<-chan error, func(string)) {
+func startAdapterHeartbeat(ctx context.Context, cfg heartbeatConfig, writeFrame func(protocol.Frame) error, onPingSent func()) (<-chan error, func(string)) {
 	done := make(chan error, 1)
 	pongs := make(chan string, 1)
 	observePong := func(nonce string) {
@@ -3397,6 +3401,9 @@ func startAdapterHeartbeat(ctx context.Context, cfg heartbeatConfig, writeFrame 
 			if err := writeFrame(&protocol.Ping{Nonce: nonce}); err != nil {
 				done <- fmt.Errorf("send heartbeat ping: %w", err)
 				return
+			}
+			if onPingSent != nil {
+				onPingSent()
 			}
 
 			timeout := time.NewTimer(cfg.Timeout)

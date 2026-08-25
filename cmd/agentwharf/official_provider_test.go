@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/winghv/agentwharf/adapter/core"
 	"github.com/winghv/agentwharf/protocol"
 	"nhooyr.io/websocket"
 )
@@ -177,7 +179,7 @@ func TestSuperviseOfficialAdapterHeartbeatClosesTimedOutTransport(t *testing.T) 
 		Timeout:  10 * time.Millisecond,
 	}, connection, func(protocol.Frame) error {
 		return nil
-	}, &officialHeartbeatPongRouter{})
+	}, &officialHeartbeatPongRouter{}, nil)
 
 	deadline := time.Now().Add(time.Second)
 	for connection.current() != nil && time.Now().Before(deadline) {
@@ -215,7 +217,7 @@ func TestOfficialProviderRotatesCredentialBeforeReconnect(t *testing.T) {
 				return
 			}
 			ack := reconnectHelloAck("ses_official", 1, 1)
-			ack.ConnectionAuthority.ExpiresAt = time.Now().Add(4 * time.Minute).UnixMilli()
+			ack.ConnectionAuthority.ExpiresAt = time.Now().Add(15 * time.Minute).UnixMilli()
 			if err := writeFrameToConn(ctx, conn, ack); err != nil {
 				serverDone <- err
 				return
@@ -321,6 +323,128 @@ func TestOfficialProviderRotatesCredentialBeforeReconnect(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("official command loop did not stop")
+	}
+}
+
+func TestRunOfficialProviderBootstrapsCredentialRotation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	binDir := t.TempDir()
+	providerPath := filepath.Join(binDir, "claude")
+	if err := os.WriteFile(providerPath, []byte("#!/bin/sh\nwhile :; do sleep 1; done\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", t.TempDir())
+
+	activated := make(chan struct{}, 1)
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		frame, err := readFrameFromConn(ctx, conn)
+		hello, ok := frame.(*protocol.Hello)
+		if err != nil || !ok || hello.ProtocolVersion != protocol.ProtocolVersionV2 {
+			serverErr <- fmt.Errorf("official hello = %T %+v, %v", frame, frame, err)
+			return
+		}
+		ack := reconnectHelloAck("ses_official_runtime", 1, 1)
+		ack.ConnectionAuthority.ExpiresAt = time.Now().Add(15 * time.Minute).UnixMilli()
+		if err := writeFrameToConn(ctx, conn, ack); err != nil {
+			serverErr <- err
+			return
+		}
+		rotationID := ""
+		for {
+			frame, err = readFrameFromConn(ctx, conn)
+			if err != nil {
+				if ctx.Err() == nil {
+					serverErr <- err
+				}
+				return
+			}
+			switch typed := frame.(type) {
+			case *protocol.Ping:
+				if err := writeFrameToConn(ctx, conn, &protocol.Pong{Nonce: typed.Nonce}); err != nil {
+					serverErr <- err
+					return
+				}
+			case *protocol.CredentialRotationRequest:
+				rotationID = typed.RotationID
+				if rotationID == "" {
+					serverErr <- errors.New("official rotation ID is empty")
+					return
+				}
+				if err := writeFrameToConn(ctx, conn, &protocol.CredentialRotationCredential{
+					SessionID: "ses_official_runtime", RotationID: rotationID, Generation: 2,
+					Credential: "new-token", ExpiresAt: time.Now().Add(15 * time.Minute).UnixMilli(),
+				}); err != nil {
+					serverErr <- err
+					return
+				}
+			case *protocol.CredentialRotationPossession:
+				if typed.RotationID != rotationID || typed.Generation != 2 {
+					serverErr <- fmt.Errorf("official possession = %+v", typed)
+					return
+				}
+				if err := writeFrameToConn(ctx, conn, &protocol.CredentialRotationActivation{
+					RotationID: rotationID, Generation: 2, ConnectionEpoch: 2, AcceptedFence: 2,
+				}); err != nil {
+					serverErr <- err
+					return
+				}
+				activated <- struct{}{}
+			}
+		}
+	}))
+	defer server.Close()
+
+	hubURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	initial, _, err := websocket.Dial(ctx, hubURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFrameToConn(ctx, initial, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2, Role: protocol.RoleAdapter,
+		Token: "old-token", SessionID: "ses_official_runtime", Provider: "claude-code",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := readFrameFromConn(ctx, initial)
+	ack, ok := frame.(*protocol.HelloAck)
+	if err != nil || !ok {
+		t.Fatalf("official ack = %T %+v, %v", frame, frame, err)
+	}
+	cfg := wrapConfig{
+		HubURL: hubURL, SessionID: "ses_official_runtime", Agent: "claude", Provider: "claude-code",
+		AdapterToken: "old-token", ProtocolVersion: protocol.ProtocolVersionV2,
+		ProviderCommand: []string{"claude"}, WorkingDirectory: t.TempDir(), Stdin: strings.NewReader(""),
+		Heartbeat: heartbeatConfig{Interval: 10 * time.Millisecond, Timeout: time.Second}, Stderr: io.Discard,
+	}
+	connection := newHubConnection(cfg, initial, ack.ConnectionAuthority)
+	defer connection.close()
+	done := make(chan error, 1)
+	go func() {
+		done <- runOfficialProvider(ctx, cfg, connection, core.NewEventMasker(nil), core.NewAdapterMetrics())
+	}()
+
+	select {
+	case <-activated:
+		cancel()
+	case err := <-serverErr:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("official provider did not stop after rotation")
 	}
 }
 
