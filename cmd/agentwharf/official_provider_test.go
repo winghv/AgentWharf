@@ -118,6 +118,27 @@ func TestTranslateTranscriptAssistantToolCall(t *testing.T) {
 	}
 }
 
+func TestTranslateTranscriptTurnCompletion(t *testing.T) {
+	line := transcriptJSON(t, map[string]any{
+		"type": "system", "subtype": "turn_duration", "uuid": "turn_1",
+		"sessionId": "provider_1", "durationMs": 1250,
+	})
+	events, err := claudeProvider{}.translateLine("ses_1", line)
+	if err != nil {
+		t.Fatalf("translateLine() error = %v", err)
+	}
+	if len(events) != 1 || events[0].Type != "agent.activity" || events[0].Seq != nil {
+		t.Fatalf("events = %+v", events)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["kind"] != "turn_completed" || payload["turn_id"] != "turn_1" || payload["provider_session_id"] != "provider_1" || payload["duration_ms"] != float64(1250) {
+		t.Fatalf("payload = %+v", payload)
+	}
+}
+
 func TestTranslateTranscriptSkipsInternalEntries(t *testing.T) {
 	for _, value := range []map[string]any{
 		{"type": "summary", "summary": "x", "leafUuid": "u1"},

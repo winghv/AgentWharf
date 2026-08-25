@@ -58,6 +58,9 @@ func (claudeProvider) translateLine(sessionID string, line []byte) ([]protocol.E
 		return nil, err
 	}
 	entryType := stringFieldFromAny(raw["type"])
+	if entryType == "system" && stringFieldFromAny(raw["subtype"]) == "turn_duration" {
+		return []protocol.Event{claudeTurnCompletedEvent(sessionID, raw)}, nil
+	}
 	if entryType != "user" && entryType != "assistant" {
 		return nil, nil
 	}
@@ -105,6 +108,26 @@ func (claudeProvider) translateLine(sessionID string, line []byte) ([]protocol.E
 		}
 	}
 	return events, nil
+}
+
+func claudeTurnCompletedEvent(sessionID string, raw map[string]any) protocol.Event {
+	payload := map[string]any{
+		"kind":    "turn_completed",
+		"turn_id": stringFieldFromAny(raw["uuid"]),
+	}
+	if providerSessionID := stringFieldFromAny(raw["sessionId"]); providerSessionID != "" {
+		payload["provider_session_id"] = providerSessionID
+	}
+	if durationMS, ok := raw["durationMs"].(float64); ok && durationMS >= 0 {
+		payload["duration_ms"] = durationMS
+	}
+	encoded, _ := json.Marshal(payload)
+	return protocol.Event{
+		Type:      "agent.activity",
+		SessionID: sessionID,
+		Time:      time.Now().UTC().UnixMilli(),
+		Payload:   encoded,
+	}
 }
 
 // toolResultContent extracts the text content and error flag from a claude
