@@ -1636,10 +1636,12 @@ func TestRunWrapProviderCommandWritesHubCommandsToProviderStdin(t *testing.T) {
 			"--adapter-token", "adapter-token",
 			"--agent", "claude",
 			"--jsonstream",
+			"--protocol-version", "2",
 			"--", os.Args[0],
 		}, nil, io.Discard, io.Discard)
 	}()
 
+	waitForSessionCapability(t, client, "ses_local")
 	writeFrame(t, client, &protocol.Command{
 		CommandID: "cmd_provider",
 		Type:      protocol.CommandSessionSend,
@@ -2567,7 +2569,11 @@ func TestRunWrapACPProviderAppliesV2SettingsAndPublishesReadback(t *testing.T) {
 	if !strings.Contains(observed.message, "acp saw ping") {
 		t.Fatalf("post-settings message = %q", observed.message)
 	}
-	if err := <-runDone; err != nil {
+	// The helper intentionally stays alive after the successful prompt so this
+	// test can observe reconnect-safe idle behavior. Stop the run explicitly
+	// after the asserted settings and prompt results have arrived.
+	cancel()
+	if err := <-runDone; err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
 		t.Fatalf("run wrap error = %v", err)
 	}
 }
@@ -3112,10 +3118,12 @@ func TestRunWrapACPProviderRoutesPermissionDecision(t *testing.T) {
 			"--adapter-token", "adapter-token",
 			"--agent", "claude",
 			"--acp",
+			"--protocol-version", "2",
 			"--", os.Args[0],
 		}, nil, io.Discard, io.Discard)
 	}()
 
+	waitForSessionCapability(t, client, "ses_local")
 	writeFrame(t, client, &protocol.Command{
 		CommandID: "cmd_permission_prompt",
 		Type:      protocol.CommandSessionSend,
@@ -3162,6 +3170,17 @@ func TestRunWrapACPProviderRoutesPermissionDecision(t *testing.T) {
 	}
 	if err := <-runDone; err != nil {
 		t.Fatalf("run wrap error = %v", err)
+	}
+}
+
+func waitForSessionCapability(t *testing.T, conn *websocket.Conn, sessionID string) {
+	t.Helper()
+	for {
+		frame := readFrame(t, conn)
+		event, ok := frame.(*protocol.Event)
+		if ok && event.SessionID == sessionID && event.Type == "session.run.capabilities" {
+			return
+		}
 	}
 }
 

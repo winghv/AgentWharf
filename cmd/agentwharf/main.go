@@ -442,8 +442,9 @@ type wrapConfig struct {
 	// ProviderSessionID enables ACP session/load during machine recovery.
 	// OnProviderSession receives the opaque provider id after a successful
 	// session/new or session/load and must only persist it locally.
-	ProviderSessionID string
-	OnProviderSession func(string)
+	ProviderSessionID   string
+	OnProviderSession   func(string)
+	OnAdapterCredential func(string, time.Time)
 }
 
 type heartbeatConfig struct {
@@ -1598,6 +1599,9 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, connection *hubConnect
 	outputDone := make(chan error, 1)
 	commandDone := make(chan error, 1)
 	rotation := newCredentialRotationManager(runCtx, authority, writeFrame, connection.credentials, connection.currentAuthority)
+	if rotation != nil {
+		rotation.setActivationCallback(cfg.OnAdapterCredential)
+	}
 	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame, func() {
 		_ = rotation.requestIfDue(time.Now())
 	})
@@ -1922,6 +1926,9 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 	pendingPermissions := make(map[string]acpPendingPermission)
 	responses := newACPResponseRouter()
 	rotation := newCredentialRotationManager(runCtx, authority, writeFrame, connection.credentials, connection.currentAuthority)
+	if rotation != nil {
+		rotation.setActivationCallback(cfg.OnAdapterCredential)
+	}
 	heartbeatDone, observePong := startAdapterHeartbeat(runCtx, cfg.Heartbeat, writeFrame, func() {
 		_ = rotation.requestIfDue(time.Now())
 	})

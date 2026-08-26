@@ -115,6 +115,15 @@ func (s *adapterCredentialSet) pendingGeneration() int64 {
 	return s.pendingGen
 }
 
+func (s *adapterCredentialSet) activeCredential() (string, int64) {
+	if s == nil {
+		return "", 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active, s.activeGen
+}
+
 // hubConnection owns a replaceable Hub transport. Provider pipes and process
 // supervision live outside it, so a temporary network failure cannot terminate
 // the Provider or create a new Session.

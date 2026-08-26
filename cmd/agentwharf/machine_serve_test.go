@@ -380,6 +380,36 @@ func TestMachineServeResumesPersistedHandoff(t *testing.T) {
 	}
 }
 
+func TestMachineServeLoadsPersistedRecoveryHandoff(t *testing.T) {
+	credentialDir := setupServeTestEnv(t)
+	if err := saveMachineCredential(machineCredential{
+		MachineID: "machine_serve", MachineToken: "machine-token", CloudAPIURL: "https://cloud.example",
+	}); err != nil {
+		t.Fatalf("save machine credential: %v", err)
+	}
+	handoff := machineServeDispatch{
+		ClaimID: "recovery:ses_recover", SessionID: "ses_recover", Provider: "claude-code",
+		HubWSURL: "wss://hub.example/ws", AdapterToken: "adapter-token",
+		AdapterExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+	}
+	if !isMachineRecoveryDispatch(handoff) {
+		t.Fatal("recovery handoff was not recognized")
+	}
+	if err := saveMachineDispatch(handoff); err != nil {
+		t.Fatalf("save recovery handoff: %v", err)
+	}
+	loaded, err := loadMachineDispatches()
+	if err != nil {
+		t.Fatalf("load recovery handoff: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].ClaimID != handoff.ClaimID {
+		t.Fatalf("loaded handoffs = %+v", loaded)
+	}
+	if _, err := os.Stat(filepath.Join(credentialDir, "dispatch", "recovery:ses_recover.json")); err != nil {
+		t.Fatalf("recovery handoff was not persisted: %v", err)
+	}
+}
+
 func TestMachineServeRestartsOnlyFailedAdapters(t *testing.T) {
 	if machineServeAdapterShouldRestart(nil, true, 0) {
 		t.Fatal("clean adapter exit must remain terminal")

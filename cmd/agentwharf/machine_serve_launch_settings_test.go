@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -36,7 +37,7 @@ func TestRememberProviderSessionUpdatesWrapConfigForRestart(t *testing.T) {
 		ClientExpiresAt:  time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
 	}
 	cfg := serveWrapConfig(handoff, false)
-	remember := rememberProviderSession(&handoff, &cfg, nil)
+	remember := rememberProviderSession(&handoff, &cfg, nil, &sync.Mutex{})
 	remember("acp_ses_1")
 	if cfg.ProviderSessionID != "acp_ses_1" {
 		t.Fatalf("wrap config provider session = %q, want acp_ses_1 so the next restart uses session/load", cfg.ProviderSessionID)

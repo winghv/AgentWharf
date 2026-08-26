@@ -124,6 +124,9 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	questions := newQuestionCache()
 	heartbeats := &officialHeartbeatPongRouter{}
 	rotation := newCredentialRotationManager(runCtx, connection.currentAuthority(), writeFrame, connection.credentials, connection.currentAuthority)
+	if rotation != nil {
+		rotation.setActivationCallback(cfg.OnAdapterCredential)
+	}
 	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 && rotation == nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()

@@ -12,12 +12,17 @@ func TestCredentialRotationManagerCompletesInPlace(t *testing.T) {
 	frames := make(chan protocol.Frame, 4)
 	now := time.Now().Add(10 * time.Minute)
 	credentials := newAdapterCredentialSet("old-token", &protocol.ConnectionAuthorityReceipt{CredentialGeneration: 1})
+	var activatedToken string
+	var activatedExpiry time.Time
 	m := &credentialRotationManager{
 		session:     "ses_1",
 		epoch:       3,
 		expires:     now,
 		write:       func(frame protocol.Frame) error { frames <- frame; return nil },
 		credentials: credentials,
+		activationCallback: func(token string, expiresAt time.Time) {
+			activatedToken, activatedExpiry = token, expiresAt
+		},
 	}
 	m.mu.Lock()
 	m.pending = "rot_1"
@@ -41,6 +46,9 @@ func TestCredentialRotationManagerCompletesInPlace(t *testing.T) {
 	}
 	if candidates := credentials.candidates(); len(candidates) == 0 || candidates[0] != "opaque" {
 		t.Fatalf("credential candidates = %#v", candidates)
+	}
+	if activatedToken != "opaque" || !activatedExpiry.Equal(time.UnixMilli(credential.ExpiresAt)) {
+		t.Fatalf("activation callback = token:%q expiry:%v", activatedToken, activatedExpiry)
 	}
 }
 

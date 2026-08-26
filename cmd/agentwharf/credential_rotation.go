@@ -16,19 +16,20 @@ const (
 )
 
 type credentialRotationManager struct {
-	mu            sync.Mutex
-	session       string
-	epoch         int64
-	expires       time.Time
-	pending       string
-	pendingGen    int64
-	lastRequestAt time.Time
-	bootstrapDone bool
-	write         func(protocol.Frame) error
-	credentials   *adapterCredentialSet
-	authority     func() *protocol.ConnectionAuthorityReceipt
-	leadTime      time.Duration
-	retryInterval time.Duration
+	mu                 sync.Mutex
+	session            string
+	epoch              int64
+	expires            time.Time
+	pending            string
+	pendingGen         int64
+	lastRequestAt      time.Time
+	bootstrapDone      bool
+	activationCallback func(string, time.Time)
+	write              func(protocol.Frame) error
+	credentials        *adapterCredentialSet
+	authority          func() *protocol.ConnectionAuthorityReceipt
+	leadTime           time.Duration
+	retryInterval      time.Duration
 }
 
 func newCredentialRotationManager(ctx context.Context, authority *protocol.ConnectionAuthorityReceipt, write func(protocol.Frame) error, credentials *adapterCredentialSet, currentAuthority func() *protocol.ConnectionAuthorityReceipt) *credentialRotationManager {
@@ -94,6 +95,15 @@ func (m *credentialRotationManager) requestIfDue(now time.Time) error {
 	return write(&protocol.CredentialRotationRequest{RotationID: rotationID})
 }
 
+func (m *credentialRotationManager) setActivationCallback(callback func(string, time.Time)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.activationCallback = callback
+	m.mu.Unlock()
+}
+
 func (m *credentialRotationManager) rotationLeadTime() time.Duration {
 	if m.leadTime > 0 {
 		return m.leadTime
@@ -148,8 +158,8 @@ func (m *credentialRotationManager) handleActivation(activation *protocol.Creden
 		return errors.New("invalid credential rotation activation")
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.pending == "" || activation.RotationID != m.pending || activation.ConnectionEpoch <= m.epoch {
+		m.mu.Unlock()
 		return errors.New("unexpected credential rotation activation")
 	}
 	m.epoch = activation.ConnectionEpoch
@@ -160,8 +170,17 @@ func (m *credentialRotationManager) handleActivation(activation *protocol.Creden
 	m.pendingGen = 0
 	m.lastRequestAt = time.Time{}
 	m.bootstrapDone = true
+	callback := m.activationCallback
+	expires := m.expires
+	m.mu.Unlock()
 	if m.credentials != nil {
 		m.credentials.activate(activation.Generation)
+	}
+	if callback != nil {
+		token, generation := m.credentials.activeCredential()
+		if token != "" && generation == activation.Generation {
+			callback(token, expires)
+		}
 	}
 	return nil
 }

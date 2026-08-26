@@ -177,7 +177,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
 	if refreshed, err := maybeRefreshMachineCredential(ctx, client, credential, machineCredentialRefreshLeadTime); err != nil {
-		return err
+		_, _ = fmt.Fprintf(stderr, "wharf machine serve: initial credential refresh failed (%v); retrying in %s\n", err, cfg.PollInterval)
 	} else if refreshed {
 		credential, err = loadMachineCredential()
 		if err != nil {
@@ -219,6 +219,12 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			defer workers.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			if isMachineRecoveryDispatch(handoff) {
+				adapters.Add(1)
+				defer adapters.Done()
+				keepAdapterAlive(serveCtx, cfg, &handoff, stdout, stderr)
+				return
+			}
 			dispatchOutcome(serveCtx, cfg, &handoff, stdout, stderr, &adapters)
 		}(handoff)
 	}
@@ -231,9 +237,8 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			if retry {
 				refreshed, refreshErr := maybeRefreshMachineCredential(ctx, client, credential, 0)
 				if refreshErr != nil {
-					return refreshErr
-				}
-				if refreshed {
+					_, _ = fmt.Fprintf(stderr, "wharf machine serve: credential refresh failed (%v); retrying in %s\n", refreshErr, cfg.PollInterval)
+				} else if refreshed {
 					credential, err = loadMachineCredential()
 					if err != nil {
 						return fmt.Errorf("reload machine credential: %w", err)
@@ -252,7 +257,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			}
 		}
 		if refreshed, refreshErr := maybeRefreshMachineCredential(ctx, client, credential, machineCredentialRefreshLeadTime); refreshErr != nil {
-			return refreshErr
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: credential refresh failed (%v); retrying in %s\n", refreshErr, cfg.PollInterval)
 		} else if refreshed {
 			credential, err = loadMachineCredential()
 			if err != nil {
@@ -264,12 +269,12 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				continue
 			}
 			workers.Add(1)
-			go func(claim machinePendingClaim) {
+			go func(claim machinePendingClaim, machineCred machineCredential) {
 				defer workers.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				dispatchClaim(serveCtx, cfg, client, credential, claim, stdout, stderr, &adapters)
-			}(claim)
+				dispatchClaim(serveCtx, cfg, client, machineCred, claim, stdout, stderr, &adapters)
+			}(claim, credential)
 		}
 		// Recover Sessions created by an older local `wharf claude` invocation or
 		// whose persisted handoff expired. The Hub remains authoritative: it only
@@ -288,11 +293,11 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				recoveryActive[session.SessionID] = true
 				recoveryMu.Unlock()
 				workers.Add(1)
-				go func(session machineRecoverableSession) {
+				go func(session machineRecoverableSession, machineCred machineCredential) {
 					defer workers.Done()
 					defer func() { recoveryMu.Lock(); delete(recoveryActive, session.SessionID); recoveryMu.Unlock() }()
-					dispatchRecovery(serveCtx, cfg, client, credential, session, stdout, stderr, &adapters)
-				}(session)
+					dispatchRecovery(serveCtx, cfg, client, machineCred, session, stdout, stderr, &adapters)
+				}(session, credential)
 			}
 		}
 		if cfg.StartupSmoke {
@@ -377,10 +382,13 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer) {
 	adapterCfg := serveWrapConfig(*handoff, cfg.StartupSmoke)
 	adapterCfg.Stderr = stderr
-	adapterCfg.OnProviderSession = rememberProviderSession(handoff, &adapterCfg, stderr)
+	handoffMu := &sync.Mutex{}
+	adapterCfg.OnProviderSession = rememberProviderSession(handoff, &adapterCfg, stderr, handoffMu)
+	adapterCfg.OnAdapterCredential = rememberAdapterCredential(handoff, stderr, handoffMu)
 	restarts := 0
 	delay := machineServeAdapterRestartInitial
 	for {
+		adapterCfg.AdapterToken = handoff.AdapterToken
 		adapterCfg.ProviderSessionID = handoff.ProviderSessionID
 		done := runAdapter(ctx, adapterCfg, stderr)
 		select {
@@ -669,11 +677,32 @@ func serveWrapConfig(handoff machineServeDispatch, startupSmoke bool) wrapConfig
 // adapterCfg.ProviderSessionID, so skipping this update would start a fresh
 // provider context after a crash and drop Claude/Codex conversation state
 // while the Hub transcript still looks complete.
-func rememberProviderSession(handoff *machineServeDispatch, adapterCfg *wrapConfig, stderr io.Writer) func(string) {
+func rememberAdapterCredential(handoff *machineServeDispatch, stderr io.Writer, handoffMu *sync.Mutex) func(string, time.Time) {
+	return func(token string, expiresAt time.Time) {
+		if handoff == nil || strings.TrimSpace(token) == "" || expiresAt.IsZero() {
+			return
+		}
+		if handoffMu != nil {
+			handoffMu.Lock()
+			defer handoffMu.Unlock()
+		}
+		handoff.AdapterToken = token
+		handoff.AdapterExpiresAt = expiresAt.UTC().Format(time.RFC3339Nano)
+		if err := saveMachineDispatch(*handoff); err != nil && stderr != nil {
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist adapter credential %s: %v\n", handoff.SessionID, err)
+		}
+	}
+}
+
+func rememberProviderSession(handoff *machineServeDispatch, adapterCfg *wrapConfig, stderr io.Writer, handoffMu *sync.Mutex) func(string) {
 	return func(id string) {
 		id = strings.TrimSpace(id)
 		if id == "" || adapterCfg == nil || handoff == nil {
 			return
+		}
+		if handoffMu != nil {
+			handoffMu.Lock()
+			defer handoffMu.Unlock()
 		}
 		adapterCfg.ProviderSessionID = id
 		if handoff.ProviderSessionID == id {
@@ -817,6 +846,11 @@ func serveInteractiveState(state string) bool {
 	}
 }
 
+func isMachineRecoveryDispatch(handoff machineServeDispatch) bool {
+	return strings.HasPrefix(handoff.ClaimID, "recovery:") && handoff.TaskID == "" && handoff.RunID == "" &&
+		handoff.ClientToken == "" && handoff.FirstInstruction == ""
+}
+
 func dispatchCredentialAlive(handoff machineServeDispatch) bool {
 	expiresAt, err := time.Parse(time.RFC3339, handoff.AdapterExpiresAt)
 	if err != nil {
@@ -911,7 +945,8 @@ func loadMachineDispatches() ([]machineServeDispatch, error) {
 		if err := json.Unmarshal(data, &dispatch); err != nil {
 			return nil, fmt.Errorf("decode dispatch %s: %w", entry.Name(), err)
 		}
-		if dispatch.ClaimID == "" || dispatch.SessionID == "" || dispatch.AdapterToken == "" || dispatch.ClientToken == "" {
+		if dispatch.ClaimID == "" || dispatch.SessionID == "" || dispatch.AdapterToken == "" ||
+			(!isMachineRecoveryDispatch(dispatch) && dispatch.ClientToken == "") {
 			return nil, fmt.Errorf("dispatch %s is incomplete", entry.Name())
 		}
 		dispatches = append(dispatches, dispatch)
