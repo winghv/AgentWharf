@@ -63,6 +63,7 @@ detect_os() {
   case "$(uname -s)" in
     Darwin) printf 'darwin' ;;
     Linux) printf 'linux' ;;
+    MINGW* | MSYS* | CYGWIN*) fail "Windows detected in Git Bash; run PowerShell: irm https://github.com/$repo/releases/latest/download/install.ps1 | iex" ;;
     *) fail "unsupported OS: $(uname -s)" ;;
   esac
 }

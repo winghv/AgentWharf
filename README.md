@@ -24,13 +24,25 @@ Prerequisites:
 - `npm` is available so the installer can install the Claude and Codex ACP
   bridge wrappers used by `wharf claude` and `wharf codex`.
 
-Install Wharf:
+Install Wharf on macOS or Linux:
 
 ```console
 $ curl -fsSL https://github.com/winghv/agentwharf/releases/latest/download/install.sh | sh
 ```
 
-The script downloads the matching prebuilt binary from GitHub Releases,
+On Windows, run PowerShell as the user who will run Wharf:
+
+```powershell
+irm https://github.com/winghv/agentwharf/releases/latest/download/install.ps1 | iex
+```
+
+The Windows installer downloads the matching `.exe` release, installs `wharf.exe`
+under `%USERPROFILE%\.local\bin` by default, and installs the `.cmd` ACP
+provider bridges. Add that directory to `PATH` when the installer reports that
+it is missing. `install.sh` is a Unix shell script and must not be pasted into
+CMD or PowerShell; Git Bash detects Windows and prints the PowerShell command.
+
+The installer downloads the matching prebuilt binary from GitHub Releases,
 installs the `wharf` command, and installs the `claude-agent-acp` /
 `codex-acp` provider bridge wrappers.
 

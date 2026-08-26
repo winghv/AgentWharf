@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -18,10 +19,11 @@ import (
 )
 
 const (
-	defaultLatestReleaseURL = "https://api.github.com/repos/winghv/agentwharf/releases/latest"
-	defaultInstallerURL     = "https://github.com/winghv/agentwharf/releases/latest/download/install.sh"
-	updateCheckInterval     = 24 * time.Hour
-	updateCheckTimeout      = 1200 * time.Millisecond
+	defaultLatestReleaseURL    = "https://api.github.com/repos/winghv/agentwharf/releases/latest"
+	defaultUnixInstallerURL    = "https://github.com/winghv/agentwharf/releases/latest/download/install.sh"
+	defaultWindowsInstallerURL = "https://github.com/winghv/agentwharf/releases/latest/download/install.ps1"
+	updateCheckInterval        = 24 * time.Hour
+	updateCheckTimeout         = 1200 * time.Millisecond
 )
 
 type releaseMetadata struct {
@@ -124,7 +126,10 @@ func fetchLatestVersion(parent context.Context, timeout time.Duration) (string, 
 func runInstaller(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
 	installerURL := os.Getenv("WHARF_INSTALLER_URL")
 	if installerURL == "" {
-		installerURL = defaultInstallerURL
+		installerURL = defaultUnixInstallerURL
+		if runtime.GOOS == "windows" {
+			installerURL = defaultWindowsInstallerURL
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, installerURL, nil)
 	if err != nil {
@@ -138,7 +143,11 @@ func runInstaller(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download Wharf installer: %s", resp.Status)
 	}
-	tempFile, err := os.CreateTemp("", "wharf-install-*.sh")
+	tempSuffix := "sh"
+	if runtime.GOOS == "windows" {
+		tempSuffix = "ps1"
+	}
+	tempFile, err := os.CreateTemp("", "wharf-install-*."+tempSuffix)
 	if err != nil {
 		return err
 	}
@@ -151,7 +160,12 @@ func runInstaller(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	if err := tempFile.Close(); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "/bin/sh", tempPath)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tempPath)
+	} else {
+		cmd = exec.CommandContext(ctx, "/bin/sh", tempPath)
+	}
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr

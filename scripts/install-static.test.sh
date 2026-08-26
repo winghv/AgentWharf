@@ -74,7 +74,12 @@ test -f .github/workflows/release.yml || {
 
 grep -F "agentwharf-linux-amd64.tar.gz" .github/workflows/release.yml >/dev/null
 grep -F "scripts/install.sh" .github/workflows/release.yml >/dev/null
+grep -F "scripts/install.ps1" .github/workflows/release.yml >/dev/null
 grep -F "curl -fsSL https://github.com/winghv/agentwharf/releases/latest/download/install.sh | sh" README.md >/dev/null
+grep -F "irm https://github.com/winghv/agentwharf/releases/latest/download/install.ps1 | iex" README.md >/dev/null
+grep -F "MINGW* | MSYS* | CYGWIN*" scripts/install.sh >/dev/null
+grep -F "Invoke-WebRequest" scripts/install.ps1 >/dev/null
+grep -F "Get-FileHash" scripts/install.ps1 >/dev/null
 grep -F "@agentclientprotocol/claude-agent-acp" scripts/install.sh >/dev/null
 grep -F "@agentclientprotocol/codex-acp" scripts/install.sh >/dev/null
 grep -F "Run the same install command again to upgrade" README.md >/dev/null

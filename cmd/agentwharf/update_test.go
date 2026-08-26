@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -71,6 +72,10 @@ func TestUpgradeRunsOfficialInstallerOnlyWhenExplicitlyRequested(t *testing.T) {
 	var installerCalled bool
 	installer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		installerCalled = true
+		if runtime.GOOS == "windows" {
+			fmt.Fprint(w, "Write-Output 'upgraded successfully'\n")
+			return
+		}
 		fmt.Fprint(w, "#!/bin/sh\nprintf 'upgraded successfully\\n'\n")
 	}))
 	defer installer.Close()
