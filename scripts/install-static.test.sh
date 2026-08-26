@@ -80,6 +80,10 @@ grep -F "irm https://github.com/winghv/agentwharf/releases/latest/download/insta
 grep -F "MINGW* | MSYS* | CYGWIN*" scripts/install.sh >/dev/null
 grep -F "Invoke-WebRequest" scripts/install.ps1 >/dev/null
 grep -F "Get-FileHash" scripts/install.ps1 >/dev/null
+grep -F "Node.js 22 or newer is required" scripts/install.ps1 >/dev/null
+grep -F "Get-Command npm.cmd" scripts/install.ps1 >/dev/null
+grep -F 'npm provider bridge installation failed (exit code' scripts/install.ps1 >/dev/null
+grep -F "Node.js 22 or newer" README.md >/dev/null
 grep -F "@agentclientprotocol/claude-agent-acp" scripts/install.sh >/dev/null
 grep -F "@agentclientprotocol/codex-acp" scripts/install.sh >/dev/null
 grep -F "Run the same install command again to upgrade" README.md >/dev/null

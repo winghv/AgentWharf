@@ -21,8 +21,8 @@ Prerequisites:
 
 - Access to [SuperWHV Console](https://cloud.superwhv.me/app/machines).
 - The agent you want to run is installed and authenticated on this machine.
-- `npm` is available so the installer can install the Claude and Codex ACP
-  bridge wrappers used by `wharf claude` and `wharf codex`.
+- Node.js 22 or newer and `npm` are available so the installer can install the
+  Claude and Codex ACP bridge wrappers used by `wharf claude` and `wharf codex`.
 
 Install Wharf on macOS or Linux:
 
@@ -30,7 +30,7 @@ Install Wharf on macOS or Linux:
 $ curl -fsSL https://github.com/winghv/agentwharf/releases/latest/download/install.sh | sh
 ```
 
-On Windows, run PowerShell as the user who will run Wharf:
+On Windows, install Node.js 22 or newer first, then run PowerShell as the user who will run Wharf:
 
 ```powershell
 irm https://github.com/winghv/agentwharf/releases/latest/download/install.ps1 | iex

@@ -99,12 +99,30 @@ try {
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "release archive does not contain agentwharf.exe" }
 
     if ([Environment]::GetEnvironmentVariable("AGENTWHARF_SKIP_PROVIDER_BRIDGES") -ne "1") {
-        $npm = Get-Command npm -ErrorAction SilentlyContinue
-        if ($null -eq $npm) { throw "missing required command: npm" }
+        $node = Get-Command node.exe -ErrorAction SilentlyContinue
+        if ($null -eq $node) { $node = Get-Command node -ErrorAction SilentlyContinue }
+        if ($null -eq $node) { throw "missing required command: node (install Node.js 22 or newer)" }
+        $nodeVersionText = (& $node.Source --version 2>$null | Select-Object -First 1)
+        if ($nodeVersionText -notmatch "^v(\d+)(?:\.\d+){0,2}") {
+            throw "could not determine Node.js version; Node.js 22 or newer is required"
+        }
+        $nodeMajor = [int]$Matches[1]
+        if ($nodeMajor -lt 22) {
+            throw "Node.js 22 or newer is required for ACP provider bridges (found $nodeVersionText)"
+        }
+
+        $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+        if ($null -eq $npm) { $npm = Get-Command npm -ErrorAction SilentlyContinue }
+        if ($null -eq $npm) { throw "missing required command: npm (install Node.js 22 or newer)" }
         Say "installing ACP provider bridges in $providerDir"
         New-Item -ItemType Directory -Path $providerDir -Force | Out-Null
-        & $npm.Source install --prefix $providerDir --omit=dev $claudeAcpPackage $codexAcpPackage | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "npm provider bridge installation failed" }
+        $npmOutput = @(& $npm.Source install --prefix $providerDir --omit=dev --loglevel=error $claudeAcpPackage $codexAcpPackage 2>&1)
+        $npmExitCode = $LASTEXITCODE
+        if ($npmExitCode -ne 0) {
+            Say "npm provider bridge installation failed (exit code $npmExitCode)"
+            $npmOutput | Select-Object -Last 20 | ForEach-Object { Say ([string]$_) }
+            throw "npm provider bridge installation failed; see the npm error above"
+        }
     }
 
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
