@@ -23,7 +23,6 @@ type credentialRotationManager struct {
 	pending            string
 	pendingGen         int64
 	lastRequestAt      time.Time
-	bootstrapDone      bool
 	activationCallback func(string, time.Time)
 	write              func(protocol.Frame) error
 	credentials        *adapterCredentialSet
@@ -59,20 +58,19 @@ func (m *credentialRotationManager) run(ctx context.Context) {
 	}
 }
 
-// requestIfDue bootstraps one rotation after admission, then renews inside the
-// expiry window. It resends the same idempotent request until the Hub advances
-// authority, so a lost credential or activation frame can still converge.
+// requestIfDue renews inside the expiry window. The credential accepted by
+// the current WebSocket admission is already usable; rotating immediately on
+// every reconnect would intentionally close that socket and create a reconnect
+// loop. It resends the same idempotent request until the Hub advances authority.
 func (m *credentialRotationManager) requestIfDue(now time.Time) error {
 	if m == nil {
 		return nil
 	}
 	m.refreshAuthority()
 	m.mu.Lock()
-	if m.bootstrapDone {
-		if !now.Before(m.expires) || now.Before(m.expires.Add(-m.rotationLeadTime())) {
-			m.mu.Unlock()
-			return nil
-		}
+	if !now.Before(m.expires) || now.Before(m.expires.Add(-m.rotationLeadTime())) {
+		m.mu.Unlock()
+		return nil
 	}
 	if !m.lastRequestAt.IsZero() && now.Sub(m.lastRequestAt) < m.rotationRetryInterval() {
 		m.mu.Unlock()
@@ -169,7 +167,6 @@ func (m *credentialRotationManager) handleActivation(activation *protocol.Creden
 	m.pending = ""
 	m.pendingGen = 0
 	m.lastRequestAt = time.Time{}
-	m.bootstrapDone = true
 	callback := m.activationCallback
 	expires := m.expires
 	m.mu.Unlock()
@@ -212,7 +209,6 @@ func (m *credentialRotationManager) refreshAuthority() {
 		m.pending = ""
 		m.pendingGen = 0
 		m.lastRequestAt = time.Time{}
-		m.bootstrapDone = true
 	}
 	if m.pending != "" && m.pendingGen > 0 && m.credentials != nil && m.credentials.pendingGeneration() != m.pendingGen {
 		m.pending = ""

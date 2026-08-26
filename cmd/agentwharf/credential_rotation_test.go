@@ -41,8 +41,8 @@ func TestCredentialRotationManagerCompletesInPlace(t *testing.T) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.pending != "" || m.epoch != 4 || !m.bootstrapDone || !m.expires.Equal(time.UnixMilli(credential.ExpiresAt)) {
-		t.Fatalf("manager state = pending:%q epoch:%d bootstrap:%t expires:%v", m.pending, m.epoch, m.bootstrapDone, m.expires)
+	if m.pending != "" || m.epoch != 4 || !m.expires.Equal(time.UnixMilli(credential.ExpiresAt)) {
+		t.Fatalf("manager state = pending:%q epoch:%d expires:%v", m.pending, m.epoch, m.expires)
 	}
 	if candidates := credentials.candidates(); len(candidates) == 0 || candidates[0] != "opaque" {
 		t.Fatalf("credential candidates = %#v", candidates)
@@ -101,11 +101,11 @@ func TestCredentialRotationManagerRetriesAfterPendingCredentialWasNotActivated(t
 	}
 }
 
-func TestCredentialRotationManagerBootstrapsAndRetriesBeforeExpiry(t *testing.T) {
+func TestCredentialRotationManagerRequestsAndRetriesInsideExpiryWindow(t *testing.T) {
 	now := time.Now()
 	frames := make(chan protocol.Frame, 3)
 	m := &credentialRotationManager{
-		session: "ses_1", epoch: 1, expires: now.Add(-time.Minute),
+		session: "ses_1", epoch: 1, expires: now.Add(time.Minute),
 		write:    func(frame protocol.Frame) error { frames <- frame; return nil },
 		leadTime: 5 * time.Minute, retryInterval: 10 * time.Second,
 	}
@@ -131,6 +131,30 @@ func TestCredentialRotationManagerBootstrapsAndRetriesBeforeExpiry(t *testing.T)
 	second, ok := (<-frames).(*protocol.CredentialRotationRequest)
 	if !ok || second.RotationID != first.RotationID {
 		t.Fatalf("retry request = %#v, want rotation %q", second, first.RotationID)
+	}
+}
+
+func TestCredentialRotationManagerDoesNotRotateImmediatelyAfterAdmission(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	frames := make(chan protocol.Frame, 1)
+	m := newCredentialRotationManager(ctx, &protocol.ConnectionAuthorityReceipt{
+		SessionID: "ses_1", ConnectionEpoch: 1, CredentialGeneration: 1,
+		ExpiresAt: time.Now().Add(15 * time.Minute).UnixMilli(),
+	}, func(frame protocol.Frame) error {
+		frames <- frame
+		return nil
+	}, newAdapterCredentialSet("adapter-token", &protocol.ConnectionAuthorityReceipt{CredentialGeneration: 1}), nil)
+	if m == nil {
+		t.Fatal("rotation manager is nil")
+	}
+	if err := m.requestIfDue(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-frames:
+		t.Fatalf("rotation requested immediately after admission: %#v", frame)
+	default:
 	}
 }
 
