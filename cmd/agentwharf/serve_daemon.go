@@ -79,7 +79,11 @@ func readDaemonPID() (int, error) {
 	return pid, nil
 }
 
-func removeDaemonPID() {
+func removeDaemonPIDIfOwner(ownerPID int) {
+	pid, err := readDaemonPID()
+	if err != nil || pid != ownerPID {
+		return
+	}
 	if path, err := daemonPIDPath(); err == nil {
 		_ = os.Remove(path)
 	}
@@ -135,10 +139,11 @@ func runForegroundServe(ctx context.Context, cfg machineServeConfig, stdout, std
 	if err := ensurePaired(); err != nil {
 		return err
 	}
-	if err := writeDaemonPID(os.Getpid()); err != nil {
+	pid := os.Getpid()
+	if err := writeDaemonPID(pid); err != nil {
 		return fmt.Errorf("record wharf serve pid: %w", err)
 	}
-	defer removeDaemonPID()
+	defer removeDaemonPIDIfOwner(pid)
 	return runMachineServe(ctx, cfg, stdout, stderr)
 }
 
@@ -236,14 +241,14 @@ func stopDaemon(stdout io.Writer) error {
 		return err
 	}
 	if !processAlive(pid) {
-		removeDaemonPID()
+		removeDaemonPIDIfOwner(pid)
 		_, _ = fmt.Fprintln(stdout, "wharf serve is not running (stale pid removed).")
 		return nil
 	}
 	if err := terminateProcess(pid); err != nil {
 		return fmt.Errorf("stop wharf serve: %w", err)
 	}
-	removeDaemonPID()
+	removeDaemonPIDIfOwner(pid)
 	_, _ = fmt.Fprintln(stdout, "wharf serve stopped.")
 	return nil
 }
@@ -258,7 +263,7 @@ func statusDaemon(stdout io.Writer) error {
 		return err
 	}
 	if !processAlive(pid) {
-		removeDaemonPID()
+		removeDaemonPIDIfOwner(pid)
 		_, _ = fmt.Fprintln(stdout, "wharf serve is not running (stale pid removed).")
 		return nil
 	}

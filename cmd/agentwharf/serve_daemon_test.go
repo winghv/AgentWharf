@@ -20,9 +20,21 @@ func TestDaemonPIDRoundTrip(t *testing.T) {
 	if err != nil || pid != 4242 {
 		t.Fatalf("readDaemonPID = %d, %v", pid, err)
 	}
-	removeDaemonPID()
+	removeDaemonPIDIfOwner(4242)
 	if _, err := readDaemonPID(); err != errDaemonNotRunning {
 		t.Fatalf("readDaemonPID after remove = %v, want errDaemonNotRunning", err)
+	}
+}
+
+func TestRemoveDaemonPIDOnlyRemovesCurrentOwner(t *testing.T) {
+	t.Setenv("AGENTWHARF_DAEMON_DIR", t.TempDir())
+	if err := writeDaemonPID(4242); err != nil {
+		t.Fatalf("writeDaemonPID: %v", err)
+	}
+	removeDaemonPIDIfOwner(4343)
+	pid, err := readDaemonPID()
+	if err != nil || pid != 4242 {
+		t.Fatalf("pid after non-owner cleanup = %d, %v; want 4242", pid, err)
 	}
 }
 
