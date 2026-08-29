@@ -42,6 +42,37 @@ type machineServeConfig struct {
 	StartupSmoke  bool
 }
 
+type machineRecoveryGuard struct {
+	mu     sync.Mutex
+	active map[string]bool
+}
+
+func newMachineRecoveryGuard() *machineRecoveryGuard {
+	return &machineRecoveryGuard{active: make(map[string]bool)}
+}
+
+func (g *machineRecoveryGuard) claim(sessionID string) bool {
+	if g == nil || sessionID == "" {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.active[sessionID] {
+		return false
+	}
+	g.active[sessionID] = true
+	return true
+}
+
+func (g *machineRecoveryGuard) release(sessionID string) {
+	if g == nil || sessionID == "" {
+		return
+	}
+	g.mu.Lock()
+	delete(g.active, sessionID)
+	g.mu.Unlock()
+}
+
 // machineServeDispatch is the crash-resume handoff persisted locally after a
 // claim exchange. It carries only this machine's own session credentials and
 // the instruction; it is never logged and never leaves the machine.
@@ -188,8 +219,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	sem := make(chan struct{}, cfg.MaxConcurrent)
 	var workers sync.WaitGroup
 	var adapters sync.WaitGroup
-	var recoveryMu sync.Mutex
-	recoveryActive := make(map[string]bool)
+	recoveryGuard := newMachineRecoveryGuard()
 	serveCtx, cancel := context.WithCancel(ctx)
 	// Shutdown order: let the dispatch goroutines finish first (they deliver the
 	// first instruction), then cancel to stop the keep-alive goroutines, then wait
@@ -211,10 +241,10 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			_ = removeMachineDispatch(handoff.ClaimID)
 			continue
 		}
+		if !recoveryGuard.claim(handoff.SessionID) {
+			continue
+		}
 		workers.Add(1)
-		recoveryMu.Lock()
-		recoveryActive[handoff.SessionID] = true
-		recoveryMu.Unlock()
 		go func(handoff machineServeDispatch) {
 			defer workers.Done()
 			sem <- struct{}{}
@@ -222,10 +252,15 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			if isMachineRecoveryDispatch(handoff) {
 				adapters.Add(1)
 				defer adapters.Done()
-				keepAdapterAlive(serveCtx, cfg, &handoff, stdout, stderr)
+				onDone := func() {
+					recoveryGuard.release(handoff.SessionID)
+				}
+				keepAdapterAlive(serveCtx, cfg, &handoff, stdout, stderr, onDone)
 				return
 			}
-			dispatchOutcome(serveCtx, cfg, &handoff, stdout, stderr, &adapters)
+			dispatchOutcome(serveCtx, cfg, &handoff, stdout, stderr, &adapters, func() {
+				recoveryGuard.release(handoff.SessionID)
+			})
 		}(handoff)
 	}
 
@@ -285,17 +320,13 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				if session.SessionID == "" {
 					continue
 				}
-				recoveryMu.Lock()
-				if recoveryActive[session.SessionID] {
-					recoveryMu.Unlock()
+				if !recoveryGuard.claim(session.SessionID) {
 					continue
 				}
-				recoveryActive[session.SessionID] = true
-				recoveryMu.Unlock()
 				workers.Add(1)
 				go func(session machineRecoverableSession, machineCred machineCredential) {
 					defer workers.Done()
-					defer func() { recoveryMu.Lock(); delete(recoveryActive, session.SessionID); recoveryMu.Unlock() }()
+					defer recoveryGuard.release(session.SessionID)
 					dispatchRecovery(serveCtx, cfg, client, machineCred, session, stdout, stderr, &adapters)
 				}(session, credential)
 			}
@@ -345,10 +376,10 @@ func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Cli
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist dispatch %s: %v\n", claim.ClaimID, err)
 		return
 	}
-	dispatchOutcome(ctx, cfg, handoff, stdout, stderr, adapters)
+	dispatchOutcome(ctx, cfg, handoff, stdout, stderr, adapters, nil)
 }
 
-func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, adapters *sync.WaitGroup) {
+func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, adapters *sync.WaitGroup, onAdapterDone func()) {
 	// Start the adapter keep-alive first so the Session can reach an interactive
 	// state; the first-instruction sender retries until it does. The keep-alive
 	// runs in the background so the semaphore only bounds the dispatch phase, not
@@ -356,7 +387,7 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 	adapters.Add(1)
 	go func() {
 		defer adapters.Done()
-		keepAdapterAlive(ctx, cfg, handoff, stdout, stderr)
+		keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onAdapterDone)
 	}()
 
 	sendErr := sendFirstInstructionWithRetry(ctx, *handoff)
@@ -379,7 +410,10 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 // credential expires, or a bounded number of restarts is exhausted. A crash
 // (for example the machine slept and the provider or its Hub socket died) is
 // restarted with backoff; the first instruction is not re-sent.
-func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer) {
+func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, onDone func()) {
+	if onDone != nil {
+		defer onDone()
+	}
 	adapterCfg := serveWrapConfig(*handoff, cfg.StartupSmoke)
 	adapterCfg.Stderr = stderr
 	handoffMu := &sync.Mutex{}
@@ -562,7 +596,7 @@ func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.
 	}
 	adapters.Add(1)
 	defer adapters.Done()
-	keepAdapterAlive(ctx, cfg, handoff, stdout, stderr)
+	keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, nil)
 }
 
 // maybeRefreshMachineCredential refreshes the machine bearer when it is within

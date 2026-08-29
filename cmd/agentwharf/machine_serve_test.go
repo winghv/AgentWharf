@@ -410,6 +410,20 @@ func TestMachineServeLoadsPersistedRecoveryHandoff(t *testing.T) {
 	}
 }
 
+func TestMachineRecoveryGuardReleasesAfterWorkerExit(t *testing.T) {
+	guard := newMachineRecoveryGuard()
+	if !guard.claim("ses_recovery") {
+		t.Fatal("first recovery claim was rejected")
+	}
+	if guard.claim("ses_recovery") {
+		t.Fatal("duplicate recovery claim was accepted")
+	}
+	guard.release("ses_recovery")
+	if !guard.claim("ses_recovery") {
+		t.Fatal("recovery claim was not reusable after worker exit")
+	}
+}
+
 func TestMachineServeRestartsOnlyFailedAdapters(t *testing.T) {
 	if machineServeAdapterShouldRestart(nil, true, 0) {
 		t.Fatal("clean adapter exit must remain terminal")
