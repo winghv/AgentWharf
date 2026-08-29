@@ -296,9 +296,9 @@ func TestTaskClaimStartupSmokeExchangesClaimAndCrossesProviderLifecycle(t *testi
 			t.Errorf("claim request = %+v, %v", request, err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		// The deployed platform contract (long-lived adapter token) responds
+		// The deployed Control Plane contract (long-lived adapter token) responds
 		// with separate adapter/client expiries and no single expires_at; this
-		// fixture must match platform/internal/controlplane/rest/machines.go.
+		// fixture must track the real exchange response shape.
 		fmt.Fprintf(w, `{"data":{"session_id":"ses_claim_smoke","provider":"claude-code","hub_ws_url":%q,"adapter_token":"adapter-token","adapter_expires_at":%q,"client_expires_at":%q}}`, "ws"+strings.TrimPrefix(hubServer.URL, "http"), time.Now().Add(24*time.Hour).UTC().Format(time.RFC3339), time.Now().Add(15*time.Minute).UTC().Format(time.RFC3339))
 	}))
 	defer controlPlane.Close()
