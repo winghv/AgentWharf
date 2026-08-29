@@ -3712,3 +3712,50 @@ func TestACPProviderReadyEventCarriesOnlyCwdBasename(t *testing.T) {
 		})
 	}
 }
+
+func TestProviderChildEnvironmentFileLoadsProfileModelMappings(t *testing.T) {
+	secretDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secretDir, "token"), []byte("sk-ant-profile-token"), 0o400); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secretDir, "base_url"), []byte("https://relay.example.com\n"), 0o400); err != nil {
+		t.Fatalf("write base url: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secretDir, "model"), []byte("relay-large-model"), 0o400); err != nil {
+		t.Fatalf("write model mapping: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secretDir, "headers"), []byte("X-Relay: on\nX-Trace: 1"), 0o400); err != nil {
+		t.Fatalf("write custom headers: %v", err)
+	}
+	parent := []string{
+		"ANTHROPIC_AUTH_TOKEN=" + filepath.Join(secretDir, "token"),
+		"ANTHROPIC_BASE_URL=" + filepath.Join(secretDir, "base_url"),
+		"ANTHROPIC_MODEL=" + filepath.Join(secretDir, "model"),
+		"ANTHROPIC_CUSTOM_HEADERS=" + filepath.Join(secretDir, "headers"),
+		"ANTHROPIC_PASSTHROUGH=relay-direct-value",
+	}
+	env, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, parent)
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	want := map[string]string{
+		"ANTHROPIC_AUTH_TOKEN":     "sk-ant-profile-token",
+		"ANTHROPIC_BASE_URL":       "https://relay.example.com",
+		"ANTHROPIC_MODEL":          "relay-large-model",
+		"ANTHROPIC_CUSTOM_HEADERS": "X-Relay: on\nX-Trace: 1",
+		"ANTHROPIC_PASSTHROUGH":    "relay-direct-value",
+	}
+	got := map[string]string{}
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			t.Fatalf("malformed env entry %q", entry)
+		}
+		got[name] = value
+	}
+	for name, value := range want {
+		if got[name] != value {
+			t.Fatalf("child env %s = %q, want %q", name, got[name], value)
+		}
+	}
+}

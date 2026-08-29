@@ -2552,29 +2552,69 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 	return core.ProcessCommand{Path: cfg.ProviderCommand[0], Args: cfg.ProviderCommand[1:], Env: env, Stdin: stdin, Stdout: stdout, Stderr: stderr}, nil
 }
 
+// providerChildEnvironment forwards ANTHROPIC_* environment to the provider
+// child. ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL keep the strict legacy
+// contract: their parent values must be bounded regular files inside the VM's
+// injected secret directory. Any other ANTHROPIC_* name (model mappings,
+// custom headers from a personal provider profile) is file-loaded when its
+// value resolves inside the secret directory and otherwise passed through
+// verbatim, so the sandbox environment stays file-path-only for secrets.
 func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
-	env := make([]string, 0, 2)
+	env := make([]string, 0, 4)
 	if cfg.Provider != "claude-code" || cfg.SecretDir == "" {
 		return env, nil
 	}
-	for _, credential := range []struct {
-		pathEnv  string
-		childEnv string
-	}{
-		{pathEnv: "ANTHROPIC_AUTH_TOKEN", childEnv: "ANTHROPIC_AUTH_TOKEN"},
-		{pathEnv: "ANTHROPIC_BASE_URL", childEnv: "ANTHROPIC_BASE_URL"},
-	} {
-		path := environmentValue(parent, credential.pathEnv)
-		if path == "" {
+	for _, entry := range parent {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok || name == "" || value == "" || !strings.HasPrefix(name, "ANTHROPIC_") {
 			continue
 		}
-		value, err := readProviderCredentialFile(cfg.SecretDir, path)
-		if err != nil {
-			return nil, fmt.Errorf("load %s for provider child: %w", credential.pathEnv, err)
+		strictCredential := name == "ANTHROPIC_AUTH_TOKEN" || name == "ANTHROPIC_BASE_URL"
+		if strictCredential {
+			loaded, err := readProviderCredentialFile(cfg.SecretDir, value, name == "ANTHROPIC_AUTH_TOKEN")
+			if err != nil {
+				return nil, fmt.Errorf("load %s for provider child: %w", name, err)
+			}
+			env = append(env, name+"="+loaded)
+			continue
 		}
-		env = append(env, credential.childEnv+"="+value)
+		if loaded, ok := readProviderConfigFile(cfg.SecretDir, value); ok {
+			value = loaded
+		}
+		env = append(env, name+"="+value)
 	}
 	return env, nil
+}
+
+// readProviderConfigFile loads an ANTHROPIC_* configuration file inside the
+// secret directory without the credential minimum length; it reports false
+// when the value is not a bounded regular file inside that directory so the
+// value can pass through verbatim.
+func readProviderConfigFile(secretDir string, valuePath string) (string, bool) {
+	if !filepath.IsAbs(valuePath) {
+		return "", false
+	}
+	root, err := filepath.EvalSymlinks(filepath.Clean(secretDir))
+	if err != nil {
+		return "", false
+	}
+	resolvedPath, err := filepath.EvalSymlinks(filepath.Clean(valuePath))
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(root, resolvedPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxProviderCredentialBytes {
+		return "", false
+	}
+	data, err := os.ReadFile(resolvedPath)
+	if err != nil || len(data) > maxProviderCredentialBytes {
+		return "", false
+	}
+	return strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r"), true
 }
 
 func environmentValue(env []string, name string) string {
@@ -2587,7 +2627,7 @@ func environmentValue(env []string, name string) string {
 	return ""
 }
 
-func readProviderCredentialFile(secretDir string, valuePath string) (string, error) {
+func readProviderCredentialFile(secretDir string, valuePath string, requireMinSecretLength bool) (string, error) {
 	if !filepath.IsAbs(secretDir) || !filepath.IsAbs(valuePath) {
 		return "", errors.New("secret directory and credential path must be absolute")
 	}
@@ -2628,7 +2668,10 @@ func readProviderCredentialFile(secretDir string, valuePath string) (string, err
 		return "", errors.New("credential file must be a bounded regular file")
 	}
 	value := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
-	if len(value) < masking.MinSecretLength || strings.IndexByte(value, 0) >= 0 {
+	if strings.IndexByte(value, 0) >= 0 {
+		return "", errors.New("credential file must not contain NUL bytes")
+	}
+	if requireMinSecretLength && len(value) < masking.MinSecretLength {
 		return "", fmt.Errorf("credential file must contain at least %d bytes of text", masking.MinSecretLength)
 	}
 	return value, nil
