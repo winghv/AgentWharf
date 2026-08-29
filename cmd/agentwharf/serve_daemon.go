@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,8 @@ const (
 	daemonLogFileName = "wharf-serve.log"
 	foregroundFlag    = "--foreground"
 )
+
+var errServeDaemonLocked = errors.New("another wharf serve daemon is already running for this machine credential")
 
 var errDaemonNotRunning = errors.New("wharf serve is not running")
 
@@ -133,12 +136,57 @@ func runServeCommand(ctx context.Context, args []string, stdout, stderr io.Write
 	}
 }
 
+// serveDaemonLockPath derives the daemon lock file from the resolved machine
+// credential path, so one lock guards exactly one daemon per credential even
+// when several credentials share the same state directory.
+func serveDaemonLockPath() (string, error) {
+	credPath, err := machineCredentialFile()
+	if err != nil {
+		return "", fmt.Errorf("resolve machine credential for serve lock: %w", err)
+	}
+	dir, err := daemonStateDir()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(credPath))
+	return filepath.Join(dir, fmt.Sprintf("wharf-serve-%x.lock", sum[:4])), nil
+}
+
+// acquireServeDaemonLock takes the non-blocking exclusive daemon lock for the
+// resolved machine credential. The lock is advisory but hard-enforced: the OS
+// releases it when the holding process exits, and a second daemon for the same
+// credential fails immediately instead of silently stacking. The lock file is
+// never removed, so the file identity the lock guards stays stable.
+func acquireServeDaemonLock() (*os.File, error) {
+	path, err := serveDaemonLockPath()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("prepare wharf serve lock directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open wharf serve lock: %w", err)
+	}
+	if err := lockFileExclusive(file); err != nil {
+		file.Close()
+		return nil, errServeDaemonLocked
+	}
+	return file, nil
+}
+
 // runForegroundServe runs the machine daemon in the foreground, recording its
 // pid so wharf serve stop/status still work while it is attached.
 func runForegroundServe(ctx context.Context, cfg machineServeConfig, stdout, stderr io.Writer) error {
 	if err := ensurePaired(); err != nil {
 		return err
 	}
+	lock, err := acquireServeDaemonLock()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	pid := os.Getpid()
 	if err := writeDaemonPID(pid); err != nil {
 		return fmt.Errorf("record wharf serve pid: %w", err)

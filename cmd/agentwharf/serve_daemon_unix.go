@@ -35,3 +35,9 @@ func terminateProcess(pid int) error {
 	}
 	return nil
 }
+
+// lockFileExclusive takes a non-blocking exclusive advisory lock on the file.
+// The lock is released when the file is closed or the process exits.
+func lockFileExclusive(file *os.File) error {
+	return syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+}

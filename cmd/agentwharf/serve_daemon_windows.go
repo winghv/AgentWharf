@@ -31,6 +31,12 @@ var (
 	procOpenProcess = kernel32DLL.NewProc("OpenProcess")
 	procGetExitCode = kernel32DLL.NewProc("GetExitCodeProcess")
 	procCloseHandle = kernel32DLL.NewProc("CloseHandle")
+	procLockFileEx  = kernel32DLL.NewProc("LockFileEx")
+)
+
+const (
+	lockfileExclusiveLock   = 0x00000002
+	lockfileFailImmediately = 0x00000001
 )
 
 // processAlive reports whether a Windows process is still running via
@@ -58,4 +64,21 @@ func terminateProcess(pid int) error {
 		return err
 	}
 	return process.Kill()
+}
+
+// lockFileExclusive takes a non-blocking exclusive byte-range lock on the
+// file. The lock is released when the handle is closed or the process exits.
+func lockFileExclusive(file *os.File) error {
+	ret, _, callErr := procLockFileEx.Call(
+		file.Fd(),
+		lockfileFailImmediately|lockfileExclusiveLock,
+		0,
+		1,
+		0,
+		0,
+	)
+	if ret == 0 {
+		return callErr
+	}
+	return nil
 }

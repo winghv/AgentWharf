@@ -122,3 +122,43 @@ func TestMachineServePollRetryMessage(t *testing.T) {
 		t.Fatalf("machineServePollRetryMessage(auth) = %q", gotAuth)
 	}
 }
+
+func TestServeDaemonLockIsExclusivePerCredential(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTWHARF_DAEMON_DIR", dir)
+
+	credA := filepath.Join(dir, "machine-a.json")
+	credB := filepath.Join(dir, "machine-b.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credA)
+
+	lockA, err := acquireServeDaemonLock()
+	if err != nil {
+		t.Fatalf("acquireServeDaemonLock(A): %v", err)
+	}
+	// A second daemon for the same credential must fail closed instead of
+	// silently stacking beside the first one.
+	if _, err := acquireServeDaemonLock(); !errors.Is(err, errServeDaemonLocked) {
+		t.Fatalf("second acquire = %v, want errServeDaemonLocked", err)
+	}
+	// A different credential in the same state directory is a separate daemon.
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credB)
+	lockB, err := acquireServeDaemonLock()
+	if err != nil {
+		t.Fatalf("acquireServeDaemonLock(B): %v", err)
+	}
+	if err := lockB.Close(); err != nil {
+		t.Fatalf("close lock B: %v", err)
+	}
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credA)
+	if err := lockA.Close(); err != nil {
+		t.Fatalf("close lock A: %v", err)
+	}
+	// A released lock must be acquirable again (daemon restart after stop).
+	lockAgain, err := acquireServeDaemonLock()
+	if err != nil {
+		t.Fatalf("acquireServeDaemonLock after release: %v", err)
+	}
+	if err := lockAgain.Close(); err != nil {
+		t.Fatalf("close reacquired lock: %v", err)
+	}
+}
