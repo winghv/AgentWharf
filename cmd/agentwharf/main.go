@@ -163,10 +163,15 @@ type machineTaskClaimExchangeRequest struct {
 
 type machineTaskClaimExchangeResponse struct {
 	Data struct {
-		SessionID         string `json:"session_id"`
-		Provider          string `json:"provider"`
-		HubWSURL          string `json:"hub_ws_url"`
-		AdapterToken      string `json:"adapter_token"`
+		SessionID    string `json:"session_id"`
+		Provider     string `json:"provider"`
+		HubWSURL     string `json:"hub_ws_url"`
+		AdapterToken string `json:"adapter_token"`
+		// The platform issues a long-lived adapter token alongside a short-lived
+		// client token, so the exchange response carries separate expiry fields;
+		// expires_at remains the single pre-long-lived-token fallback.
+		AdapterExpiresAt  string `json:"adapter_expires_at"`
+		ClientExpiresAt   string `json:"client_expires_at"`
 		ExpiresAt         string `json:"expires_at"`
 		ModelID           string `json:"model_id"`
 		ReasoningEffortID string `json:"reasoning_effort_id"`
@@ -234,7 +239,8 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		return errors.New("claim unavailable")
 	}
 	var handoff machineTaskClaimExchangeResponse
-	if err := decodeCloudAPIJSON(body, &handoff); err != nil || handoff.Data.SessionID == "" || handoff.Data.HubWSURL == "" || handoff.Data.AdapterToken == "" || handoff.Data.ExpiresAt == "" {
+	if err := decodeCloudAPIJSON(body, &handoff); err != nil || handoff.Data.SessionID == "" || handoff.Data.HubWSURL == "" || handoff.Data.AdapterToken == "" ||
+		(handoff.Data.AdapterExpiresAt == "" && handoff.Data.ExpiresAt == "") {
 		return errors.New("claim unavailable")
 	}
 	provider := strings.TrimSpace(handoff.Data.Provider)
@@ -244,7 +250,11 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 	if provider == "" || strings.ContainsAny(provider, " \t\r\n") {
 		return errors.New("claim unavailable")
 	}
-	expiresAt, err := time.Parse(time.RFC3339, handoff.Data.ExpiresAt)
+	expiresAtRaw := handoff.Data.AdapterExpiresAt
+	if expiresAtRaw == "" {
+		expiresAtRaw = handoff.Data.ExpiresAt
+	}
+	expiresAt, err := time.Parse(time.RFC3339, expiresAtRaw)
 	if err != nil || !expiresAt.After(time.Now().UTC()) {
 		return errors.New("claim unavailable")
 	}
