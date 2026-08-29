@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -466,12 +467,63 @@ func TestLocalSessionAuthenticatorAcceptsOnlyCurrentLocalSessionBearer(t *testin
 func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	t.Parallel()
 
-	err := run(context.Background(), nil, io.Discard, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "usage: wharf serve|hub|wrap|claude|codex|gemini|logout|version|upgrade|attention-backfill [options]") {
-		t.Fatalf("run() error = %v, want wharf usage", err)
+	var stdout bytes.Buffer
+	if err := runWithInput(context.Background(), []string{"definitely-not-a-command"}, nil, &stdout, io.Discard); err != nil {
+		t.Fatalf("run() error = %v, want usage output", err)
 	}
-	if strings.Contains(err.Error(), "usage: agentwharf") {
-		t.Fatalf("run() error = %v, must not mention legacy agentwharf entrypoint", err)
+	if !strings.Contains(stdout.String(), "usage: wharf [pair]|serve|hub|wrap|claude|codex|gemini|logout|version|upgrade|attention-backfill [options]") {
+		t.Fatalf("run() output = %q, want wharf usage", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "usage: agentwharf") {
+		t.Fatalf("run() output = %q, must not mention legacy agentwharf entrypoint", stdout.String())
+	}
+}
+
+func TestBareWharfPairsWithDefaultHub(t *testing.T) {
+	t.Setenv("AGENTWHARF_CLOUD_API_URL", "")
+	credentialFile := filepath.Join(t.TempDir(), "machine.json")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
+
+	refreshSecret := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/machine-pairing-codes" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"data":{"device_code":"dev_pair","user_code":"ABC12","interval_seconds":1}}`)
+		case r.URL.Path == "/machine-pairing-codes/token" && r.Method == http.MethodPost:
+			_, _ = fmt.Fprintf(w, `{"data":{"machine":{"id":"machine_pair"},"machine_token":"machine-token","refresh_secret":%q,"hub_ws_url":"wss://hub.example.invalid","expires_at":%q}}`,
+				refreshSecret, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer controlPlane.Close()
+	t.Setenv("AGENTWHARF_CLOUD_API_URL", controlPlane.URL)
+
+	var stdout bytes.Buffer
+	// Bare 'wharf' is the onboarding default: pair against the configured hub.
+	if err := runWithInput(context.Background(), nil, nil, &stdout, io.Discard); err != nil {
+		t.Fatalf("bare run() = %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Pairing complete") {
+		t.Fatalf("bare run() output = %q, want pairing completion", stdout.String())
+	}
+	credential, err := loadMachineCredential()
+	if err != nil {
+		t.Fatalf("loadMachineCredential after bare pair: %v", err)
+	}
+	if credential.MachineID != "machine_pair" || credential.CloudAPIURL != controlPlane.URL {
+		t.Fatalf("paired credential = %+v", credential)
+	}
+
+	// A second bare run reuses the same-hub credential instead of re-pairing.
+	var secondStdout bytes.Buffer
+	if err := runWithInput(context.Background(), nil, nil, &secondStdout, io.Discard); err != nil {
+		t.Fatalf("second bare run() = %v", err)
+	}
+	if strings.Contains(secondStdout.String(), "Pair this machine at") {
+		t.Fatalf("second bare run() re-paired: %q", secondStdout.String())
 	}
 }
 
@@ -3760,5 +3812,14 @@ func TestProviderChildEnvironmentFileLoadsProfileModelMappings(t *testing.T) {
 		if got[name] != value {
 			t.Fatalf("child env %s = %q, want %q", name, got[name], value)
 		}
+	}
+}
+
+func TestPairCommandArgumentHandling(t *testing.T) {
+	if err := runPairCommand(context.Background(), []string{"https://a.example/v1", "extra"}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: wharf pair") {
+		t.Fatalf("runPairCommand with two args = %v, want usage error", err)
+	}
+	if err := runPairCommand(context.Background(), []string{"  "}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: wharf pair") {
+		t.Fatalf("runPairCommand with blank url = %v, want usage error", err)
 	}
 }

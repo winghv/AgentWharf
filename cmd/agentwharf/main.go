@@ -79,7 +79,10 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 
 func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: wharf serve|hub|wrap|claude|codex|gemini|logout|version|upgrade|attention-backfill [options]")
+		// Bare 'wharf' is the onboarding default: pair this machine with the
+		// default hub. runPairOnly reuses an existing same-hub credential, so
+		// re-running it is a safe "make sure I am paired" command.
+		return runPairCommand(ctx, nil, stdout, stderr)
 	}
 
 	switch args[0] {
@@ -153,7 +156,10 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 	case "attention-backfill":
 		return runAttentionBackfill(ctx, args[1:], stdout, stderr)
 	default:
-		return fmt.Errorf("unknown command %q", args[0])
+		_, _ = fmt.Fprintf(stdout, "usage: wharf [pair]|serve|hub|wrap|claude|codex|gemini|logout|version|upgrade|attention-backfill [options]\n")
+		_, _ = fmt.Fprintln(stdout, "  wharf            pair this machine with the default hub (reuses an existing pairing)")
+		_, _ = fmt.Fprintln(stdout, "  wharf pair [url] pair with a specific cloud API base URL")
+		return nil
 	}
 }
 
@@ -1198,6 +1204,27 @@ func applyMachineSession(cfg wrapConfig, session machineSessionResponse) (wrapCo
 // concise success message, starts the background daemon, and exits. It is the
 // user-facing onboarding flow: pair once here, then manage everything from the
 // Console while wharf serve keeps the machine online.
+func runPairCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) > 1 {
+		return errors.New("usage: wharf pair [cloud-api-url]")
+	}
+	cfg := wrapConfig{
+		Agent:   "claude",
+		Format:  "acp",
+		Pair:    true,
+		Managed: true,
+	}
+	cfg.CloudAPIURL = envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", defaultManagedCloudAPIURL))
+	if len(args) == 1 {
+		cloudURL := strings.TrimSpace(args[0])
+		if cloudURL == "" {
+			return errors.New("usage: wharf pair [cloud-api-url]")
+		}
+		cfg.CloudAPIURL = cloudURL
+	}
+	return runPairOnly(ctx, cfg, stdout, stderr)
+}
+
 func runPairOnly(ctx context.Context, cfg wrapConfig, stdout, stderr io.Writer) error {
 	normalized, err := normalizeWrapConfig(cfg)
 	if err != nil {
