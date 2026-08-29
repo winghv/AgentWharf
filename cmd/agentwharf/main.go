@@ -2554,9 +2554,9 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 
 // providerChildEnvironment forwards ANTHROPIC_* environment to the provider
 // child. ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL keep the strict legacy
-// contract: their parent values must be bounded regular files inside the VM's
+// contract: their parent values must be bounded regular files inside the
 // injected secret directory. Any other ANTHROPIC_* name (model mappings,
-// custom headers from a personal provider profile) is file-loaded when its
+// custom headers from a provider configuration file) is file-loaded when its
 // value resolves inside the secret directory and otherwise passed through
 // verbatim, so the sandbox environment stays file-path-only for secrets.
 func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
