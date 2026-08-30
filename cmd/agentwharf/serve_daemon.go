@@ -18,7 +18,8 @@ const (
 	daemonPIDFileName       = "wharf-serve.pid"
 	daemonLogFileName       = "wharf-serve.log"
 	foregroundFlag          = "--foreground"
-	daemonStartupWait       = 3 * time.Second
+	daemonReadyFileEnv      = "AGENTWHARF_DAEMON_READY_FILE"
+	daemonStartupWait       = 10 * time.Second
 	daemonStartupPollPeriod = 25 * time.Millisecond
 )
 
@@ -64,6 +65,49 @@ func writeDaemonPID(pid int) error {
 		return err
 	}
 	return os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o600)
+}
+
+func daemonReadyPath() string {
+	if path := strings.TrimSpace(os.Getenv(daemonReadyFileEnv)); path != "" {
+		return path
+	}
+	dir, err := daemonStateDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, ".wharf-serve-ready")
+}
+
+func markDaemonReady(pid int) error {
+	path := daemonReadyPath()
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o600)
+}
+
+func removeDaemonReadyIfOwner(ownerPID int) {
+	path := daemonReadyPath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || strings.TrimSpace(string(data)) != strconv.Itoa(ownerPID) {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+func daemonReady(pid int) bool {
+	path := daemonReadyPath()
+	if path == "" {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	return err == nil && strings.TrimSpace(string(data)) == strconv.Itoa(pid)
 }
 
 func readDaemonPID() (int, error) {
@@ -195,19 +239,21 @@ func runForegroundServe(ctx context.Context, cfg machineServeConfig, stdout, std
 		return fmt.Errorf("record wharf serve pid: %w", err)
 	}
 	defer removeDaemonPIDIfOwner(pid)
+	defer removeDaemonReadyIfOwner(pid)
 	return runMachineServe(ctx, cfg, stdout, stderr)
 }
 
 // startBackgroundServe re-executes the daemon detached from the terminal so it
 // keeps serving after the user closes the shell. The child runs with
 // --foreground and writes its own pid; the parent exits immediately.
-// daemonAlreadyRunning reports whether a live wharf serve daemon owns the pid file.
+// daemonAlreadyRunning reports whether a live wharf serve daemon has
+// completed its authenticated startup handshake for the current state dir.
 func daemonAlreadyRunning() bool {
 	pid, err := readDaemonPID()
-	if err != nil {
+	if err != nil || !processAlive(pid) {
 		return false
 	}
-	return processAlive(pid)
+	return daemonReady(pid)
 }
 
 // isTestBinary reports whether the running executable is a go test binary, in
@@ -286,6 +332,11 @@ func startBackgroundServe(stdout, stderr io.Writer) error {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
+	readyPath := filepath.Join(filepath.Dir(logPath), ".wharf-serve-ready")
+	cmd.Env = append(os.Environ(), daemonReadyFileEnv+"="+readyPath)
+	if err := os.Remove(readyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("reset wharf serve readiness: %w", err)
+	}
 	if err := detachBackgroundCommand(cmd); err != nil {
 		return fmt.Errorf("start wharf serve in background: %w", err)
 	}
@@ -293,7 +344,8 @@ func startBackgroundServe(stdout, stderr io.Writer) error {
 		return fmt.Errorf("start wharf serve: %w", err)
 	}
 	pid := cmd.Process.Pid
-	if err := waitForDaemonStartup(pid); err != nil {
+	if err := waitForDaemonStartup(pid, readyPath); err != nil {
+		_ = terminateProcess(pid)
 		return fmt.Errorf("wharf serve did not start: %w (logs: %s)", err, logPath)
 	}
 	_, _ = fmt.Fprintf(stdout, "wharf serve started in the background (PID %d).\n", pid)
@@ -302,14 +354,14 @@ func startBackgroundServe(stdout, stderr io.Writer) error {
 	return nil
 }
 
-func waitForDaemonStartup(expectedPID int) error {
+func waitForDaemonStartup(expectedPID int, readyPath string) error {
 	deadline := time.NewTimer(daemonStartupWait)
 	defer deadline.Stop()
 	ticker := time.NewTicker(daemonStartupPollPeriod)
 	defer ticker.Stop()
 	for {
 		pid, err := readDaemonPID()
-		if err == nil && pid == expectedPID {
+		if err == nil && pid == expectedPID && daemonReady(expectedPID) {
 			if processAlive(expectedPID) {
 				return nil
 			}

@@ -299,6 +299,11 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				return fmt.Errorf("reload machine credential: %w", err)
 			}
 		}
+		if daemonReadyPath() != "" {
+			if err := markDaemonReady(os.Getpid()); err != nil {
+				return fmt.Errorf("mark wharf serve ready: %w", err)
+			}
+		}
 		for _, claim := range claims {
 			if claim.ClaimID == "" || !claimActiveNow(claim) {
 				continue

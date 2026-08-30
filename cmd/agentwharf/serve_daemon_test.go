@@ -88,15 +88,23 @@ func TestServeBackgroundRequiresPairing(t *testing.T) {
 	}
 }
 
-func TestDaemonAlreadyRunningRejectsStalePID(t *testing.T) {
-	t.Setenv("AGENTWHARF_DAEMON_DIR", t.TempDir())
-	// A pid far above any live process id; Signal(0) reports it absent.
-	if err := writeDaemonPID(2147483647); err != nil {
+func TestDaemonAlreadyRunningRequiresReadiness(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTWHARF_DAEMON_DIR", dir)
+	pid := os.Getpid()
+	if err := writeDaemonPID(pid); err != nil {
 		t.Fatalf("writeDaemonPID: %v", err)
 	}
 	if daemonAlreadyRunning() {
-		t.Fatal("daemonAlreadyRunning = true for a non-existent pid")
+		t.Fatal("daemonAlreadyRunning = true before readiness")
 	}
+	if err := markDaemonReady(pid); err != nil {
+		t.Fatalf("markDaemonReady: %v", err)
+	}
+	if !daemonAlreadyRunning() {
+		t.Fatal("daemonAlreadyRunning = false after readiness")
+	}
+	removeDaemonReadyIfOwner(pid)
 }
 
 func TestEnsureBackgroundDaemonNotPairedIsSilent(t *testing.T) {
@@ -159,11 +167,17 @@ func TestWaitForDaemonStartupRequiresMatchingLivePID(t *testing.T) {
 	if err := writeDaemonPID(pid); err != nil {
 		t.Fatalf("writeDaemonPID: %v", err)
 	}
-	if err := waitForDaemonStartup(pid); err != nil {
+	readyPath := filepath.Join(dir, "ready")
+	t.Setenv(daemonReadyFileEnv, readyPath)
+	if err := markDaemonReady(pid); err != nil {
+		t.Fatalf("markDaemonReady: %v", err)
+	}
+	if err := waitForDaemonStartup(pid, readyPath); err != nil {
 		t.Fatalf("waitForDaemonStartup = %v", err)
 	}
-	if err := waitForDaemonStartup(pid + 1); err == nil {
-		t.Fatal("waitForDaemonStartup accepted a different PID")
+	removeDaemonReadyIfOwner(pid)
+	if daemonReady(pid) {
+		t.Fatal("daemonReady remained true after owner cleanup")
 	}
 }
 

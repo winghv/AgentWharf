@@ -1137,12 +1137,6 @@ func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wra
 // credential, without creating or running a Session. It is shared by the
 // pair-only entrypoint and the session-running wrap flow.
 func pairMachineCredential(ctx context.Context, client *http.Client, cfg wrapConfig, output io.Writer) (machineCredential, error) {
-	pairingLock, err := acquirePairingReplacementLock()
-	if err != nil {
-		return machineCredential{}, err
-	}
-	defer pairingLock.Close()
-
 	createURL, err := cloudAPIEndpoint(cfg.CloudAPIURL, "/machine-pairing-codes")
 	if err != nil {
 		return machineCredential{}, err
@@ -1182,6 +1176,11 @@ func pairMachineCredential(ctx context.Context, client *http.Client, cfg wrapCon
 		HubWSURL:      machineToken.Data.HubWSURL,
 		ExpiresAt:     machineToken.Data.ExpiresAt,
 	}
+	pairingLock, err := acquirePairingReplacementLock()
+	if err != nil {
+		return machineCredential{}, err
+	}
+	defer pairingLock.Close()
 	if err := saveMachineCredential(credential); err != nil {
 		return machineCredential{}, err
 	}
