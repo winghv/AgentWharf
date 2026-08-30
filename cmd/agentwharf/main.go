@@ -119,7 +119,7 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		}
 		_, _ = fmt.Fprintf(stdout, "wharf wrap sent events for session_id=%s provider=%s\n", effective.SessionID, effective.Provider)
 		return nil
-	case "claude", "codex", "gemini":
+	case "claude", "codex", "dsh", "gemini":
 		go maybePrintUpdateReminder(ctx, stderr)
 		cfg, err := parseAgentEntrypointConfig(args[0], args[1:], stderr)
 		if err != nil {
@@ -158,7 +158,7 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 	case "attention-backfill":
 		return runAttentionBackfill(ctx, args[1:], stdout, stderr)
 	default:
-		_, _ = fmt.Fprintf(stdout, "usage: wharf [pair]|serve|hub|wrap|claude|codex|gemini|logout|version|upgrade|attention-backfill [options]\n")
+		_, _ = fmt.Fprintf(stdout, "usage: wharf [pair]|serve|hub|wrap|claude|codex|dsh|gemini|logout|version|upgrade|attention-backfill [options]\n")
 		_, _ = fmt.Fprintln(stdout, "  wharf            pair this machine with the default hub (reuses an existing pairing)")
 		_, _ = fmt.Fprintln(stdout, "  wharf pair [url] pair with a specific cloud API base URL")
 		return nil
@@ -811,6 +811,8 @@ func providerForAgent(agent string) string {
 	switch agent {
 	case "claude", "claude-code":
 		return defaultProvider
+	case "dsh":
+		return "deepseek-harness"
 	default:
 		return agent
 	}
@@ -822,6 +824,13 @@ func defaultProviderCommand(agent string) []string {
 		return []string{"claude-agent-acp"}
 	case "codex":
 		return []string{"codex-acp"}
+	case "dsh":
+		// The sandbox image ships the DSH ACP composition at this path
+		// (under /usr/local so the image seed carries it), and the config
+		// resolves its plugins from the sibling global npm packages. The
+		// config carries the approved tool roster and sandbox/approval
+		// policy.
+		return []string{"dsh-acp-activity", "--config", "/usr/local/lib/dsh/cordis.yml"}
 	default:
 		return []string{agent}
 	}
@@ -2600,26 +2609,29 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 	return core.ProcessCommand{Path: cfg.ProviderCommand[0], Args: cfg.ProviderCommand[1:], Env: env, Stdin: stdin, Stdout: stdout, Stderr: stderr}, nil
 }
 
-// providerChildEnvironment forwards ANTHROPIC_* environment to the provider
-// child. ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL keep the strict legacy
-// contract: their parent values must be bounded regular files inside the
-// injected secret directory. Any other ANTHROPIC_* name (model mappings,
-// custom headers from a provider configuration file) is file-loaded when its
-// value resolves inside the secret directory and otherwise passed through
-// verbatim, so the sandbox environment stays file-path-only for secrets.
+// providerChildEnvironment forwards provider credential environment to the
+// provider child. ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL keep the strict
+// legacy contract: their parent values must be bounded regular files inside
+// the injected secret directory. DEEPSEEK_API_KEY and DEEPSEEK_BASE_URL follow
+// the same contract for the deepseek-harness provider, whose child reads the
+// plaintext values directly. Any other ANTHROPIC_* or DEEPSEEK_* name
+// (model mappings, custom headers from a provider configuration file) is
+// file-loaded when its value resolves inside the secret directory and
+// otherwise passed through verbatim, so the sandbox environment stays
+// file-path-only for secrets.
 func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
 	env := make([]string, 0, 4)
-	if cfg.Provider != "claude-code" || cfg.SecretDir == "" {
+	prefix, strictCredentials, minLengthCredential := providerCredentialEnvContract(cfg.Provider)
+	if prefix == "" || cfg.SecretDir == "" {
 		return env, nil
 	}
 	for _, entry := range parent {
 		name, value, ok := strings.Cut(entry, "=")
-		if !ok || name == "" || value == "" || !strings.HasPrefix(name, "ANTHROPIC_") {
+		if !ok || name == "" || value == "" || !strings.HasPrefix(name, prefix) {
 			continue
 		}
-		strictCredential := name == "ANTHROPIC_AUTH_TOKEN" || name == "ANTHROPIC_BASE_URL"
-		if strictCredential {
-			loaded, err := readProviderCredentialFile(cfg.SecretDir, value, name == "ANTHROPIC_AUTH_TOKEN")
+		if strictCredentials[name] {
+			loaded, err := readProviderCredentialFile(cfg.SecretDir, value, name == minLengthCredential)
 			if err != nil {
 				return nil, fmt.Errorf("load %s for provider child: %w", name, err)
 			}
@@ -2632,6 +2644,21 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 		env = append(env, name+"="+value)
 	}
 	return env, nil
+}
+
+// providerCredentialEnvContract returns the env prefix a provider's child may
+// receive, the strict credentials that must resolve to files inside the
+// injected secret directory, and which of those requires the minimum secret
+// length (the API key, not a base URL).
+func providerCredentialEnvContract(provider string) (prefix string, strict map[string]bool, minLengthCredential string) {
+	switch provider {
+	case "claude-code":
+		return "ANTHROPIC_", map[string]bool{"ANTHROPIC_AUTH_TOKEN": true, "ANTHROPIC_BASE_URL": true}, "ANTHROPIC_AUTH_TOKEN"
+	case "deepseek-harness":
+		return "DEEPSEEK_", map[string]bool{"DEEPSEEK_API_KEY": true, "DEEPSEEK_BASE_URL": true}, "DEEPSEEK_API_KEY"
+	default:
+		return "", nil, ""
+	}
 }
 
 // readProviderConfigFile loads an ANTHROPIC_* configuration file inside the

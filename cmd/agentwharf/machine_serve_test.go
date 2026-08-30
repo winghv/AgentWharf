@@ -501,3 +501,27 @@ func TestParseMachineServeConfigRejectsInvalidArguments(t *testing.T) {
 		t.Fatalf("parsed config = %+v", cfg)
 	}
 }
+
+func TestServeWrapConfigMapsDeepSeekHarnessProvider(t *testing.T) {
+	handoff := machineServeDispatch{
+		SessionID:   "ses_dsh",
+		Provider:    "deepseek-harness",
+		HubWSURL:    "ws://hub.example.test/session",
+	}
+	cfg := serveWrapConfig(handoff, false)
+	if cfg.Agent != "dsh" {
+		t.Fatalf("agent = %q, want dsh", cfg.Agent)
+	}
+	if cfg.Provider != "deepseek-harness" {
+		t.Fatalf("provider = %q, want deepseek-harness", cfg.Provider)
+	}
+	want := []string{"dsh-acp-activity", "--config", "/usr/local/lib/dsh/cordis.yml"}
+	if len(cfg.ProviderCommand) != len(want) {
+		t.Fatalf("provider command = %v, want %v", cfg.ProviderCommand, want)
+	}
+	for i := range want {
+		if cfg.ProviderCommand[i] != want[i] {
+			t.Fatalf("provider command[%d] = %q, want %q", i, cfg.ProviderCommand[i], want[i])
+		}
+	}
+}

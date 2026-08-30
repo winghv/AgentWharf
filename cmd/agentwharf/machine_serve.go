@@ -695,6 +695,9 @@ func serveWrapConfig(handoff machineServeDispatch, startupSmoke bool) wrapConfig
 	if agent == "claude-code" {
 		agent = "claude"
 	}
+	if agent == "deepseek-harness" {
+		agent = "dsh"
+	}
 	return wrapConfig{
 		HubURL:            handoff.HubWSURL,
 		SessionID:         handoff.SessionID,

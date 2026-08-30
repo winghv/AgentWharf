@@ -471,7 +471,7 @@ func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	if err := runWithInput(context.Background(), []string{"definitely-not-a-command"}, nil, &stdout, io.Discard); err != nil {
 		t.Fatalf("run() error = %v, want usage output", err)
 	}
-	if !strings.Contains(stdout.String(), "usage: wharf [pair]|serve|hub|wrap|claude|codex|gemini|logout|version|upgrade|attention-backfill [options]") {
+	if !strings.Contains(stdout.String(), "usage: wharf [pair]|serve|hub|wrap|claude|codex|dsh|gemini|logout|version|upgrade|attention-backfill [options]") {
 		t.Fatalf("run() output = %q, want wharf usage", stdout.String())
 	}
 	if strings.Contains(stdout.String(), "usage: agentwharf") {
@@ -3020,6 +3020,101 @@ func TestProviderChildEnvironmentRejectsCredentialTooShortToMask(t *testing.T) {
 	_, err := providerChildEnvironment(wrapConfig{Provider: "claude-code", SecretDir: secretDir}, []string{"ANTHROPIC_AUTH_TOKEN=" + credentialPath})
 	if err == nil || !strings.Contains(err.Error(), "at least 4 bytes") {
 		t.Fatalf("providerChildEnvironment() error = %v, want short-credential rejection", err)
+	}
+}
+
+func TestProviderForAgentMapsDSHToPlatformProvider(t *testing.T) {
+	if got := providerForAgent("dsh"); got != "deepseek-harness" {
+		t.Fatalf("providerForAgent(dsh) = %q, want deepseek-harness", got)
+	}
+	if got := providerForAgent("claude"); got != defaultProvider {
+		t.Fatalf("providerForAgent(claude) = %q, want %q", got, defaultProvider)
+	}
+}
+
+func TestDefaultProviderCommandDSHUsesShippedComposition(t *testing.T) {
+	got := defaultProviderCommand("dsh")
+	want := []string{"dsh-acp-activity", "--config", "/usr/local/lib/dsh/cordis.yml"}
+	if len(got) != len(want) {
+		t.Fatalf("defaultProviderCommand(dsh) = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("defaultProviderCommand(dsh)[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestProviderChildEnvironmentForwardsDeepSeekCredentialsForChildOnly(t *testing.T) {
+	secretDir := t.TempDir()
+	apiKeyPath := filepath.Join(secretDir, "deepseek_api_key")
+	baseURLPath := filepath.Join(secretDir, "deepseek_base_url")
+	headerPath := filepath.Join(secretDir, "deepseek_env_extra")
+	if err := os.WriteFile(apiKeyPath, []byte("test-deepseek-api-key\n"), 0o400); err != nil {
+		t.Fatalf("write API key: %v", err)
+	}
+	if err := os.WriteFile(baseURLPath, []byte("https://provider.example.test\n"), 0o400); err != nil {
+		t.Fatalf("write base URL: %v", err)
+	}
+	if err := os.WriteFile(headerPath, []byte("value-from-file"), 0o400); err != nil {
+		t.Fatalf("write config env: %v", err)
+	}
+	parent := []string{
+		"DEEPSEEK_API_KEY=" + apiKeyPath,
+		"DEEPSEEK_BASE_URL=" + baseURLPath,
+		"DEEPSEEK_EXTRA=" + headerPath,
+		"PATH=/usr/bin:/bin",
+	}
+	env, err := providerChildEnvironment(wrapConfig{Provider: "deepseek-harness", SecretDir: secretDir}, parent)
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	want := []string{
+		"DEEPSEEK_API_KEY=test-deepseek-api-key",
+		"DEEPSEEK_BASE_URL=https://provider.example.test",
+		"DEEPSEEK_EXTRA=value-from-file",
+	}
+	if len(env) != len(want) {
+		t.Fatalf("child env = %v, want %v", env, want)
+	}
+	for i := range want {
+		if env[i] != want[i] {
+			t.Fatalf("child env[%d] = %q, want %q", i, env[i], want[i])
+		}
+	}
+}
+
+func TestProviderChildEnvironmentRejectsDeepSeekCredentialOutsideSecretDir(t *testing.T) {
+	secretDir := t.TempDir()
+	outsidePath := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(outsidePath, []byte("secret-key"), 0o400); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	_, err := providerChildEnvironment(wrapConfig{Provider: "deepseek-harness", SecretDir: secretDir}, []string{"DEEPSEEK_API_KEY=" + outsidePath})
+	if err == nil || !strings.Contains(err.Error(), "outside the injected secret directory") {
+		t.Fatalf("providerChildEnvironment() error = %v, want outside-secret-dir rejection", err)
+	}
+}
+
+func TestProviderChildEnvironmentRejectsShortDeepSeekCredential(t *testing.T) {
+	secretDir := t.TempDir()
+	credentialPath := filepath.Join(secretDir, "key")
+	if err := os.WriteFile(credentialPath, []byte("abc"), 0o400); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	_, err := providerChildEnvironment(wrapConfig{Provider: "deepseek-harness", SecretDir: secretDir}, []string{"DEEPSEEK_API_KEY=" + credentialPath})
+	if err == nil || !strings.Contains(err.Error(), "at least 4 bytes") {
+		t.Fatalf("providerChildEnvironment() error = %v, want short-credential rejection", err)
+	}
+}
+
+func TestProviderChildEnvironmentLeavesOtherProvidersEmpty(t *testing.T) {
+	env, err := providerChildEnvironment(wrapConfig{Provider: "codex", SecretDir: "/unused"}, []string{"DEEPSEEK_API_KEY=/tmp/unused"})
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	if len(env) != 0 {
+		t.Fatalf("child env = %v, want empty", env)
 	}
 }
 
