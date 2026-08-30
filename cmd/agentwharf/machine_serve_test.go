@@ -512,6 +512,13 @@ func TestServeWrapConfigMapsDeepSeekHarnessProvider(t *testing.T) {
 	if cfg.Agent != "dsh" {
 		t.Fatalf("agent = %q, want dsh", cfg.Agent)
 	}
+	if !cfg.ForceHeadless {
+		t.Fatal("ForceHeadless = false, want true: dsh has no official terminal CLI")
+	}
+	claudeCfg := serveWrapConfig(machineServeDispatch{SessionID: "ses_claude", Provider: "claude-code"}, false)
+	if claudeCfg.ForceHeadless {
+		t.Fatal("ForceHeadless = true for claude-code, want false (official CLI path stays available)")
+	}
 	if cfg.Provider != "deepseek-harness" {
 		t.Fatalf("provider = %q, want deepseek-harness", cfg.Provider)
 	}

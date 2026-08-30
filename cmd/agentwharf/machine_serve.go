@@ -705,6 +705,7 @@ func serveWrapConfig(handoff machineServeDispatch, startupSmoke bool) wrapConfig
 		Provider:          handoff.Provider,
 		AdapterToken:      handoff.AdapterToken,
 		Format:            "acp",
+		ForceHeadless:     providerIsBridgeOnly(handoff.Provider),
 		ProviderCommand:   defaultProviderCommand(agent),
 		ProtocolVersion:   protocol.HubProtocolVersion,
 		StartupSmoke:      startupSmoke,

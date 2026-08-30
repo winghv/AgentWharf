@@ -457,6 +457,7 @@ type wrapConfig struct {
 	Stderr             io.Writer
 	Stdin              io.Reader
 	Interactive        bool
+	ForceHeadless      bool
 	// ProviderSessionID enables ACP session/load during machine recovery.
 	// OnProviderSession receives the opaque provider id after a successful
 	// session/new or session/load and must only persist it locally.
@@ -595,6 +596,18 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 	}
 	if useJSONStream {
 		cfg.Format = "jsonstream"
+	}
+	// Cloud sandboxes launch `wrap --provider <id> --acp` without an explicit
+	// bridge command: resolve the agent entry point from the provider so the
+	// platform does not have to know agent binaries. Bridge-only providers
+	// also force the headless path: they have no official terminal CLI, so a
+	// character-device stdin (dispatchers allocate PTYs) must not select the
+	// official-CLI transcript path.
+	if cfg.Format == "acp" && len(cfg.ProviderCommand) == 0 && strings.TrimSpace(cfg.Provider) != "" {
+		cfg.Provider = strings.TrimSpace(cfg.Provider)
+		cfg.Agent = agentForProvider(cfg.Provider)
+		cfg.ProviderCommand = defaultProviderCommand(cfg.Agent)
+		cfg.ForceHeadless = providerIsBridgeOnly(cfg.Provider)
 	}
 	return normalizeWrapConfig(cfg)
 }
@@ -807,6 +820,27 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 	return cfg, nil
 }
 
+// agentForProvider maps a platform provider id onto the wharf agent entry
+// point that serves it; unknown providers fall through so custom entries keep
+// working with an explicit provider command.
+func agentForProvider(provider string) string {
+	switch provider {
+	case "claude-code":
+		return "claude"
+	case "deepseek-harness":
+		return "dsh"
+	default:
+		return provider
+	}
+}
+
+// providerIsBridgeOnly reports whether a provider has no official terminal
+// CLI: dispatched sessions for it must run the headless ACP bridge even when
+// the dispatcher hands the wrap a character-device stdin.
+func providerIsBridgeOnly(provider string) bool {
+	return provider == "deepseek-harness"
+}
+
 func providerForAgent(agent string) string {
 	switch agent {
 	case "claude", "claude-code":
@@ -931,7 +965,7 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	// the official claude/codex CLI and mirror its transcript to the Hub. The
 	// nil-stdin default (and pipes) stay headless, and smoke/pair-only never
 	// enter the interactive path.
-	if explicitStdin && !cfg.StartupSmoke && !cfg.PairOnly {
+	if explicitStdin && !cfg.ForceHeadless && !cfg.StartupSmoke && !cfg.PairOnly {
 		if file, ok := stdin.(*os.File); ok {
 			if info, err := file.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
 				cfg.Interactive = true

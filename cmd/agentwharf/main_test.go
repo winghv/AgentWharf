@@ -3032,6 +3032,52 @@ func TestProviderForAgentMapsDSHToPlatformProvider(t *testing.T) {
 	}
 }
 
+func TestParseWrapConfigDefaultsBridgeCommandFromProvider(t *testing.T) {
+	cfg, err := parseWrapConfig([]string{"--provider", "deepseek-harness", "--acp"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseWrapConfig() error = %v", err)
+	}
+	if cfg.Agent != "dsh" {
+		t.Fatalf("agent = %q, want dsh", cfg.Agent)
+	}
+	want := []string{"dsh-acp-activity", "--config", "/usr/local/lib/dsh/cordis.yml"}
+	if len(cfg.ProviderCommand) != len(want) {
+		t.Fatalf("provider command = %v, want %v", cfg.ProviderCommand, want)
+	}
+	for i := range want {
+		if cfg.ProviderCommand[i] != want[i] {
+			t.Fatalf("provider command[%d] = %q, want %q", i, cfg.ProviderCommand[i], want[i])
+		}
+	}
+
+	if !cfg.ForceHeadless {
+		t.Fatal("ForceHeadless = false, want true when defaulting from a bridge-only provider")
+	}
+
+	explicit, err := parseWrapConfig([]string{"--provider", "deepseek-harness", "--acp", "--", "my-bridge"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseWrapConfig(explicit) error = %v", err)
+	}
+	if len(explicit.ProviderCommand) != 1 || explicit.ProviderCommand[0] != "my-bridge" {
+		t.Fatalf("explicit provider command = %v, want my-bridge untouched", explicit.ProviderCommand)
+	}
+	if explicit.ForceHeadless {
+		t.Fatal("explicit bridge command must not set ForceHeadless")
+	}
+}
+
+func TestAgentForProviderMapsPlatformIDs(t *testing.T) {
+	if got := agentForProvider("claude-code"); got != "claude" {
+		t.Fatalf("agentForProvider(claude-code) = %q, want claude", got)
+	}
+	if got := agentForProvider("deepseek-harness"); got != "dsh" {
+		t.Fatalf("agentForProvider(deepseek-harness) = %q, want dsh", got)
+	}
+	if got := agentForProvider("codex"); got != "codex" {
+		t.Fatalf("agentForProvider(codex) = %q, want codex", got)
+	}
+}
+
 func TestDefaultProviderCommandDSHUsesShippedComposition(t *testing.T) {
 	got := defaultProviderCommand("dsh")
 	want := []string{"dsh-acp-activity", "--config", "/usr/local/lib/dsh/cordis.yml"}
