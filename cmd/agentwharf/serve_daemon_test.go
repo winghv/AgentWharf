@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -120,6 +121,49 @@ func TestMachineServePollRetryMessage(t *testing.T) {
 	gotAuth := machineServePollRetryMessage(auth, 10*time.Second)
 	if strings.Contains(gotAuth, "cloud unreachable") || !strings.Contains(gotAuth, "retrying in 10s") {
 		t.Fatalf("machineServePollRetryMessage(auth) = %q", gotAuth)
+	}
+}
+
+func TestPairingReplacementRejectsRunningDaemon(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTWHARF_DAEMON_DIR", dir)
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(dir, "machine.json"))
+
+	lock, err := acquireServeDaemonLock()
+	if err != nil {
+		t.Fatalf("acquireServeDaemonLock: %v", err)
+	}
+	defer lock.Close()
+	if _, err := acquirePairingReplacementLock(); err == nil || !strings.Contains(err.Error(), "existing wharf serve daemon") {
+		t.Fatalf("acquirePairingReplacementLock = %v, want existing daemon error", err)
+	}
+}
+
+func TestPairingReplacementAllowsNoRunningDaemon(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTWHARF_DAEMON_DIR", dir)
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(dir, "machine.json"))
+	lock, err := acquirePairingReplacementLock()
+	if err != nil {
+		t.Fatalf("acquirePairingReplacementLock = %v", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatalf("close pairing replacement lock: %v", err)
+	}
+}
+
+func TestWaitForDaemonStartupRequiresMatchingLivePID(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTWHARF_DAEMON_DIR", dir)
+	pid := os.Getpid()
+	if err := writeDaemonPID(pid); err != nil {
+		t.Fatalf("writeDaemonPID: %v", err)
+	}
+	if err := waitForDaemonStartup(pid); err != nil {
+		t.Fatalf("waitForDaemonStartup = %v", err)
+	}
+	if err := waitForDaemonStartup(pid + 1); err == nil {
+		t.Fatal("waitForDaemonStartup accepted a different PID")
 	}
 }
 

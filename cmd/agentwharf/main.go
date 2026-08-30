@@ -134,8 +134,10 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		if !cfg.StartupSmoke {
 			// After pairing (or reusing an existing pairing) plus one session, hand
 			// off to the background daemon so the machine stays online without a
-			// manual wharf serve. Best-effort: a failed daemon start only prints a hint.
-			ensureBackgroundDaemon(stderr)
+			// manual wharf serve.
+			if daemonErr := ensureBackgroundDaemon(stderr); daemonErr != nil {
+				return daemonErr
+			}
 		}
 		if err != nil {
 			return err
@@ -947,7 +949,9 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		// running. Starting it only after runWrap returns leaves Console-created
 		// auto claims in `starting` until the local CLI exits.
 		if !cfg.StartupSmoke && !cfg.PairOnly {
-			ensureBackgroundDaemon(cfg.Stderr)
+			if daemonErr := ensureBackgroundDaemon(cfg.Stderr); daemonErr != nil {
+				return cfg, daemonErr
+			}
 		}
 	} else if cfg.Pair {
 		cfg, err = pairWrapSession(ctx, cfg, pairOutput)
@@ -1133,6 +1137,12 @@ func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wra
 // credential, without creating or running a Session. It is shared by the
 // pair-only entrypoint and the session-running wrap flow.
 func pairMachineCredential(ctx context.Context, client *http.Client, cfg wrapConfig, output io.Writer) (machineCredential, error) {
+	pairingLock, err := acquirePairingReplacementLock()
+	if err != nil {
+		return machineCredential{}, err
+	}
+	defer pairingLock.Close()
+
 	createURL, err := cloudAPIEndpoint(cfg.CloudAPIURL, "/machine-pairing-codes")
 	if err != nil {
 		return machineCredential{}, err
@@ -1247,9 +1257,11 @@ func runPairOnly(ctx context.Context, cfg wrapConfig, stdout, stderr io.Writer) 
 	if credential.MachineID == "" || credential.MachineToken == "" {
 		return errors.New("pairing did not produce a usable machine credential")
 	}
+	if err := ensureBackgroundDaemon(stderr); err != nil {
+		return fmt.Errorf("pairing completed but could not start the background daemon: %w", err)
+	}
 	_, _ = fmt.Fprintln(stdout, "Pairing complete. This machine is connected to SuperWHV.")
 	_, _ = fmt.Fprintln(stdout, "The background daemon (wharf serve) is running; you can close this window. Manage tasks from the Console.")
-	ensureBackgroundDaemon(stderr)
 	return nil
 }
 

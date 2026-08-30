@@ -11,12 +11,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
-	daemonPIDFileName = "wharf-serve.pid"
-	daemonLogFileName = "wharf-serve.log"
-	foregroundFlag    = "--foreground"
+	daemonPIDFileName       = "wharf-serve.pid"
+	daemonLogFileName       = "wharf-serve.log"
+	foregroundFlag          = "--foreground"
+	daemonStartupWait       = 3 * time.Second
+	daemonStartupPollPeriod = 25 * time.Millisecond
 )
 
 var errServeDaemonLocked = errors.New("another wharf serve daemon is already running for this machine credential")
@@ -220,21 +223,37 @@ func isTestBinary() bool {
 
 // ensureBackgroundDaemon starts the background daemon after a one-shot pairing
 // or agent session so the machine stays online without a manual wharf serve.
-// It is best-effort and silent on success; failures get a recovery hint.
-func ensureBackgroundDaemon(stderr io.Writer) {
+// It returns startup failures so onboarding cannot report a false connection.
+func ensureBackgroundDaemon(stderr io.Writer) error {
 	if isTestBinary() {
-		return
+		return nil
 	}
 	if daemonAlreadyRunning() {
-		return
+		return nil
 	}
 	exists, err := machineCredentialExists()
 	if err != nil || !exists {
-		return
+		return nil
 	}
 	if err := startBackgroundServe(io.Discard, stderr); err != nil {
 		_, _ = fmt.Fprintf(stderr, "wharf: could not start the background daemon (%v). Run wharf serve to keep this machine online.\n", err)
+		return err
 	}
+	return nil
+}
+
+// acquirePairingReplacementLock prevents a new pairing from replacing the
+// credential that an already-running daemon still holds in memory. Callers must
+// hold the returned lock until the new credential has been persisted.
+func acquirePairingReplacementLock() (*os.File, error) {
+	lock, err := acquireServeDaemonLock()
+	if err != nil {
+		if errors.Is(err, errServeDaemonLocked) {
+			return nil, errors.New("an existing wharf serve daemon is using this machine credential; stop it before pairing again")
+		}
+		return nil, err
+	}
+	return lock, nil
 }
 
 func startBackgroundServe(stdout, stderr io.Writer) error {
@@ -273,10 +292,35 @@ func startBackgroundServe(stdout, stderr io.Writer) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start wharf serve: %w", err)
 	}
-	_, _ = fmt.Fprintf(stdout, "wharf serve started in the background (PID %d).\n", cmd.Process.Pid)
+	pid := cmd.Process.Pid
+	if err := waitForDaemonStartup(pid); err != nil {
+		return fmt.Errorf("wharf serve did not start: %w (logs: %s)", err, logPath)
+	}
+	_, _ = fmt.Fprintf(stdout, "wharf serve started in the background (PID %d).\n", pid)
 	_, _ = fmt.Fprintf(stdout, "Logs: %s\n", logPath)
 	_, _ = fmt.Fprintln(stdout, "Stop it with: wharf serve stop")
 	return nil
+}
+
+func waitForDaemonStartup(expectedPID int) error {
+	deadline := time.NewTimer(daemonStartupWait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(daemonStartupPollPeriod)
+	defer ticker.Stop()
+	for {
+		pid, err := readDaemonPID()
+		if err == nil && pid == expectedPID {
+			if processAlive(expectedPID) {
+				return nil
+			}
+			return errors.New("daemon exited during startup")
+		}
+		select {
+		case <-deadline.C:
+			return errors.New("daemon did not publish a live PID")
+		case <-ticker.C:
+		}
+	}
 }
 
 func stopDaemon(stdout io.Writer) error {
