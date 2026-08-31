@@ -300,8 +300,8 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			}
 		}
 		if daemonReadyPath() != "" {
-			if err := markDaemonReady(os.Getpid()); err != nil {
-				return fmt.Errorf("mark wharf serve ready: %w", err)
+			if err := markDaemonConnected(os.Getpid()); err != nil {
+				return fmt.Errorf("mark wharf serve connected: %w", err)
 			}
 		}
 		for _, claim := range claims {
@@ -320,7 +320,9 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 		// whose persisted handoff expired. The Hub remains authoritative: it only
 		// lists a Session after its adapter heartbeat has gone stale.
 		recoverable, recoverErr := listRecoverableMachineSessions(ctx, client, credential)
-		if recoverErr == nil {
+		if recoverErr != nil {
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: session recovery poll failed (%v); retrying in %s\n", recoverErr, cfg.PollInterval)
+		} else {
 			for _, session := range recoverable {
 				if session.SessionID == "" {
 					continue

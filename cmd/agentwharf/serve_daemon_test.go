@@ -61,6 +61,47 @@ func TestServeStopNotRunning(t *testing.T) {
 	}
 }
 
+func TestServeStatusReportsLockOwnerWhenPIDMetadataIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTWHARF_DAEMON_DIR", dir)
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(dir, "machine.json"))
+	lock, err := acquireServeDaemonLock()
+	if err != nil {
+		t.Fatalf("acquireServeDaemonLock: %v", err)
+	}
+	defer lock.Close()
+
+	var out strings.Builder
+	if err := statusDaemon(&out); err != nil {
+		t.Fatalf("statusDaemon: %v", err)
+	}
+	if !strings.Contains(out.String(), "process is running") || !strings.Contains(out.String(), "metadata is unavailable") {
+		t.Fatalf("statusDaemon output = %q", out.String())
+	}
+}
+
+func TestStartContenderPreservesLiveReadinessMetadata(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTWHARF_DAEMON_DIR", dir)
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(dir, "machine.json"))
+	lock, err := acquireServeDaemonLock()
+	if err != nil {
+		t.Fatalf("acquireServeDaemonLock: %v", err)
+	}
+	defer lock.Close()
+	if err := markDaemonReady(4242); err != nil {
+		t.Fatalf("markDaemonReady: %v", err)
+	}
+
+	err = startBackgroundServe(io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "holds the machine lock") {
+		t.Fatalf("startBackgroundServe error = %v", err)
+	}
+	if !daemonReady(4242) {
+		t.Fatal("contending start erased the live daemon readiness marker")
+	}
+}
+
 func TestServeUnknownArgument(t *testing.T) {
 	err := runServeCommand(context.Background(), []string{"bogus"}, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "unknown wharf serve argument") {
@@ -105,6 +146,53 @@ func TestDaemonAlreadyRunningRequiresReadiness(t *testing.T) {
 		t.Fatal("daemonAlreadyRunning = false after readiness")
 	}
 	removeDaemonReadyIfOwner(pid)
+}
+
+func TestMarkDaemonConnectedRestoresMissingPIDMetadata(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTWHARF_DAEMON_DIR", dir)
+	pid := os.Getpid()
+
+	if err := markDaemonConnected(pid); err != nil {
+		t.Fatalf("markDaemonConnected: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, daemonPIDFileName)); err != nil {
+		t.Fatalf("remove daemon PID metadata: %v", err)
+	}
+	if err := markDaemonConnected(pid); err != nil {
+		t.Fatalf("restore daemon metadata: %v", err)
+	}
+	if got, err := readDaemonPID(); err != nil || got != pid {
+		t.Fatalf("readDaemonPID = %d, %v; want %d", got, err, pid)
+	}
+	if !daemonReady(pid) {
+		t.Fatal("daemon readiness was not refreshed")
+	}
+}
+
+func TestServeStatusDoesNotCallAStaleReadinessMarkerConnected(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTWHARF_DAEMON_DIR", dir)
+	pid := os.Getpid()
+	if err := writeDaemonPID(pid); err != nil {
+		t.Fatalf("writeDaemonPID: %v", err)
+	}
+	if err := markDaemonReady(pid); err != nil {
+		t.Fatalf("markDaemonReady: %v", err)
+	}
+	readyPath := daemonReadyPath()
+	staleAt := time.Now().Add(-daemonReadyStaleAfter - time.Minute)
+	if err := os.Chtimes(readyPath, staleAt, staleAt); err != nil {
+		t.Fatalf("age readiness marker: %v", err)
+	}
+
+	var out strings.Builder
+	if err := statusDaemon(&out); err != nil {
+		t.Fatalf("statusDaemon: %v", err)
+	}
+	if !strings.Contains(out.String(), "running but not connected") {
+		t.Fatalf("statusDaemon output = %q", out.String())
+	}
 }
 
 func TestEnsureBackgroundDaemonNotPairedIsSilent(t *testing.T) {

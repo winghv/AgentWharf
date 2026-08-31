@@ -21,6 +21,7 @@ const (
 	daemonReadyFileEnv      = "AGENTWHARF_DAEMON_READY_FILE"
 	daemonStartupWait       = 10 * time.Second
 	daemonStartupPollPeriod = 25 * time.Millisecond
+	daemonReadyStaleAfter   = 2 * time.Minute
 )
 
 var errServeDaemonLocked = errors.New("another wharf serve daemon is already running for this machine credential")
@@ -89,6 +90,28 @@ func markDaemonReady(pid int) error {
 	return os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o600)
 }
 
+// markDaemonConnected refreshes both metadata files after an authenticated
+// machine poll, so a missing PID file self-heals while the lock owner is live.
+func markDaemonConnected(pid int) error {
+	if err := writeDaemonPID(pid); err != nil {
+		return err
+	}
+	return markDaemonReady(pid)
+}
+
+// resetDaemonReady runs only after the foreground process owns the credential
+// lock. A contender must never erase the live owner's readiness evidence.
+func resetDaemonReady() error {
+	path := daemonReadyPath()
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func removeDaemonReadyIfOwner(ownerPID int) {
 	path := daemonReadyPath()
 	if path == "" {
@@ -107,7 +130,11 @@ func daemonReady(pid int) bool {
 		return false
 	}
 	data, err := os.ReadFile(path)
-	return err == nil && strings.TrimSpace(string(data)) == strconv.Itoa(pid)
+	if err != nil || strings.TrimSpace(string(data)) != strconv.Itoa(pid) {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && time.Since(info.ModTime()) <= daemonReadyStaleAfter
 }
 
 func readDaemonPID() (int, error) {
@@ -235,6 +262,9 @@ func runForegroundServe(ctx context.Context, cfg machineServeConfig, stdout, std
 	}
 	defer lock.Close()
 	pid := os.Getpid()
+	if err := resetDaemonReady(); err != nil {
+		return fmt.Errorf("reset wharf serve readiness: %w", err)
+	}
 	if err := writeDaemonPID(pid); err != nil {
 		return fmt.Errorf("record wharf serve pid: %w", err)
 	}
@@ -249,11 +279,32 @@ func runForegroundServe(ctx context.Context, cfg machineServeConfig, stdout, std
 // daemonAlreadyRunning reports whether a live wharf serve daemon has
 // completed its authenticated startup handshake for the current state dir.
 func daemonAlreadyRunning() bool {
+	pid, running := daemonProcessRunning()
+	return running && daemonReady(pid)
+}
+
+func daemonProcessRunning() (int, bool) {
 	pid, err := readDaemonPID()
 	if err != nil || !processAlive(pid) {
-		return false
+		return 0, false
 	}
-	return daemonReady(pid)
+	return pid, true
+}
+
+// serveDaemonLockHeld detects a live daemon even when a legacy process lost
+// its PID/readiness files. The lock is the process-lifetime ownership proof.
+func serveDaemonLockHeld() (bool, error) {
+	lock, err := acquireServeDaemonLock()
+	if errors.Is(err, errServeDaemonLocked) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := lock.Close(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // isTestBinary reports whether the running executable is a go test binary, in
@@ -303,10 +354,19 @@ func acquirePairingReplacementLock() (*os.File, error) {
 }
 
 func startBackgroundServe(stdout, stderr io.Writer) error {
-	if daemonAlreadyRunning() {
-		pid, _ := readDaemonPID()
-		_, _ = fmt.Fprintf(stdout, "wharf serve is already running (PID %d).\n", pid)
-		return nil
+	if pid, running := daemonProcessRunning(); running {
+		if daemonReady(pid) {
+			_, _ = fmt.Fprintf(stdout, "wharf serve is already running and connected (PID %d).\n", pid)
+			return nil
+		}
+		return fmt.Errorf("wharf serve is running but not connected (PID %d); check %s", pid, mustDaemonLogPath())
+	}
+	locked, err := serveDaemonLockHeld()
+	if err != nil {
+		return fmt.Errorf("inspect wharf serve lock: %w", err)
+	}
+	if locked {
+		return fmt.Errorf("another wharf serve process holds the machine lock, but its PID metadata is unavailable; check %s", mustDaemonLogPath())
 	}
 	if err := ensurePaired(); err != nil {
 		return err
@@ -334,9 +394,6 @@ func startBackgroundServe(stdout, stderr io.Writer) error {
 	cmd.Stdin = nil
 	readyPath := filepath.Join(filepath.Dir(logPath), ".wharf-serve-ready")
 	cmd.Env = append(os.Environ(), daemonReadyFileEnv+"="+readyPath)
-	if err := os.Remove(readyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("reset wharf serve readiness: %w", err)
-	}
 	if err := detachBackgroundCommand(cmd); err != nil {
 		return fmt.Errorf("start wharf serve in background: %w", err)
 	}
@@ -379,6 +436,13 @@ func stopDaemon(stdout io.Writer) error {
 	pid, err := readDaemonPID()
 	if err != nil {
 		if errors.Is(err, errDaemonNotRunning) {
+			locked, lockErr := serveDaemonLockHeld()
+			if lockErr != nil {
+				return fmt.Errorf("inspect wharf serve lock: %w", lockErr)
+			}
+			if locked {
+				return fmt.Errorf("wharf serve process holds the machine lock, but its PID metadata is unavailable; identify it from %s", mustDaemonLogPath())
+			}
 			_, _ = fmt.Fprintln(stdout, "wharf serve is not running.")
 			return nil
 		}
@@ -400,17 +464,37 @@ func stopDaemon(stdout io.Writer) error {
 func statusDaemon(stdout io.Writer) error {
 	pid, err := readDaemonPID()
 	if err != nil {
-		if errors.Is(err, errDaemonNotRunning) {
-			_, _ = fmt.Fprintln(stdout, "wharf serve is not running.")
+		if !errors.Is(err, errDaemonNotRunning) {
+			return err
+		}
+		locked, lockErr := serveDaemonLockHeld()
+		if lockErr != nil {
+			return fmt.Errorf("inspect wharf serve lock: %w", lockErr)
+		}
+		if locked {
+			_, _ = fmt.Fprintf(stdout, "wharf serve process is running, but its PID/readiness metadata is unavailable (logs: %s).\n", mustDaemonLogPath())
 			return nil
 		}
-		return err
+		_, _ = fmt.Fprintln(stdout, "wharf serve is not running.")
+		return nil
 	}
 	if !processAlive(pid) {
 		removeDaemonPIDIfOwner(pid)
 		_, _ = fmt.Fprintln(stdout, "wharf serve is not running (stale pid removed).")
 		return nil
 	}
-	_, _ = fmt.Fprintf(stdout, "wharf serve is running (PID %d).\n", pid)
+	if !daemonReady(pid) {
+		_, _ = fmt.Fprintf(stdout, "wharf serve is running but not connected (PID %d; logs: %s).\n", pid, mustDaemonLogPath())
+		return nil
+	}
+	_, _ = fmt.Fprintf(stdout, "wharf serve is running and connected (PID %d).\n", pid)
 	return nil
+}
+
+func mustDaemonLogPath() string {
+	path, err := daemonLogPath()
+	if err != nil {
+		return daemonLogFileName
+	}
+	return path
 }
