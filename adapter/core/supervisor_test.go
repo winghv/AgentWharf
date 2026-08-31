@@ -274,6 +274,17 @@ func TestProcessSupervisorProviderDoesNotInheritAdapterEnvironment(t *testing.T)
 	}
 }
 
+func TestSafeProviderEnvNameAllowsApprovedProviderCredentials(t *testing.T) {
+	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"} {
+		if !safeProviderEnvName(name) {
+			t.Fatalf("safeProviderEnvName(%q) = false, want true (approved provider credential)", name)
+		}
+	}
+	if safeProviderEnvName("DEEPSEEK_SECRET") || safeProviderEnvName("OPENAI_API_KEY") {
+		t.Fatal("unapproved credential names must stay rejected")
+	}
+}
+
 func TestSafeProviderEnvNameRejectsArbitrarySensitiveHelpers(t *testing.T) {
 	for _, name := range []string{"MY_SECRET_HELPER", "API_TOKEN_HELPER", "AGENTWHARF_SECRET_HELPER"} {
 		if safeProviderEnvName(name) {
