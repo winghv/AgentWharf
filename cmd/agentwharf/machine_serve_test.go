@@ -301,6 +301,29 @@ func TestMachineServeDispatchesAutoClaimEndToEnd(t *testing.T) {
 	}
 }
 
+func TestMachineServeDoesNotExchangeAnOwnedSessionAgain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	setupServeTestEnv(t)
+
+	hub := newServeTestHub(t, ctx, "ses_auto")
+	t.Cleanup(hub.Server.Close)
+	controlPlane, _, exchanges, _ := newServeTestControlPlane(t, "ws"+strings.TrimPrefix(hub.Server.URL, "http"), "ses_auto", 100, false)
+	if err := saveMachineCredential(machineCredential{MachineID: "machine_serve", MachineToken: "machine-token", CloudAPIURL: controlPlane.URL, HubWSURL: "ws://unused.invalid", ExpiresAt: time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)}); err != nil {
+		t.Fatalf("save machine credential: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := runWithInput(ctx, []string{"serve", "--foreground", "--poll-interval", "1"}, strings.NewReader(""), &stdout, &stderr)
+	if err != nil && !strings.Contains(err.Error(), context.Canceled.Error()) && !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("machine serve duplicate claim guard: %v stderr=%q", err, stderr.String())
+	}
+	if exchanges.Load() != 1 {
+		t.Fatalf("exchanges = %d, want exactly one while Session is owned", exchanges.Load())
+	}
+}
+
 func TestMachineServeRetriesWhileSessionIsStarting(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()

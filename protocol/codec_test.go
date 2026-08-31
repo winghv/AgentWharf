@@ -301,6 +301,34 @@ func TestSettingsCapabilityPayloadRejectsNonCanonicalChoices(t *testing.T) {
 	}
 }
 
+func TestSettingsCapabilityV2NormalizesNilReasoningEffortsToEmptyArray(t *testing.T) {
+	capability := SettingsCapabilityPayload{
+		SchemaVersion:                 SettingsCapabilitySchemaVersion,
+		Models:                        []SettingsCapabilityChoice{{ID: "gpt-5", Label: "GPT-5"}},
+		PermissionModes:               []SettingsCapabilityChoice{{ID: "auto", Label: "Auto"}},
+		EffectiveModelID:              "gpt-5",
+		EffectivePermissionModeID:     "auto",
+		ModelChange:                   "read_only",
+		ReasoningEffortChange:         "unsupported",
+		PermissionChange:              "read_only",
+		ModelReadOnlyReason:           settingsTestString("provider_read_only"),
+		ReasoningEffortReadOnlyReason: settingsTestString("provider_unsupported"),
+		PermissionReadOnlyReason:      settingsTestString("provider_read_only"),
+	}
+	capability.Fingerprint = SettingsCapabilityFingerprint(capability)
+	payload, err := json.Marshal(capability)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), `"reasoning_efforts":null`) {
+		t.Fatalf("nil reasoning efforts were encoded as null: %s", payload)
+	}
+	decoded, err := DecodeSettingsCapabilityPayload(payload)
+	if err != nil || len(decoded.ReasoningEfforts) != 0 {
+		t.Fatalf("normalized unsupported reasoning capability = %+v, %v", decoded, err)
+	}
+}
+
 func TestSettingsCapabilityV2CarriesOnlyProviderConfirmedReasoningEfforts(t *testing.T) {
 	effectiveReasoning := "high"
 	capability := SettingsCapabilityPayload{

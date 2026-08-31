@@ -402,6 +402,10 @@ func (p SettingsCapabilityPayload) MarshalJSON() ([]byte, error) {
 			p.PermissionChange, p.ModelReadOnlyReason, p.PermissionReadOnlyReason,
 		})
 	}
+	reasoningEfforts := p.ReasoningEfforts
+	if reasoningEfforts == nil {
+		reasoningEfforts = []SettingsCapabilityChoice{}
+	}
 	type v2 struct {
 		SchemaVersion                 int                        `json:"schema_version"`
 		Fingerprint                   string                     `json:"fingerprint"`
@@ -418,7 +422,22 @@ func (p SettingsCapabilityPayload) MarshalJSON() ([]byte, error) {
 		ReasoningEffortReadOnlyReason *string                    `json:"reasoning_effort_read_only_reason"`
 		PermissionReadOnlyReason      *string                    `json:"permission_read_only_reason"`
 	}
-	return json.Marshal(v2(p))
+	return json.Marshal(v2{
+		SchemaVersion:                 p.SchemaVersion,
+		Fingerprint:                   p.Fingerprint,
+		Models:                        p.Models,
+		ReasoningEfforts:              reasoningEfforts,
+		PermissionModes:               p.PermissionModes,
+		EffectiveModelID:              p.EffectiveModelID,
+		EffectiveReasoningEffortID:    p.EffectiveReasoningEffortID,
+		EffectivePermissionModeID:     p.EffectivePermissionModeID,
+		ModelChange:                   p.ModelChange,
+		ReasoningEffortChange:         p.ReasoningEffortChange,
+		PermissionChange:              p.PermissionChange,
+		ModelReadOnlyReason:           p.ModelReadOnlyReason,
+		ReasoningEffortReadOnlyReason: p.ReasoningEffortReadOnlyReason,
+		PermissionReadOnlyReason:      p.PermissionReadOnlyReason,
+	})
 }
 
 // SettingsEffectivePayload is the Adapter's bounded result proposal. The Hub

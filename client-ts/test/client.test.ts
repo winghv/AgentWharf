@@ -53,6 +53,40 @@ test('hydrates settings capability from historical events skipped by lastSeq rep
   assert.equal(update?.seq, 2)
 })
 
+test('accepts legacy null reasoning efforts for unsupported v2 capabilities', () => {
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws',
+    token: 'control-token',
+    sessions: [{ sessionId: 'ses_1', lastSeq: 0 }],
+    reconnect: false,
+  })
+  client.hydrateFromEvents([{
+    frame: 'event',
+    type: 'session.settings.capabilities',
+    session_id: 'ses_1',
+    seq: 1,
+    time: 1,
+    payload: {
+      schema_version: 2,
+      fingerprint: `sha256:${'cd'.repeat(32)}`,
+      models: [{ id: 'gpt-5', label: 'GPT-5' }],
+      reasoning_efforts: null,
+      permission_modes: [{ id: 'auto', label: 'Auto' }],
+      effective_model_id: 'gpt-5',
+      effective_reasoning_effort_id: null,
+      effective_permission_mode_id: 'auto',
+      model_change: 'read_only',
+      reasoning_effort_change: 'unsupported',
+      permission_change: 'read_only',
+      model_read_only_reason: 'provider_read_only',
+      reasoning_effort_read_only_reason: 'provider_unsupported',
+      permission_read_only_reason: 'provider_read_only',
+    },
+  }])
+  assert.deepEqual(client.settingsCapability('ses_1')?.capability.reasoningEfforts, [])
+  assert.equal(client.settingsCapability('ses_1')?.capability.reasoningEffortChange, 'unsupported')
+})
+
 test('encodes and decodes protocol frames', () => {
   const hello: HelloFrame = {
     frame: 'hello',

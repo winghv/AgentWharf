@@ -1389,11 +1389,14 @@ function decodeSettingsCapability(value: JsonValue): SettingsCapability {
       ...(permissionReadOnlyReason === undefined ? {} : { permissionReadOnlyReason }),
     }
   }
-  if (!Array.isArray(object.reasoning_efforts) ||
-    (object.reasoning_effort_change !== 'allowed' && object.reasoning_effort_change !== 'read_only' && object.reasoning_effort_change !== 'unsupported')) {
+  if ((object.reasoning_effort_change !== 'allowed' && object.reasoning_effort_change !== 'read_only' && object.reasoning_effort_change !== 'unsupported') ||
+    (object.reasoning_efforts !== null && !Array.isArray(object.reasoning_efforts)) ||
+    (object.reasoning_efforts === null && object.reasoning_effort_change !== 'unsupported')) {
     throw new Error('invalid settings capability event')
   }
-  const reasoningEfforts = object.reasoning_efforts.length === 0 ? [] : decodeSettingsChoices(object.reasoning_efforts, 16)
+  const reasoningEfforts = object.reasoning_efforts === null
+    ? []
+    : object.reasoning_efforts.length === 0 ? [] : decodeSettingsChoices(object.reasoning_efforts, 16)
   const effectiveReasoningEffortId = object.effective_reasoning_effort_id === null ? undefined : object.effective_reasoning_effort_id
   const reasoningEffortReadOnlyReason = optionalSettingsReason(object.reasoning_effort_read_only_reason)
   if (object.reasoning_effort_change === 'unsupported') {

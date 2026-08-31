@@ -42,6 +42,17 @@ type machineServeConfig struct {
 	StartupSmoke  bool
 }
 
+type machineServeLockedWriter struct {
+	mu sync.Mutex
+	io.Writer
+}
+
+func (w *machineServeLockedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Writer.Write(p)
+}
+
 type machineRecoveryGuard struct {
 	mu     sync.Mutex
 	active map[string]bool
@@ -202,6 +213,10 @@ func parseMachineServeConfig(args []string, stderr io.Writer) (machineServeConfi
 }
 
 func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr io.Writer) error {
+	// Polling and adapter workers report concurrently; serialize each stream so
+	// callers can safely provide ordinary writers such as bytes.Buffer.
+	stdout = &machineServeLockedWriter{Writer: stdout}
+	stderr = &machineServeLockedWriter{Writer: stderr}
 	credential, err := loadMachineCredential()
 	if err != nil {
 		return fmt.Errorf("load machine credential: %w", err)
@@ -305,7 +320,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			}
 		}
 		for _, claim := range claims {
-			if claim.ClaimID == "" || !claimActiveNow(claim) {
+			if claim.ClaimID == "" || !claimActiveNow(claim) || !recoveryGuard.claim(claim.SessionID) {
 				continue
 			}
 			workers.Add(1)
@@ -313,7 +328,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				defer workers.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				dispatchClaim(serveCtx, cfg, client, machineCred, claim, stdout, stderr, &adapters)
+				dispatchClaim(serveCtx, cfg, client, machineCred, claim, stdout, stderr, &adapters, recoveryGuard)
 			}(claim, credential)
 		}
 		// Recover Sessions created by an older local `wharf claude` invocation or
@@ -373,17 +388,21 @@ func machineServePollRetryMessage(err error, interval time.Duration) string {
 }
 
 // dispatchClaim exchanges one pending auto claim and runs the dispatch.
-func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, claim machinePendingClaim, stdout, stderr io.Writer, adapters *sync.WaitGroup) {
+func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, claim machinePendingClaim, stdout, stderr io.Writer, adapters *sync.WaitGroup, recoveryGuard *machineRecoveryGuard) {
 	handoff, err := exchangeAutoMachineClaim(ctx, client, credential, claim)
 	if err != nil {
+		recoveryGuard.release(claim.SessionID)
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: exchange claim %s: %v\n", claim.ClaimID, err)
 		return
 	}
 	if err := saveMachineDispatch(*handoff); err != nil {
+		recoveryGuard.release(claim.SessionID)
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist dispatch %s: %v\n", claim.ClaimID, err)
 		return
 	}
-	dispatchOutcome(ctx, cfg, handoff, stdout, stderr, adapters, nil)
+	dispatchOutcome(ctx, cfg, handoff, stdout, stderr, adapters, func() {
+		recoveryGuard.release(claim.SessionID)
+	})
 }
 
 func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, adapters *sync.WaitGroup, onAdapterDone func()) {
