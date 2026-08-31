@@ -3154,8 +3154,67 @@ func TestProviderChildEnvironmentRejectsShortDeepSeekCredential(t *testing.T) {
 	}
 }
 
-func TestProviderChildEnvironmentLeavesOtherProvidersEmpty(t *testing.T) {
-	env, err := providerChildEnvironment(wrapConfig{Provider: "codex", SecretDir: "/unused"}, []string{"DEEPSEEK_API_KEY=/tmp/unused"})
+func TestProviderChildEnvironmentBuildsCodexResponsesConfig(t *testing.T) {
+	secretDir := t.TempDir()
+	apiKeyPath := filepath.Join(secretDir, "codex_api_key")
+	baseURLPath := filepath.Join(secretDir, "codex_base_url")
+	modelPath := filepath.Join(secretDir, "codex_model")
+	for path, value := range map[string]string{
+		apiKeyPath:  "test-codex-api-key\n",
+		baseURLPath: "https://responses.example.test/v1\n",
+		modelPath:   "gpt-custom\n",
+	} {
+		if err := os.WriteFile(path, []byte(value), 0o400); err != nil {
+			t.Fatalf("write Codex config: %v", err)
+		}
+	}
+	env, err := providerChildEnvironment(wrapConfig{Provider: "codex", SecretDir: secretDir}, []string{
+		"OPENAI_API_KEY=" + apiKeyPath,
+		"OPENAI_BASE_URL=" + baseURLPath,
+		"CODEX_MODEL=" + modelPath,
+	})
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	if environmentValue(env, "OPENAI_API_KEY") != "test-codex-api-key" ||
+		environmentValue(env, "MODEL_PROVIDER") != "superwhv-profile" ||
+		environmentValue(env, "NO_BROWSER") != "1" {
+		t.Fatalf("child env = %v", env)
+	}
+	var config map[string]any
+	if err := json.Unmarshal([]byte(environmentValue(env, "CODEX_CONFIG")), &config); err != nil {
+		t.Fatalf("decode CODEX_CONFIG: %v", err)
+	}
+	if config["model"] != "gpt-custom" {
+		t.Fatalf("CODEX_CONFIG model = %v, want gpt-custom", config["model"])
+	}
+	providers, ok := config["model_providers"].(map[string]any)
+	if !ok {
+		t.Fatalf("CODEX_CONFIG providers = %#v", config["model_providers"])
+	}
+	profile, ok := providers["superwhv-profile"].(map[string]any)
+	if !ok || profile["base_url"] != "https://responses.example.test/v1" || profile["wire_api"] != "responses" {
+		t.Fatalf("CODEX_CONFIG profile = %#v", providers["superwhv-profile"])
+	}
+}
+
+func TestProviderChildEnvironmentRejectsCodexModelOutsideSecretDir(t *testing.T) {
+	secretDir := t.TempDir()
+	apiKeyPath := filepath.Join(secretDir, "codex_api_key")
+	if err := os.WriteFile(apiKeyPath, []byte("test-codex-api-key"), 0o400); err != nil {
+		t.Fatalf("write Codex API key: %v", err)
+	}
+	_, err := providerChildEnvironment(wrapConfig{Provider: "codex", SecretDir: secretDir}, []string{
+		"OPENAI_API_KEY=" + apiKeyPath,
+		"CODEX_MODEL=" + filepath.Join(t.TempDir(), "outside-model"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "CODEX_MODEL") {
+		t.Fatalf("providerChildEnvironment() error = %v, want CODEX_MODEL rejection", err)
+	}
+}
+
+func TestProviderChildEnvironmentLeavesUnknownProvidersEmpty(t *testing.T) {
+	env, err := providerChildEnvironment(wrapConfig{Provider: "unknown", SecretDir: "/unused"}, []string{"DEEPSEEK_API_KEY=/tmp/unused"})
 	if err != nil {
 		t.Fatalf("providerChildEnvironment() error = %v", err)
 	}

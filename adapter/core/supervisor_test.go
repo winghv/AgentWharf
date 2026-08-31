@@ -275,12 +275,12 @@ func TestProcessSupervisorProviderDoesNotInheritAdapterEnvironment(t *testing.T)
 }
 
 func TestSafeProviderEnvNameAllowsApprovedProviderCredentials(t *testing.T) {
-	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"} {
+	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"} {
 		if !safeProviderEnvName(name) {
 			t.Fatalf("safeProviderEnvName(%q) = false, want true (approved provider credential)", name)
 		}
 	}
-	if safeProviderEnvName("DEEPSEEK_SECRET") || safeProviderEnvName("OPENAI_API_KEY") {
+	if safeProviderEnvName("DEEPSEEK_SECRET") || safeProviderEnvName("OPENAI_SECRET") {
 		t.Fatal("unapproved credential names must stay rejected")
 	}
 }

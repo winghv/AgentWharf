@@ -2654,6 +2654,9 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 // otherwise passed through verbatim, so the sandbox environment stays
 // file-path-only for secrets.
 func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
+	if cfg.Provider == "codex" {
+		return codexProviderChildEnvironment(cfg.SecretDir, parent)
+	}
 	env := make([]string, 0, 4)
 	prefix, strictCredentials, minLengthCredential := providerCredentialEnvContract(cfg.Provider)
 	if prefix == "" || cfg.SecretDir == "" {
@@ -2680,10 +2683,56 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 	return env, nil
 }
 
-// providerCredentialEnvContract returns the env prefix a provider's child may
-// receive, the strict credentials that must resolve to files inside the
-// injected secret directory, and which of those requires the minimum secret
-// length (the API key, not a base URL).
+// codexProviderChildEnvironment translates file-path-only profile inputs into
+// codex-acp's API-key and fixed Responses provider configuration.
+func codexProviderChildEnvironment(secretDir string, parent []string) ([]string, error) {
+	apiKeyPath := environmentValue(parent, "OPENAI_API_KEY")
+	if secretDir == "" || apiKeyPath == "" {
+		return nil, nil
+	}
+	apiKey, err := readProviderCredentialFile(secretDir, apiKeyPath, true)
+	if err != nil {
+		return nil, fmt.Errorf("load OPENAI_API_KEY for provider child: %w", err)
+	}
+	config := make(map[string]any)
+	env := []string{
+		"OPENAI_API_KEY=" + apiKey,
+		"NO_BROWSER=1",
+		`DEFAULT_AUTH_REQUEST={"methodId":"api-key"}`,
+	}
+	if baseURLPath := environmentValue(parent, "OPENAI_BASE_URL"); baseURLPath != "" {
+		baseURL, err := readProviderCredentialFile(secretDir, baseURLPath, false)
+		if err != nil {
+			return nil, fmt.Errorf("load OPENAI_BASE_URL for provider child: %w", err)
+		}
+		const profileProvider = "superwhv-profile"
+		config["model_providers"] = map[string]any{
+			profileProvider: map[string]string{
+				"name": "SuperWHV profile", "base_url": baseURL,
+				"env_key": "OPENAI_API_KEY", "wire_api": "responses",
+			},
+		}
+		env = append(env, "MODEL_PROVIDER="+profileProvider)
+	}
+	if modelPath := environmentValue(parent, "CODEX_MODEL"); modelPath != "" {
+		model, ok := readProviderConfigFile(secretDir, modelPath)
+		if !ok || strings.TrimSpace(model) == "" {
+			return nil, errors.New("load CODEX_MODEL for provider child: model must be a bounded regular file inside the injected secret directory")
+		}
+		config["model"] = strings.TrimSpace(model)
+	}
+	if len(config) > 0 {
+		data, err := json.Marshal(config)
+		if err != nil {
+			return nil, fmt.Errorf("marshal Codex provider config: %w", err)
+		}
+		env = append(env, "CODEX_CONFIG="+string(data))
+	}
+	return env, nil
+}
+
+// providerCredentialEnvContract defines the file-loading contract for
+// prefix-based Claude and DeepSeek child environments.
 func providerCredentialEnvContract(provider string) (prefix string, strict map[string]bool, minLengthCredential string) {
 	switch provider {
 	case "claude-code":
@@ -2695,8 +2744,8 @@ func providerCredentialEnvContract(provider string) (prefix string, strict map[s
 	}
 }
 
-// readProviderConfigFile loads an ANTHROPIC_* configuration file inside the
-// secret directory without the credential minimum length; it reports false
+// readProviderConfigFile loads approved non-credential configuration inside
+// the secret directory without the credential minimum length; it reports false
 // when the value is not a bounded regular file inside that directory so the
 // value can pass through verbatim.
 func readProviderConfigFile(secretDir string, valuePath string) (string, bool) {
