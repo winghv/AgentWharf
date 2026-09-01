@@ -274,6 +274,96 @@ func (q *Queries) PrepareAdapterCredentialRotation(ctx context.Context, arg Prep
 	return i, err
 }
 
+const recoverAdapterCredential = `-- name: RecoverAdapterCredential :one
+WITH inserted AS (
+  INSERT INTO session_adapter_connections (
+      session_id, connection_epoch, accepted_fence, active_credential_generation,
+      credential_generation_high_watermark, active_credential_expires_at
+  )
+  SELECT $1, 0, 0, 1, 1, $2
+  WHERE $3::TIMESTAMPTZ > clock_timestamp()
+    AND $2::TIMESTAMPTZ > $3::TIMESTAMPTZ
+  ON CONFLICT (session_id) DO NOTHING
+  RETURNING session_id, connection_epoch, accepted_fence, active_credential_generation, credential_generation_high_watermark, active_credential_expires_at, pending_credential_generation, pending_credential_expires_at, prior_recovery_credential_generation, rotation_id, revoked_at, terminal_at, created_at, updated_at
+), locked AS MATERIALIZED (
+  SELECT connection.session_id, connection.connection_epoch, connection.accepted_fence, connection.active_credential_generation, connection.credential_generation_high_watermark, connection.active_credential_expires_at, connection.pending_credential_generation, connection.pending_credential_expires_at, connection.prior_recovery_credential_generation, connection.rotation_id, connection.revoked_at, connection.terminal_at, connection.created_at, connection.updated_at FROM session_adapter_connections connection
+  WHERE connection.session_id = $1
+    AND NOT EXISTS (SELECT 1 FROM inserted)
+  FOR UPDATE
+), recovered AS (
+  UPDATE session_adapter_connections AS connection
+  SET prior_recovery_credential_generation = connection.active_credential_generation,
+      active_credential_generation = connection.credential_generation_high_watermark + 1,
+      credential_generation_high_watermark = connection.credential_generation_high_watermark + 1,
+      active_credential_expires_at = $2,
+      pending_credential_generation = NULL,
+      pending_credential_expires_at = NULL,
+      rotation_id = NULL,
+      updated_at = clock_timestamp()
+  WHERE connection.session_id = $1
+    AND EXISTS (SELECT 1 FROM locked)
+    AND connection.active_credential_expires_at <= $3::TIMESTAMPTZ
+    AND $3::TIMESTAMPTZ > clock_timestamp()
+    AND $2::TIMESTAMPTZ > $3::TIMESTAMPTZ
+    AND connection.revoked_at IS NULL AND connection.terminal_at IS NULL
+  RETURNING connection.session_id, connection.connection_epoch, connection.accepted_fence, connection.active_credential_generation, connection.credential_generation_high_watermark, connection.active_credential_expires_at, connection.pending_credential_generation, connection.pending_credential_expires_at, connection.prior_recovery_credential_generation, connection.rotation_id, connection.revoked_at, connection.terminal_at, connection.created_at, connection.updated_at
+)
+SELECT session_id, connection_epoch, accepted_fence, active_credential_generation, credential_generation_high_watermark, active_credential_expires_at, pending_credential_generation, pending_credential_expires_at, prior_recovery_credential_generation, rotation_id, revoked_at, terminal_at, created_at, updated_at FROM inserted
+UNION ALL
+SELECT session_id, connection_epoch, accepted_fence, active_credential_generation, credential_generation_high_watermark, active_credential_expires_at, pending_credential_generation, pending_credential_expires_at, prior_recovery_credential_generation, rotation_id, revoked_at, terminal_at, created_at, updated_at FROM recovered
+UNION ALL
+SELECT locked.session_id, locked.connection_epoch, locked.accepted_fence, locked.active_credential_generation, locked.credential_generation_high_watermark, locked.active_credential_expires_at, locked.pending_credential_generation, locked.pending_credential_expires_at, locked.prior_recovery_credential_generation, locked.rotation_id, locked.revoked_at, locked.terminal_at, locked.created_at, locked.updated_at FROM locked
+WHERE locked.active_credential_expires_at > $3::TIMESTAMPTZ
+  AND locked.revoked_at IS NULL AND locked.terminal_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM recovered)
+LIMIT 1
+`
+
+type RecoverAdapterCredentialParams struct {
+	SessionID       string
+	ActiveExpiresAt pgtype.Timestamptz
+	RefreshBefore   pgtype.Timestamptz
+}
+
+type RecoverAdapterCredentialRow struct {
+	SessionID                         string
+	ConnectionEpoch                   int64
+	AcceptedFence                     int64
+	ActiveCredentialGeneration        int64
+	CredentialGenerationHighWatermark int64
+	ActiveCredentialExpiresAt         pgtype.Timestamptz
+	PendingCredentialGeneration       pgtype.Int8
+	PendingCredentialExpiresAt        pgtype.Timestamptz
+	PriorRecoveryCredentialGeneration pgtype.Int8
+	RotationID                        pgtype.Text
+	RevokedAt                         pgtype.Timestamptz
+	TerminalAt                        pgtype.Timestamptz
+	CreatedAt                         pgtype.Timestamptz
+	UpdatedAt                         pgtype.Timestamptz
+}
+
+func (q *Queries) RecoverAdapterCredential(ctx context.Context, arg RecoverAdapterCredentialParams) (RecoverAdapterCredentialRow, error) {
+	row := q.db.QueryRow(ctx, recoverAdapterCredential, arg.SessionID, arg.ActiveExpiresAt, arg.RefreshBefore)
+	var i RecoverAdapterCredentialRow
+	err := row.Scan(
+		&i.SessionID,
+		&i.ConnectionEpoch,
+		&i.AcceptedFence,
+		&i.ActiveCredentialGeneration,
+		&i.CredentialGenerationHighWatermark,
+		&i.ActiveCredentialExpiresAt,
+		&i.PendingCredentialGeneration,
+		&i.PendingCredentialExpiresAt,
+		&i.PriorRecoveryCredentialGeneration,
+		&i.RotationID,
+		&i.RevokedAt,
+		&i.TerminalAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const refreshAdapterCredentialBeforeHello = `-- name: RefreshAdapterCredentialBeforeHello :one
 WITH locked AS MATERIALIZED (
   SELECT connection.session_id, connection.connection_epoch, connection.accepted_fence, connection.active_credential_generation, connection.credential_generation_high_watermark, connection.active_credential_expires_at, connection.pending_credential_generation, connection.pending_credential_expires_at, connection.prior_recovery_credential_generation, connection.rotation_id, connection.revoked_at, connection.terminal_at, connection.created_at, connection.updated_at FROM session_adapter_connections connection

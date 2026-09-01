@@ -54,6 +54,50 @@ WHERE locked.active_credential_generation = sqlc.arg(expected_active_generation)
   AND NOT EXISTS (SELECT 1 FROM refreshed)
 LIMIT 1;
 
+-- name: RecoverAdapterCredential :one
+WITH inserted AS (
+  INSERT INTO session_adapter_connections (
+      session_id, connection_epoch, accepted_fence, active_credential_generation,
+      credential_generation_high_watermark, active_credential_expires_at
+  )
+  SELECT sqlc.arg(session_id), 0, 0, 1, 1, sqlc.arg(active_expires_at)
+  WHERE sqlc.arg(refresh_before)::TIMESTAMPTZ > clock_timestamp()
+    AND sqlc.arg(active_expires_at)::TIMESTAMPTZ > sqlc.arg(refresh_before)::TIMESTAMPTZ
+  ON CONFLICT (session_id) DO NOTHING
+  RETURNING *
+), locked AS MATERIALIZED (
+  SELECT connection.* FROM session_adapter_connections connection
+  WHERE connection.session_id = sqlc.arg(session_id)
+    AND NOT EXISTS (SELECT 1 FROM inserted)
+  FOR UPDATE
+), recovered AS (
+  UPDATE session_adapter_connections AS connection
+  SET prior_recovery_credential_generation = connection.active_credential_generation,
+      active_credential_generation = connection.credential_generation_high_watermark + 1,
+      credential_generation_high_watermark = connection.credential_generation_high_watermark + 1,
+      active_credential_expires_at = sqlc.arg(active_expires_at),
+      pending_credential_generation = NULL,
+      pending_credential_expires_at = NULL,
+      rotation_id = NULL,
+      updated_at = clock_timestamp()
+  WHERE connection.session_id = sqlc.arg(session_id)
+    AND EXISTS (SELECT 1 FROM locked)
+    AND connection.active_credential_expires_at <= sqlc.arg(refresh_before)::TIMESTAMPTZ
+    AND sqlc.arg(refresh_before)::TIMESTAMPTZ > clock_timestamp()
+    AND sqlc.arg(active_expires_at)::TIMESTAMPTZ > sqlc.arg(refresh_before)::TIMESTAMPTZ
+    AND connection.revoked_at IS NULL AND connection.terminal_at IS NULL
+  RETURNING connection.*
+)
+SELECT * FROM inserted
+UNION ALL
+SELECT * FROM recovered
+UNION ALL
+SELECT locked.* FROM locked
+WHERE locked.active_credential_expires_at > sqlc.arg(refresh_before)::TIMESTAMPTZ
+  AND locked.revoked_at IS NULL AND locked.terminal_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM recovered)
+LIMIT 1;
+
 -- name: TerminateAdapterConnectionBeforeHello :one
 WITH locked AS MATERIALIZED (
   SELECT connection.* FROM session_adapter_connections connection

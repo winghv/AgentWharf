@@ -309,6 +309,14 @@ type AdapterCredentialPreHelloRefresh struct {
 	ActiveCredentialExpiresAt          time.Time
 }
 
+// AdapterCredentialRecovery reissues current authority while it has enough
+// lifetime to reconnect. Otherwise the Store advances beyond every issued
+// generation so expired active and pending credentials remain fenced.
+type AdapterCredentialRecovery struct {
+	RefreshBefore             time.Time
+	ActiveCredentialExpiresAt time.Time
+}
+
 type AdapterConnectionPreHelloTermination struct {
 	ExpectedActiveCredentialGeneration int64
 }
@@ -380,6 +388,12 @@ type AdapterConnectionStore interface {
 type AdapterConnectionTransactor interface {
 	AdapterConnectionStore
 	WithAdapterConnectionTransaction(ctx context.Context, fn func(AdapterConnectionStore) error) error
+}
+
+// AdapterCredentialRecoveryStore is an out-of-band recovery surface for a
+// trusted runtime authority. It never accepts a caller-selected generation.
+type AdapterCredentialRecoveryStore interface {
+	RecoverAdapterCredential(context.Context, string, AdapterCredentialRecovery) (AdapterConnection, error)
 }
 
 // AdapterConnectionAuthorityReceiptStore proves that the exact admission and

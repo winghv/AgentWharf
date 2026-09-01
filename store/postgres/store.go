@@ -2142,6 +2142,26 @@ func (s *Store) RefreshAdapterCredentialBeforeHello(ctx context.Context, session
 	return adapterConnection(db.SessionAdapterConnection(row)), nil
 }
 
+func (s *Store) RecoverAdapterCredential(ctx context.Context, sessionID string, recovery store.AdapterCredentialRecovery) (store.AdapterConnection, error) {
+	if !validConnectionID(sessionID) || recovery.RefreshBefore.IsZero() ||
+		!recovery.ActiveCredentialExpiresAt.After(recovery.RefreshBefore) {
+		return store.AdapterConnection{}, errors.New("invalid adapter credential recovery")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return store.AdapterConnection{}, err
+	}
+	row, err := queries.RecoverAdapterCredential(ctx, db.RecoverAdapterCredentialParams{
+		SessionID:       sessionID,
+		RefreshBefore:   pgtype.Timestamptz{Time: recovery.RefreshBefore, Valid: true},
+		ActiveExpiresAt: pgtype.Timestamptz{Time: recovery.ActiveCredentialExpiresAt, Valid: true},
+	})
+	if err != nil {
+		return store.AdapterConnection{}, fmt.Errorf("recover adapter credential: %w", err)
+	}
+	return adapterConnection(db.SessionAdapterConnection(row)), nil
+}
+
 func (s *Store) TerminateAdapterConnectionBeforeHello(ctx context.Context, sessionID string, termination store.AdapterConnectionPreHelloTermination) (store.AdapterConnection, error) {
 	if !validConnectionID(sessionID) || termination.ExpectedActiveCredentialGeneration < 1 {
 		return store.AdapterConnection{}, errors.New("invalid pre-hello adapter connection termination")

@@ -1506,6 +1506,103 @@ func TestAdapterConnectionInitializeExactRetry(t *testing.T) {
 	}
 }
 
+func TestAdapterCredentialRecoveryAdvancesExpiredLineageAndRetriesExactly(t *testing.T) {
+	ctx := context.Background()
+	harness := newPostgresConnectionHarness(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := harness.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
+		SessionID: "ses_recovery", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	original, err := harness.AcceptAdapterHello(ctx, "ses_recovery", store.AdapterHello{CredentialGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.pool.Exec(ctx, `UPDATE session_adapter_connections
+SET created_at = clock_timestamp() - interval '1 hour',
+    active_credential_generation = 34,
+    credential_generation_high_watermark = 35,
+    active_credential_expires_at = clock_timestamp() - interval '2 seconds',
+    pending_credential_generation = 35,
+    pending_credential_expires_at = clock_timestamp() - interval '1 second',
+    prior_recovery_credential_generation = 33,
+    rotation_id = 'stale-rotation'
+WHERE session_id = 'ses_recovery'`); err != nil {
+		t.Fatal(err)
+	}
+
+	recovery := store.AdapterCredentialRecovery{
+		RefreshBefore: now.Add(2 * time.Minute), ActiveCredentialExpiresAt: now.Add(15 * time.Minute),
+	}
+	recovered, err := harness.RecoverAdapterCredential(ctx, "ses_recovery", recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.ActiveCredentialGeneration != 36 || recovered.CredentialGenerationHighWatermark != 36 ||
+		recovered.PendingCredentialGeneration != nil || recovered.PendingCredentialExpiresAt != nil || recovered.RotationID != nil ||
+		recovered.PriorRecoveryGeneration == nil || *recovered.PriorRecoveryGeneration != 34 ||
+		recovered.ConnectionEpoch != original.ConnectionEpoch || recovered.AcceptedFence != original.AcceptedFence ||
+		!recovered.ActiveCredentialExpiresAt.Equal(recovery.ActiveCredentialExpiresAt) {
+		t.Fatalf("recovered connection = %+v", recovered)
+	}
+	retry, err := harness.RecoverAdapterCredential(ctx, "ses_recovery", recovery)
+	if err != nil || !reflect.DeepEqual(retry, recovered) {
+		t.Fatalf("exact recovery retry = %+v, %v; want %+v", retry, err, recovered)
+	}
+	if _, err := harness.AcceptAdapterHello(ctx, "ses_recovery", store.AdapterHello{CredentialGeneration: 34}); err == nil {
+		t.Fatal("fenced credential generation was accepted")
+	}
+	accepted, err := harness.AcceptAdapterHello(ctx, "ses_recovery", store.AdapterHello{CredentialGeneration: 36})
+	if err != nil || accepted.ConnectionEpoch != original.ConnectionEpoch+1 || accepted.AcceptedFence <= original.AcceptedFence {
+		t.Fatalf("recovered hello = %+v, %v", accepted, err)
+	}
+}
+
+func TestAdapterCredentialRecoveryReissuesLiveGeneration(t *testing.T) {
+	ctx := context.Background()
+	harness := newPostgresConnectionHarness(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	initial := store.AdapterConnectionInitialize{
+		SessionID: "ses_recovery_live", ActiveCredentialGeneration: 7,
+		ActiveCredentialExpiresAt: now.Add(10 * time.Minute),
+	}
+	if _, err := harness.InitializeAdapterConnection(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := harness.AcceptAdapterHello(ctx, initial.SessionID, store.AdapterHello{CredentialGeneration: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := harness.RecoverAdapterCredential(ctx, initial.SessionID, store.AdapterCredentialRecovery{
+		RefreshBefore: now.Add(2 * time.Minute), ActiveCredentialExpiresAt: now.Add(15 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(recovered, accepted) {
+		t.Fatalf("live recovery = %+v, want unchanged %+v", recovered, accepted)
+	}
+}
+
+func TestAdapterCredentialRecoveryInitializesMissingAuthority(t *testing.T) {
+	ctx := context.Background()
+	harness := newPostgresConnectionHarness(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	recovery := store.AdapterCredentialRecovery{
+		RefreshBefore: now.Add(2 * time.Minute), ActiveCredentialExpiresAt: now.Add(15 * time.Minute),
+	}
+	connection, err := harness.RecoverAdapterCredential(ctx, "ses_recovery_missing", recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connection.ActiveCredentialGeneration != 1 || connection.CredentialGenerationHighWatermark != 1 ||
+		connection.ConnectionEpoch != 0 || connection.AcceptedFence != 0 ||
+		!connection.ActiveCredentialExpiresAt.Equal(recovery.ActiveCredentialExpiresAt) {
+		t.Fatalf("initial recovery connection = %+v", connection)
+	}
+}
+
 func TestAdapterConnectionPreHelloLifecycle(t *testing.T) {
 	ctx := context.Background()
 	harness := newPostgresConnectionHarness(t)
