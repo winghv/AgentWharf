@@ -1510,6 +1510,9 @@ func TestAdapterCredentialRecoveryAdvancesExpiredLineageAndRetriesExactly(t *tes
 	ctx := context.Background()
 	harness := newPostgresConnectionHarness(t)
 	now := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ('ses_recovery')`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := harness.InitializeAdapterConnection(ctx, store.AdapterConnectionInitialize{
 		SessionID: "ses_recovery", ActiveCredentialGeneration: 1, ActiveCredentialExpiresAt: now.Add(time.Minute),
 	}); err != nil {
@@ -1567,6 +1570,9 @@ func TestAdapterCredentialRecoveryReissuesLiveGeneration(t *testing.T) {
 		SessionID: "ses_recovery_live", ActiveCredentialGeneration: 7,
 		ActiveCredentialExpiresAt: now.Add(10 * time.Minute),
 	}
+	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ($1)`, initial.SessionID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := harness.InitializeAdapterConnection(ctx, initial); err != nil {
 		t.Fatal(err)
 	}
@@ -1591,6 +1597,9 @@ func TestAdapterCredentialRecoveryInitializesMissingAuthority(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	recovery := store.AdapterCredentialRecovery{
 		RefreshBefore: now.Add(2 * time.Minute), ActiveCredentialExpiresAt: now.Add(15 * time.Minute),
+	}
+	if _, err := harness.pool.Exec(ctx, `INSERT INTO agent_sessions (id) VALUES ('ses_recovery_missing')`); err != nil {
+		t.Fatal(err)
 	}
 	connection, err := harness.RecoverAdapterCredential(ctx, "ses_recovery_missing", recovery)
 	if err != nil {
