@@ -73,7 +73,7 @@ func TestMapperMapsT0_5ACPFrames(t *testing.T) {
 
 	assertEvent(t, events[5], "session.message")
 	message := payloadMap(t, events[5])
-	if message["role"] != "agent" || message["message_id"] != "acp_ses_1" {
+	if message["role"] != "agent" || message["message_id"] != "acp-message-1" {
 		t.Fatalf("message payload = %+v", message)
 	}
 	if got := message["content"].([]any); len(got) != 1 || got[0].(map[string]any)["text"] != "pong" {
@@ -126,8 +126,23 @@ func TestMapperSupportsJSONRPCSessionUpdateEnvelope(t *testing.T) {
 	}
 	assertEvent(t, events[0], "session.message")
 	message := payloadMap(t, events[0])
-	if message["message_id"] != "acp_ses_1" {
+	if message["message_id"] != "acp-message-1" {
 		t.Fatalf("message payload = %+v", message)
+	}
+
+	next, err := mapper.MapLine([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"session_id":"acp_ses_1","update":{"type":"agent_message_chunk","text":"world"}}}`))
+	if err != nil {
+		t.Fatalf("MapLine(second) error = %v", err)
+	}
+	if len(next) != 1 {
+		t.Fatalf("second events = %+v, want one message", next)
+	}
+	second := payloadMap(t, next[0])
+	if second["message_id"] != "acp-message-2" {
+		t.Fatalf("second message payload = %+v", second)
+	}
+	if second["message_id"] == message["message_id"] {
+		t.Fatal("independent ACP replies reused the same message_id")
 	}
 }
 

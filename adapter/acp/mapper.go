@@ -36,9 +36,10 @@ type Config struct {
 }
 
 type Mapper struct {
-	sessionID string
-	provider  string
-	now       func() time.Time
+	sessionID       string
+	provider        string
+	now             func() time.Time
+	nextMessageID   uint64
 }
 
 func NewMapper(cfg Config) (*Mapper, error) {
@@ -233,7 +234,7 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		}
 		messageID := firstString(update, "message_id", "messageId", "id", "session_id", "sessionId")
 		if messageID == "" {
-			messageID = providerSessionID
+			messageID = m.nextMessageIDValue()
 		}
 		return m.messageEvents(messageID, text)
 	case "tool_use", "tool_call":
@@ -598,6 +599,11 @@ func (m *Mapper) messageEvents(messageID string, text string) []protocol.Event {
 	return splitMessageEvents(text, maxMessagePayloadBytes, func(part string) protocol.Event {
 		return m.messageEvent(messageID, part)
 	})
+}
+
+func (m *Mapper) nextMessageIDValue() string {
+	m.nextMessageID++
+	return fmt.Sprintf("acp-message-%d", m.nextMessageID)
 }
 
 func splitMessageEvents(text string, maxPayloadBytes int, event func(string) protocol.Event) []protocol.Event {

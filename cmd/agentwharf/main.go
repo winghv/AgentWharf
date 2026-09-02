@@ -2967,11 +2967,30 @@ func translateWrapInput(ctx context.Context, cfg wrapConfig, stdin io.Reader) ([
 func streamProviderOutput(ctx context.Context, cfg wrapConfig, stdout io.Reader, send func(protocol.Event) error) error {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var mapper *acp.Mapper
+	var translator *jsonstream.Translator
+	var err error
+	switch cfg.Format {
+	case "acp":
+		mapper, err = acp.NewMapper(acp.Config{SessionID: cfg.SessionID, Provider: cfg.Provider})
+	case "jsonstream":
+		translator, err = jsonstream.NewTranslator(jsonstream.Config{SessionID: cfg.SessionID, Provider: cfg.Provider})
+	default:
+		err = fmt.Errorf("unsupported wrap format %q", cfg.Format)
+	}
+	if err != nil {
+		return err
+	}
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		events, err := translateWrapLine(cfg, scanner.Bytes())
+		var events []protocol.Event
+		if mapper != nil {
+			events, err = mapper.MapLine(scanner.Bytes())
+		} else {
+			events, err = translator.TranslateLine(scanner.Bytes())
+		}
 		if err != nil {
 			return err
 		}
@@ -3081,6 +3100,10 @@ type acpPendingPermission struct {
 }
 
 func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio.Scanner, responses *acpResponseRouter, observe func([]byte, uint64) error, send func(protocol.Event) error) error {
+	mapper, err := acp.NewMapper(acp.Config{SessionID: cfg.SessionID, Provider: cfg.Provider})
+	if err != nil {
+		return err
+	}
 	var sourceSequence uint64
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -3096,7 +3119,7 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 				return err
 			}
 		}
-		events, err := translateWrapLine(cfg, line)
+		events, err := mapper.MapLine(line)
 		if err != nil {
 			return err
 		}
