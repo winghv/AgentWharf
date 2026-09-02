@@ -122,7 +122,13 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		}
 		_, _ = fmt.Fprintf(stdout, "wharf wrap sent events for session_id=%s provider=%s\n", effective.SessionID, effective.Provider)
 		return nil
-	case "claude", "codex", "dsh", "gemini":
+	case "dsh":
+		// DSH exposes ACP only; it has no local terminal/TUI surface that Wharf
+		// can drive. Keep the terminal command side-effect free and direct the
+		// user to the Workbench, where the ACP session is rendered.
+		_, _ = fmt.Fprintln(stdout, "DSH sessions are available in the Agent Workbench; closing this terminal command.")
+		return nil
+	case "claude", "codex", "gemini":
 		go maybePrintUpdateReminder(ctx, stderr)
 		cfg, err := parseAgentEntrypointConfig(args[0], args[1:], stderr)
 		if err != nil {

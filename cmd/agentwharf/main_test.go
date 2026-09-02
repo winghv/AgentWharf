@@ -3045,6 +3045,20 @@ func TestValidateDeepSeekOwnMachinePrerequisites(t *testing.T) {
 	}
 }
 
+func TestDSHEntrypointDirectsUsersToWorkbenchWithoutPairing(t *testing.T) {
+	stdout := new(bytes.Buffer)
+	stderr := new(bytes.Buffer)
+	if err := runWithInput(context.Background(), []string{"dsh"}, strings.NewReader(""), stdout, stderr); err != nil {
+		t.Fatalf("runWithInput(dsh) error = %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Agent Workbench") {
+		t.Fatalf("dsh output = %q, want Agent Workbench guidance", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "device_code") || strings.Contains(stderr.String(), "device_code") {
+		t.Fatalf("dsh unexpectedly started pairing: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
 func TestProviderForAgentMapsDSHToPlatformProvider(t *testing.T) {
 	if got := providerForAgent("dsh"); got != "deepseek-harness" {
 		t.Fatalf("providerForAgent(dsh) = %q, want deepseek-harness", got)
