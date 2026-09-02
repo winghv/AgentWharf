@@ -21,8 +21,10 @@ Prerequisites:
 
 - Access to [SuperWHV Console](https://cloud.superwhv.me/app/machines).
 - The agent you want to run is installed and authenticated on this machine.
+  `wharf dsh` installs its pinned runtime and bridge automatically; it still
+  requires your own `DEEPSEEK_API_KEY`.
 - Node.js 22 or newer and `npm` are available so the installer can install the
-  Claude and Codex ACP bridge wrappers used by `wharf claude` and `wharf codex`.
+  Claude, Codex, and DeepSeek Harness ACP bridges used by AgentWharf.
 
 Install Wharf on macOS or Linux:
 
@@ -43,8 +45,10 @@ it is missing. `install.sh` is a Unix shell script and must not be pasted into
 CMD or PowerShell; Git Bash detects Windows and prints the PowerShell command.
 
 The installer downloads the matching prebuilt binary from GitHub Releases,
-installs the `wharf` command, and installs the `claude-agent-acp` /
-`codex-acp` provider bridge wrappers.
+installs the `wharf` command, and installs the Claude/Codex ACP bridge wrappers
+plus the pinned DeepSeek Harness runtime, our `dsh-acp-activity` bridge, and a
+user-level DSH composition under `~/.agentwharf/providers/dsh/cordis.yml`.
+Set `AGENTWHARF_SKIP_DSH=1` only when DSH is intentionally not needed.
 
 Run the same install command again to upgrade. When `wharf` already exists on
 `PATH`, the installer upgrades that existing directory in place so the active
@@ -75,13 +79,35 @@ and safely retries durable events whose acknowledgement was lost. It exits when
 the user stops it or when the Session authority is explicitly rejected or
 terminated.
 
+Set the DeepSeek credential in the shell that will run Wharf. The API key is
+used only by the local DSH child process and is never sent to SuperWHV:
+
+```console
+$ export DEEPSEEK_API_KEY=your-deepseek-api-key
+# optional: export DEEPSEEK_BASE_URL=https://api.deepseek.com
+# optional: export DEEPSEEK_MODEL=deepseek-v4-flash
+```
+
+PowerShell:
+
+```powershell
+$env:DEEPSEEK_API_KEY = "your-deepseek-api-key"
+# optional: $env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+# optional: $env:DEEPSEEK_MODEL = "deepseek-v4-flash"
+```
+
 Start the agent you want to use:
 
 ```console
 $ wharf claude
 # or:
 $ wharf codex
+# or:
+$ wharf dsh
 ```
+
+`wharf dsh` automatically uses the installed user-level composition. No manual
+DSH bridge installation or system path configuration is required.
 
 The CLI prints a pairing prompt:
 

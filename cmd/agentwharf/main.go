@@ -59,8 +59,11 @@ const (
 )
 
 var (
-	errUnsafeDefaultToken = errors.New("default local tokens require a loopback listen address")
-	errClaimAuthRejection = errors.New("claim authentication rejected")
+	errUnsafeDefaultToken        = errors.New("default local tokens require a loopback listen address")
+	errClaimAuthRejection        = errors.New("claim authentication rejected")
+	errProviderCommandNotFound   = errors.New("provider command not found")
+	errProviderConfigNotFound    = errors.New("provider config not found")
+	errProviderCredentialMissing = errors.New("provider credential missing")
 )
 
 func main() {
@@ -656,6 +659,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 		Format:          "acp",
 		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
 		Managed:         managed,
+		ForceHeadless:   providerIsBridgeOnly(providerForAgent(agent)),
 		ProviderCommand: defaultProviderCommand(agent),
 	}
 	if cfg.Managed {
@@ -863,14 +867,50 @@ func defaultProviderCommand(agent string) []string {
 		// (under /usr/local so the image seed carries it), and the config
 		// resolves its plugins from the sibling global npm packages. The
 		// config carries the approved tool roster and sandbox/approval
-		// policy.
-		return []string{"dsh-acp-activity", "--config", "/usr/local/lib/dsh/cordis.yml"}
+		// policy. Own Machine installs use the user-level config; managed
+		// deployments provide the system-level fallback.
+		return []string{"dsh-acp-activity", "--config", defaultDSHConfigPath()}
 	default:
 		return []string{agent}
 	}
 }
 
+func defaultDSHConfigPath() string {
+	if configured := strings.TrimSpace(os.Getenv("AGENTWHARF_DSH_CONFIG")); configured != "" {
+		return configured
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		userConfig := filepath.Join(home, ".agentwharf", "providers", "dsh", "cordis.yml")
+		if _, err := os.Stat(userConfig); err == nil {
+			return userConfig
+		}
+	}
+	return "/usr/local/lib/dsh/cordis.yml"
+}
+
+func providerStartFailureReason(err error) string {
+	switch {
+	case errors.Is(err, errProviderCommandNotFound):
+		return "provider_command_unavailable"
+	case errors.Is(err, errProviderConfigNotFound):
+		return "provider_config_unavailable"
+	case errors.Is(err, errProviderCredentialMissing):
+		return "provider_credentials_unavailable"
+	default:
+		return "provider_start_failed"
+	}
+}
+
 func validateProviderCommand(cfg wrapConfig) error {
+	if cfg.Provider == "deepseek-harness" {
+		configPath := defaultDSHConfigPath()
+		if _, err := os.Stat(configPath); err != nil {
+			return fmt.Errorf("%w: DSH composition config %s is unavailable; run the AgentWharf installer again or set AGENTWHARF_DSH_CONFIG", errProviderConfigNotFound, configPath)
+		}
+		if cfg.SecretDir == "" && strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY")) == "" {
+			return fmt.Errorf("%w: set DEEPSEEK_API_KEY before running wharf dsh", errProviderCredentialMissing)
+		}
+	}
 	if len(cfg.ProviderCommand) == 0 {
 		return nil
 	}
@@ -880,7 +920,7 @@ func validateProviderCommand(cfg wrapConfig) error {
 	}
 	if _, err := exec.LookPath(command); err != nil {
 		if errors.Is(err, exec.ErrNotFound) {
-			return fmt.Errorf("provider command %s not found in PATH; install the Agent Client Protocol bridge or pass an explicit provider command", command)
+			return fmt.Errorf("%w: provider command %s not found in PATH; install the Agent Client Protocol bridge or pass an explicit provider command", errProviderCommandNotFound, command)
 		}
 		return fmt.Errorf("check provider command %s: %w", command, err)
 	}
@@ -2648,12 +2688,23 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 // legacy contract: their parent values must be bounded regular files inside
 // the injected secret directory. DEEPSEEK_API_KEY and DEEPSEEK_BASE_URL follow
 // the same contract for the deepseek-harness provider, whose child reads the
-// plaintext values directly. Any other ANTHROPIC_* or DEEPSEEK_* name
+// plaintext values directly. For Own Machine, the approved local DEEPSEEK_*
+// values are already user-controlled child-process environment and are passed
+// through without a SecretDir. Any other ANTHROPIC_* or DEEPSEEK_* name
 // (model mappings, custom headers from a provider configuration file) is
 // file-loaded when its value resolves inside the secret directory and
 // otherwise passed through verbatim, so the sandbox environment stays
-// file-path-only for secrets.
+// file-path-only for injected secrets.
 func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
+	if cfg.Provider == "deepseek-harness" && cfg.SecretDir == "" {
+		env := make([]string, 0, 4)
+		for _, name := range []string{"DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"} {
+			if value := environmentValue(parent, name); value != "" {
+				env = append(env, name+"="+value)
+			}
+		}
+		return env, nil
+	}
 	if cfg.Provider == "codex" {
 		return codexProviderChildEnvironment(cfg.SecretDir, parent)
 	}

@@ -447,6 +447,37 @@ func TestMachineRecoveryGuardReleasesAfterWorkerExit(t *testing.T) {
 	}
 }
 
+func TestReportMachineSessionStartFailure(t *testing.T) {
+	var gotAuthorization string
+	var gotPath string
+	var gotReason string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthorization = r.Header.Get("Authorization")
+		gotPath = r.URL.EscapedPath()
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode failure report: %v", err)
+		}
+		gotReason = payload["reason"]
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	credential := machineCredential{CloudAPIURL: server.URL, MachineToken: "machine-token"}
+	if err := reportMachineSessionStartFailure(context.Background(), server.Client(), credential, "session-provider-failure", "provider_command_unavailable"); err != nil {
+		t.Fatalf("reportMachineSessionStartFailure() error = %v", err)
+	}
+	if gotAuthorization != "Bearer machine-token" {
+		t.Fatalf("Authorization = %q, want machine bearer", gotAuthorization)
+	}
+	if gotPath != "/machine-sessions/session-provider-failure/end" {
+		t.Fatalf("path = %q, want session end path", gotPath)
+	}
+	if gotReason != "provider_command_unavailable" {
+		t.Fatalf("reason = %q, want provider_command_unavailable", gotReason)
+	}
+}
+
 func TestMachineServeRestartsOnlyFailedAdapters(t *testing.T) {
 	if machineServeAdapterShouldRestart(nil, true, 0) {
 		t.Fatal("clean adapter exit must remain terminal")
@@ -526,10 +557,11 @@ func TestParseMachineServeConfigRejectsInvalidArguments(t *testing.T) {
 }
 
 func TestServeWrapConfigMapsDeepSeekHarnessProvider(t *testing.T) {
+	t.Setenv("AGENTWHARF_DSH_CONFIG", "/tmp/agentwharf-test-dsh/cordis.yml")
 	handoff := machineServeDispatch{
-		SessionID:   "ses_dsh",
-		Provider:    "deepseek-harness",
-		HubWSURL:    "ws://hub.example.test/session",
+		SessionID: "ses_dsh",
+		Provider:  "deepseek-harness",
+		HubWSURL:  "ws://hub.example.test/session",
 	}
 	cfg := serveWrapConfig(handoff, false)
 	if cfg.Agent != "dsh" {
@@ -545,7 +577,7 @@ func TestServeWrapConfigMapsDeepSeekHarnessProvider(t *testing.T) {
 	if cfg.Provider != "deepseek-harness" {
 		t.Fatalf("provider = %q, want deepseek-harness", cfg.Provider)
 	}
-	want := []string{"dsh-acp-activity", "--config", "/usr/local/lib/dsh/cordis.yml"}
+	want := []string{"dsh-acp-activity", "--config", "/tmp/agentwharf-test-dsh/cordis.yml"}
 	if len(cfg.ProviderCommand) != len(want) {
 		t.Fatalf("provider command = %v, want %v", cfg.ProviderCommand, want)
 	}

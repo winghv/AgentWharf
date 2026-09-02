@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -3023,6 +3024,27 @@ func TestProviderChildEnvironmentRejectsCredentialTooShortToMask(t *testing.T) {
 	}
 }
 
+func TestValidateDeepSeekOwnMachinePrerequisites(t *testing.T) {
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "cordis.yml")
+	t.Setenv("AGENTWHARF_DSH_CONFIG", configPath)
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	cfg := wrapConfig{Provider: "deepseek-harness", ProviderCommand: []string{"true"}}
+	if err := validateProviderCommand(cfg); !errors.Is(err, errProviderConfigNotFound) {
+		t.Fatalf("missing DSH config error = %v, want errProviderConfigNotFound", err)
+	}
+	if err := os.WriteFile(configPath, []byte("config"), 0o600); err != nil {
+		t.Fatalf("write DSH config: %v", err)
+	}
+	if err := validateProviderCommand(cfg); !errors.Is(err, errProviderCredentialMissing) {
+		t.Fatalf("missing DSH credential error = %v, want errProviderCredentialMissing", err)
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "local-api-key")
+	if err := validateProviderCommand(cfg); err != nil {
+		t.Fatalf("valid DSH prerequisites error = %v", err)
+	}
+}
+
 func TestProviderForAgentMapsDSHToPlatformProvider(t *testing.T) {
 	if got := providerForAgent("dsh"); got != "deepseek-harness" {
 		t.Fatalf("providerForAgent(dsh) = %q, want deepseek-harness", got)
@@ -3032,7 +3054,21 @@ func TestProviderForAgentMapsDSHToPlatformProvider(t *testing.T) {
 	}
 }
 
+func TestParseDSHEntrypointForcesACPHeadlessMode(t *testing.T) {
+	cfg, err := parseAgentEntrypointConfig("dsh", nil, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseAgentEntrypointConfig(dsh) error = %v", err)
+	}
+	if !cfg.ForceHeadless {
+		t.Fatal("DSH entrypoint must force ACP headless mode")
+	}
+	if cfg.Provider != "deepseek-harness" {
+		t.Fatalf("provider = %q, want deepseek-harness", cfg.Provider)
+	}
+}
+
 func TestParseWrapConfigDefaultsBridgeCommandFromProvider(t *testing.T) {
+	t.Setenv("AGENTWHARF_DSH_CONFIG", "/tmp/agentwharf-test-dsh/cordis.yml")
 	cfg, err := parseWrapConfig([]string{"--provider", "deepseek-harness", "--acp"}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("parseWrapConfig() error = %v", err)
@@ -3040,7 +3076,7 @@ func TestParseWrapConfigDefaultsBridgeCommandFromProvider(t *testing.T) {
 	if cfg.Agent != "dsh" {
 		t.Fatalf("agent = %q, want dsh", cfg.Agent)
 	}
-	want := []string{"dsh-acp-activity", "--config", "/usr/local/lib/dsh/cordis.yml"}
+	want := []string{"dsh-acp-activity", "--config", "/tmp/agentwharf-test-dsh/cordis.yml"}
 	if len(cfg.ProviderCommand) != len(want) {
 		t.Fatalf("provider command = %v, want %v", cfg.ProviderCommand, want)
 	}
@@ -3078,9 +3114,10 @@ func TestAgentForProviderMapsPlatformIDs(t *testing.T) {
 	}
 }
 
-func TestDefaultProviderCommandDSHUsesShippedComposition(t *testing.T) {
+func TestDefaultProviderCommandDSHUsesConfiguredComposition(t *testing.T) {
+	t.Setenv("AGENTWHARF_DSH_CONFIG", "/tmp/agentwharf-test-dsh/cordis.yml")
 	got := defaultProviderCommand("dsh")
-	want := []string{"dsh-acp-activity", "--config", "/usr/local/lib/dsh/cordis.yml"}
+	want := []string{"dsh-acp-activity", "--config", "/tmp/agentwharf-test-dsh/cordis.yml"}
 	if len(got) != len(want) {
 		t.Fatalf("defaultProviderCommand(dsh) = %v, want %v", got, want)
 	}
@@ -3088,6 +3125,27 @@ func TestDefaultProviderCommandDSHUsesShippedComposition(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("defaultProviderCommand(dsh)[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestProviderChildEnvironmentForwardsLocalDeepSeekCredentials(t *testing.T) {
+	parent := []string{
+		"DEEPSEEK_API_KEY=local-api-key",
+		"DEEPSEEK_BASE_URL=https://api.deepseek.example",
+		"DEEPSEEK_MODEL=deepseek-v4-pro",
+		"DEEPSEEK_UNAPPROVED=should-not-pass",
+	}
+	env, err := providerChildEnvironment(wrapConfig{Provider: "deepseek-harness"}, parent)
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	want := []string{
+		"DEEPSEEK_API_KEY=local-api-key",
+		"DEEPSEEK_BASE_URL=https://api.deepseek.example",
+		"DEEPSEEK_MODEL=deepseek-v4-pro",
+	}
+	if !reflect.DeepEqual(env, want) {
+		t.Fatalf("provider child env = %v, want %v", env, want)
 	}
 }
 

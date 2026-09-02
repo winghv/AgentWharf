@@ -160,6 +160,8 @@ type machineAutoExchangeResponse struct {
 	} `json:"data"`
 }
 
+type machineSessionFailureReporter func(context.Context, string, string) error
+
 type machineTokenRefreshEnvelope struct {
 	Data struct {
 		Machine struct {
@@ -259,8 +261,11 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 		if !recoveryGuard.claim(handoff.SessionID) {
 			continue
 		}
+		reportFailure := machineSessionFailureReporter(func(reportCtx context.Context, sessionID, reason string) error {
+			return reportMachineSessionStartFailure(reportCtx, client, credential, sessionID, reason)
+		})
 		workers.Add(1)
-		go func(handoff machineServeDispatch) {
+		go func(handoff machineServeDispatch, reportFailure machineSessionFailureReporter) {
 			defer workers.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -270,13 +275,13 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				onDone := func() {
 					recoveryGuard.release(handoff.SessionID)
 				}
-				keepAdapterAlive(serveCtx, cfg, &handoff, stdout, stderr, onDone)
+				keepAdapterAlive(serveCtx, cfg, &handoff, stdout, stderr, onDone, reportFailure)
 				return
 			}
 			dispatchOutcome(serveCtx, cfg, &handoff, stdout, stderr, &adapters, func() {
 				recoveryGuard.release(handoff.SessionID)
-			})
-		}(handoff)
+			}, reportFailure)
+		}(handoff, reportFailure)
 	}
 
 	poll := time.NewTicker(cfg.PollInterval)
@@ -349,7 +354,10 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				go func(session machineRecoverableSession, machineCred machineCredential) {
 					defer workers.Done()
 					defer recoveryGuard.release(session.SessionID)
-					dispatchRecovery(serveCtx, cfg, client, machineCred, session, stdout, stderr, &adapters)
+					reportFailure := machineSessionFailureReporter(func(reportCtx context.Context, sessionID, reason string) error {
+						return reportMachineSessionStartFailure(reportCtx, client, machineCred, sessionID, reason)
+					})
+					dispatchRecovery(serveCtx, cfg, client, machineCred, session, stdout, stderr, &adapters, reportFailure)
 				}(session, credential)
 			}
 		}
@@ -400,12 +408,31 @@ func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Cli
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist dispatch %s: %v\n", claim.ClaimID, err)
 		return
 	}
+	reportFailure := func(reportCtx context.Context, sessionID, reason string) error {
+		return reportMachineSessionStartFailure(reportCtx, client, credential, sessionID, reason)
+	}
 	dispatchOutcome(ctx, cfg, handoff, stdout, stderr, adapters, func() {
 		recoveryGuard.release(claim.SessionID)
-	})
+	}, reportFailure)
 }
 
-func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, adapters *sync.WaitGroup, onAdapterDone func()) {
+func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, adapters *sync.WaitGroup, onAdapterDone func(), reportFailure machineSessionFailureReporter) {
+	// Validate before starting the adapter so a missing local bridge can close
+	// the exchanged Session immediately instead of leaving it in `starting`.
+	if err := validateProviderCommand(serveWrapConfig(*handoff, cfg.StartupSmoke)); err != nil {
+		if (errors.Is(err, errProviderCommandNotFound) || errors.Is(err, errProviderConfigNotFound) || errors.Is(err, errProviderCredentialMissing)) && reportFailure != nil {
+			if reportErr := reportFailure(ctx, handoff.SessionID, providerStartFailureReason(err)); reportErr != nil {
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: report provider start failure for %s: %v\n", handoff.SessionID, reportErr)
+			}
+		}
+		_ = removeMachineDispatch(handoff.ClaimID)
+		_, _ = fmt.Fprintf(stderr, "wharf machine serve: dispatch %s: %v\n", handoff.ClaimID, err)
+		if onAdapterDone != nil {
+			onAdapterDone()
+		}
+		return
+	}
+
 	// Start the adapter keep-alive first so the Session can reach an interactive
 	// state; the first-instruction sender retries until it does. The keep-alive
 	// runs in the background so the semaphore only bounds the dispatch phase, not
@@ -413,7 +440,7 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 	adapters.Add(1)
 	go func() {
 		defer adapters.Done()
-		keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onAdapterDone)
+		keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onAdapterDone, reportFailure)
 	}()
 
 	sendErr := sendFirstInstructionWithRetry(ctx, *handoff)
@@ -436,7 +463,7 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 // credential expires, or a bounded number of restarts is exhausted. A crash
 // (for example the machine slept and the provider or its Hub socket died) is
 // restarted with backoff; the first instruction is not re-sent.
-func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, onDone func()) {
+func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, onDone func(), reportFailure machineSessionFailureReporter) {
 	if onDone != nil {
 		defer onDone()
 	}
@@ -456,6 +483,15 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 			return
 		case err := <-done:
 			if ctx.Err() != nil {
+				return
+			}
+			if errors.Is(err, errProviderCommandNotFound) || errors.Is(err, errProviderConfigNotFound) || errors.Is(err, errProviderCredentialMissing) {
+				if reportFailure != nil {
+					if reportErr := reportFailure(ctx, handoff.SessionID, providerStartFailureReason(err)); reportErr != nil {
+						_, _ = fmt.Fprintf(stderr, "wharf machine serve: report provider start failure for %s: %v\n", handoff.SessionID, reportErr)
+					}
+				}
+				_ = removeMachineDispatch(handoff.ClaimID)
 				return
 			}
 			if cfg.StartupSmoke {
@@ -497,6 +533,24 @@ func runAdapter(ctx context.Context, cfg wrapConfig, stderr io.Writer) <-chan er
 		done <- err
 	}()
 	return done
+}
+
+func reportMachineSessionStartFailure(ctx context.Context, client *http.Client, credential machineCredential, sessionID, reason string) error {
+	if client == nil || strings.TrimSpace(sessionID) == "" {
+		return errors.New("machine session failure report is incomplete")
+	}
+	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machine-sessions/"+url.PathEscape(sessionID)+"/end")
+	if err != nil {
+		return err
+	}
+	status, body, err := postCloudAPIJSON(ctx, client, endpoint, credential.MachineToken, map[string]string{"reason": reason})
+	if err != nil {
+		return err
+	}
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return newCloudStatusError("report machine session start failure", status, body)
+	}
+	return nil
 }
 
 // exchangeAutoMachineClaim consumes the claim with the machine bearer alone and
@@ -610,7 +664,7 @@ func recoverMachineSession(ctx context.Context, client *http.Client, credential 
 	}, nil
 }
 
-func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, session machineRecoverableSession, stdout, stderr io.Writer, adapters *sync.WaitGroup) {
+func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, session machineRecoverableSession, stdout, stderr io.Writer, adapters *sync.WaitGroup, reportFailure machineSessionFailureReporter) {
 	handoff, err := recoverMachineSession(ctx, client, credential, session)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: recover session %s: %v\n", session.SessionID, err)
@@ -622,7 +676,7 @@ func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.
 	}
 	adapters.Add(1)
 	defer adapters.Done()
-	keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, nil)
+	keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, nil, reportFailure)
 }
 
 // maybeRefreshMachineCredential refreshes the machine bearer when it is within

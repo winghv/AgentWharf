@@ -63,6 +63,7 @@ jobs:
 
           cp scripts/install.sh "$dist/install.sh"
           cp scripts/install.ps1 "$dist/install.ps1"
+          cp scripts/dsh/cordis.yml "$dist/dsh-cordis.yml"
           chmod 0755 "$dist/install.sh"
 
           (cd "$dist" && shasum -a 256 \
@@ -73,7 +74,8 @@ jobs:
             agentwharf-windows-amd64.zip \
             agentwharf-windows-arm64.zip \
             install.sh \
-            install.ps1 > checksums.txt)
+            install.ps1 \
+            dsh-cordis.yml > checksums.txt)
 
       - name: Publish GitHub release
         env:
@@ -89,6 +91,7 @@ jobs:
               "$dist"/*.zip \
               "$dist"/install.sh \
               "$dist"/install.ps1 \
+              "$dist"/dsh-cordis.yml \
               "$dist"/checksums.txt \
               --clobber
           else
@@ -97,6 +100,7 @@ jobs:
               "$dist"/*.zip \
               "$dist"/install.sh \
               "$dist"/install.ps1 \
+              "$dist"/dsh-cordis.yml \
               "$dist"/checksums.txt \
               --title "$TAG_NAME" \
               --generate-notes

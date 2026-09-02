@@ -6,6 +6,9 @@ version=${AGENTWHARF_VERSION:-latest}
 provider_dir=${AGENTWHARF_PROVIDER_DIR:-${HOME:-}/.agentwharf/providers}
 claude_acp_package=${AGENTWHARF_CLAUDE_ACP_PACKAGE:-@agentclientprotocol/claude-agent-acp@0.54.1}
 codex_acp_package=${AGENTWHARF_CODEX_ACP_PACKAGE:-@agentclientprotocol/codex-acp@1.0.2}
+dsh_version=${AGENTWHARF_DSH_VERSION:-0.1.1-rc.2}
+dsh_acp_activity_package=${AGENTWHARF_DSH_ACP_ACTIVITY_PACKAGE:-@winghv/dsh-acp-activity@0.1.1-rc.2.1}
+dsh_config_asset=dsh-cordis.yml
 
 say() {
   printf 'wharf: %s\n' "$*" >&2
@@ -107,6 +110,11 @@ if [ "${AGENTWHARF_INSTALL_DRY_RUN:-}" = "1" ]; then
   printf 'provider_dir=%s\n' "$provider_dir"
   printf 'provider_package=%s\n' "$claude_acp_package"
   printf 'provider_package=%s\n' "$codex_acp_package"
+  if [ "${AGENTWHARF_SKIP_DSH:-}" != "1" ] && [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
+    printf 'provider_package=%s\n' "$dsh_acp_activity_package"
+    printf 'dsh_version=%s\n' "$dsh_version"
+    printf 'dsh_config_url=%s/%s\n' "$release_base" "$dsh_config_asset"
+  fi
   exit 0
 fi
 
@@ -130,6 +138,7 @@ trap cleanup EXIT INT TERM
 
 archive="$tmp_dir/$asset"
 checksums="$tmp_dir/checksums.txt"
+dsh_config="$tmp_dir/$dsh_config_asset"
 
 say "downloading $asset_url"
 curl -fsSL "$asset_url" -o "$archive"
@@ -148,6 +157,24 @@ if curl -fsSL "$checksum_url" -o "$checksums"; then
   fi
 else
   fail "failed to download checksums.txt"
+fi
+
+install_dsh=0
+if [ "${AGENTWHARF_SKIP_DSH:-}" != "1" ] && [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
+  install_dsh=1
+  dsh_config_url="$release_base/$dsh_config_asset"
+  say "downloading $dsh_config_url"
+  curl -fsSL "$dsh_config_url" -o "$dsh_config"
+  expected_dsh=$(grep "  $dsh_config_asset\$" "$checksums" | awk '{print $1}' || true)
+  [ -n "$expected_dsh" ] || fail "checksum for $dsh_config_asset not found"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_dsh=$(sha256sum "$dsh_config" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual_dsh=$(shasum -a 256 "$dsh_config" | awk '{print $1}')
+  else
+    fail "sha256sum or shasum is required to verify $dsh_config_asset"
+  fi
+  [ "$actual_dsh" = "$expected_dsh" ] || fail "checksum mismatch for $dsh_config_asset"
 fi
 
 tar -xzf "$archive" -C "$tmp_dir"
@@ -188,6 +215,22 @@ install_provider_bridges() {
   say "installing ACP provider bridges in $provider_dir"
   mkdir -p "$provider_dir"
   npm install --prefix "$provider_dir" --omit=dev "$claude_acp_package" "$codex_acp_package" >/dev/null
+  if [ "$install_dsh" = "1" ]; then
+    npm install --prefix "$provider_dir" --omit=dev \
+      "$dsh_acp_activity_package" \
+      "@deepseek-ai/dsh-llm-deepseek@$dsh_version" \
+      "@deepseek-ai/dsh-sandbox-local@$dsh_version" \
+      "@deepseek-ai/dsh-sandbox-policy@$dsh_version" \
+      "@deepseek-ai/dsh-subprocess-local@$dsh_version" \
+      "@deepseek-ai/dsh-bash-sandbox@$dsh_version" \
+      "@deepseek-ai/dsh-user-approval@$dsh_version" \
+      "@deepseek-ai/dsh-fs-sandbox@$dsh_version" \
+      "@deepseek-ai/dsh-fs-observation-policy@$dsh_version" \
+      "@deepseek-ai/dsh-tool-fs@$dsh_version" \
+      "@deepseek-ai/dsh-tool-todo@$dsh_version" \
+      "@deepseek-ai/dsh-token-meter@$dsh_version" \
+      "@deepseek-ai/dsh-compaction-basic@$dsh_version" >/dev/null
+  fi
 
   claude_bridge="$provider_dir/node_modules/.bin/claude-agent-acp"
   codex_bridge="$provider_dir/node_modules/.bin/codex-acp"
@@ -196,6 +239,11 @@ install_provider_bridges() {
 
   write_provider_wrapper "$tmp_dir/claude-agent-acp" "$claude_bridge"
   write_provider_wrapper "$tmp_dir/codex-acp" "$codex_bridge"
+  if [ "$install_dsh" = "1" ]; then
+    dsh_bridge="$provider_dir/node_modules/.bin/dsh-acp-activity"
+    [ -x "$dsh_bridge" ] || fail "dsh-acp-activity was not installed"
+    write_provider_wrapper "$tmp_dir/dsh-acp-activity" "$dsh_bridge"
+  fi
 }
 
 install_provider_bridges
@@ -211,12 +259,22 @@ fi
 if [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
   run_install cp "$tmp_dir/claude-agent-acp" "$install_dir/claude-agent-acp"
   run_install cp "$tmp_dir/codex-acp" "$install_dir/codex-acp"
+  if [ "$install_dsh" = "1" ]; then
+    run_install cp "$tmp_dir/dsh-acp-activity" "$install_dir/dsh-acp-activity"
+    run_install mkdir -p "$provider_dir/dsh"
+    run_install cp "$dsh_config" "$provider_dir/dsh/cordis.yml"
+    run_install chmod 0600 "$provider_dir/dsh/cordis.yml"
+  fi
 fi
 
 say "installed $install_dir/wharf"
 if [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
   say "installed $install_dir/claude-agent-acp"
   say "installed $install_dir/codex-acp"
+  if [ "$install_dsh" = "1" ]; then
+    say "installed $install_dir/dsh-acp-activity"
+    say "installed $provider_dir/dsh/cordis.yml"
+  fi
 fi
 
 case ":$PATH:" in
