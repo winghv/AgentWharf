@@ -876,13 +876,9 @@ func defaultProviderCommand(agent string) []string {
 	case "codex":
 		return []string{"codex-acp"}
 	case "dsh":
-		// The sandbox image ships the DSH ACP composition at this path
-		// (under /usr/local so the image seed carries it), and the config
-		// resolves its plugins from the sibling global npm packages. The
-		// config carries the approved tool roster and sandbox/approval
-		// policy. Own Machine installs use the user-level config; managed
-		// deployments provide the system-level fallback.
-		return []string{"dsh-acp-activity", "--config", defaultDSHConfigPath()}
+		// The official DSH ACP profile owns the runtime composition. SuperWHV's
+		// final patch narrows its tool and network surface to the approved policy.
+		return []string{"dsh", "--profile", "acp", "--patch", defaultDSHConfigPath()}
 	default:
 		return []string{agent}
 	}
@@ -2711,9 +2707,10 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 // legacy contract: their parent values must be bounded regular files inside
 // the injected secret directory. DEEPSEEK_API_KEY and DEEPSEEK_BASE_URL follow
 // the same contract for the deepseek-harness provider, whose child reads the
-// plaintext values directly. For Own Machine, the approved local DEEPSEEK_*
-// values are already user-controlled child-process environment and are passed
-// through without a SecretDir. Any other ANTHROPIC_* or DEEPSEEK_* name
+// plaintext values directly. DSH_PERSISTENCE_ROOT is a non-secret deployment
+// path consumed by the official ACP profile policy patch. For Own Machine, the
+// approved local values are already user-controlled child-process environment
+// and are passed through without a SecretDir. Any other ANTHROPIC_* or DEEPSEEK_* name
 // (model mappings, custom headers from a provider configuration file) is
 // file-loaded when its value resolves inside the secret directory and
 // otherwise passed through verbatim, so the sandbox environment stays
@@ -2721,7 +2718,7 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
 	if cfg.Provider == "deepseek-harness" && cfg.SecretDir == "" {
 		env := make([]string, 0, 4)
-		for _, name := range []string{"DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"} {
+		for _, name := range []string{"DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DSH_PERSISTENCE_ROOT"} {
 			if value := environmentValue(parent, name); value != "" {
 				env = append(env, name+"="+value)
 			}
@@ -2753,6 +2750,11 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 			value = loaded
 		}
 		env = append(env, name+"="+value)
+	}
+	if cfg.Provider == "deepseek-harness" {
+		if value := environmentValue(parent, "DSH_PERSISTENCE_ROOT"); value != "" {
+			env = append(env, "DSH_PERSISTENCE_ROOT="+value)
+		}
 	}
 	return env, nil
 }

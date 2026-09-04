@@ -3108,7 +3108,7 @@ func TestParseWrapConfigDefaultsBridgeCommandFromProvider(t *testing.T) {
 	if cfg.Agent != "dsh" {
 		t.Fatalf("agent = %q, want dsh", cfg.Agent)
 	}
-	want := []string{"dsh-acp-activity", "--config", "/tmp/agentwharf-test-dsh/cordis.yml"}
+	want := []string{"dsh", "--profile", "acp", "--patch", "/tmp/agentwharf-test-dsh/cordis.yml"}
 	if len(cfg.ProviderCommand) != len(want) {
 		t.Fatalf("provider command = %v, want %v", cfg.ProviderCommand, want)
 	}
@@ -3149,7 +3149,7 @@ func TestAgentForProviderMapsPlatformIDs(t *testing.T) {
 func TestDefaultProviderCommandDSHUsesConfiguredComposition(t *testing.T) {
 	t.Setenv("AGENTWHARF_DSH_CONFIG", "/tmp/agentwharf-test-dsh/cordis.yml")
 	got := defaultProviderCommand("dsh")
-	want := []string{"dsh-acp-activity", "--config", "/tmp/agentwharf-test-dsh/cordis.yml"}
+	want := []string{"dsh", "--profile", "acp", "--patch", "/tmp/agentwharf-test-dsh/cordis.yml"}
 	if len(got) != len(want) {
 		t.Fatalf("defaultProviderCommand(dsh) = %v, want %v", got, want)
 	}
@@ -3165,6 +3165,8 @@ func TestProviderChildEnvironmentForwardsLocalDeepSeekCredentials(t *testing.T) 
 		"DEEPSEEK_API_KEY=local-api-key",
 		"DEEPSEEK_BASE_URL=https://api.deepseek.example",
 		"DEEPSEEK_MODEL=deepseek-v4-pro",
+		"DSH_PERSISTENCE_ROOT=/tmp/agentwharf-dsh-sessions",
+		"DSH_PERMISSION_MODE=unapproved",
 		"DEEPSEEK_UNAPPROVED=should-not-pass",
 	}
 	env, err := providerChildEnvironment(wrapConfig{Provider: "deepseek-harness"}, parent)
@@ -3175,6 +3177,7 @@ func TestProviderChildEnvironmentForwardsLocalDeepSeekCredentials(t *testing.T) 
 		"DEEPSEEK_API_KEY=local-api-key",
 		"DEEPSEEK_BASE_URL=https://api.deepseek.example",
 		"DEEPSEEK_MODEL=deepseek-v4-pro",
+		"DSH_PERSISTENCE_ROOT=/tmp/agentwharf-dsh-sessions",
 	}
 	if !reflect.DeepEqual(env, want) {
 		t.Fatalf("provider child env = %v, want %v", env, want)
@@ -3199,6 +3202,8 @@ func TestProviderChildEnvironmentForwardsDeepSeekCredentialsForChildOnly(t *test
 		"DEEPSEEK_API_KEY=" + apiKeyPath,
 		"DEEPSEEK_BASE_URL=" + baseURLPath,
 		"DEEPSEEK_EXTRA=" + headerPath,
+		"DSH_PERSISTENCE_ROOT=/home/agent/.dsh/sessions",
+		"DSH_PERMISSION_MODE=unapproved",
 		"PATH=/usr/bin:/bin",
 	}
 	env, err := providerChildEnvironment(wrapConfig{Provider: "deepseek-harness", SecretDir: secretDir}, parent)
@@ -3209,6 +3214,7 @@ func TestProviderChildEnvironmentForwardsDeepSeekCredentialsForChildOnly(t *test
 		"DEEPSEEK_API_KEY=test-deepseek-api-key",
 		"DEEPSEEK_BASE_URL=https://provider.example.test",
 		"DEEPSEEK_EXTRA=value-from-file",
+		"DSH_PERSISTENCE_ROOT=/home/agent/.dsh/sessions",
 	}
 	if len(env) != len(want) {
 		t.Fatalf("child env = %v, want %v", env, want)

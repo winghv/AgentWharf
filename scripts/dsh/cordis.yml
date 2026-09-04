@@ -1,74 +1,95 @@
-# DeepSeek Harness ACP composition for AgentWharf Own Machine.
-# The installer places this file under ~/.agentwharf/providers/dsh/ so Cordis
-# resolves the sibling packages installed in ~/.agentwharf/providers/node_modules.
-# stdout must contain ACP JSON-RPC frames only.
+# SuperWHV policy overlay for the official DeepSeek Harness ACP profile.
+# The installer passes this file as the final `dsh --profile acp --patch` layer.
+# It preserves the approved v0 tool surface and fails closed on sandbox policy.
 
-- id: llm-deepseek
-  name: '@deepseek-ai/dsh-llm-deepseek'
+- id: session-persistence-jsonl
   config:
-    models:
-      - id: deepseek-v4-flash
-      - id: deepseek-v4-pro
-
-- id: sandbox
-  name: '@deepseek-ai/dsh-sandbox-local'
+    root: !!js process.env.DSH_PERSISTENCE_ROOT ?? ((process.env.HOME || process.env.USERPROFILE) + '/.agentwharf/dsh/sessions')
 
 - id: sandbox-policy
-  name: '@deepseek-ai/dsh-sandbox-policy'
   config:
     mode: workspace-write
     workspaceRoot: !!js process.env.DSH_WORKSPACE_ROOT ?? process.cwd()
 
-- id: subprocess
-  name: '@deepseek-ai/dsh-subprocess-local'
-
-- id: bash
-  name: '@deepseek-ai/dsh-bash-sandbox'
-  config:
-    timeoutMs: 60000
-
 - id: approval
-  name: '@deepseek-ai/dsh-user-approval'
   config:
     policy: ask
 
-- id: acp-activity
-  name: '@winghv/dsh-acp-activity'
+- id: acp
   config:
     provider: deepseek-official
     model: !!js process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash'
-    persistenceRoot: !!js process.env.DSH_PERSISTENCE_ROOT ?? ((process.env.HOME || process.env.USERPROFILE) + '/.agentwharf/dsh/sessions')
-    persistenceCompression: zstd
-    workspaceContext:
-      maxBytes: 65536
+
+- id: system-prompt
+  config:
     persona: |
-      You are a coding assistant powered by the {{model}} model. Your working directory is {{cwd}}. Your bash tool runs under a file sandbox — a `[sandbox: file access denied …]` result is policy, not a command bug.
+      You are a coding assistant powered by the {{model}} model. Your working directory is {{cwd}}. Your shell and filesystem tools run under a workspace-write sandbox; a file-access denial is policy, not a command bug.
 
       Verify your work by running the code or tests. Keep answers brief and factual.
 
-- id: token-meter
-  name: '@deepseek-ai/dsh-token-meter'
+# SuperWHV does not opt user sessions into upstream telemetry.
+- id: session-telemetry-otel
+  disabled: true
 
-- id: compaction-basic
-  name: '@deepseek-ai/dsh-compaction-basic'
-  config:
-    thresholdRatio: 0.8
-    retainRatio: 0.08
-    maxTokens: 8192
-    compactionRetries: 1
-
-- id: fs-sandbox
-  name: '@deepseek-ai/dsh-fs-sandbox'
-  config:
-    cwd: !!js process.cwd()
-
-- id: fs-observation-policy
-  name: '@deepseek-ai/dsh-fs-observation-policy'
-
-- id: tool-fs
-  name: '@deepseek-ai/dsh-tool-fs'
-
-- id: tool-todo
-  name: '@deepseek-ai/dsh-tool-todo'
-  config:
-    allowParallelInProgress: true
+# Keep the approved v0 surface: shell, filesystem, todo, token meter, and
+# compaction. All other model-facing or auxiliary execution surfaces stay off.
+- id: user-questions
+  disabled: true
+- id: jobs
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: skill
+  disabled: true
+- id: skill-filesystem
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: commands
+  disabled: true
+- id: command-feedback
+  disabled: true
+- id: goal
+  disabled: true
+- id: goal-round-driver
+  disabled: true
+- id: command-goal
+  disabled: true
+- id: plan-mode
+  disabled: true
+- id: command-compact
+  disabled: true
+- id: subagent
+  disabled: true
+- id: subagent-spawn-in-process
+  disabled: true
+- id: subagent-fork-in-process
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: workflow-worker-thread
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: tool-ralph
+  disabled: true
+- id: tool-fs-search
+  disabled: true
+- id: tool-str-replace-editor
+  disabled: true
+- id: web
+  disabled: true
+- id: web-search-deepseek
+  disabled: true
+- id: web-fetch-http
+  disabled: true
+- id: tool-web
+  disabled: true

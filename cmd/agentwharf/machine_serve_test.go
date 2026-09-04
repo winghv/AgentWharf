@@ -577,7 +577,7 @@ func TestServeWrapConfigMapsDeepSeekHarnessProvider(t *testing.T) {
 	if cfg.Provider != "deepseek-harness" {
 		t.Fatalf("provider = %q, want deepseek-harness", cfg.Provider)
 	}
-	want := []string{"dsh-acp-activity", "--config", "/tmp/agentwharf-test-dsh/cordis.yml"}
+	want := []string{"dsh", "--profile", "acp", "--patch", "/tmp/agentwharf-test-dsh/cordis.yml"}
 	if len(cfg.ProviderCommand) != len(want) {
 		t.Fatalf("provider command = %v, want %v", cfg.ProviderCommand, want)
 	}

@@ -46,8 +46,8 @@ CMD or PowerShell; Git Bash detects Windows and prints the PowerShell command.
 
 The installer downloads the matching prebuilt binary from GitHub Releases,
 installs the `wharf` command, and installs the Claude/Codex ACP bridge wrappers
-plus the pinned DeepSeek Harness runtime, our `dsh-acp-activity` bridge, and a
-user-level DSH composition under `~/.agentwharf/providers/dsh/cordis.yml`.
+plus the pinned official DeepSeek Harness runtime and a SuperWHV policy patch
+under `~/.agentwharf/providers/dsh/cordis.yml`.
 Set `AGENTWHARF_SKIP_DSH=1` only when DSH is intentionally not needed.
 
 Run the same install command again to upgrade. When `wharf` already exists on
@@ -106,12 +106,12 @@ $ wharf codex
 $ wharf dsh
 ```
 
-`wharf dsh` automatically uses the installed user-level composition. No manual
-DSH bridge installation or system path configuration is required. When this
-machine is already paired, the command also starts the background dispatch
-daemon before returning, so Tasks created for DSH in the Agent Workbench are
-picked up without another local command. It does not start an interactive DSH
-terminal session or initiate pairing by itself.
+`wharf dsh` uses the installed user-level policy patch with the official DSH ACP
+profile. No manual DSH bridge installation or system path configuration is
+required. When this machine is already paired, the command also starts the
+background dispatch daemon before returning, so Tasks created for DSH in the
+Agent Workbench are picked up without another local command. It does not start
+an interactive DSH terminal session or initiate pairing by itself.
 
 The CLI prints a pairing prompt:
 

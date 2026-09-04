@@ -6,8 +6,8 @@ version=${AGENTWHARF_VERSION:-latest}
 provider_dir=${AGENTWHARF_PROVIDER_DIR:-${HOME:-}/.agentwharf/providers}
 claude_acp_package=${AGENTWHARF_CLAUDE_ACP_PACKAGE:-@agentclientprotocol/claude-agent-acp@0.54.1}
 codex_acp_package=${AGENTWHARF_CODEX_ACP_PACKAGE:-@agentclientprotocol/codex-acp@1.8.0}
-dsh_version=${AGENTWHARF_DSH_VERSION:-0.1.1-rc.2}
-dsh_acp_activity_package=${AGENTWHARF_DSH_ACP_ACTIVITY_PACKAGE:-@winghv/dsh-acp-activity@0.1.1-rc.2.1}
+dsh_version=${AGENTWHARF_DSH_VERSION:-0.1.2-rc.1}
+dsh_package=${AGENTWHARF_DSH_PACKAGE:-@deepseek-ai/dsh@$dsh_version}
 dsh_config_asset=dsh-cordis.yml
 
 say() {
@@ -111,7 +111,7 @@ if [ "${AGENTWHARF_INSTALL_DRY_RUN:-}" = "1" ]; then
   printf 'provider_package=%s\n' "$claude_acp_package"
   printf 'provider_package=%s\n' "$codex_acp_package"
   if [ "${AGENTWHARF_SKIP_DSH:-}" != "1" ] && [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
-    printf 'provider_package=%s\n' "$dsh_acp_activity_package"
+    printf 'provider_package=%s\n' "$dsh_package"
     printf 'dsh_version=%s\n' "$dsh_version"
     printf 'dsh_config_url=%s/%s\n' "$release_base" "$dsh_config_asset"
   fi
@@ -216,20 +216,7 @@ install_provider_bridges() {
   mkdir -p "$provider_dir"
   npm install --prefix "$provider_dir" --omit=dev "$claude_acp_package" "$codex_acp_package" >/dev/null
   if [ "$install_dsh" = "1" ]; then
-    npm install --prefix "$provider_dir" --omit=dev \
-      "$dsh_acp_activity_package" \
-      "@deepseek-ai/dsh-llm-deepseek@$dsh_version" \
-      "@deepseek-ai/dsh-sandbox-local@$dsh_version" \
-      "@deepseek-ai/dsh-sandbox-policy@$dsh_version" \
-      "@deepseek-ai/dsh-subprocess-local@$dsh_version" \
-      "@deepseek-ai/dsh-bash-sandbox@$dsh_version" \
-      "@deepseek-ai/dsh-user-approval@$dsh_version" \
-      "@deepseek-ai/dsh-fs-sandbox@$dsh_version" \
-      "@deepseek-ai/dsh-fs-observation-policy@$dsh_version" \
-      "@deepseek-ai/dsh-tool-fs@$dsh_version" \
-      "@deepseek-ai/dsh-tool-todo@$dsh_version" \
-      "@deepseek-ai/dsh-token-meter@$dsh_version" \
-      "@deepseek-ai/dsh-compaction-basic@$dsh_version" >/dev/null
+    npm install --prefix "$provider_dir" --omit=dev "$dsh_package" >/dev/null
   fi
 
   claude_bridge="$provider_dir/node_modules/.bin/claude-agent-acp"
@@ -240,9 +227,9 @@ install_provider_bridges() {
   write_provider_wrapper "$tmp_dir/claude-agent-acp" "$claude_bridge"
   write_provider_wrapper "$tmp_dir/codex-acp" "$codex_bridge"
   if [ "$install_dsh" = "1" ]; then
-    dsh_bridge="$provider_dir/node_modules/.bin/dsh-acp-activity"
-    [ -x "$dsh_bridge" ] || fail "dsh-acp-activity was not installed"
-    write_provider_wrapper "$tmp_dir/dsh-acp-activity" "$dsh_bridge"
+    dsh_bridge="$provider_dir/node_modules/.bin/dsh"
+    [ -x "$dsh_bridge" ] || fail "official dsh ACP runtime was not installed"
+    write_provider_wrapper "$tmp_dir/dsh" "$dsh_bridge"
   fi
 }
 
@@ -260,7 +247,7 @@ if [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
   run_install cp "$tmp_dir/claude-agent-acp" "$install_dir/claude-agent-acp"
   run_install cp "$tmp_dir/codex-acp" "$install_dir/codex-acp"
   if [ "$install_dsh" = "1" ]; then
-    run_install cp "$tmp_dir/dsh-acp-activity" "$install_dir/dsh-acp-activity"
+    run_install cp "$tmp_dir/dsh" "$install_dir/dsh"
     run_install mkdir -p "$provider_dir/dsh"
     run_install cp "$dsh_config" "$provider_dir/dsh/cordis.yml"
     run_install chmod 0600 "$provider_dir/dsh/cordis.yml"
@@ -272,7 +259,7 @@ if [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
   say "installed $install_dir/claude-agent-acp"
   say "installed $install_dir/codex-acp"
   if [ "$install_dsh" = "1" ]; then
-    say "installed $install_dir/dsh-acp-activity"
+    say "installed $install_dir/dsh"
     say "installed $provider_dir/dsh/cordis.yml"
   fi
 fi

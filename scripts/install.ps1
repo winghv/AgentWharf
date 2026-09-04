@@ -10,13 +10,19 @@ function Say([string]$Message) {
     [Console]::Error.WriteLine("wharf: $Message")
 }
 
+function Write-ProviderWrapper([string]$Path, [string]$Target) {
+    $escapedTarget = $Target.Replace("%", "%%")
+    $content = "@echo off`r`ncall `"$escapedTarget`" %*`r`n"
+    [IO.File]::WriteAllText($Path, $content, [Text.UTF8Encoding]::new($false))
+}
+
 $repo = Get-EnvOrDefault "AGENTWHARF_REPO" "winghv/agentwharf"
 $version = Get-EnvOrDefault "AGENTWHARF_VERSION" "latest"
 $providerDir = Get-EnvOrDefault "AGENTWHARF_PROVIDER_DIR" (Join-Path $HOME ".agentwharf/providers")
 $claudeAcpPackage = Get-EnvOrDefault "AGENTWHARF_CLAUDE_ACP_PACKAGE" "@agentclientprotocol/claude-agent-acp@0.54.1"
 $codexAcpPackage = Get-EnvOrDefault "AGENTWHARF_CODEX_ACP_PACKAGE" "@agentclientprotocol/codex-acp@1.8.0"
-$dshVersion = Get-EnvOrDefault "AGENTWHARF_DSH_VERSION" "0.1.1-rc.2"
-$dshAcpActivityPackage = Get-EnvOrDefault "AGENTWHARF_DSH_ACP_ACTIVITY_PACKAGE" "@winghv/dsh-acp-activity@0.1.1-rc.2.1"
+$dshVersion = Get-EnvOrDefault "AGENTWHARF_DSH_VERSION" "0.1.2-rc.1"
+$dshPackage = Get-EnvOrDefault "AGENTWHARF_DSH_PACKAGE" "@deepseek-ai/dsh@$dshVersion"
 $dshConfigAsset = "dsh-cordis.yml"
 $skipDsh = [Environment]::GetEnvironmentVariable("AGENTWHARF_SKIP_DSH") -eq "1"
 $skipBridges = [Environment]::GetEnvironmentVariable("AGENTWHARF_SKIP_PROVIDER_BRIDGES") -eq "1"
@@ -77,7 +83,7 @@ if ([Environment]::GetEnvironmentVariable("AGENTWHARF_INSTALL_DRY_RUN") -eq "1")
     "provider_package=$claudeAcpPackage"
     "provider_package=$codexAcpPackage"
     if (-not $skipDsh -and -not $skipBridges) {
-        "provider_package=$dshAcpActivityPackage"
+        "provider_package=$dshPackage"
         "dsh_version=$dshVersion"
         "dsh_config_url=$releaseBase/$dshConfigAsset"
     }
@@ -147,22 +153,7 @@ try {
             throw "npm provider bridge installation failed; see the npm error above"
         }
         if ($installDsh) {
-            $dshPackages = @(
-                $dshAcpActivityPackage,
-                "@deepseek-ai/dsh-llm-deepseek@$dshVersion",
-                "@deepseek-ai/dsh-sandbox-local@$dshVersion",
-                "@deepseek-ai/dsh-sandbox-policy@$dshVersion",
-                "@deepseek-ai/dsh-subprocess-local@$dshVersion",
-                "@deepseek-ai/dsh-bash-sandbox@$dshVersion",
-                "@deepseek-ai/dsh-user-approval@$dshVersion",
-                "@deepseek-ai/dsh-fs-sandbox@$dshVersion",
-                "@deepseek-ai/dsh-fs-observation-policy@$dshVersion",
-                "@deepseek-ai/dsh-tool-fs@$dshVersion",
-                "@deepseek-ai/dsh-tool-todo@$dshVersion",
-                "@deepseek-ai/dsh-token-meter@$dshVersion",
-                "@deepseek-ai/dsh-compaction-basic@$dshVersion"
-            )
-            $npmOutput = @(& $npm.Source install --prefix $providerDir --omit=dev --loglevel=error $dshPackages 2>&1)
+            $npmOutput = @(& $npm.Source install --prefix $providerDir --omit=dev --loglevel=error $dshPackage 2>&1)
             $npmExitCode = $LASTEXITCODE
             if ($npmExitCode -ne 0) {
                 Say "npm DSH installation failed (exit code $npmExitCode)"
@@ -178,12 +169,12 @@ try {
         foreach ($bridge in @("claude-agent-acp", "codex-acp")) {
             $bridgePath = Join-Path $providerDir "node_modules/.bin/$bridge.cmd"
             if (-not (Test-Path -LiteralPath $bridgePath -PathType Leaf)) { throw "$bridge was not installed" }
-            Copy-Item -LiteralPath $bridgePath -Destination (Join-Path $installDir "$bridge.cmd") -Force
+            Write-ProviderWrapper (Join-Path $installDir "$bridge.cmd") $bridgePath
         }
         if ($installDsh) {
-            $dshBridgePath = Join-Path $providerDir "node_modules/.bin/dsh-acp-activity.cmd"
-            if (-not (Test-Path -LiteralPath $dshBridgePath -PathType Leaf)) { throw "dsh-acp-activity was not installed" }
-            Copy-Item -LiteralPath $dshBridgePath -Destination (Join-Path $installDir "dsh-acp-activity.cmd") -Force
+            $dshBridgePath = Join-Path $providerDir "node_modules/.bin/dsh.cmd"
+            if (-not (Test-Path -LiteralPath $dshBridgePath -PathType Leaf)) { throw "official dsh ACP runtime was not installed" }
+            Write-ProviderWrapper (Join-Path $installDir "dsh.cmd") $dshBridgePath
             $dshConfigDir = Join-Path $providerDir "dsh"
             New-Item -ItemType Directory -Path $dshConfigDir -Force | Out-Null
             Copy-Item -LiteralPath $dshConfig -Destination (Join-Path $dshConfigDir "cordis.yml") -Force
@@ -195,7 +186,7 @@ try {
         Say "installed $(Join-Path $installDir 'claude-agent-acp')"
         Say "installed $(Join-Path $installDir 'codex-acp')"
         if ($installDsh) {
-            Say "installed $(Join-Path $installDir 'dsh-acp-activity')"
+            Say "installed $(Join-Path $installDir 'dsh')"
             Say "installed $(Join-Path $providerDir 'dsh/cordis.yml')"
         }
     }
