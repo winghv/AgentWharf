@@ -221,8 +221,8 @@ func TestMapperDoesNotTreatJSONRPCErrorAsReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MapLine() error = %v", err)
 	}
-	if len(events) != 1 {
-		t.Fatalf("events = %+v, want one agent message for the prompt error", events)
+	if len(events) != 2 {
+		t.Fatalf("events = %+v, want agent message plus error state for the prompt error", events)
 	}
 	assertEvent(t, events[0], "session.message")
 	payload := payloadMap(t, events[0])
@@ -237,6 +237,48 @@ func TestMapperDoesNotTreatJSONRPCErrorAsReady(t *testing.T) {
 	text, _ := part["text"].(string)
 	if !strings.Contains(text, "session failed") {
 		t.Fatalf("error message text = %q, want the Provider error", text)
+	}
+	assertEvent(t, events[1], "session.state")
+	state := payloadMap(t, events[1])
+	metadata, _ := state["metadata"].(map[string]any)
+	if state["state"] != "error" || metadata["reason"] != "provider_rpc_error" {
+		t.Fatalf("error state payload = %+v", state)
+	}
+}
+
+func TestMapperFinalizesToolCallWhenProviderRPCFails(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "deepseek-harness", Now: func() time.Time {
+		return time.UnixMilli(1700000000456)
+	}})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+	start, err := mapper.MapLine([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"call_001","title":"Run branches","kind":"execute","status":"in_progress","rawInput":{"command":"git branch -a"}}}}`))
+	if err != nil || len(start) != 1 {
+		t.Fatalf("tool start = %+v, err=%v", start, err)
+	}
+	events, err := mapper.MapLine([]byte(`{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"provider failed"}}`))
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events = %+v, want tool result, message, and error state", events)
+	}
+	result := payloadMap(t, events[0])
+	if result["tool_call_id"] != "call_001" || result["phase"] != "result" {
+		t.Fatalf("finalized tool payload = %+v", result)
+	}
+	resultBody := result["result"].(map[string]any)
+	if resultBody["status"] != "error" {
+		t.Fatalf("finalized tool result = %+v", resultBody)
+	}
+	if payloadMap(t, events[1])["message_id"] != "acp-rpc-error" || payloadMap(t, events[2])["state"] != "error" {
+		t.Fatalf("finalized error events = %+v", events)
+	}
+	if final := mapper.Finalize("should be empty"); len(final) != 0 {
+		t.Fatalf("Finalize() after RPC error = %+v, want no duplicate terminal events", final)
 	}
 }
 
@@ -325,6 +367,28 @@ func TestMapperMapsCodexMessageIDsAndProviderWarnings(t *testing.T) {
 	warning := payloadMap(t, warningEvents[0])
 	if warning["kind"] != "provider_warning" || warning["text"] != "Model metadata is unavailable" || warning["warning_id"] != "notice_1" {
 		t.Fatalf("warning payload = %+v", warning)
+	}
+}
+
+func TestMapperClosesToolOnProviderFailureNotice(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "codex"})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+	if _, err := mapper.MapLine([]byte(`{"type":"session/update","session_id":"acp_ses_1","update":{"type":"tool_call","tool_call_id":"call_1","name":"bash","status":"in_progress"}}`)); err != nil {
+		t.Fatalf("MapLine(tool) error = %v", err)
+	}
+	events, err := mapper.MapLine([]byte(`{"type":"session/update","session_id":"acp_ses_1","update":{"type":"session_info_update","_meta":{"jetbrains":{"air":{"sessionFailure":{"severity":"error","title":"Provider unavailable"}}}}}}`))
+	if err != nil {
+		t.Fatalf("MapLine(failure) error = %v", err)
+	}
+	if len(events) != 3 || events[0].Type != "session.tool_call" || events[1].Type != "agent.activity" || events[2].Type != "session.state" {
+		t.Fatalf("failure events = %+v, want tool result, failure activity, and error state", events)
+	}
+	if payloadMap(t, events[0])["phase"] != "result" || payloadMap(t, events[2])["state"] != "error" {
+		t.Fatalf("failure terminal events = %+v", events)
 	}
 }
 

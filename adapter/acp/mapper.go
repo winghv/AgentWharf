@@ -37,10 +37,12 @@ type Config struct {
 }
 
 type Mapper struct {
-	sessionID     string
-	provider      string
-	now           func() time.Time
-	nextMessageID uint64
+	sessionID         string
+	provider          string
+	now               func() time.Time
+	nextMessageID     uint64
+	providerSessionID string
+	activeToolCallIDs map[string]struct{}
 }
 
 func NewMapper(cfg Config) (*Mapper, error) {
@@ -55,9 +57,10 @@ func NewMapper(cfg Config) (*Mapper, error) {
 		now = time.Now
 	}
 	return &Mapper{
-		sessionID: cfg.SessionID,
-		provider:  cfg.Provider,
-		now:       now,
+		sessionID:         cfg.SessionID,
+		provider:          cfg.Provider,
+		now:               now,
+		activeToolCallIDs: make(map[string]struct{}),
 	}, nil
 }
 
@@ -97,7 +100,40 @@ func (m *Mapper) MapLine(line []byte) ([]protocol.Event, error) {
 	if err := decoder.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("%w: decode JSON line: %w", ErrInvalidACPEvent, err)
 	}
-	return m.mapFrame(raw, firstString(raw, "session_id", "sessionId")), nil
+	providerSessionID := firstString(raw, "session_id", "sessionId")
+	if providerSessionID == "" {
+		if params := objectField(raw, "params"); params != nil {
+			providerSessionID = firstString(params, "session_id", "sessionId")
+		}
+	}
+	if providerSessionID != "" {
+		m.providerSessionID = providerSessionID
+	}
+	return m.mapFrame(raw, providerSessionID), nil
+}
+
+// Finalize closes provider-side work that was started but never given a result.
+// This is used when an ACP process exits or its stdout stream breaks: without a
+// terminal event, clients would correctly keep rendering the tool as running.
+func (m *Mapper) Finalize(reason string) []protocol.Event {
+	if m == nil || len(m.activeToolCallIDs) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(m.activeToolCallIDs))
+	for id := range m.activeToolCallIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	events := make([]protocol.Event, 0, len(ids)+2)
+	for _, id := range ids {
+		events = append(events, m.toolCallResultEvent(id, "error", "Provider exited before returning a tool result."))
+		delete(m.activeToolCallIDs, id)
+	}
+	events = append(events,
+		m.messageEvent("acp-provider-error", "The Agent could not complete this turn: "+nonEmptyReason(reason, "provider output closed unexpectedly"), m.providerSessionID),
+		m.stateEvent("error", m.providerSessionID, map[string]any{"reason": "provider_output_closed", "source": "acp"}),
+	)
+	return events
 }
 
 func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protocol.Event {
@@ -126,8 +162,8 @@ func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protoc
 	case "session/request_permission":
 		return m.mapSessionPermissionRequest(raw, providerSessionID)
 	default:
-		if event := m.jsonRPCErrorEvent(raw); event != nil {
-			return []protocol.Event{*event}
+		if events := m.jsonRPCErrorEvents(raw); len(events) > 0 {
+			return events
 		}
 		if responseSessionID := sessionIDFromResponse(raw); responseSessionID != "" {
 			return []protocol.Event{m.stateEvent("ready", responseSessionID, copyWithout(raw, "type", "method", "session_id", "sessionId"))}
@@ -136,11 +172,11 @@ func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protoc
 	}
 }
 
-// jsonRPCErrorEvent turns an unmatched Provider JSON-RPC error into a visible
-// Agent message. session/prompt failures otherwise vanish: the Adapter already
-// acked the Hub command, and error responses have no sessionId so they never
-// became session.state or session.message.
-func (m *Mapper) jsonRPCErrorEvent(raw map[string]any) *protocol.Event {
+// jsonRPCErrorEvents turns an unmatched Provider JSON-RPC error into visible
+// terminal events. Prompt failures otherwise leave the last tool call open:
+// the Adapter already acknowledged the Hub command, and an error response has
+// no sessionId of its own.
+func (m *Mapper) jsonRPCErrorEvents(raw map[string]any) []protocol.Event {
 	if _, ok := raw["id"]; !ok || raw["method"] != nil {
 		return nil
 	}
@@ -152,8 +188,12 @@ func (m *Mapper) jsonRPCErrorEvent(raw map[string]any) *protocol.Event {
 	if message == "" {
 		message = "unknown error"
 	}
-	event := m.messageEvent("acp-rpc-error", "The Agent could not complete this turn: "+message, "")
-	return &event
+	events := m.finishActiveToolCalls("Provider failed before returning a tool result.")
+	events = append(events,
+		m.messageEvent("acp-rpc-error", "The Agent could not complete this turn: "+message, m.providerSessionID),
+		m.stateEvent("error", m.providerSessionID, map[string]any{"reason": "provider_rpc_error", "source": "acp"}),
+	)
+	return events
 }
 
 func (m *Mapper) mapSessionUpdate(raw map[string]any, providerSessionID string) []protocol.Event {
@@ -230,7 +270,12 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		})
 	case "session_info_update":
 		if event := m.providerFailureEvent(update, providerSessionID); event != nil {
-			return []protocol.Event{*event}
+			events := []protocol.Event{*event}
+			if isProviderFailureEvent(*event) {
+				events = append(m.finishActiveToolCalls("Provider failed before returning a tool result."), events...)
+				events = append(events, m.stateEvent("error", m.providerSessionID, map[string]any{"reason": "provider_failure", "source": "acp"}))
+			}
+			return events
 		}
 		return nil
 	case "agent_message_chunk", "prompt_response":
@@ -292,6 +337,7 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 			"input":        input,
 			"result":       nil,
 		})}
+		m.activeToolCallIDs[toolCallID] = struct{}{}
 		if isACPAskUserQuestion(name) {
 			events = append(events, m.event("permission.request", map[string]any{
 				"request_id": "question:" + toolCallID,
@@ -316,21 +362,47 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 		return nil
 	}
 
+	delete(m.activeToolCallIDs, toolCallID)
 	preview, truncated := toolOutputPreview(firstAny(update, "rawOutput", "raw_output", "result", "content"))
+	return []protocol.Event{m.toolCallResultEventWithOutput(toolCallID, resultStatus, preview, truncated, firstString(update, "name", "kind", "title"))}
+}
+
+func (m *Mapper) finishActiveToolCalls(output string) []protocol.Event {
+	if len(m.activeToolCallIDs) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(m.activeToolCallIDs))
+	for id := range m.activeToolCallIDs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	events := make([]protocol.Event, 0, len(ids))
+	for _, id := range ids {
+		events = append(events, m.toolCallResultEvent(id, "error", output))
+		delete(m.activeToolCallIDs, id)
+	}
+	return events
+}
+
+func (m *Mapper) toolCallResultEvent(toolCallID, status, output string) protocol.Event {
+	return m.toolCallResultEventWithOutput(toolCallID, status, output, false, "")
+}
+
+func (m *Mapper) toolCallResultEventWithOutput(toolCallID, status, output string, truncated bool, name string) protocol.Event {
 	payload := map[string]any{
 		"tool_call_id": toolCallID,
 		"phase":        "result",
 		"input":        nil,
 		"result": map[string]any{
-			"status":         resultStatus,
-			"output_preview": preview,
+			"status":         status,
+			"output_preview": output,
 			"truncated":      truncated,
 		},
 	}
-	if name := firstString(update, "name", "kind", "title"); name != "" {
+	if name != "" {
 		payload["name"] = name
 	}
-	return []protocol.Event{m.event("session.tool_call", payload)}
+	return m.event("session.tool_call", payload)
 }
 
 func toolOutputPreview(value any) (string, bool) {
@@ -561,6 +633,7 @@ func (m *Mapper) permissionToolCallEvent(source map[string]any, requestID string
 	if options, ok := source["options"]; ok {
 		input["options"] = options
 	}
+	m.activeToolCallIDs[toolCallID] = struct{}{}
 	return m.event("session.tool_call", map[string]any{
 		"tool_call_id": toolCallID,
 		"phase":        "start",
@@ -632,6 +705,15 @@ func (m *Mapper) providerWarningEvent(text, warningID, providerSessionID string)
 	return m.event("agent.activity", payload)
 }
 
+func isProviderFailureEvent(event protocol.Event) bool {
+	var payload map[string]any
+	if json.Unmarshal(event.Payload, &payload) != nil {
+		return false
+	}
+	kind, _ := payload["kind"].(string)
+	return kind == "provider_failure"
+}
+
 func (m *Mapper) providerFailureEvent(update map[string]any, providerSessionID string) *protocol.Event {
 	meta := objectField(update, "_meta")
 	jetbrains := objectField(meta, "jetbrains")
@@ -662,6 +744,13 @@ func (m *Mapper) providerFailureEvent(update map[string]any, providerSessionID s
 	}
 	event := m.event("agent.activity", payload)
 	return &event
+}
+
+func nonEmptyReason(reason, fallback string) string {
+	if strings.TrimSpace(reason) != "" {
+		return strings.TrimSpace(reason)
+	}
+	return fallback
 }
 
 func (m *Mapper) nextMessageIDValue() string {

@@ -3020,7 +3020,26 @@ func streamProviderOutput(ctx context.Context, cfg wrapConfig, stdout io.Reader,
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		if mapper != nil {
+			if finalizeErr := sendFinalACPEvents(mapper, send, "provider stdout failed"); finalizeErr != nil {
+				return finalizeErr
+			}
+		}
 		return fmt.Errorf("scan provider stdout: %w", err)
+	}
+	if mapper != nil {
+		if err := sendFinalACPEvents(mapper, send, "provider output closed unexpectedly"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sendFinalACPEvents(mapper *acp.Mapper, send func(protocol.Event) error, reason string) error {
+	for _, event := range mapper.Finalize(reason) {
+		if err := send(event); err != nil {
+			return fmt.Errorf("send finalized acp provider event %s: %w", event.Type, err)
+		}
 	}
 	return nil
 }
@@ -3124,7 +3143,13 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		if finalizeErr := sendFinalACPEvents(mapper, send, "provider stdout failed"); finalizeErr != nil {
+			return finalizeErr
+		}
 		return fmt.Errorf("scan acp provider stdout: %w", err)
+	}
+	if err := sendFinalACPEvents(mapper, send, "provider output closed unexpectedly"); err != nil {
+		return err
 	}
 	return nil
 }
