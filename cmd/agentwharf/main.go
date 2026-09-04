@@ -3023,31 +3023,6 @@ func streamProviderOutput(ctx context.Context, cfg wrapConfig, stdout io.Reader,
 	return nil
 }
 
-func translateWrapLine(cfg wrapConfig, line []byte) ([]protocol.Event, error) {
-	switch cfg.Format {
-	case "jsonstream":
-		translator, err := jsonstream.NewTranslator(jsonstream.Config{
-			SessionID: cfg.SessionID,
-			Provider:  cfg.Provider,
-		})
-		if err != nil {
-			return nil, err
-		}
-		return translator.TranslateLine(line)
-	case "acp":
-		mapper, err := acp.NewMapper(acp.Config{
-			SessionID: cfg.SessionID,
-			Provider:  cfg.Provider,
-		})
-		if err != nil {
-			return nil, err
-		}
-		return mapper.MapLine(line)
-	default:
-		return nil, fmt.Errorf("unsupported wrap format %q", cfg.Format)
-	}
-}
-
 func forwardHubCommandsToProvider(ctx context.Context, readFrame func(context.Context) (protocol.Frame, error), stdin io.WriteCloser, writeFrame func(protocol.Frame) error, observePong func(string), rotation *credentialRotationManager, startAdmission *providerStartAdmission, supervisor *core.ProcessSupervisor, stopInProgress *atomic.Bool, cfg wrapConfig) error {
 	defer stdin.Close()
 	accepted := newAcceptedCommandSet(2048)
