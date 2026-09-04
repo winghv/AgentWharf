@@ -20,6 +20,7 @@ dry_run_output=$(
 
 printf '%s\n' "$dry_run_output" | grep -F "https://github.com/winghv/agentwharf/releases/download/v0.1.2/agentwharf-linux-amd64.tar.gz" >/dev/null
 printf '%s\n' "$dry_run_output" | grep -F "install_wharf=/tmp/agentwharf-bin/wharf" >/dev/null
+printf '%s\n' "$dry_run_output" | grep -F "provider_package=@agentclientprotocol/codex-acp@1.8.0" >/dev/null
 printf '%s\n' "$dry_run_output" | grep -F "provider_package=@winghv/dsh-acp-activity@0.1.1-rc.2.1" >/dev/null
 printf '%s\n' "$dry_run_output" | grep -F "dsh_config_url=https://github.com/winghv/agentwharf/releases/download/v0.1.2/dsh-cordis.yml" >/dev/null
 if printf '%s\n' "$dry_run_output" | grep -F "install_agentwharf=" >/dev/null; then
@@ -114,7 +115,8 @@ grep -F "Get-Command npm.cmd" scripts/install.ps1 >/dev/null
 grep -F 'npm provider bridge installation failed (exit code' scripts/install.ps1 >/dev/null
 grep -F "Node.js 22 or newer" README.md >/dev/null
 grep -F "@agentclientprotocol/claude-agent-acp" scripts/install.sh >/dev/null
-grep -F "@agentclientprotocol/codex-acp" scripts/install.sh >/dev/null
+grep -F "@agentclientprotocol/codex-acp@1.8.0" scripts/install.sh >/dev/null
+grep -F '@agentclientprotocol/codex-acp@1.8.0' scripts/install.ps1 >/dev/null
 grep -F "@winghv/dsh-acp-activity" scripts/install.sh >/dev/null
 grep -F "AGENTWHARF_SKIP_DSH" scripts/install.sh >/dev/null
 grep -F "dsh-cordis.yml" scripts/install.ps1 >/dev/null

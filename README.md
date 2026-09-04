@@ -107,7 +107,11 @@ $ wharf dsh
 ```
 
 `wharf dsh` automatically uses the installed user-level composition. No manual
-DSH bridge installation or system path configuration is required.
+DSH bridge installation or system path configuration is required. When this
+machine is already paired, the command also starts the background dispatch
+daemon before returning, so Tasks created for DSH in the Agent Workbench are
+picked up without another local command. It does not start an interactive DSH
+terminal session or initiate pairing by itself.
 
 The CLI prints a pairing prompt:
 
@@ -140,7 +144,8 @@ prompts you to pair again.
 ## Auto-Dispatch: Run Tasks From Console Without Touching This Machine
 
 A paired machine can also receive Tasks created in the Console automatically.
-Start the local dispatch daemon:
+`wharf dsh` starts this daemon when the machine is already paired; otherwise
+start it explicitly:
 
 ```console
 $ wharf machine serve

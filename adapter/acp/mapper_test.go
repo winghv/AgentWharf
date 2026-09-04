@@ -293,6 +293,61 @@ func TestMapperSupportsLiveACPCamelCaseSessionUpdate(t *testing.T) {
 	}
 }
 
+func TestMapperMapsCodexMessageIDsAndProviderWarnings(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "codex"})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+
+	line := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","messageId":"item_42","content":{"type":"text","text":"hello"}}}}`
+	events, err := mapper.MapLine([]byte(line))
+	if err != nil {
+		t.Fatalf("MapLine(message) error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("message events = %+v, want one event", events)
+	}
+	message := payloadMap(t, events[0])
+	if message["message_id"] != "item_42" || message["provider_session_id"] != "acp_ses_1" {
+		t.Fatalf("message payload = %+v", message)
+	}
+
+	warningLine := `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"session_info_update","_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":{"id":"notice_1","severity":"warning","category":"provider_error","title":"Model metadata is unavailable"}}}}}}}`
+	warningEvents, err := mapper.MapLine([]byte(warningLine))
+	if err != nil {
+		t.Fatalf("MapLine(warning) error = %v", err)
+	}
+	if len(warningEvents) != 1 || warningEvents[0].Type != "agent.activity" {
+		t.Fatalf("warning events = %+v, want one agent.activity", warningEvents)
+	}
+	warning := payloadMap(t, warningEvents[0])
+	if warning["kind"] != "provider_warning" || warning["text"] != "Model metadata is unavailable" || warning["warning_id"] != "notice_1" {
+		t.Fatalf("warning payload = %+v", warning)
+	}
+}
+
+func TestMapperMapsLegacyCodexWarningAsActivity(t *testing.T) {
+	t.Parallel()
+
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "codex"})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+	events, err := mapper.MapLine([]byte(`{"type":"session/update","session_id":"acp_ses_1","update":{"type":"agent_message_chunk","text":"Warning: Model metadata for gpt-5.6-sol not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}`))
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) != 1 || events[0].Type != "agent.activity" {
+		t.Fatalf("events = %+v, want one agent.activity", events)
+	}
+	warning := payloadMap(t, events[0])
+	if warning["kind"] != "provider_warning" || warning["provider_session_id"] != "acp_ses_1" {
+		t.Fatalf("warning payload = %+v", warning)
+	}
+}
+
 func TestMapperMapsACPCancelResponseToReadyState(t *testing.T) {
 	t.Parallel()
 

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -36,10 +37,10 @@ type Config struct {
 }
 
 type Mapper struct {
-	sessionID       string
-	provider        string
-	now             func() time.Time
-	nextMessageID   uint64
+	sessionID     string
+	provider      string
+	now           func() time.Time
+	nextMessageID uint64
 }
 
 func NewMapper(cfg Config) (*Mapper, error) {
@@ -151,7 +152,7 @@ func (m *Mapper) jsonRPCErrorEvent(raw map[string]any) *protocol.Event {
 	if message == "" {
 		message = "unknown error"
 	}
-	event := m.messageEvent("acp-rpc-error", "The Agent could not complete this turn: "+message)
+	event := m.messageEvent("acp-rpc-error", "The Agent could not complete this turn: "+message, "")
 	return &event
 }
 
@@ -227,16 +228,24 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 				"provider_session_id": providerSessionID,
 			})
 		})
+	case "session_info_update":
+		if event := m.providerFailureEvent(update, providerSessionID); event != nil {
+			return []protocol.Event{*event}
+		}
+		return nil
 	case "agent_message_chunk", "prompt_response":
 		text := updateText(update)
 		if text == "" {
 			return nil
 		}
+		if m.provider == "codex" && isLegacyCodexWarning(text) {
+			return []protocol.Event{m.providerWarningEvent(strings.TrimSpace(text), "", providerSessionID)}
+		}
 		messageID := firstString(update, "message_id", "messageId", "id", "session_id", "sessionId")
 		if messageID == "" {
 			messageID = m.nextMessageIDValue()
 		}
-		return m.messageEvents(messageID, text)
+		return m.messageEvents(messageID, text, providerSessionID)
 	case "tool_use", "tool_call":
 		return m.toolCallEvents(update, false)
 	case "tool_call_update", "tool_result":
@@ -571,15 +580,19 @@ func (m *Mapper) stateEvent(state string, providerSessionID string, metadata map
 	})
 }
 
-func (m *Mapper) messageEvent(messageID string, text string) protocol.Event {
-	return m.event("session.message", map[string]any{
+func (m *Mapper) messageEvent(messageID, text, providerSessionID string) protocol.Event {
+	payload := map[string]any{
 		"message_id": messageID,
 		"role":       "agent",
 		"content": []map[string]any{{
 			"kind": "text",
 			"text": text,
 		}},
-	})
+	}
+	if providerSessionID != "" {
+		payload["provider_session_id"] = providerSessionID
+	}
+	return m.event("session.message", payload)
 }
 
 func (m *Mapper) event(eventType string, payload map[string]any) protocol.Event {
@@ -595,10 +608,60 @@ func (m *Mapper) event(eventType string, payload map[string]any) protocol.Event 
 	}
 }
 
-func (m *Mapper) messageEvents(messageID string, text string) []protocol.Event {
+func (m *Mapper) messageEvents(messageID, text, providerSessionID string) []protocol.Event {
 	return splitMessageEvents(text, maxMessagePayloadBytes, func(part string) protocol.Event {
-		return m.messageEvent(messageID, part)
+		return m.messageEvent(messageID, part, providerSessionID)
 	})
+}
+
+func isLegacyCodexWarning(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return strings.HasPrefix(trimmed, "Warning: Model metadata for ") ||
+		strings.HasPrefix(trimmed, "Config warning:")
+}
+
+func (m *Mapper) providerWarningEvent(text, warningID, providerSessionID string) protocol.Event {
+	payload := map[string]any{
+		"kind":                "provider_warning",
+		"text":                text,
+		"provider_session_id": providerSessionID,
+	}
+	if warningID != "" {
+		payload["warning_id"] = warningID
+	}
+	return m.event("agent.activity", payload)
+}
+
+func (m *Mapper) providerFailureEvent(update map[string]any, providerSessionID string) *protocol.Event {
+	meta := objectField(update, "_meta")
+	jetbrains := objectField(meta, "jetbrains")
+	air := objectField(jetbrains, "air")
+	failure := objectField(air, "sessionFailure")
+	if failure == nil {
+		return nil
+	}
+	text := firstString(failure, "title", "message")
+	if text == "" {
+		return nil
+	}
+	kind := "provider_warning"
+	if firstString(failure, "severity") == "error" {
+		kind = "provider_failure"
+	}
+	warningID := firstString(failure, "id")
+	payload := map[string]any{
+		"kind":                kind,
+		"text":                text,
+		"provider_session_id": providerSessionID,
+	}
+	if warningID != "" {
+		payload["warning_id"] = warningID
+	}
+	if category := firstString(failure, "category"); category != "" {
+		payload["category"] = category
+	}
+	event := m.event("agent.activity", payload)
+	return &event
 }
 
 func (m *Mapper) nextMessageIDValue() string {

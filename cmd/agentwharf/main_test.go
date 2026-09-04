@@ -3045,7 +3045,7 @@ func TestValidateDeepSeekOwnMachinePrerequisites(t *testing.T) {
 	}
 }
 
-func TestDSHEntrypointDirectsUsersToWorkbenchWithoutPairing(t *testing.T) {
+func TestDSHEntrypointDoesNotPairWhenUnpaired(t *testing.T) {
 	stdout := new(bytes.Buffer)
 	stderr := new(bytes.Buffer)
 	if err := runWithInput(context.Background(), []string{"dsh"}, strings.NewReader(""), stdout, stderr); err != nil {
@@ -3056,6 +3056,24 @@ func TestDSHEntrypointDirectsUsersToWorkbenchWithoutPairing(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "device_code") || strings.Contains(stderr.String(), "device_code") {
 		t.Fatalf("dsh unexpectedly started pairing: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestDSHEntrypointEnsuresBackgroundDaemon(t *testing.T) {
+	var ensured bool
+	stdout := new(bytes.Buffer)
+	stderr := new(bytes.Buffer)
+	if err := runDSHCommand(stdout, stderr, func(got io.Writer) error {
+		ensured = got == stderr
+		return nil
+	}); err != nil {
+		t.Fatalf("runDSHCommand error = %v", err)
+	}
+	if !ensured {
+		t.Fatal("DSH entrypoint did not ensure the background daemon")
+	}
+	if !strings.Contains(stdout.String(), "Agent Workbench") {
+		t.Fatalf("dsh output = %q, want Agent Workbench guidance", stdout.String())
 	}
 }
 

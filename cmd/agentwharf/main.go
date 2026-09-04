@@ -123,11 +123,7 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		_, _ = fmt.Fprintf(stdout, "wharf wrap sent events for session_id=%s provider=%s\n", effective.SessionID, effective.Provider)
 		return nil
 	case "dsh":
-		// DSH exposes ACP only; it has no local terminal/TUI surface that Wharf
-		// can drive. Keep the terminal command side-effect free and direct the
-		// user to the Workbench, where the ACP session is rendered.
-		_, _ = fmt.Fprintln(stdout, "DSH sessions are available in the Agent Workbench; closing this terminal command.")
-		return nil
+		return runDSHCommand(stdout, stderr, ensureBackgroundDaemon)
 	case "claude", "codex", "gemini":
 		go maybePrintUpdateReminder(ctx, stderr)
 		cfg, err := parseAgentEntrypointConfig(args[0], args[1:], stderr)
@@ -828,6 +824,17 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 		cfg.Stderr = io.Discard
 	}
 	return cfg, nil
+}
+
+func runDSHCommand(stdout, stderr io.Writer, ensureDaemon func(io.Writer) error) error {
+	// DSH exposes ACP only; it has no local terminal/TUI surface that Wharf can
+	// drive. Keep the terminal command non-interactive, but keep a paired machine
+	// online so the Workbench can auto-dispatch DSH Tasks to it.
+	if err := ensureDaemon(stderr); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(stdout, "DSH sessions are available in the Agent Workbench; closing this terminal command.")
+	return nil
 }
 
 // agentForProvider maps a platform provider id onto the wharf agent entry
@@ -1954,6 +1961,16 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 				"writeTextFile": true,
 			},
 			"terminal": false,
+			// Codex uses this negotiated extension for provider notices and
+			// failures. Without it, older bridges encode notices as Agent prose.
+			"_meta": map[string]any{
+				"jetbrains": map[string]any{
+					"air": map[string]any{
+						"version":      1,
+						"capabilities": []string{"sessionFailure"},
+					},
+				},
+			},
 		},
 	}); err != nil {
 		cancel()
