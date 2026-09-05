@@ -23,6 +23,7 @@ $claudeAcpPackage = Get-EnvOrDefault "AGENTWHARF_CLAUDE_ACP_PACKAGE" "@agentclie
 $codexAcpPackage = Get-EnvOrDefault "AGENTWHARF_CODEX_ACP_PACKAGE" "@agentclientprotocol/codex-acp@1.8.0"
 $dshVersion = Get-EnvOrDefault "AGENTWHARF_DSH_VERSION" "0.1.2-rc.1"
 $dshPackage = Get-EnvOrDefault "AGENTWHARF_DSH_PACKAGE" "@deepseek-ai/dsh@$dshVersion"
+$dshRuntimeDir = Get-EnvOrDefault "AGENTWHARF_DSH_RUNTIME_DIR" (Join-Path $providerDir "dsh-runtime-$dshVersion")
 $dshConfigAsset = "dsh-cordis.yml"
 $skipDsh = [Environment]::GetEnvironmentVariable("AGENTWHARF_SKIP_DSH") -eq "1"
 $skipBridges = [Environment]::GetEnvironmentVariable("AGENTWHARF_SKIP_PROVIDER_BRIDGES") -eq "1"
@@ -80,6 +81,7 @@ if ([Environment]::GetEnvironmentVariable("AGENTWHARF_INSTALL_DRY_RUN") -eq "1")
     if ($null -ne $existing) { "existing_wharf=$($existing.Source)" }
     "install_wharf=$(Join-Path $installDir 'wharf.exe')"
     "provider_dir=$providerDir"
+    if (-not $skipDsh -and -not $skipBridges) { "dsh_runtime_dir=$dshRuntimeDir" }
     "provider_package=$claudeAcpPackage"
     "provider_package=$codexAcpPackage"
     if (-not $skipDsh -and -not $skipBridges) {
@@ -153,7 +155,8 @@ try {
             throw "npm provider bridge installation failed; see the npm error above"
         }
         if ($installDsh) {
-            $npmOutput = @(& $npm.Source install --prefix $providerDir --omit=dev --loglevel=error $dshPackage 2>&1)
+            New-Item -ItemType Directory -Path $dshRuntimeDir -Force | Out-Null
+            $npmOutput = @(& $npm.Source install --prefix $dshRuntimeDir --omit=dev --loglevel=error $dshPackage 2>&1)
             $npmExitCode = $LASTEXITCODE
             if ($npmExitCode -ne 0) {
                 Say "npm DSH installation failed (exit code $npmExitCode)"
@@ -172,7 +175,7 @@ try {
             Write-ProviderWrapper (Join-Path $installDir "$bridge.cmd") $bridgePath
         }
         if ($installDsh) {
-            $dshBridgePath = Join-Path $providerDir "node_modules/.bin/dsh.cmd"
+            $dshBridgePath = Join-Path $dshRuntimeDir "node_modules/.bin/dsh.cmd"
             if (-not (Test-Path -LiteralPath $dshBridgePath -PathType Leaf)) { throw "official dsh ACP runtime was not installed" }
             Write-ProviderWrapper (Join-Path $installDir "dsh.cmd") $dshBridgePath
             $dshConfigDir = Join-Path $providerDir "dsh"

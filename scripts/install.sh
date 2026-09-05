@@ -8,6 +8,7 @@ claude_acp_package=${AGENTWHARF_CLAUDE_ACP_PACKAGE:-@agentclientprotocol/claude-
 codex_acp_package=${AGENTWHARF_CODEX_ACP_PACKAGE:-@agentclientprotocol/codex-acp@1.8.0}
 dsh_version=${AGENTWHARF_DSH_VERSION:-0.1.2-rc.1}
 dsh_package=${AGENTWHARF_DSH_PACKAGE:-@deepseek-ai/dsh@$dsh_version}
+dsh_runtime_dir=${AGENTWHARF_DSH_RUNTIME_DIR:-$provider_dir/dsh-runtime-$dsh_version}
 dsh_config_asset=dsh-cordis.yml
 
 say() {
@@ -108,6 +109,9 @@ if [ "${AGENTWHARF_INSTALL_DRY_RUN:-}" = "1" ]; then
     printf 'cleanup_legacy_agentwharf=%s\n' "$install_dir/agentwharf"
   fi
   printf 'provider_dir=%s\n' "$provider_dir"
+  if [ "${AGENTWHARF_SKIP_DSH:-}" != "1" ] && [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
+    printf 'dsh_runtime_dir=%s\n' "$dsh_runtime_dir"
+  fi
   printf 'provider_package=%s\n' "$claude_acp_package"
   printf 'provider_package=%s\n' "$codex_acp_package"
   if [ "${AGENTWHARF_SKIP_DSH:-}" != "1" ] && [ "${AGENTWHARF_SKIP_PROVIDER_BRIDGES:-}" != "1" ]; then
@@ -216,7 +220,11 @@ install_provider_bridges() {
   mkdir -p "$provider_dir"
   npm install --prefix "$provider_dir" --omit=dev "$claude_acp_package" "$codex_acp_package" >/dev/null
   if [ "$install_dsh" = "1" ]; then
-    npm install --prefix "$provider_dir" --omit=dev "$dsh_package" >/dev/null
+    # DSH has an internal Symbol contract between dsh-agent-loop and dsh-tools.
+    # Keep it in a clean prefix so stale ACP-era packages in the shared bridge
+    # prefix cannot make Node load two release lines at once.
+    mkdir -p "$dsh_runtime_dir"
+    npm install --prefix "$dsh_runtime_dir" --omit=dev "$dsh_package" >/dev/null
   fi
 
   claude_bridge="$provider_dir/node_modules/.bin/claude-agent-acp"
@@ -227,7 +235,7 @@ install_provider_bridges() {
   write_provider_wrapper "$tmp_dir/claude-agent-acp" "$claude_bridge"
   write_provider_wrapper "$tmp_dir/codex-acp" "$codex_bridge"
   if [ "$install_dsh" = "1" ]; then
-    dsh_bridge="$provider_dir/node_modules/.bin/dsh"
+    dsh_bridge="$dsh_runtime_dir/node_modules/.bin/dsh"
     [ -x "$dsh_bridge" ] || fail "official dsh ACP runtime was not installed"
     write_provider_wrapper "$tmp_dir/dsh" "$dsh_bridge"
   fi

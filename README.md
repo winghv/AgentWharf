@@ -46,8 +46,11 @@ CMD or PowerShell; Git Bash detects Windows and prints the PowerShell command.
 
 The installer downloads the matching prebuilt binary from GitHub Releases,
 installs the `wharf` command, and installs the Claude/Codex ACP bridge wrappers
-plus the pinned official DeepSeek Harness runtime and a SuperWHV policy patch
-under `~/.agentwharf/providers/dsh/cordis.yml`.
+plus the pinned official DeepSeek Harness runtime in a versioned, isolated
+prefix under `~/.agentwharf/providers/dsh-runtime-<version>/`, and installs a
+SuperWHV policy patch under `~/.agentwharf/providers/dsh/cordis.yml`. The DSH
+prefix is isolated because its runtime packages exchange identity-sensitive
+symbols and must not resolve through stale packages from another release line.
 Set `AGENTWHARF_SKIP_DSH=1` only when DSH is intentionally not needed.
 
 Run the same install command again to upgrade. When `wharf` already exists on

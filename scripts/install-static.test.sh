@@ -22,6 +22,7 @@ printf '%s\n' "$dry_run_output" | grep -F "https://github.com/winghv/agentwharf/
 printf '%s\n' "$dry_run_output" | grep -F "install_wharf=/tmp/agentwharf-bin/wharf" >/dev/null
 printf '%s\n' "$dry_run_output" | grep -F "provider_package=@agentclientprotocol/codex-acp@1.8.0" >/dev/null
 printf '%s\n' "$dry_run_output" | grep -F "provider_package=@deepseek-ai/dsh@0.1.2-rc.1" >/dev/null
+printf '%s\n' "$dry_run_output" | grep -F 'dsh_runtime_dir=' >/dev/null
 printf '%s\n' "$dry_run_output" | grep -F "dsh_config_url=https://github.com/winghv/agentwharf/releases/download/v0.1.2/dsh-cordis.yml" >/dev/null
 if printf '%s\n' "$dry_run_output" | grep -F "install_agentwharf=" >/dev/null; then
   echo "installer must expose only the wharf command" >&2
@@ -118,7 +119,12 @@ grep -F "@agentclientprotocol/claude-agent-acp" scripts/install.sh >/dev/null
 grep -F "@agentclientprotocol/codex-acp@1.8.0" scripts/install.sh >/dev/null
 grep -F '@agentclientprotocol/codex-acp@1.8.0' scripts/install.ps1 >/dev/null
 grep -F '@deepseek-ai/dsh@$dsh_version' scripts/install.sh >/dev/null
+grep -F 'dsh_runtime_dir' scripts/install.sh >/dev/null
 grep -F '@deepseek-ai/dsh@$dshVersion' scripts/install.ps1 >/dev/null
+grep -F 'dshRuntimeDir' scripts/install.ps1 >/dev/null
+test -x scripts/dsh-version-consistency.sh
+grep -F '@deepseek-ai/dsh-agent-loop' scripts/dsh-version-consistency.sh >/dev/null
+grep -F '@deepseek-ai/dsh-tools' scripts/dsh-version-consistency.sh >/dev/null
 if grep -F '@winghv/dsh-acp-activity' scripts/install.sh scripts/install.ps1 >/dev/null; then
   echo "the retired DSH fork must not be installed" >&2
   exit 1
