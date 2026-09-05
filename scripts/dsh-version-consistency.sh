@@ -59,21 +59,19 @@ function visitNodeModules(directory) {
   }
 }
 
-function resolvedPackage(name) {
-  const manifestPath = require.resolve(`${name}/package.json`, { paths: [root] })
-  const info = packageInfo(path.dirname(manifestPath))
-  if (info?.name === name) return info
-  throw new Error(`resolved package manifest has an unexpected name for ${name}: ${manifestPath}`)
-}
-
+visitNodeModules(path.join(root, 'node_modules'))
 for (const name of required) {
-  const info = resolvedPackage(name)
-  if (info.version !== expected) {
-    throw new Error(`${name} resolved to ${info.version}; expected ${expected}`)
+  const matches = [...packages.values()].filter(info => info.name === name)
+  if (matches.length === 0) {
+    throw new Error(`${name} is missing from the DSH dependency closure`)
+  }
+  for (const info of matches) {
+    if (info.version !== expected) {
+      throw new Error(`${name} at ${info.directory} resolved to ${info.version}; expected ${expected}`)
+    }
   }
 }
 
-visitNodeModules(path.join(root, 'node_modules'))
 for (const info of packages.values()) {
   if (info.version !== expected) {
     throw new Error(`${info.name} at ${info.directory} resolved to ${info.version}; expected ${expected}`)
