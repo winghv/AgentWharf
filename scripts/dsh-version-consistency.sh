@@ -11,7 +11,7 @@ node - "$runtime_dir" "$expected_version" <<'NODE'
 const fs = require('node:fs')
 const path = require('node:path')
 
-const root = path.resolve(process.argv[2])
+const root = fs.realpathSync(path.resolve(process.argv[2]))
 const expected = process.argv[3]
 const required = [
   '@deepseek-ai/dsh-agent',

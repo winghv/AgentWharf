@@ -123,6 +123,8 @@ grep -F 'dsh_runtime_dir' scripts/install.sh >/dev/null
 grep -F '@deepseek-ai/dsh@$dshVersion' scripts/install.ps1 >/dev/null
 grep -F 'dshRuntimeDir' scripts/install.ps1 >/dev/null
 test -x scripts/dsh-version-consistency.sh
+test -x scripts/dsh-version-consistency.test.sh
+bash scripts/dsh-version-consistency.test.sh >/dev/null
 grep -F '@deepseek-ai/dsh-agent-loop' scripts/dsh-version-consistency.sh >/dev/null
 grep -F '@deepseek-ai/dsh-tools' scripts/dsh-version-consistency.sh >/dev/null
 if grep -F '@winghv/dsh-acp-activity' scripts/install.sh scripts/install.ps1 >/dev/null; then
