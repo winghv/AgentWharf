@@ -14,6 +14,7 @@ const path = require('node:path')
 const root = fs.realpathSync(path.resolve(process.argv[2]))
 const expected = process.argv[3]
 const required = [
+  '@deepseek-ai/dsh',
   '@deepseek-ai/dsh-agent',
   '@deepseek-ai/dsh-agent-loop',
   '@deepseek-ai/dsh-tools',
@@ -59,16 +60,10 @@ function visitNodeModules(directory) {
 }
 
 function resolvedPackage(name) {
-  const entry = require.resolve(name, { paths: [root] })
-  let directory = path.dirname(entry)
-  while (directory.startsWith(root)) {
-    const info = packageInfo(directory)
-    if (info?.name === name) return info
-    const parent = path.dirname(directory)
-    if (parent === directory) break
-    directory = parent
-  }
-  throw new Error(`could not identify package root for ${name} from ${entry}`)
+  const manifestPath = require.resolve(`${name}/package.json`, { paths: [root] })
+  const info = packageInfo(path.dirname(manifestPath))
+  if (info?.name === name) return info
+  throw new Error(`resolved package manifest has an unexpected name for ${name}: ${manifestPath}`)
 }
 
 for (const name of required) {

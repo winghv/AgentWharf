@@ -4,7 +4,7 @@ set -eu
 root=$(mktemp -d "${TMPDIR:-/tmp}/dsh-version-consistency.XXXXXX")
 trap 'rm -rf "$root"' EXIT
 
-packages="dsh-agent dsh-agent-loop dsh-tools dsh-code-runtime dsh-session dsh-llm"
+packages="dsh dsh-agent dsh-agent-loop dsh-tools dsh-code-runtime dsh-session dsh-llm"
 for package in $packages; do
   directory="$root/node_modules/@deepseek-ai/$package"
   mkdir -p "$directory"
