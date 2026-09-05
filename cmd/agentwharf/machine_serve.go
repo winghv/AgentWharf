@@ -773,6 +773,9 @@ func serveWrapConfig(handoff machineServeDispatch, startupSmoke bool) wrapConfig
 	if agent == "deepseek-harness" {
 		agent = "dsh"
 	}
+	if agent == "pi" {
+		agent = "pi"
+	}
 	return wrapConfig{
 		HubURL:            handoff.HubWSURL,
 		SessionID:         handoff.SessionID,

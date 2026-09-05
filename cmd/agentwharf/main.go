@@ -124,6 +124,8 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		return nil
 	case "dsh":
 		return runDSHCommand(stdout, stderr, ensureBackgroundDaemon)
+	case "pi":
+		return runPICommand(stdout, stderr, ensureBackgroundDaemon)
 	case "claude", "codex", "gemini":
 		go maybePrintUpdateReminder(ctx, stderr)
 		cfg, err := parseAgentEntrypointConfig(args[0], args[1:], stderr)
@@ -163,7 +165,7 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 	case "attention-backfill":
 		return runAttentionBackfill(ctx, args[1:], stdout, stderr)
 	default:
-		_, _ = fmt.Fprintf(stdout, "usage: wharf [pair]|serve|hub|wrap|claude|codex|dsh|gemini|logout|version|upgrade|attention-backfill [options]\n")
+		_, _ = fmt.Fprintf(stdout, "usage: wharf [pair]|serve|hub|wrap|claude|codex|dsh|pi|gemini|logout|version|upgrade|attention-backfill [options]\n")
 		_, _ = fmt.Fprintln(stdout, "  wharf            pair this machine with the default hub (reuses an existing pairing)")
 		_, _ = fmt.Fprintln(stdout, "  wharf pair [url] pair with a specific cloud API base URL")
 		return nil
@@ -827,13 +829,18 @@ func normalizeWrapConfig(cfg wrapConfig) (wrapConfig, error) {
 }
 
 func runDSHCommand(stdout, stderr io.Writer, ensureDaemon func(io.Writer) error) error {
-	// DSH exposes ACP only; it has no local terminal/TUI surface that Wharf can
-	// drive. Keep the terminal command non-interactive, but keep a paired machine
-	// online so the Workbench can auto-dispatch DSH Tasks to it.
 	if err := ensureDaemon(stderr); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintln(stdout, "DSH sessions are available in the Agent Workbench; closing this terminal command.")
+	return nil
+}
+
+func runPICommand(stdout, stderr io.Writer, ensureDaemon func(io.Writer) error) error {
+	if err := ensureDaemon(stderr); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(stdout, "pi sessions are available in the Agent Workbench; closing this terminal command.")
 	return nil
 }
 
@@ -846,6 +853,8 @@ func agentForProvider(provider string) string {
 		return "claude"
 	case "deepseek-harness":
 		return "dsh"
+	case "pi":
+		return "pi"
 	default:
 		return provider
 	}
@@ -855,7 +864,7 @@ func agentForProvider(provider string) string {
 // CLI: dispatched sessions for it must run the headless ACP bridge even when
 // the dispatcher hands the wrap a character-device stdin.
 func providerIsBridgeOnly(provider string) bool {
-	return provider == "deepseek-harness"
+	return provider == "deepseek-harness" || provider == "pi"
 }
 
 func providerForAgent(agent string) string {
@@ -864,6 +873,8 @@ func providerForAgent(agent string) string {
 		return defaultProvider
 	case "dsh":
 		return "deepseek-harness"
+	case "pi":
+		return "pi"
 	default:
 		return agent
 	}
@@ -876,9 +887,9 @@ func defaultProviderCommand(agent string) []string {
 	case "codex":
 		return []string{"codex-acp"}
 	case "dsh":
-		// The official DSH ACP profile owns the runtime composition. SuperWHV's
-		// final patch narrows its tool and network surface to the approved policy.
 		return []string{"dsh", "--profile", "acp", "--patch", defaultDSHConfigPath()}
+	case "pi":
+		return []string{"pi-acp"}
 	default:
 		return []string{agent}
 	}
@@ -2716,6 +2727,15 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 // otherwise passed through verbatim, so the sandbox environment stays
 // file-path-only for injected secrets.
 func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
+	if cfg.Provider == "pi" && cfg.SecretDir == "" {
+		env := make([]string, 0, 4)
+		for _, name := range []string{"OPENAI_API_KEY", "OPENAI_BASE_URL", "PI_MODEL"} {
+			if value := environmentValue(parent, name); value != "" {
+				env = append(env, name+"="+value)
+			}
+		}
+		return env, nil
+	}
 	if cfg.Provider == "deepseek-harness" && cfg.SecretDir == "" {
 		env := make([]string, 0, 4)
 		for _, name := range []string{"DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DSH_PERSISTENCE_ROOT"} {
@@ -2727,6 +2747,9 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 	}
 	if cfg.Provider == "codex" {
 		return codexProviderChildEnvironment(cfg.SecretDir, parent)
+	}
+	if cfg.Provider == "pi" {
+		return piProviderChildEnvironment(cfg.SecretDir, parent)
 	}
 	env := make([]string, 0, 4)
 	prefix, strictCredentials, minLengthCredential := providerCredentialEnvContract(cfg.Provider)
@@ -2755,6 +2778,42 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 		if value := environmentValue(parent, "DSH_PERSISTENCE_ROOT"); value != "" {
 			env = append(env, "DSH_PERSISTENCE_ROOT="+value)
 		}
+	}
+	return env, nil
+}
+
+// piProviderChildEnvironment translates file-path-only profile inputs into the
+// OpenAI credentials consumed by pi-ai. PI_MODEL is a bounded config file.
+func piProviderChildEnvironment(secretDir string, parent []string) ([]string, error) {
+	if secretDir == "" {
+		return nil, nil
+	}
+	env := make([]string, 0, 3)
+	for _, name := range []string{"OPENAI_API_KEY", "OPENAI_BASE_URL"} {
+		path := environmentValue(parent, name)
+		if path == "" {
+			continue
+		}
+		if name == "OPENAI_API_KEY" {
+			value, err := readProviderCredentialFile(secretDir, path, true)
+			if err != nil {
+				return nil, fmt.Errorf("load %s for pi provider child: %w", name, err)
+			}
+			env = append(env, name+"="+value)
+			continue
+		}
+		value, ok := readProviderConfigFile(secretDir, path)
+		if !ok {
+			return nil, errors.New("load OPENAI_BASE_URL for pi provider child: bounded config file required")
+		}
+		env = append(env, name+"="+value)
+	}
+	if path := environmentValue(parent, "PI_MODEL"); path != "" {
+		value, ok := readProviderConfigFile(secretDir, path)
+		if !ok || strings.TrimSpace(value) == "" {
+			return nil, errors.New("load PI_MODEL for pi provider child: bounded config file required")
+		}
+		env = append(env, "PI_MODEL="+strings.TrimSpace(value))
 	}
 	return env, nil
 }
@@ -2815,6 +2874,8 @@ func providerCredentialEnvContract(provider string) (prefix string, strict map[s
 		return "ANTHROPIC_", map[string]bool{"ANTHROPIC_AUTH_TOKEN": true, "ANTHROPIC_BASE_URL": true}, "ANTHROPIC_AUTH_TOKEN"
 	case "deepseek-harness":
 		return "DEEPSEEK_", map[string]bool{"DEEPSEEK_API_KEY": true, "DEEPSEEK_BASE_URL": true}, "DEEPSEEK_API_KEY"
+	case "pi":
+		return "OPENAI_", map[string]bool{"OPENAI_API_KEY": true, "OPENAI_BASE_URL": true}, "OPENAI_API_KEY"
 	default:
 		return "", nil, ""
 	}
