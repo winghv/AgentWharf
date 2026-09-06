@@ -56,6 +56,7 @@ const (
 	defaultHeartbeatInterval  = 20 * time.Second
 	defaultHeartbeatTimeout   = 60 * time.Second
 	cloudAPIMaxAttempts       = 3
+	managedPICommandOverride  = "/opt/superwhv/bin/superwhv-pi"
 )
 
 var (
@@ -2784,6 +2785,8 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 
 // piProviderChildEnvironment translates file-path-only profile inputs into the
 // OpenAI credentials consumed by pi-ai. PI_MODEL is a bounded config file.
+// Managed images also receive a fixed wrapper so PI_MODEL is applied as pi's
+// startup --model argument; pi itself does not consume PI_MODEL directly.
 func piProviderChildEnvironment(secretDir string, parent []string) ([]string, error) {
 	if secretDir == "" {
 		return nil, nil
@@ -2815,6 +2818,7 @@ func piProviderChildEnvironment(secretDir string, parent []string) ([]string, er
 		}
 		env = append(env, "PI_MODEL="+strings.TrimSpace(value))
 	}
+	env = append(env, "PI_ACP_PI_COMMAND="+managedPICommandOverride)
 	return env, nil
 }
 

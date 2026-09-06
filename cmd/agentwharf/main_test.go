@@ -3184,6 +3184,60 @@ func TestProviderChildEnvironmentForwardsLocalDeepSeekCredentials(t *testing.T) 
 	}
 }
 
+func TestProviderChildEnvironmentForwardsPiCredentialsForChildOnly(t *testing.T) {
+	secretDir := t.TempDir()
+	apiKeyPath := filepath.Join(secretDir, "pi_api_key")
+	baseURLPath := filepath.Join(secretDir, "pi_base_url")
+	modelPath := filepath.Join(secretDir, "pi_model")
+	for path, value := range map[string]string{
+		apiKeyPath:  "test-pi-api-key\n",
+		baseURLPath: "https://provider.example.test/v1\n",
+		modelPath:   "gpt-5.6-sol\n",
+	} {
+		if err := os.WriteFile(path, []byte(value), 0o400); err != nil {
+			t.Fatalf("write pi config: %v", err)
+		}
+	}
+	env, err := providerChildEnvironment(wrapConfig{Provider: "pi", SecretDir: secretDir}, []string{
+		"OPENAI_API_KEY=" + apiKeyPath,
+		"OPENAI_BASE_URL=" + baseURLPath,
+		"PI_MODEL=" + modelPath,
+	})
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	want := map[string]string{
+		"OPENAI_API_KEY":    "test-pi-api-key",
+		"OPENAI_BASE_URL":   "https://provider.example.test/v1",
+		"PI_MODEL":          "gpt-5.6-sol",
+		"PI_ACP_PI_COMMAND": managedPICommandOverride,
+	}
+	for name, value := range want {
+		if got := environmentValue(env, name); got != value {
+			t.Fatalf("child env %s = %q, want %q", name, got, value)
+		}
+	}
+}
+
+func TestProviderChildEnvironmentForwardsLocalPiCredentials(t *testing.T) {
+	env, err := providerChildEnvironment(wrapConfig{Provider: "pi"}, []string{
+		"OPENAI_API_KEY=local-api-key",
+		"OPENAI_BASE_URL=https://api.example.test/v1",
+		"PI_MODEL=gpt-5.6-sol",
+	})
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	want := []string{
+		"OPENAI_API_KEY=local-api-key",
+		"OPENAI_BASE_URL=https://api.example.test/v1",
+		"PI_MODEL=gpt-5.6-sol",
+	}
+	if !reflect.DeepEqual(env, want) {
+		t.Fatalf("local pi child env = %v, want %v", env, want)
+	}
+}
+
 func TestProviderChildEnvironmentForwardsDeepSeekCredentialsForChildOnly(t *testing.T) {
 	secretDir := t.TempDir()
 	apiKeyPath := filepath.Join(secretDir, "deepseek_api_key")
