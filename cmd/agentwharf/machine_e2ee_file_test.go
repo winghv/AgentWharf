@@ -47,10 +47,21 @@ func TestEncryptedFileReadClaimsReadsAndSealsResult(t *testing.T) {
 		wire, _ := json.Marshal(map[string]any{"version": 1, "scope": "command", "key_id": "key", "sender": "client", "message_id": id, "type": commandType, "packet": packet})
 		return wire
 	}
-	frames := make([]protocol.Frame, 0)
-	write := func(frame protocol.Frame) error { frames = append(frames, frame); return nil }
 	command := &protocol.Command{SessionID: "session", CommandID: "file-read", Type: protocol.CommandFileRead, Payload: seal("file-read", protocol.CommandFileRead, []byte(`{"path":"secret.txt"}`))}
-	cfg := wrapConfig{SessionID: "session", WorkingDirectory: root, e2eeRuntime: runtime}
+	cfg := wrapConfig{SessionID: "session", WorkingDirectory: root, ProtocolVersion: protocol.ProtocolVersionV2, ContentMode: protocol.ContentModeRequired, e2eeRuntime: runtime}
+	frames := make([]protocol.Frame, 0)
+	connection := newHubConnection(cfg, nil, nil)
+	write := func(frame protocol.Frame) error {
+		if event, ok := frame.(*protocol.Event); ok {
+			prepared, err := connection.prepareEvent(ctx, event)
+			if err != nil {
+				return err
+			}
+			frame = prepared
+		}
+		frames = append(frames, frame)
+		return nil
+	}
 	if err := deliverEncryptedFileRead(ctx, cfg, command, write); err != nil {
 		t.Fatal(err)
 	}
@@ -95,17 +106,25 @@ func TestEncryptedFileReadClaimsReadsAndSealsResult(t *testing.T) {
 			}
 		}
 		for _, tc := range []struct {
-			path     string
-			rejected bool
-		}{{".", false}, {"empty", false}, {"large", true}, {"secret.txt", true}, {"../", true}} {
+			path       string
+			reasonCode string
+		}{{".", ""}, {"empty", ""}, {"large", "file_unavailable"}, {"secret.txt", "file_unavailable"}, {"../", "invalid_file_request"}} {
 			frames = nil
 			id := fmt.Sprintf("list-%d", len(tc.path)) + strings.ReplaceAll(tc.path, "/", "_")
 			payload, _ := json.Marshal(map[string]string{"path": tc.path})
 			command := &protocol.Command{SessionID: "session", CommandID: id, Type: protocol.CommandFileList, Payload: seal(id, protocol.CommandFileList, payload)}
 			err := deliverEncryptedFileList(ctx, cfg, command, write)
-			if tc.rejected {
-				if err == nil || len(frames) != 0 {
-					t.Fatalf("directory %q accepted or emitted output", tc.path)
+			if tc.reasonCode != "" {
+				if err != nil || len(frames) != 1 {
+					t.Fatalf("directory %q rejection: frames=%d err=%v", tc.path, len(frames), err)
+				}
+				ack, ok := frames[0].(*protocol.CommandAck)
+				if !ok || ack.Status != protocol.AckRejected || ack.Reason != tc.reasonCode {
+					t.Fatalf("directory %q rejection = %#v", tc.path, frames[0])
+				}
+				var count int
+				if err := runtime.database.QueryRowContext(ctx, `SELECT count(*) FROM e2ee_local_commands WHERE session='session' AND message=?`, id).Scan(&count); err != nil || count != 0 {
+					t.Fatalf("rejected directory command was journaled: count=%d err=%v", count, err)
 				}
 				continue
 			}
@@ -154,17 +173,30 @@ func TestEncryptedFileReadClaimsReadsAndSealsResult(t *testing.T) {
 	frames = nil
 	linkListID := "list-directory-link"
 	linkListPayload := seal(linkListID, protocol.CommandFileList, []byte(`{"path":"directory-link"}`))
-	if err := deliverEncryptedFileList(ctx, cfg, &protocol.Command{SessionID: "session", CommandID: linkListID, Type: protocol.CommandFileList, Payload: linkListPayload}, write); err == nil || len(frames) != 0 {
-		t.Fatal("directory symlink accepted or emitted output")
+	if err := deliverEncryptedFileList(ctx, cfg, &protocol.Command{SessionID: "session", CommandID: linkListID, Type: protocol.CommandFileList, Payload: linkListPayload}, write); err != nil || len(frames) != 1 || frames[0].(*protocol.CommandAck).Status != protocol.AckRejected || frames[0].(*protocol.CommandAck).Reason != "file_unavailable" {
+		t.Fatal("directory symlink rejection failed", err)
 	}
 	for _, path := range []string{"../secret.txt", "dir/../secret.txt", "name..txt", "/etc/passwd", "secret-link", "missing.txt"} {
 		frames = frames[:0]
 		bad := &protocol.Command{SessionID: "session", CommandID: "bad-" + strings.ReplaceAll(path, "/", "_"), Type: protocol.CommandFileRead, Payload: seal("bad-"+strings.ReplaceAll(path, "/", "_"), protocol.CommandFileRead, []byte(`{"path":"`+path+`"}`))}
-		if err := deliverEncryptedFileRead(ctx, cfg, bad, write); err == nil {
-			t.Fatalf("unsafe path accepted: %s", path)
+		if err := deliverEncryptedFileRead(ctx, cfg, bad, write); err != nil {
+			t.Fatalf("file rejection terminated delivery: %s: %v", path, err)
 		}
-		if len(frames) != 0 {
-			t.Fatal("unsafe file produced output")
+		if len(frames) != 1 {
+			t.Fatal("rejected file produced unexpected output")
 		}
+		ack := frames[0].(*protocol.CommandAck)
+		wantReason := "file_unavailable"
+		if path == "../secret.txt" || path == "dir/../secret.txt" || path == "/etc/passwd" {
+			wantReason = "invalid_file_request"
+		}
+		if ack.Status != protocol.AckRejected || ack.Reason != wantReason {
+			t.Fatalf("file %q rejection = %#v", path, ack)
+		}
+	}
+	frames = nil
+	followUp := &protocol.Command{SessionID: "session", CommandID: "file-read-after-rejection", Type: protocol.CommandFileRead, Payload: seal("file-read-after-rejection", protocol.CommandFileRead, []byte(`{"path":"secret.txt"}`))}
+	if err := deliverEncryptedFileRead(ctx, cfg, followUp, write); err != nil || len(frames) != 2 || frames[1].(*protocol.CommandAck).Status != protocol.AckAccepted {
+		t.Fatalf("valid file command after rejection failed: frames=%d err=%v", len(frames), err)
 	}
 }

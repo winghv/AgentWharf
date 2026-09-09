@@ -76,6 +76,31 @@ func TestRequiredCompletedDuplicateAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestRequiredTerminalRejectionReasonAllowlist(t *testing.T) {
+	for _, tc := range []struct {
+		mode   string
+		kind   protocol.CommandType
+		status protocol.AckStatus
+		reason string
+		want   bool
+	}{
+		{protocol.ContentModeRequired, protocol.CommandFileRead, protocol.AckRejected, "invalid_file_request", true},
+		{protocol.ContentModeRequired, protocol.CommandFileList, protocol.AckRejected, "file_unavailable", true},
+		{protocol.ContentModeRequired, protocol.CommandFileRead, protocol.AckRejected, "private_adapter_detail", false},
+		{protocol.ContentModeRequired, protocol.CommandSessionSend, protocol.AckRejected, "invalid_file_request", false},
+		{protocol.ContentModeRequired, protocol.CommandFileRead, protocol.AckAccepted, "invalid_file_request", false},
+		{"legacy", protocol.CommandFileRead, protocol.AckRejected, "invalid_file_request", false},
+	} {
+		got, ok := pendingCommandAckTerminalRejection(tc.mode, tc.kind, &protocol.CommandAck{Status: tc.status, Reason: tc.reason})
+		if ok != tc.want || (ok && got != tc.reason) || (!ok && got != "") {
+			t.Fatalf("ack mode=%s status=%s reason=%q: reason=%q allowed=%v", tc.mode, tc.status, tc.reason, got, ok)
+		}
+	}
+	if reason, ok := pendingCommandAckTerminalRejection(protocol.ContentModeRequired, protocol.CommandFileRead, nil); ok || reason != "" {
+		t.Fatal("nil acknowledgement exposed a rejection reason")
+	}
+}
+
 func TestUnknownOutcomeRetainsRequiredModeAfterDisconnect(t *testing.T) {
 	probe := &opaqueLedgerProbe{}
 	handler := &webSocketHandler{events: probe}

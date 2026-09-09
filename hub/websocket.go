@@ -219,10 +219,11 @@ type webSocketHandler struct {
 }
 
 type pendingCommandClient struct {
-	adapter   *adapterConnection
-	peer      *clientConnection
-	commandID string
-	timer     *time.Timer
+	adapter     *adapterConnection
+	peer        *clientConnection
+	commandID   string
+	commandType protocol.CommandType
+	timer       *time.Timer
 }
 
 type attentionSubscription struct {
@@ -2099,8 +2100,22 @@ func pendingCommandAckCompleted(contentMode string, ack *protocol.CommandAck) bo
 	return ack != nil && ack.Reason == "" && (ack.Status == protocol.AckAccepted || (contentMode == protocol.ContentModeRequired && ack.Status == protocol.AckDuplicate))
 }
 
+func pendingCommandAckTerminalRejection(contentMode string, commandType protocol.CommandType, ack *protocol.CommandAck) (string, bool) {
+	if contentMode != protocol.ContentModeRequired || (commandType != protocol.CommandFileRead && commandType != protocol.CommandFileList) || ack == nil || ack.Status != protocol.AckRejected {
+		return "", false
+	}
+	switch ack.Reason {
+	case "invalid_file_request", "file_unavailable":
+		return ack.Reason, true
+	default:
+		return "", false
+	}
+}
+
 func (h *webSocketHandler) handlePendingCommandAck(ctx context.Context, adapter *adapterConnection, ack *protocol.CommandAck, key string, client *pendingCommandClient) error {
-	if client.adapter != adapter || !pendingCommandAckCompleted(adapter.contentMode, ack) || h.settingsCurrentAdapter(adapter.sessionID) != adapter {
+	completed := pendingCommandAckCompleted(adapter.contentMode, ack)
+	rejectionReason, terminallyRejected := pendingCommandAckTerminalRejection(adapter.contentMode, client.commandType, ack)
+	if client.adapter != adapter || (!completed && !terminallyRejected) || h.settingsCurrentAdapter(adapter.sessionID) != adapter {
 		h.takePendingCommandClient(key)
 		h.resolvePendingCommandUnknown(adapter.sessionID, ack.CommandID, adapter.contentMode)
 		h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
@@ -2127,6 +2142,9 @@ func (h *webSocketHandler) handlePendingCommandAck(ctx context.Context, adapter 
 		return fmt.Errorf("resolve acknowledged pending command: %w", err)
 	}
 	h.takePendingCommandClient(key)
+	if terminallyRejected {
+		return h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckRejected, rejectionReason)
+	}
 	h.commandMu.Lock()
 	h.markCommandAcceptedLocked(ack.CommandID)
 	h.commandMu.Unlock()
@@ -2324,8 +2342,8 @@ func (h *webSocketHandler) takePendingCommandClient(key string) *pendingCommandC
 	return client
 }
 
-func (h *webSocketHandler) addPendingCommandClient(key string, adapter *adapterConnection, peer *clientConnection, commandID string) {
-	client := &pendingCommandClient{adapter: adapter, peer: peer, commandID: commandID}
+func (h *webSocketHandler) addPendingCommandClient(key string, adapter *adapterConnection, peer *clientConnection, commandID string, commandType protocol.CommandType) {
+	client := &pendingCommandClient{adapter: adapter, peer: peer, commandID: commandID, commandType: commandType}
 	client.timer = time.AfterFunc(time.Hour, func() {
 		h.expirePendingCommandClient(key)
 	})
@@ -2596,7 +2614,7 @@ func (h *webSocketHandler) handleDurableSessionSendMode(ctx context.Context, con
 	}
 
 	key := settingsCommandKey(cmd.SessionID, cmd.CommandID)
-	h.addPendingCommandClient(key, adapter, peer, cmd.CommandID)
+	h.addPendingCommandClient(key, adapter, peer, cmd.CommandID, cmd.Type)
 	routed := cloneCommand(cmd)
 	if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
 		h.takePendingCommandClient(key)
@@ -3074,7 +3092,7 @@ func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *
 				continue
 			}
 			key := settingsCommandKey(adapter.sessionID, command.CommandID)
-			h.addPendingCommandClient(key, adapter, nil, command.CommandID)
+			h.addPendingCommandClient(key, adapter, nil, command.CommandID, protocol.CommandType(command.Type))
 			if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
 				h.takePendingCommandClient(key)
 				_, _ = ledger.ResolvePendingCommandUnknown(ctx, adapter.sessionID, command.CommandID)
