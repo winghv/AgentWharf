@@ -345,11 +345,12 @@ func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, pr
 	}
 
 	return protocol.HelloAck{
+			ContentMode:     hello.ContentMode,
 			ProtocolVersion: selectedVersion,
 			Sessions:        []protocol.SessionSummary{summary},
 		}, AcceptedPeer{
 			Role: protocol.RoleAdapter, ProtocolVersion: selectedVersion, Principal: principal,
-			SessionID: hello.SessionID, Provider: hello.Provider, Resume: hello.Resume,
+			ContentMode: hello.ContentMode, SessionID: hello.SessionID, Provider: hello.Provider, Resume: hello.Resume,
 		}, nil
 }
 

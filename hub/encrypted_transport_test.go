@@ -43,7 +43,7 @@ func TestRequiredTransportUsesEncryptedDispatcher(t *testing.T) {
 	writeFrame(t, adapter, &protocol.Hello{ProtocolVersion: 2, Role: protocol.RoleAdapter, Token: "adapter", SessionID: "ses_1", Provider: "claude-code", ContentMode: protocol.ContentModeRequired})
 	adapterFrame := readFrame(t, adapter)
 	ack, ok := adapterFrame.(*protocol.HelloAck)
-	if !ok || ack.ProtocolVersion != protocol.ProtocolVersionV2 || ack.ConnectionAuthority == nil {
+	if !ok || ack.ProtocolVersion != protocol.ProtocolVersionV2 || ack.ContentMode != protocol.ContentModeRequired || ack.ConnectionAuthority == nil {
 		t.Fatalf("required adapter hello was not accepted: %T %+v", adapterFrame, adapterFrame)
 	}
 

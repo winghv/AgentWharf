@@ -53,6 +53,25 @@ func (a plainAuth) SessionAdmissionClaim(_ context.Context, _ auth.Principal, se
 	return auth.SessionAdmissionClaim{SessionID: sessionID, Provider: "claude-code", ExpiresAt: time.Now().Add(time.Minute)}, nil
 }
 
+func TestRequiredAdapterContentModeIsPreserved(t *testing.T) {
+	principal := auth.Principal{Subject: "adapter", Scopes: []auth.Scope{auth.SessionAdapter("session")}}
+	h := NewHandshake(HandshakeConfig{Authenticator: e2eeTestAuth{principal: principal}, EventStore: e2eeStore{}})
+	ack, peer, err := h.HandleHello(context.Background(), &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2,
+		Role:            protocol.RoleAdapter,
+		Token:           "token",
+		SessionID:       "session",
+		Provider:        "claude-code",
+		ContentMode:     protocol.ContentModeRequired,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.ContentMode != protocol.ContentModeRequired || peer.ContentMode != protocol.ContentModeRequired {
+		t.Fatalf("adapter mode was not preserved: ack=%q peer=%q", ack.ContentMode, peer.ContentMode)
+	}
+}
+
 func TestContentModeRequiresDurableAuthorizerAndExactBinding(t *testing.T) {
 	principal := auth.Principal{Subject: "client", Scopes: []auth.Scope{auth.SessionControl("session")}}
 	base := e2eeTestAuth{principal: principal}
