@@ -67,12 +67,8 @@ func maskJSONStrings(masker *masking.Masker, value any) any {
 }
 
 func cloneEventPayload(ev protocol.Event, payload json.RawMessage) protocol.Event {
-	cloned := protocol.Event{
-		Type:      ev.Type,
-		SessionID: ev.SessionID,
-		Time:      ev.Time,
-		Payload:   append(json.RawMessage(nil), payload...),
-	}
+	cloned := ev
+	cloned.Payload = append(json.RawMessage(nil), payload...)
 	if ev.Seq != nil {
 		seq := *ev.Seq
 		cloned.Seq = &seq

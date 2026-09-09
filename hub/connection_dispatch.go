@@ -178,15 +178,24 @@ func (h *webSocketHandler) watchAdapter(ctx context.Context, adapter *adapterCon
 
 type fencedAdapterEventStore struct {
 	store.EventStore
-	handler *webSocketHandler
-	adapter *adapterConnection
+	handler   *webSocketHandler
+	adapter   *adapterConnection
+	encrypted bool
 }
 
 func (s fencedAdapterEventStore) Append(ctx context.Context, _ string, events []store.PendingEvent) (firstSeq int64, err error) {
 	err = s.handler.withSessionPublication(ctx, s.adapter.sessionID, func() error {
 		return s.handler.withAdapterEffect(ctx, s.adapter, func() error {
 			var appendErr error
-			firstSeq, appendErr = s.handler.adapterAuthority.store.AppendAdapterEvents(ctx, s.adapter.sessionID, s.adapter.admission, events)
+			if s.encrypted {
+				encryptedStore, ok := s.handler.adapterAuthority.store.(store.EncryptedAdapterEventStore)
+				if !ok {
+					return errors.New("encrypted adapter event store is unavailable")
+				}
+				firstSeq, appendErr = encryptedStore.AppendEncryptedAdapterEvents(ctx, s.adapter.sessionID, s.adapter.admission, events)
+			} else {
+				firstSeq, appendErr = s.handler.adapterAuthority.store.AppendAdapterEvents(ctx, s.adapter.sessionID, s.adapter.admission, events)
+			}
 			return appendErr
 		})
 	})
@@ -200,7 +209,17 @@ func (s fencedAdapterEventStore) publish(ctx context.Context, batch []pendingAda
 			for i, item := range batch {
 				pending[i] = item.pending
 			}
-			firstSeq, err := s.handler.adapterAuthority.store.AppendAdapterEvents(ctx, s.adapter.sessionID, s.adapter.admission, pending)
+			var firstSeq int64
+			var err error
+			if s.encrypted {
+				encryptedStore, ok := s.handler.adapterAuthority.store.(store.EncryptedAdapterEventStore)
+				if !ok {
+					return errors.New("encrypted adapter event store is unavailable")
+				}
+				firstSeq, err = encryptedStore.AppendEncryptedAdapterEvents(ctx, s.adapter.sessionID, s.adapter.admission, pending)
+			} else {
+				firstSeq, err = s.handler.adapterAuthority.store.AppendAdapterEvents(ctx, s.adapter.sessionID, s.adapter.admission, pending)
+			}
 			if err != nil {
 				return err
 			}

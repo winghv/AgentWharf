@@ -21,11 +21,26 @@ func (s *Store) ValidateAdapterEffectAdmission(ctx context.Context, sessionID st
 }
 
 func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (int64, error) {
+	return s.appendAdapterEvents(ctx, sessionID, admission, events, false)
+}
+
+// AppendEncryptedAdapterEvents persists opaque endpoint events with the same
+// authority transaction as legacy append. The caller must establish required
+// session mode; public projections are control metadata, not endpoint authority.
+func (s *Store) AppendEncryptedAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (int64, error) {
+	return s.appendAdapterEvents(ctx, sessionID, admission, events, true)
+}
+
+func (s *Store) appendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent, encrypted bool) (int64, error) {
 	if s == nil || s.pool == nil || len(events) == 0 {
 		return 0, errors.New("invalid postgres adapter event commit")
 	}
-	for _, event := range events[:len(events)-1] {
-		if attentionEventProjection(event).terminal {
+	for index, event := range events {
+		projection, err := eventProjection(event, encrypted)
+		if err != nil {
+			return 0, err
+		}
+		if index < len(events)-1 && projection.terminal {
 			return 0, errors.New("terminal adapter event must be final")
 		}
 	}
@@ -52,7 +67,7 @@ func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admis
 	if err = tx.QueryRow(ctx, `SELECT 1 FROM session_adapter_connections WHERE session_id=$1 AND active_credential_generation=$2 AND connection_epoch=$3 AND accepted_fence=$4 AND connection_epoch>0 AND accepted_fence>0 AND $5::BIGINT>accepted_fence AND active_credential_expires_at>clock_timestamp() AND revoked_at IS NULL AND terminal_at IS NULL FOR UPDATE`, sessionID, admission.CredentialGeneration, admission.ConnectionEpoch, admission.AcceptedFence, admission.GrantFence).Scan(new(int)); err != nil {
 		return 0, errors.New("adapter authority lost")
 	}
-	firstSeq, terminal, err := appendEventsLocked(ctx, queries, sessionID, events)
+	firstSeq, terminal, err := appendEventsWithModeLocked(ctx, queries, sessionID, events, encrypted)
 	if err != nil {
 		return 0, err
 	}

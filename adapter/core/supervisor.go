@@ -43,6 +43,10 @@ type ProcessConfig struct {
 	Backoff        time.Duration
 	GracePeriod    time.Duration
 	StartAdmission ProcessStartAdmission
+	// StartGuard serializes an endpoint-owned authorization check with the actual
+	// child creation. It must invoke start synchronously at most once and return
+	// its result without introducing failures after successful child creation.
+	StartGuard func(context.Context, func() error) error
 }
 
 // ProcessStartAdmission binds every individual Provider child start to a
@@ -269,7 +273,21 @@ func (s *ProcessSupervisor) start(ctx context.Context, attempt int) (*runningPro
 			return nil, fmt.Errorf("prepare provider start admission: %w", err)
 		}
 	}
-	handle, err := s.runner.Start(s.cfg.Command)
+	var handle processHandle
+	start := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var err error
+		handle, err = s.runner.Start(s.cfg.Command)
+		return err
+	}
+	var err error
+	if s.cfg.StartGuard != nil {
+		err = s.cfg.StartGuard(ctx, start)
+	} else {
+		err = start()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("start provider process: %w", err)
 	}

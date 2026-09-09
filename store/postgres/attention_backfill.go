@@ -107,7 +107,21 @@ func (s *Store) BackfillAttentionBatch(ctx context.Context, checkpoint Attention
 	return result, nil
 }
 
+// BackfillEncryptedAttentionSession rebuilds a known encrypted-only stream.
+// The caller must resolve mode from durable policy, never from payload shape.
+// Mixed or malformed streams fail atomically instead of using legacy fallback.
+func (s *Store) BackfillEncryptedAttentionSession(ctx context.Context, sessionID string) (bool, error) {
+	if s == nil || s.pool == nil || sessionID == "" || len(sessionID) > 255 {
+		return false, errors.New("invalid encrypted attention backfill")
+	}
+	return s.backfillAttentionSessionMode(ctx, sessionID, true)
+}
+
 func (s *Store) backfillAttentionSession(ctx context.Context, sessionID string) (bool, error) {
+	return s.backfillAttentionSessionMode(ctx, sessionID, false)
+}
+
+func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID string, encrypted bool) (bool, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return false, fmt.Errorf("begin attention backfill: %w", err)
@@ -140,7 +154,10 @@ func (s *Store) backfillAttentionSession(ctx context.Context, sessionID string) 
 			break
 		}
 		for _, row := range rows {
-			projection := attentionEventProjection(store.PendingEvent{Type: row.Type, Time: row.CreatedAt.Time, Payload: row.Payload})
+			projection, err := eventProjection(store.PendingEvent{Type: row.Type, Time: row.CreatedAt.Time, Payload: row.Payload}, encrypted)
+			if err != nil {
+				return false, errors.New("invalid encrypted attention event")
+			}
 			if eventCount == 0 && projection.state == nil {
 				projection.projectionIncomplete = true
 			}

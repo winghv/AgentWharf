@@ -88,22 +88,22 @@ func (g *machineRecoveryGuard) release(sessionID string) {
 // claim exchange. It carries only this machine's own session credentials and
 // the instruction; it is never logged and never leaves the machine.
 type machineServeDispatch struct {
-	ClaimID           string `json:"claim_id"`
-	TaskID            string `json:"task_id"`
-	RunID             string `json:"run_id"`
-	SessionID         string `json:"session_id"`
-	Provider          string `json:"provider"`
-	HubWSURL          string `json:"hub_ws_url"`
-	AdapterToken      string `json:"adapter_token"`
-	ClientToken       string `json:"client_token"`
-	FirstInstruction  string `json:"first_instruction"`
-	WorkingDirectory  string `json:"working_directory"`
-	ModelID           string `json:"model_id"`
-	ReasoningEffortID string `json:"reasoning_effort_id"`
-	PermissionModeID  string `json:"permission_mode_id"`
-	ProviderSessionID string `json:"provider_session_id,omitempty"`
-	AdapterExpiresAt  string `json:"adapter_expires_at"`
-	ClientExpiresAt   string `json:"client_expires_at"`
+	ClaimID                   string `json:"claim_id"`
+	TaskID                    string `json:"task_id"`
+	RunID                     string `json:"run_id"`
+	SessionID                 string `json:"session_id"`
+	Provider                  string `json:"provider"`
+	HubWSURL                  string `json:"hub_ws_url"`
+	AdapterToken              string `json:"adapter_token"`
+	ClientToken               string `json:"client_token"`
+	EncryptedFirstInstruction string `json:"first_instruction"`
+	WorkingDirectory          string `json:"working_directory"`
+	ModelID                   string `json:"model_id"`
+	ReasoningEffortID         string `json:"reasoning_effort_id"`
+	PermissionModeID          string `json:"permission_mode_id"`
+	ProviderSessionID         string `json:"provider_session_id,omitempty"`
+	AdapterExpiresAt          string `json:"adapter_expires_at"`
+	ClientExpiresAt           string `json:"client_expires_at"`
 }
 
 type machinePendingClaim struct {
@@ -136,27 +136,29 @@ type machineSessionRecoveryResponse struct {
 			ID       string `json:"id"`
 			Provider string `json:"provider"`
 		} `json:"session"`
-		HubWSURL     string `json:"hub_ws_url"`
-		AdapterToken string `json:"adapter_token"`
-		ExpiresAt    string `json:"expires_at"`
+		HubWSURL       string `json:"hub_ws_url"`
+		AdapterToken   string `json:"adapter_token"`
+		EncryptionMode string `json:"encryption_mode"`
+		ExpiresAt      string `json:"expires_at"`
 	} `json:"data"`
 }
 
 type machineAutoExchangeResponse struct {
 	Data struct {
-		SessionID         string `json:"session_id"`
-		Provider          string `json:"provider"`
-		HubWSURL          string `json:"hub_ws_url"`
-		AdapterToken      string `json:"adapter_token"`
-		ClientToken       string `json:"client_token"`
-		FirstInstruction  string `json:"first_instruction"`
-		WorkingDirectory  string `json:"working_directory"`
-		ModelID           string `json:"model_id"`
-		ReasoningEffortID string `json:"reasoning_effort_id"`
-		PermissionModeID  string `json:"permission_mode_id"`
-		Delivery          string `json:"delivery"`
-		AdapterExpiresAt  string `json:"adapter_expires_at"`
-		ClientExpiresAt   string `json:"client_expires_at"`
+		SessionID                 string `json:"session_id"`
+		Provider                  string `json:"provider"`
+		HubWSURL                  string `json:"hub_ws_url"`
+		AdapterToken              string `json:"adapter_token"`
+		ClientToken               string `json:"client_token"`
+		EncryptedFirstInstruction string `json:"encrypted_first_instruction"`
+		WorkingDirectory          string `json:"working_directory"`
+		ModelID                   string `json:"model_id"`
+		ReasoningEffortID         string `json:"reasoning_effort_id"`
+		PermissionModeID          string `json:"permission_mode_id"`
+		EncryptionMode            string `json:"encryption_mode"`
+		Delivery                  string `json:"delivery"`
+		AdapterExpiresAt          string `json:"adapter_expires_at"`
+		ClientExpiresAt           string `json:"client_expires_at"`
 	} `json:"data"`
 }
 
@@ -245,6 +247,12 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	defer cancel()
 	defer workers.Wait()
 
+	// Recover locally authorized session initialization before starting any
+	// persisted handoff. Relay failure never supplies fallback key authority.
+	if err := pollSessionInitializations(ctx, client, credential); err != nil {
+		_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted initialization poll unavailable")
+	}
+
 	// Crash-resume: re-run each persisted handoff with the stored credentials
 	// instead of re-exchanging. The deterministic command ID makes the resend
 	// safe; the Hub acknowledges a duplicate without a second delivery.
@@ -287,6 +295,12 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	poll := time.NewTicker(cfg.PollInterval)
 	defer poll.Stop()
 	for {
+		if err := pollSessionInitializations(ctx, client, credential); err != nil {
+			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted initialization poll unavailable")
+		}
+		if err := pollSessionKeyRequests(ctx, client, credential); err != nil {
+			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted key request poll unavailable")
+		}
 		claims, retry, err := listPendingMachineClaims(ctx, client, credential)
 		if err != nil {
 			if retry {
@@ -437,13 +451,17 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 	// state; the first-instruction sender retries until it does. The keep-alive
 	// runs in the background so the semaphore only bounds the dispatch phase, not
 	// the session lifetime.
+	senderCtx, cancelSender := context.WithCancel(ctx)
+	defer cancelSender()
 	adapters.Add(1)
 	go func() {
 		defer adapters.Done()
-		keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onAdapterDone, reportFailure)
+		if err := keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onAdapterDone, reportFailure); err != nil {
+			cancelSender()
+		}
 	}()
 
-	sendErr := sendFirstInstructionWithRetry(ctx, *handoff)
+	sendErr := sendFirstInstructionWithRetry(senderCtx, *handoff)
 	switch {
 	case sendErr == nil:
 		_, _ = fmt.Fprintf(stdout, "auto_dispatch_ok: claim_id=%s session_id=%s\n", handoff.ClaimID, handoff.SessionID)
@@ -463,11 +481,74 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 // credential expires, or a bounded number of restarts is exhausted. A crash
 // (for example the machine slept and the provider or its Hub socket died) is
 // restarted with backoff; the first instruction is not re-sent.
-func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, onDone func(), reportFailure machineSessionFailureReporter) {
+func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, onDone func(), reportFailure machineSessionFailureReporter) (result error) {
+	result = errors.New("machine adapter unavailable")
 	if onDone != nil {
 		defer onDone()
 	}
 	adapterCfg := serveWrapConfig(*handoff, cfg.StartupSmoke)
+	var endpointRuntime *machineE2EERuntime
+	// Every machine-serve dispatch is Own Machine, including recovery handoffs
+	// with no first instruction. Empty content must never select legacy mode.
+	{
+		accountBinding := strings.TrimSpace(os.Getenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING"))
+		if accountBinding == "" {
+			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted Own Machine dispatch requires AGENTWHARF_LOCAL_ACCOUNT_BINDING")
+			return
+		}
+		credential, err := loadMachineCredential()
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: load machine credential for encrypted endpoint: %v\n", err)
+			return
+		}
+		directory, err := machineEndpointDirectory(credential, accountBinding)
+		if err != nil {
+			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted endpoint location unavailable")
+			return
+		}
+		endpointRuntime, err = openMachineE2EERuntime(ctx, directory, credential.MachineID, accountBinding)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: open encrypted endpoint runtime: %v\n", err)
+			return
+		}
+		defer endpointRuntime.database.Close()
+		if err := endpointRuntime.requireSession(ctx, handoff.SessionID); err != nil {
+			_, _ = fmt.Fprintln(stderr, "wharf machine serve: trusted encrypted session initialization required")
+			return err
+		}
+		launchHandoff := *handoff
+		if launchHandoff.EncryptedFirstInstruction == "" {
+			provider, wire, err := endpointRuntime.loadLaunch(ctx, handoff.SessionID)
+			if err != nil || provider != handoff.Provider {
+				return errors.New("local signed launch required for recovery")
+			}
+			launchHandoff.EncryptedFirstInstruction = wire
+		}
+		{
+			commandID, err := decodeEncryptedLaunchCarrier(launchHandoff.EncryptedFirstInstruction)
+			if err != nil {
+				return err
+			}
+			if err := applyEncryptedLaunchConfiguration(ctx, endpointRuntime, launchHandoff, &adapterCfg); err != nil {
+				return err
+			}
+			if err := endpointRuntime.retainLaunch(ctx, launchHandoff.SessionID, launchHandoff.Provider, launchHandoff.EncryptedFirstInstruction); err != nil {
+				return err
+			}
+			launchSession, launchWire := launchHandoff.SessionID, []byte(launchHandoff.EncryptedFirstInstruction)
+			adapterCfg.guardLocalProcessStart = func(startCtx context.Context, start func() error) error {
+				return endpointRuntime.executor.WithProcessStart(startCtx, launchSession, commandID, launchWire, start)
+			}
+			adapterCfg.verifyLocalProcessStart = func(startCtx context.Context) error {
+				return endpointRuntime.executor.VerifyWire(startCtx, launchSession, commandID, "session.send", launchWire)
+			}
+			if err := adapterCfg.verifyLocalProcessStart(ctx); err != nil {
+				return errors.New("encrypted launch signature or local grant rejected")
+			}
+		}
+		adapterCfg.ContentMode = protocol.ContentModeRequired
+		adapterCfg.e2eeRuntime = endpointRuntime
+	}
 	adapterCfg.Stderr = stderr
 	handoffMu := &sync.Mutex{}
 	adapterCfg.OnProviderSession = rememberProviderSession(handoff, &adapterCfg, stderr, handoffMu)
@@ -480,7 +561,10 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 		done := runAdapter(ctx, adapterCfg, stderr)
 		select {
 		case <-ctx.Done():
-			return
+			// runWrap owns Provider shutdown and may still use the vault while
+			// draining output. Its bounded cleanup must finish before DB close.
+			<-done
+			return ctx.Err()
 		case err := <-done:
 			if ctx.Err() != nil {
 				return
@@ -496,14 +580,14 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 			}
 			if cfg.StartupSmoke {
 				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended: %v\n", handoff.SessionID, err)
-				return
+				return err
 			}
 			credentialAlive := dispatchCredentialAlive(*handoff)
 			if !machineServeAdapterShouldRestart(err, credentialAlive, restarts) {
 				_ = removeMachineDispatch(handoff.ClaimID)
 				if err == nil {
 					_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended normally; not restarting\n", handoff.SessionID)
-					return
+					return nil
 				}
 				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended (%v); giving up (restarts=%d)\n", handoff.SessionID, err, restarts)
 				return
@@ -526,10 +610,18 @@ func machineServeAdapterShouldRestart(err error, credentialAlive bool, restarts 
 	return err != nil && credentialAlive && restarts < machineServeAdapterRestartLimit
 }
 
+type encryptedAdapterError struct{ cause error }
+
+func (encryptedAdapterError) Error() string   { return "encrypted adapter failed" }
+func (e encryptedAdapterError) Unwrap() error { return e.cause }
+
 func runAdapter(ctx context.Context, cfg wrapConfig, stderr io.Writer) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		_, err := runWrap(ctx, cfg, strings.NewReader(""), stderr)
+		if err != nil && cfg.ContentMode == protocol.ContentModeRequired {
+			err = encryptedAdapterError{err}
+		}
 		done <- err
 	}()
 	return done
@@ -570,27 +662,29 @@ func exchangeAutoMachineClaim(ctx context.Context, client *http.Client, credenti
 	}
 	data := response.Data
 	if data.SessionID == "" || data.HubWSURL == "" || data.AdapterToken == "" || data.ClientToken == "" ||
-		data.FirstInstruction == "" || data.Delivery != "auto" || data.AdapterExpiresAt == "" || data.ClientExpiresAt == "" {
+		data.EncryptedFirstInstruction == "" || data.Delivery != "auto" || data.EncryptionMode != "required" || data.AdapterExpiresAt == "" || data.ClientExpiresAt == "" {
 		return nil, errors.New("claim exchange response is incomplete")
+	}
+	if data.WorkingDirectory != "" || data.ModelID != "" || data.ReasoningEffortID != "" || data.PermissionModeID != "" {
+		return nil, errors.New("claim exchange contains unauthenticated launch settings")
+	}
+	if _, err := decodeEncryptedLaunchCarrier(data.EncryptedFirstInstruction); err != nil {
+		return nil, err
 	}
 	adapterExpiresAt := data.AdapterExpiresAt
 	clientExpiresAt := data.ClientExpiresAt
 	return &machineServeDispatch{
-		ClaimID:           claim.ClaimID,
-		TaskID:            claim.TaskID,
-		RunID:             claim.RunID,
-		SessionID:         data.SessionID,
-		Provider:          data.Provider,
-		HubWSURL:          data.HubWSURL,
-		AdapterToken:      data.AdapterToken,
-		ClientToken:       data.ClientToken,
-		FirstInstruction:  data.FirstInstruction,
-		WorkingDirectory:  data.WorkingDirectory,
-		ModelID:           data.ModelID,
-		ReasoningEffortID: data.ReasoningEffortID,
-		PermissionModeID:  data.PermissionModeID,
-		AdapterExpiresAt:  adapterExpiresAt,
-		ClientExpiresAt:   clientExpiresAt,
+		ClaimID:                   claim.ClaimID,
+		TaskID:                    claim.TaskID,
+		RunID:                     claim.RunID,
+		SessionID:                 data.SessionID,
+		Provider:                  data.Provider,
+		HubWSURL:                  data.HubWSURL,
+		AdapterToken:              data.AdapterToken,
+		ClientToken:               data.ClientToken,
+		EncryptedFirstInstruction: data.EncryptedFirstInstruction,
+		AdapterExpiresAt:          adapterExpiresAt,
+		ClientExpiresAt:           clientExpiresAt,
 	}, nil
 }
 
@@ -651,7 +745,7 @@ func recoverMachineSession(ctx context.Context, client *http.Client, credential 
 	if err := decodeCloudAPIJSON(body, &response); err != nil {
 		return nil, fmt.Errorf("decode session recovery: %w", err)
 	}
-	if response.Data.Session.ID == "" || response.Data.HubWSURL == "" || response.Data.AdapterToken == "" || response.Data.ExpiresAt == "" {
+	if response.Data.Session.ID == "" || response.Data.HubWSURL == "" || response.Data.AdapterToken == "" || response.Data.EncryptionMode != "required" || response.Data.ExpiresAt == "" {
 		return nil, errors.New("session recovery response is incomplete")
 	}
 	return &machineServeDispatch{
@@ -845,7 +939,10 @@ func rememberProviderSession(handoff *machineServeDispatch, adapterCfg *wrapConf
 // claim, so a resend after a lost acknowledgement is a duplicate, never a
 // second delivery.
 func sendFirstInstructionWithRetry(ctx context.Context, handoff machineServeDispatch) error {
-	commandID := handoff.ClaimID + ":command"
+	commandID, err := decodeEncryptedLaunchCarrier(handoff.EncryptedFirstInstruction)
+	if err != nil {
+		return err
+	}
 	delay := machineServeSenderRetryInitial
 	for {
 		err := sendFirstInstruction(ctx, handoff, commandID)
@@ -870,6 +967,19 @@ func sendFirstInstructionWithRetry(ctx context.Context, handoff machineServeDisp
 	}
 }
 
+func decodeEncryptedLaunchCarrier(raw string) (string, error) {
+	var routing struct {
+		MessageID string `json:"message_id"`
+	}
+	if err := json.Unmarshal([]byte(raw), &routing); err != nil || routing.MessageID == "" {
+		return "", errors.New("encrypted launch carrier is invalid")
+	}
+	if _, err := protocol.DecodeEncryptedPacketCarrier([]byte(raw), "command", "session.send", routing.MessageID); err != nil {
+		return "", errors.New("encrypted launch carrier is invalid")
+	}
+	return routing.MessageID, nil
+}
+
 // sendFirstInstruction opens one client connection, waits for the Session to
 // reach an interactive state, sends the instruction, and waits for the
 // acknowledgement. A single attempt is bounded by the attempt window so a
@@ -884,13 +994,15 @@ func sendFirstInstruction(ctx context.Context, handoff machineServeDispatch, com
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 	if err := writeCLIProtocolFrame(ctx, conn, &protocol.Hello{
-		ProtocolVersion: protocol.HubProtocolVersion,
+		ProtocolVersion: protocol.ProtocolVersionV2,
+		ContentMode:     protocol.ContentModeRequired,
 		Role:            protocol.RoleClient,
 		Token:           handoff.ClientToken,
 		Subscriptions:   []protocol.Subscription{{SessionID: handoff.SessionID, LastSeq: 0}},
 	}); err != nil {
 		return fmt.Errorf("send client hello: %w", err)
 	}
+	negotiated := false
 	for {
 		frame, err := readCLIProtocolFrame(ctx, conn)
 		if err != nil {
@@ -901,19 +1013,26 @@ func sendFirstInstruction(ctx context.Context, handoff machineServeDispatch, com
 		}
 		switch typed := frame.(type) {
 		case *protocol.HelloAck:
+			if typed.ProtocolVersion != protocol.ProtocolVersionV2 || typed.ContentMode != protocol.ContentModeRequired || len(typed.Sessions) != 1 || typed.Sessions[0].SessionID != handoff.SessionID {
+				return errors.New("encrypted launch negotiation mismatch")
+			}
+			negotiated = true
 			for _, summary := range typed.Sessions {
 				if summary.SessionID == handoff.SessionID && serveInteractiveState(summary.State) {
-					return sendClientCommand(ctx, conn, handoff.SessionID, handoff.FirstInstruction, commandID)
+					return sendClientCommand(ctx, conn, handoff.SessionID, handoff.EncryptedFirstInstruction, commandID)
 				}
 			}
 		case *protocol.Event:
+			if !negotiated {
+				return errors.New("encrypted launch event before negotiation")
+			}
 			if typed.SessionID == handoff.SessionID && typed.Type == "session.state" {
 				var payload struct {
 					State string `json:"state"`
 				}
 				_ = json.Unmarshal(typed.Payload, &payload)
 				if serveInteractiveState(payload.State) {
-					return sendClientCommand(ctx, conn, handoff.SessionID, handoff.FirstInstruction, commandID)
+					return sendClientCommand(ctx, conn, handoff.SessionID, handoff.EncryptedFirstInstruction, commandID)
 				}
 			}
 		case *protocol.Ping:
@@ -925,12 +1044,12 @@ func sendFirstInstruction(ctx context.Context, handoff machineServeDispatch, com
 }
 
 func sendClientCommand(ctx context.Context, conn *websocket.Conn, sessionID, instruction, commandID string) error {
-	payload, err := json.Marshal(map[string]any{
-		"content": []map[string]string{{"kind": "text", "text": instruction}},
-	})
-	if err != nil {
-		return fmt.Errorf("encode instruction: %w", err)
+	// Validate routing before any write, including callers bypassing the retry loop.
+	id, err := decodeEncryptedLaunchCarrier(instruction)
+	if err != nil || id != commandID {
+		return errors.New("encrypted launch carrier or command id is invalid")
 	}
+	payload := []byte(instruction)
 	if err := writeCLIProtocolFrame(ctx, conn, &protocol.Command{
 		CommandID: commandID, Type: protocol.CommandSessionSend, SessionID: sessionID, Payload: payload,
 	}); err != nil {
@@ -969,7 +1088,7 @@ func serveInteractiveState(state string) bool {
 
 func isMachineRecoveryDispatch(handoff machineServeDispatch) bool {
 	return strings.HasPrefix(handoff.ClaimID, "recovery:") && handoff.TaskID == "" && handoff.RunID == "" &&
-		handoff.ClientToken == "" && handoff.FirstInstruction == ""
+		handoff.ClientToken == "" && handoff.EncryptedFirstInstruction == ""
 }
 
 func dispatchCredentialAlive(handoff machineServeDispatch) bool {
@@ -999,6 +1118,11 @@ func machineDispatchDir() (string, error) {
 }
 
 func saveMachineDispatch(dispatch machineServeDispatch) error {
+	if dispatch.EncryptedFirstInstruction != "" {
+		if _, err := decodeEncryptedLaunchCarrier(dispatch.EncryptedFirstInstruction); err != nil {
+			return err
+		}
+	}
 	dir, err := machineDispatchDir()
 	if err != nil {
 		return err
@@ -1069,6 +1193,11 @@ func loadMachineDispatches() ([]machineServeDispatch, error) {
 		if dispatch.ClaimID == "" || dispatch.SessionID == "" || dispatch.AdapterToken == "" ||
 			(!isMachineRecoveryDispatch(dispatch) && dispatch.ClientToken == "") {
 			return nil, fmt.Errorf("dispatch %s is incomplete", entry.Name())
+		}
+		if dispatch.EncryptedFirstInstruction != "" {
+			if _, err := decodeEncryptedLaunchCarrier(dispatch.EncryptedFirstInstruction); err != nil {
+				return nil, fmt.Errorf("dispatch %s has invalid encrypted launch carrier: %w", entry.Name(), err)
+			}
 		}
 		dispatches = append(dispatches, dispatch)
 	}

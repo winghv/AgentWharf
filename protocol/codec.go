@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -90,6 +91,9 @@ const (
 	CommandSessionStop       CommandType = "session.stop"
 	CommandSessionAttach     CommandType = "session.attach"
 	CommandSettingsChange    CommandType = "session.settings.change"
+	CommandMembershipChange  CommandType = "session.membership.change"
+	CommandFileRead          CommandType = "session.file.read"
+	CommandFileList          CommandType = "session.file.list"
 )
 
 type AckStatus string
@@ -112,6 +116,9 @@ type Hello struct {
 	SessionID       string         `json:"session_id,omitempty"`
 	Provider        string         `json:"provider,omitempty"`
 	Resume          bool           `json:"resume,omitempty"`
+	// ContentMode is explicit session protection negotiation. "required" may
+	// never be downgraded to omitted/plaintext by a client.
+	ContentMode string `json:"content_mode,omitempty"`
 }
 
 // TargetJoin is the sole client frame permitted on a pending target socket.
@@ -186,6 +193,7 @@ type Subscription struct {
 }
 
 type HelloAck struct {
+	ContentMode         string                      `json:"content_mode,omitempty"`
 	ProtocolVersion     int                         `json:"protocol_version"`
 	Sessions            []SessionSummary            `json:"sessions"`
 	Capabilities        *HelloCapabilities          `json:"capabilities,omitempty"`
@@ -252,6 +260,9 @@ type ProviderStartAck struct {
 }
 
 func (*ProviderStartAck) FrameName() FrameName { return FrameProviderStartAck }
+
+const ContentModeRequired = "required"
+const ContentModeLegacy = "legacy"
 
 type HelloCapabilities struct {
 	HistoryPage      *HistoryPageCapability        `json:"history_page,omitempty"`
@@ -330,6 +341,69 @@ type EventReceipt struct {
 }
 
 func (*EventReceipt) FrameName() FrameName { return FrameEventReceipt }
+
+// EncryptedContentPayload defines the proposed opaque content encoding.
+// It is not accepted by any negotiated Hub capability yet; callers must not
+// infer encryption support from the availability of this decoder.
+type EncryptedContentPayload struct {
+	Version    int    `json:"version"`
+	Scope      string `json:"scope"`
+	KeyID      string `json:"key_id"`
+	Sender     string `json:"sender"`
+	MessageID  string `json:"message_id"`
+	Type       string `json:"type"`
+	Nonce      string `json:"nonce"`
+	Ciphertext string `json:"ciphertext"`
+	Signature  string `json:"signature"`
+}
+
+func DecodeEncryptedContentPayload(data []byte) (EncryptedContentPayload, error) {
+	var payload EncryptedContentPayload
+	if len(data) > 48*1024 {
+		return payload, errors.New("invalid encrypted content payload")
+	}
+	fields, err := strictObject(data)
+	if err != nil || len(fields) != 9 {
+		return payload, errors.New("invalid encrypted content payload")
+	}
+	for _, name := range []string{"version", "scope", "key_id", "sender", "message_id", "type", "nonce", "ciphertext", "signature"} {
+		if fields[name] == nil || bytes.Equal(bytes.TrimSpace(fields[name]), []byte("null")) {
+			return payload, errors.New("invalid encrypted content payload")
+		}
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return payload, errors.New("invalid encrypted content payload")
+	}
+	if payload.Version != 1 || (payload.Scope != "command" && payload.Scope != "event" && payload.Scope != "launch") ||
+		!validProtocolIdentifier(payload.KeyID) || !validProtocolIdentifier(payload.Sender) ||
+		!validProtocolIdentifier(payload.MessageID) || !validProtocolIdentifier(payload.Type) ||
+		!validBase64URL(payload.Nonce, 12, 12) || !validBase64URL(payload.Ciphertext, 16, 32768+16) ||
+		!validBase64URL(payload.Signature, 64, 64) {
+		return EncryptedContentPayload{}, errors.New("invalid encrypted content payload")
+	}
+	return payload, nil
+}
+
+func validProtocolIdentifier(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '_' || char == '.' || char == ':' || char == '/' || char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validBase64URL(value string, min, max int) bool {
+	if len(value) > base64.RawURLEncoding.EncodedLen(max) {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(value)
+	return err == nil && len(decoded) >= min && len(decoded) <= max && base64.RawURLEncoding.EncodeToString(decoded) == value
+}
 
 type Command struct {
 	CommandID string          `json:"cmd_id"`
@@ -945,7 +1019,11 @@ func decodeCommand(data []byte) (Frame, error) {
 		return nil, errors.New("decode settings command: invalid command")
 	}
 	if _, err := DecodeSettingsChangePayload(fields["payload"]); err != nil {
-		return nil, fmt.Errorf("decode settings command: %w", err)
+		// Wire decoding accepts a structurally valid opaque carrier, not execution
+		// authority. Mode-aware Hub and endpoint ingress still reject downgrade.
+		if _, opaqueErr := DecodeEncryptedPacketCarrier(fields["payload"], "command", string(command.Type), command.CommandID); opaqueErr != nil {
+			return nil, fmt.Errorf("decode settings command: %w", err)
+		}
 	}
 	return command, nil
 }

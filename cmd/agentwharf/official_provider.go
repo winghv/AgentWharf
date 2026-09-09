@@ -224,6 +224,9 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connec
 				return err
 			}
 		case *protocol.Command:
+			if cfg.ContentMode == protocol.ContentModeRequired {
+				return errors.New("required encrypted command executor is unavailable")
+			}
 			if accepted.Contains(typed.CommandID) {
 				if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
 					return err
