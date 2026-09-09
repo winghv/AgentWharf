@@ -369,12 +369,6 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, fr
 		return AcceptedPeer{}, "", nil, err
 	}
 	ack, accepted, err := h.handshake.HandleHello(ctx, hello)
-	if err == nil && hello.ContentMode == protocol.ContentModeRequired {
-		// Never route required-mode peers through the legacy content dispatcher.
-		_ = writeProtocolError(ctx, conn, "encrypted_transport_unavailable", "encrypted transport is unavailable", true)
-		_ = conn.Close(websocket.StatusPolicyViolation, "encrypted transport unavailable")
-		return AcceptedPeer{}, "", nil, auth.ErrUnauthorized
-	}
 	if err != nil {
 		code := protocolErrorCode(err)
 		_ = writeProtocolError(ctx, conn, code, err.Error(), true)
