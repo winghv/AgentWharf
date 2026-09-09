@@ -137,7 +137,7 @@ func (h *Handshake) HandleHello(ctx context.Context, hello *protocol.Hello) (pro
 
 	principal, err := h.authenticator.Authenticate(ctx, hello.Token)
 	if err != nil {
-		return protocol.HelloAck{}, AcceptedPeer{}, err
+		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: authentication failed", auth.ErrInvalidToken)
 	}
 	if err := h.authorizeContentMode(ctx, hello, principal, selectedVersion); err != nil {
 		return protocol.HelloAck{}, AcceptedPeer{}, err

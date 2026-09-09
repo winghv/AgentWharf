@@ -48,6 +48,32 @@ func TestWebSocketServerAcceptsHelloAndPing(t *testing.T) {
 	}
 }
 
+func TestWebSocketServerClassifiesAuthenticatorFailuresAsUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	privateMessage := "private platform token validation detail"
+	server := newWebSocketTestServer(t, hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator: fakeAuth{authenticateErr: errors.New(privateMessage)},
+		EventStore:    newFakeEventStore(map[string]int64{"ses_1": 0}, nil),
+	}))
+	conn := dialWebSocket(t, server.URL)
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	writeFrame(t, conn, &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "expired-platform-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_1"}},
+	})
+	got := readFrame(t, conn).(*protocol.Error)
+	if got.Code != "unauthorized" || !got.Fatal {
+		t.Fatalf("hello error = %+v, want fatal unauthorized", got)
+	}
+	if strings.Contains(got.Message, privateMessage) {
+		t.Fatalf("hello error leaked authenticator detail: %+v", got)
+	}
+}
+
 func TestWebSocketServerRejectsAdapterWithoutDispatchStore(t *testing.T) {
 	t.Parallel()
 
