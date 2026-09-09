@@ -98,6 +98,8 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		return nil
 	case "upgrade":
 		return runUpgradeCommand(ctx, args[1:], stdin, stdout, stderr)
+	case "pair":
+		return runPairCommand(ctx, args[1:], stdout, stderr)
 	case "serve":
 		return runServeCommand(ctx, args[1:], stdout, stderr)
 	case "hub":

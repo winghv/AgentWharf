@@ -4173,3 +4173,10 @@ func TestPairCommandArgumentHandling(t *testing.T) {
 		t.Fatalf("runPairCommand with blank url = %v, want usage error", err)
 	}
 }
+
+func TestExplicitPairCommandRoutesEnrollment(t *testing.T) {
+	err := runWithInput(context.Background(), []string{"pair", "--enroll"}, nil, io.Discard, io.Discard)
+	if err == nil || err.Error() != "usage: wharf pair --enroll <local-account-binding> <absolute-private-offer-file>" {
+		t.Fatalf("runWithInput(pair --enroll) error = %v, want enrollment usage", err)
+	}
+}
