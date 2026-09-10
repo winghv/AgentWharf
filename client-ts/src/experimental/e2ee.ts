@@ -38,11 +38,16 @@ function decode(value: string, min: number, max: number): Uint8Array<ArrayBuffer
   if (result.length < min || result.length > max || encode(result) !== value) invalid()
   return result
 }
-async function contentKey(key: Uint8Array, usage: KeyUsage): Promise<CryptoKey> {
+export type ContentKey = Uint8Array | CryptoKey
+async function contentKey(key: ContentKey, usage: KeyUsage): Promise<CryptoKey> {
+  if (key instanceof CryptoKey) {
+    if (key.type !== 'secret' || key.algorithm.name !== 'AES-GCM' || !key.usages.includes(usage)) invalid()
+    return key
+  }
   if (key.length !== 32) invalid()
   return crypto.subtle.importKey('raw', new Uint8Array(key), 'AES-GCM', false, [usage])
 }
-export async function sealContent(context: ContentContext, key: Uint8Array, signingKey: CryptoKey, plaintext: Uint8Array): Promise<ContentEnvelope> {
+export async function sealContent(context: ContentContext, key: ContentKey, signingKey: CryptoKey, plaintext: Uint8Array): Promise<ContentEnvelope> {
   try {
     if (plaintext.length > MAX_CONTENT_BYTES || signingKey.algorithm.name !== 'Ed25519' || signingKey.type !== 'private') invalid()
     const aad = contextBytes(context)
@@ -52,7 +57,7 @@ export async function sealContent(context: ContentContext, key: Uint8Array, sign
     return { nonce: encode(nonce), ciphertext: encode(ciphertext), signature: encode(signature) }
   } catch { return invalid() }
 }
-export async function openContent(context: ContentContext, key: Uint8Array, verifyKey: CryptoKey, envelope: ContentEnvelope): Promise<Uint8Array<ArrayBuffer>> {
+export async function openContent(context: ContentContext, key: ContentKey, verifyKey: CryptoKey, envelope: ContentEnvelope): Promise<Uint8Array<ArrayBuffer>> {
   try {
     if (verifyKey.algorithm.name !== 'Ed25519' || verifyKey.type !== 'public' || Object.keys(envelope).sort().join(',') !== 'ciphertext,nonce,signature') invalid()
     const aad = contextBytes(context)

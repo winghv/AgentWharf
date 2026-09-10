@@ -3,8 +3,9 @@ export const PROTOCOL_VERSION = 2
 export type ProtocolVersion = 1 | 2
 
 export type Role = 'client' | 'adapter'
-export type CommandType = 'session.send' | 'permission.respond' | 'session.interrupt' | 'session.stop' | 'session.attach' | 'session.settings.change'
+export type CommandType = 'session.send' | 'permission.respond' | 'session.interrupt' | 'session.stop' | 'session.attach' | 'session.settings.change' | 'session.file.read' | 'session.file.list'
 export type AckStatus = 'accepted' | 'rejected' | 'duplicate'
+export type ContentMode = 'required' | 'legacy'
 
 /**
  * Routing, Adapter receipt, and Provider completion are separate authorities.
@@ -69,6 +70,7 @@ export type HelloFrame =
       protocol_version: ProtocolVersion
       role: 'client'
       token: string
+      content_mode?: ContentMode
       subscriptions: Subscription[]
     }
   | {
@@ -92,6 +94,7 @@ export interface SessionSummary {
 export interface HelloAckFrame {
   frame: 'hello.ack'
   protocol_version: ProtocolVersion
+  content_mode?: ContentMode
   sessions: SessionSummary[]
   capabilities?: HelloCapabilities
 }
@@ -349,6 +352,13 @@ export interface AgentWharfClientOptions {
   webSocketFactory?: WebSocketFactory
   reconnect?: false | Partial<ReconnectConfig>
   commandIdFactory?: () => string
+  encrypted?: EncryptedSessionCodec
+}
+
+export interface EncryptedSessionCodec {
+  contentMode?: 'required'
+  openEvent(event: AgentWharfEvent): Promise<AgentWharfEvent>
+  sealCommand(command: { cmd_id: string; type: CommandType; session_id: string; payload: JsonValue }): Promise<JsonValue>
 }
 
 export interface SendCommandOptions {
@@ -397,6 +407,13 @@ interface PendingHistoryPage {
   abort: () => void
 }
 
+interface EncryptedEventState {
+  socket: WebSocketLike
+  lane: Promise<void>
+  count: number
+  failed: boolean
+}
+
 export function encodeFrame(frame: AgentWharfFrame): string {
   return JSON.stringify(frame)
 }
@@ -442,6 +459,7 @@ export class AgentWharfClient {
   private readonly deliveryStates = new Map<string, CommandDeliveryState>()
   private readonly pendingCommands = new Map<string, PendingCommand>()
   private readonly pendingHistoryPages = new Map<string, PendingHistoryPage>()
+  private readonly encryptedCommands = new Map<string, { type: CommandType; sessionId: string; payloadJSON: string; payload: Promise<JsonValue> }>()
 
   private socket: WebSocketLike | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -450,6 +468,7 @@ export class AgentWharfClient {
   private nextCommandNumber = 1
   private lastHelloAck: HelloAckFrame | null = null
   private handshakeReady = false
+  private encryptedEventState: EncryptedEventState | null = null
 
   constructor(private readonly options: AgentWharfClientOptions) {
     if (options.sessions.length === 0) {
@@ -671,19 +690,15 @@ export class AgentWharfClient {
     if (socket === null) {
       return Promise.reject(new Error('client is not connected'))
     }
+    if (this.options.encrypted !== undefined && !this.handshakeReady) {
+      return Promise.reject(new Error('encrypted session handshake is not ready'))
+    }
     const commandId = options.commandId ?? this.commandIdFactory()
     if (typeof commandId !== 'string' || commandId.trim() === '') {
       return Promise.reject(new Error('command id is required'))
     }
     if (this.pendingCommands.has(commandId)) {
       return Promise.reject(new Error(`command ${commandId} is already pending`))
-    }
-    const command: CommandFrame = {
-      frame: 'command',
-      cmd_id: commandId,
-      type,
-      session_id: sessionId,
-      payload,
     }
     const state: CommandDeliveryState = {
       commandId,
@@ -697,13 +712,63 @@ export class AgentWharfClient {
     const ack = new Promise<CommandAckFrame>((resolve, reject) => {
       this.pendingCommands.set(commandId, { resolve, reject, state })
     })
-    try {
-      socket.send(encodeFrame(command))
-    } catch (error) {
+    const payloadJSON = JSON.stringify(payload)
+    let encrypted = this.encryptedCommands.get(commandId)
+    if (this.options.encrypted !== undefined) {
+      if (encrypted !== undefined && (encrypted.type !== type || encrypted.sessionId !== sessionId || encrypted.payloadJSON !== payloadJSON)) {
+        this.pendingCommands.delete(commandId)
+        return Promise.reject(new Error('encrypted command retry does not match original'))
+      }
+      if (encrypted === undefined) {
+        if (this.encryptedCommands.size >= 128) {
+          let settled: string | undefined
+          for (const id of this.encryptedCommands.keys()) {
+            if (!this.pendingCommands.has(id)) {
+              settled = id
+              break
+            }
+          }
+          if (settled === undefined) {
+            this.pendingCommands.delete(commandId)
+            return Promise.reject(new Error('encrypted command retry capacity reached'))
+          }
+          this.encryptedCommands.delete(settled)
+        }
+        encrypted = {
+          type,
+          sessionId,
+          payloadJSON,
+          payload: Promise.resolve().then(() => this.options.encrypted!.sealCommand({
+            cmd_id: commandId,
+            type,
+            session_id: sessionId,
+            payload: JSON.parse(payloadJSON) as JsonValue,
+          })),
+        }
+        this.encryptedCommands.set(commandId, encrypted)
+      }
+    }
+    if (encrypted === undefined) {
+      try {
+        socket.send(encodeFrame({ frame: 'command', cmd_id: commandId, type, session_id: sessionId, payload }))
+      } catch (error) {
+        this.pendingCommands.delete(commandId)
+        this.setDeliveryState({ ...state, routing: 'outcome_unknown', adapter: 'outcome_unknown', provider: 'outcome_unknown' })
+        return Promise.reject(normalizeError(error))
+      }
+      return ack
+    }
+    const wirePayload = encrypted.payload
+    wirePayload.then((sealed) => {
+      if (this.socket !== socket || !this.handshakeReady) throw new Error('connection changed before command encryption completed')
+      socket.send(encodeFrame({ frame: 'command', cmd_id: commandId, type, session_id: sessionId, payload: sealed }))
+    }).catch((error) => {
+      const pending = this.pendingCommands.get(commandId)
+      if (pending === undefined) return
       this.pendingCommands.delete(commandId)
       this.setDeliveryState({ ...state, routing: 'outcome_unknown', adapter: 'outcome_unknown', provider: 'outcome_unknown' })
-      return Promise.reject(normalizeError(error))
-    }
+      pending.reject(normalizeError(error))
+    })
     return ack
   }
 
@@ -714,6 +779,9 @@ export class AgentWharfClient {
     const socket = this.socket
     if (socket === null) {
       return Promise.reject(new Error('client is not connected'))
+    }
+    if (this.options.encrypted !== undefined && !this.handshakeReady) {
+      return Promise.reject(new Error('encrypted session handshake is not ready'))
     }
     const limit = options.limit ?? 100
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
@@ -749,6 +817,9 @@ export class AgentWharfClient {
   private openSocket(): Promise<HelloAckFrame> {
     const socket = this.webSocketFactory(this.options.url)
     this.socket = socket
+    if (this.options.encrypted !== undefined) {
+      this.encryptedEventState = { socket, lane: Promise.resolve(), count: 0, failed: false }
+    }
 
     return new Promise<HelloAckFrame>((resolve, reject) => {
       let handshakeComplete = false
@@ -761,7 +832,11 @@ export class AgentWharfClient {
         try {
           const frame = decodeFrame(event.data)
           if (frame.frame === 'hello.ack') {
+            if (handshakeComplete) throw new Error('duplicate hello.ack')
             const ack = validateHelloAck(frame, this.protocolVersion)
+            if (this.options.encrypted !== undefined && (ack.protocol_version !== 2 || ack.content_mode !== 'required' || ack.sessions.length !== 1 || ack.sessions[0]?.session_id !== this.options.sessions[0]?.sessionId)) {
+              throw new Error('encrypted hello.ack negotiation failed')
+            }
             handshakeComplete = true
             this.handshakeReady = true
             this.lastHelloAck = ack
@@ -770,7 +845,7 @@ export class AgentWharfClient {
             resolve(ack)
             return
           }
-          this.handleFrame(frame)
+          this.handleFrame(frame, socket)
         } catch (error) {
           const normalized = normalizeError(error)
           this.emitError(normalized)
@@ -780,6 +855,8 @@ export class AgentWharfClient {
             }
             socket.onmessage = null
             reject(normalized)
+            socket.close()
+          } else if (this.options.encrypted !== undefined) {
             socket.close()
           }
         }
@@ -799,6 +876,7 @@ export class AgentWharfClient {
         }
         this.socket = null
         this.handshakeReady = false
+        if (this.encryptedEventState?.socket === socket) this.encryptedEventState = null
         if (!handshakeComplete) {
           reject(new Error('websocket closed before hello.ack'))
         }
@@ -811,10 +889,14 @@ export class AgentWharfClient {
     })
   }
 
-  private handleFrame(frame: AgentWharfFrame): void {
+  private handleFrame(frame: AgentWharfFrame, socket: WebSocketLike): void {
     switch (frame.frame) {
       case 'event':
-        this.handleEvent(frame)
+        if (this.options.encrypted === undefined) {
+          this.handleEvent(frame)
+        } else {
+          this.enqueueEncryptedEvent(frame, socket)
+        }
         return
       case 'command.ack':
         this.resolveCommand(frame)
@@ -826,7 +908,7 @@ export class AgentWharfClient {
         this.emitError(frame)
         return
       case 'history.page':
-        if ('events' in frame) this.resolveHistoryPage(frame)
+        if ('events' in frame) this.resolveHistoryPage(frame, socket)
         return
       case 'pong':
       case 'hello':
@@ -836,6 +918,35 @@ export class AgentWharfClient {
       case 'attention.summary':
         return
     }
+  }
+
+  private enqueueEncryptedEvent(event: AgentWharfEvent, socket: WebSocketLike): void {
+    const state = this.encryptedEventState
+    if (state === null || state.socket !== socket || state.failed) return
+    if (state.count >= 128) {
+      this.emitError(new Error('encrypted event queue capacity reached'))
+      state.failed = true
+      socket.close()
+      return
+    }
+    state.count++
+    state.lane = state.lane.then(async () => {
+      if (state.failed || this.socket !== socket || !this.handshakeReady) return
+      const ephemeral = event.seq === undefined && isEphemeralSessionEvent(event.type)
+      const current = this.cursors.get(event.session_id) ?? 0
+      if (!ephemeral && (!Number.isSafeInteger(event.seq) || event.seq !== current + 1)) throw new Error('encrypted event sequence gap')
+      const opened = await withTimeout(this.options.encrypted!.openEvent(event), 10_000, 'encrypted event authentication timed out')
+      if (state.failed || this.socket !== socket || !this.handshakeReady) return
+      if (opened.session_id !== event.session_id || opened.seq !== event.seq || !validOpenedEventType(event, opened)) {
+        throw new Error('encrypted event routing changed')
+      }
+      this.handleEvent(opened)
+    }).catch((error) => {
+      if (state.failed || this.socket !== socket) return
+      state.failed = true
+      this.emitError(normalizeError(error))
+      socket.close()
+    }).finally(() => { state.count-- })
   }
 
   private handleEvent(event: AgentWharfEvent): void {
@@ -894,14 +1005,32 @@ export class AgentWharfClient {
     }
   }
 
-  private resolveHistoryPage(page: HistoryPageResponseFrame): void {
+  private resolveHistoryPage(page: HistoryPageResponseFrame, socket: WebSocketLike): void {
     const pending = this.pendingHistoryPages.get(page.request_id)
     if (pending === undefined) return
     this.pendingHistoryPages.delete(page.request_id)
     pending.signal?.removeEventListener('abort', pending.abort)
     try {
       validateHistoryPage(page)
-      pending.resolve(page)
+      if (this.options.encrypted === undefined) {
+        pending.resolve(page)
+        return
+      }
+      const openedPage = (async () => {
+        const events: AgentWharfEvent[] = []
+        for (const event of page.events) {
+          if (this.socket !== socket || !this.handshakeReady) throw new Error('connection changed during encrypted history authentication')
+          const opened = await this.options.encrypted!.openEvent(event)
+          if (this.socket !== socket || !this.handshakeReady) throw new Error('connection changed during encrypted history authentication')
+          if (opened.session_id !== event.session_id || opened.seq !== event.seq || !validOpenedEventType(event, opened)) {
+            throw new Error('encrypted history routing changed')
+          }
+          events.push(opened)
+        }
+        if (this.socket !== socket || !this.handshakeReady) throw new Error('connection changed during encrypted history authentication')
+        pending.resolve({ ...page, events })
+      })()
+      withTimeout(openedPage, 10_000, 'encrypted history authentication timed out').catch((error) => pending.reject(normalizeError(error)))
     } catch (error) {
       pending.reject(normalizeError(error))
     }
@@ -913,6 +1042,7 @@ export class AgentWharfClient {
       protocol_version: this.protocolVersion,
       role: 'client',
       token: this.options.token,
+      ...(this.options.encrypted ? { content_mode: this.options.encrypted.contentMode ?? 'required' } : {}),
       subscriptions: this.options.sessions.map((session) => ({
         session_id: session.sessionId,
         last_seq: this.lastSeq(session.sessionId),
@@ -1575,4 +1705,26 @@ function validateHelloAck(frame: HelloAckFrame, requestedVersion: ProtocolVersio
     throw new Error('v1 hello.ack must omit capabilities')
   }
   return frame
+}
+
+function isEphemeralSessionEvent(type: string): boolean {
+  return type === 'presence' || type === 'agent.activity' || type === 'log.tail' || type === 'resource.sample'
+}
+
+function validOpenedEventType(wire: AgentWharfEvent, opened: AgentWharfEvent): boolean {
+  if (opened.type === wire.type) return true
+  const carrier = asJsonObject(wire.payload)
+  const payload = asJsonObject(opened.payload)
+  return wire.type === 'session.command' && carrier?.scope === 'command' && carrier.type === 'session.send' &&
+    opened.type === 'session.message' && payload?.role === 'user' && Array.isArray(payload.content)
+}
+
+function withTimeout<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), milliseconds)
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error) => { clearTimeout(timer); reject(error) },
+    )
+  })
 }

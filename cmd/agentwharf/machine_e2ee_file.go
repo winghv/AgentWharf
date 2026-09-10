@@ -10,11 +10,13 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/winghv/agentwharf/experimental/e2ee"
 	"github.com/winghv/agentwharf/protocol"
 )
 
 const maxEncryptedFileReadBytes = 1024 * 1024
 const maxEncryptedFileListEntries = 256
+const maxEncryptedFileResultBytes = e2ee.MaxContentBytes - 64
 
 var (
 	errInvalidEncryptedFileRequest = errors.New("invalid encrypted file request")
@@ -83,11 +85,23 @@ func encryptedFileReadResult(cfg wrapConfig, payload json.RawMessage) ([]byte, e
 		return nil, errEncryptedFileUnavailable
 	}
 	defer clear(raw)
-	result, err := json.Marshal(map[string]any{"path": request.Path, "content": string(raw), "bytes": len(raw), "truncated": false})
-	if err != nil {
-		return nil, errEncryptedFileUnavailable
+	end := min(len(raw), maxEncryptedFileResultBytes)
+	for end > 0 && !utf8.Valid(raw[:end]) {
+		end--
 	}
-	return result, nil
+	for {
+		result, marshalErr := json.Marshal(map[string]any{"path": request.Path, "content": string(raw[:end]), "bytes": end, "truncated": end < len(raw)})
+		if marshalErr != nil {
+			return nil, errEncryptedFileUnavailable
+		}
+		if len(result) <= maxEncryptedFileResultBytes {
+			return result, nil
+		}
+		end -= min(end, len(result)-maxEncryptedFileResultBytes)
+		for end > 0 && !utf8.Valid(raw[:end]) {
+			end--
+		}
+	}
 }
 
 func deliverEncryptedFileRead(ctx context.Context, cfg wrapConfig, command *protocol.Command, writeFrame func(protocol.Frame) error) error {
@@ -170,11 +184,19 @@ func encryptedFileListResult(cfg wrapConfig, payload json.RawMessage) ([]byte, e
 		}
 		nodes = append(nodes, node)
 	}
-	result, err := json.Marshal(map[string]any{"path": request.Path, "nodes": nodes, "truncated": false})
-	if err != nil {
-		return nil, errEncryptedFileUnavailable
+	for {
+		result, marshalErr := json.Marshal(map[string]any{"path": request.Path, "nodes": nodes, "truncated": len(nodes) < len(entries)})
+		if marshalErr != nil {
+			return nil, errEncryptedFileUnavailable
+		}
+		if len(result) <= maxEncryptedFileResultBytes {
+			return result, nil
+		}
+		if len(nodes) == 0 {
+			return nil, errEncryptedFileUnavailable
+		}
+		nodes = nodes[:len(nodes)-1]
 	}
-	return result, nil
 }
 
 func deliverEncryptedFileList(ctx context.Context, cfg wrapConfig, command *protocol.Command, writeFrame func(protocol.Frame) error) error {

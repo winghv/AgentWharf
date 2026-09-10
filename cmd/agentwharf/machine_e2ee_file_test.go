@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/winghv/agentwharf/experimental/e2ee"
 	"github.com/winghv/agentwharf/protocol"
@@ -90,6 +91,43 @@ func TestEncryptedFileReadClaimsReadsAndSealsResult(t *testing.T) {
 		t.Fatalf("decrypt result: %v", err)
 	}
 	clear(decoded)
+	t.Run("wire-bounded UTF-8 truncation", func(t *testing.T) {
+		large := strings.Repeat("界", 12000)
+		largePath := filepath.Join(root, "large-utf8.txt")
+		if err := os.WriteFile(largePath, []byte(large), 0600); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(largePath)
+		frames = nil
+		id := "file-read-large-utf8"
+		command := &protocol.Command{SessionID: "session", CommandID: id, Type: protocol.CommandFileRead, Payload: seal(id, protocol.CommandFileRead, []byte(`{"path":"large-utf8.txt"}`))}
+		if err := deliverEncryptedFileRead(ctx, cfg, command, write); err != nil || len(frames) != 2 {
+			t.Fatalf("large UTF-8 read: frames=%d err=%v", len(frames), err)
+		}
+		event := frames[0].(*protocol.Event)
+		carrier, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "event", "session.file.result", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		packetJSON, _ := json.Marshal(carrier.Packet)
+		var packet e2ee.ContentPacket
+		if err := json.Unmarshal(packetJSON, &packet); err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := e2ee.OpenPacket(e2ee.Context{Scope: "event", Session: "session", Sender: runtime.public.Device, KeyID: carrier.KeyID, MessageID: carrier.MessageID, Type: "session.file.result"}, key, ed25519.PublicKey(signing), packet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(decoded)
+		var result struct {
+			Content   string `json:"content"`
+			Bytes     int    `json:"bytes"`
+			Truncated bool   `json:"truncated"`
+		}
+		if json.Unmarshal(decoded, &result) != nil || !result.Truncated || result.Bytes != len([]byte(result.Content)) || !utf8.ValidString(result.Content) || !strings.HasPrefix(large, result.Content) {
+			t.Fatalf("invalid truncated result: bytes=%d truncated=%t", result.Bytes, result.Truncated)
+		}
+	})
 	var state string
 	if err := runtime.database.QueryRowContext(ctx, `SELECT state FROM e2ee_local_commands WHERE session='session' AND message='file-read'`).Scan(&state); err != nil || state != "completed" {
 		t.Fatalf("journal state=%s err=%v", state, err)
@@ -162,6 +200,47 @@ func TestEncryptedFileReadClaimsReadsAndSealsResult(t *testing.T) {
 			if err := deliverEncryptedFileList(ctx, cfg, command, write); err != nil || len(frames) != 1 || frames[0].(*protocol.CommandAck).Status != protocol.AckDuplicate {
 				t.Fatal("listing redelivery executed", err)
 			}
+		}
+	})
+	t.Run("wire-bounded directory listing", func(t *testing.T) {
+		directoryPath := filepath.Join(root, "wide")
+		if err := os.Mkdir(directoryPath, 0700); err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(directoryPath)
+		for i := 0; i < 200; i++ {
+			name := fmt.Sprintf("file-%03d-%s", i, strings.Repeat("x", 190))
+			if err := os.WriteFile(filepath.Join(directoryPath, name), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		frames = nil
+		id := "list-wide"
+		command := &protocol.Command{SessionID: "session", CommandID: id, Type: protocol.CommandFileList, Payload: seal(id, protocol.CommandFileList, []byte(`{"path":"wide"}`))}
+		if err := deliverEncryptedFileList(ctx, cfg, command, write); err != nil || len(frames) != 2 {
+			t.Fatalf("wide directory: frames=%d err=%v", len(frames), err)
+		}
+		event := frames[0].(*protocol.Event)
+		carrier, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "event", "session.file.result", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		packetJSON, _ := json.Marshal(carrier.Packet)
+		var packet e2ee.ContentPacket
+		if err := json.Unmarshal(packetJSON, &packet); err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := e2ee.OpenPacket(e2ee.Context{Scope: "event", Session: "session", Sender: runtime.public.Device, KeyID: carrier.KeyID, MessageID: carrier.MessageID, Type: "session.file.result"}, key, ed25519.PublicKey(signing), packet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(decoded)
+		var result struct {
+			Nodes     []json.RawMessage `json:"nodes"`
+			Truncated bool              `json:"truncated"`
+		}
+		if err := json.Unmarshal(decoded, &result); err != nil || !result.Truncated || len(result.Nodes) == 0 || len(result.Nodes) >= 200 || len(decoded) > maxEncryptedFileResultBytes {
+			t.Fatalf("invalid bounded listing: bytes=%d nodes=%d truncated=%t err=%v", len(decoded), len(result.Nodes), result.Truncated, err)
 		}
 	})
 	if err := os.Symlink("secret.txt", filepath.Join(root, "secret-link")); err != nil {

@@ -1,5 +1,5 @@
 import { decodeStrictJson } from './strictJson.js'
-import { openContent, sealContent, type ContentContext, type ContentEnvelope } from './e2ee.js'
+import { openContent, sealContent, type ContentContext, type ContentEnvelope, type ContentKey } from './e2ee.js'
 
 export interface PublicMetadata { state?: string; role?: string; request_id?: string; decision?: string }
 export interface ContentPacket { version: 1; public: PublicMetadata; encrypted: ContentEnvelope }
@@ -43,7 +43,7 @@ export function projectPublicMetadata(type: string, payload: unknown): PublicMet
   validatePublic(type, projection)
   return projection
 }
-export async function sealPacket(context: ContentContext, key: Uint8Array, signer: CryptoKey, publicMetadata: PublicMetadata, payload: unknown): Promise<ContentPacket> {
+export async function sealPacket(context: ContentContext, key: ContentKey, signer: CryptoKey, publicMetadata: PublicMetadata, payload: unknown): Promise<ContentPacket> {
   validatePublic(context.type, publicMetadata)
   if (normalized(projectPublicMetadata(context.type, payload)) !== normalized(publicMetadata)) invalid()
   const projection = { ...publicMetadata }
@@ -56,7 +56,7 @@ export function decodePacketUTF8(bytes: Uint8Array): string {
   if (typeof TextDecoder !== 'undefined') return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   return decodeURIComponent(Array.from(bytes, byte => '%' + byte.toString(16).padStart(2, '0')).join(''))
 }
-export async function openPacket(context: ContentContext, key: Uint8Array, signer: CryptoKey, packet: ContentPacket): Promise<unknown> {
+export async function openPacket(context: ContentContext, key: ContentKey, signer: CryptoKey, packet: ContentPacket): Promise<unknown> {
   try {
     if (!packet || Object.keys(packet).sort().join(',') !== 'encrypted,public,version' || packet.version !== 1) invalid()
     validatePublic(context.type, packet.public)

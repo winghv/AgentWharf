@@ -138,6 +138,153 @@ test('connect sends client hello with the current replay cursor', async () => {
   client.close()
 })
 
+test('encrypted sessions negotiate required content mode and reject downgrade acknowledgements', async () => {
+  const sockets = new FakeSocketFactory()
+  const codec = {
+    contentMode: 'required' as const,
+    openEvent: async (event: AgentWharfEvent) => event,
+    sealCommand: async () => ({ carrier: true }),
+  }
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure' }],
+    encrypted: codec, webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  assert.equal(sockets.last().sentFrames()[0].content_mode, 'required')
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }], content_mode: 'legacy' })
+  await assert.rejects(connected, /encrypted hello\.ack negotiation failed/)
+  assert.equal(sockets.last().isClosed(), true)
+})
+
+test('encrypted sessions reject commands before handshake and duplicate acknowledgements', async () => {
+  const sockets = new FakeSocketFactory()
+  const errors: string[] = []
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure' }],
+    encrypted: { contentMode: 'required', openEvent: async (event) => event, sealCommand: async () => ({}) },
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  client.onError((error) => errors.push(error.message))
+  const connected = client.connect()
+  sockets.last().open()
+  await assert.rejects(client.sendMessage('ses_secure', [], { commandId: 'before-ack' }), /handshake is not ready/)
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }] })
+  await connected
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }] })
+  await waitFor(() => errors.length === 1)
+  assert.match(errors[0], /duplicate hello\.ack/)
+  assert.equal(sockets.last().isClosed(), true)
+})
+
+test('encrypted command retries reuse the original opaque carrier', async () => {
+  const sockets = new FakeSocketFactory()
+  let seals = 0
+  const secret = 'plaintext-must-not-reach-the-wire'
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure' }],
+    encrypted: {
+      contentMode: 'required',
+      openEvent: async (event) => event,
+      sealCommand: async (command) => ({ carrier: `sealed-${++seals}`, message_id: command.cmd_id }),
+    },
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }] })
+  await connected
+
+  const first = client.sendMessage('ses_secure', [{ kind: 'text', text: secret }], { commandId: 'same-command' })
+  await waitFor(() => sockets.last().sentFrames().length === 2)
+  const firstWire = sockets.last().sentFrames()[1]
+  assert.equal(JSON.stringify(firstWire).includes(secret), false)
+  sockets.last().receive({ frame: 'command.ack', cmd_id: 'same-command', status: 'duplicate', reason: '' })
+  await first
+
+  const retry = client.sendMessage('ses_secure', [{ kind: 'text', text: secret }], { commandId: 'same-command' })
+  await waitFor(() => sockets.last().sentFrames().length === 3)
+  assert.deepEqual(sockets.last().sentFrames()[2].payload, firstWire.payload)
+  assert.equal(seals, 1)
+  sockets.last().receive({ frame: 'command.ack', cmd_id: 'same-command', status: 'accepted', reason: '' })
+  await retry
+  client.close()
+})
+
+test('encrypted event sequence gaps fail closed before reducer delivery', async () => {
+  const sockets = new FakeSocketFactory()
+  const errors: string[] = []
+  const seen: AgentWharfEvent[] = []
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure' }],
+    encrypted: { contentMode: 'required', openEvent: async (event) => event, sealCommand: async () => ({}) },
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  client.onError((error) => errors.push(error.message))
+  client.onEvent((event) => seen.push(event))
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }] })
+  await connected
+  sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq: 2, time: 2, payload: { opaque: true } })
+  await waitFor(() => errors.length === 1)
+  assert.match(errors[0], /encrypted event sequence gap/)
+  assert.deepEqual(seen, [])
+  assert.equal(client.lastSeq('ses_secure'), 0)
+  assert.equal(sockets.last().isClosed(), true)
+})
+
+test('late encrypted event from a replaced socket cannot advance replay state', async () => {
+  const sockets = new FakeSocketFactory()
+  let release!: (event: AgentWharfEvent) => void
+  const delayed = new Promise<AgentWharfEvent>((resolve) => { release = resolve })
+  const seen: AgentWharfEvent[] = []
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure' }],
+    encrypted: { contentMode: 'required', openEvent: async (event) => event.seq === 1 ? delayed : event, sealCommand: async () => ({}) },
+    webSocketFactory: sockets.factory, reconnect: { initialDelayMs: 1, maxDelayMs: 1 },
+  })
+  client.onEvent((event) => seen.push(event))
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }] })
+  await connected
+  const oldSocket = sockets.last()
+  const late = { frame: 'event', type: 'session.message', session_id: 'ses_secure', seq: 1, time: 1, payload: { opaque: true } } as AgentWharfEvent
+  oldSocket.receive(late)
+  oldSocket.close()
+  await waitFor(() => sockets.all.length === 2)
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }] })
+  release(late)
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.equal(client.lastSeq('ses_secure'), 0)
+  assert.deepEqual(seen, [])
+  client.close()
+})
+
+test('encrypted history rejects unauthenticated entries without hydrating client state', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure' }],
+    encrypted: { contentMode: 'required', openEvent: async () => { throw new Error('authentication failed') }, sealCommand: async () => ({}) },
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 1 }] })
+  await connected
+  const history = client.historyPage('ses_secure', { requestId: 'secure-history' })
+  sockets.last().receive({
+    frame: 'history.page', request_id: 'secure-history', session_id: 'ses_secure', latest_seq: 1,
+    next_before_seq: null, retention_state: 'complete',
+    events: [{ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq: 1, time: 1, payload: { opaque: true } }],
+  })
+  await assert.rejects(history, /authentication failed/)
+  assert.equal(client.lastSeq('ses_secure'), 0)
+  client.close()
+})
+
 test('requests typed reverse history pages and validates cursors', async () => {
   const sockets = new FakeSocketFactory()
   const client = new AgentWharfClient({
