@@ -13,7 +13,7 @@ import (
 	"github.com/winghv/agentwharf/protocol"
 )
 
-func pollSessionKeyRequests(ctx context.Context, client *http.Client, credential machineCredential) error {
+func pollSessionKeyRequests(ctx context.Context, client *http.Client, credential machineCredential, trusted bool) error {
 	account := strings.TrimSpace(os.Getenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING"))
 	if account == "" {
 		return errors.New("local key binding unavailable")
@@ -53,14 +53,14 @@ func pollSessionKeyRequests(ctx context.Context, client *http.Client, credential
 			failure = errors.New("invalid key request identity")
 			continue
 		}
-		if err := deliverSessionKeyRequest(ctx, client, credential, runtime, session, device, keyID); err != nil {
+		if err := deliverSessionKeyRequest(ctx, client, credential, runtime, session, device, keyID, trusted); err != nil {
 			failure = errors.New("one or more key requests failed")
 		}
 	}
 	return failure
 }
 
-func deliverSessionKeyRequest(ctx context.Context, client *http.Client, credential machineCredential, runtime *machineE2EERuntime, session, device, keyID string) error {
+func deliverSessionKeyRequest(ctx context.Context, client *http.Client, credential machineCredential, runtime *machineE2EERuntime, session, device, keyID string, trusted bool) error {
 	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machines/"+url.PathEscape(credential.MachineID)+"/e2ee-key-requests/"+url.PathEscape(session)+"/"+url.PathEscape(device)+"/"+url.PathEscape(keyID)+"/endpoint")
 	if err != nil {
 		return err
@@ -81,7 +81,7 @@ func deliverSessionKeyRequest(ctx context.Context, client *http.Client, credenti
 		return errors.New("invalid key request")
 	}
 	raw := []byte(response.Data.Request)
-	trusted := strings.TrimSpace(os.Getenv("AGENTWHARF_TRUST_ACCOUNT_TERMINALS")) == "1"
+	trusted = trusted || strings.TrimSpace(os.Getenv("AGENTWHARF_TRUST_ACCOUNT_TERMINALS")) == "1"
 	var wrapped e2ee.WrappedKey
 	if signed, legacyErr := e2ee.DecodeSessionKeyRequest(raw); legacyErr == nil && signed.Machine == credential.MachineID && signed.Session == session && signed.Device == device && signed.KeyID == keyID {
 		if response.Data.State == "completed" {

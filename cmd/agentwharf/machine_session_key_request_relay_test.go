@@ -81,7 +81,7 @@ func TestSessionKeyRequestRelayVerifiesGrantAndRetriesFixedResponse(t *testing.T
 	}))
 	defer server.Close()
 	credential := machineCredential{CloudAPIURL: server.URL, MachineID: "machine", MachineToken: "test"}
-	if err := deliverSessionKeyRequest(ctx, server.Client(), credential, runtime, "session", clientIdentity.Device, "key"); err != nil {
+	if err := deliverSessionKeyRequest(ctx, server.Client(), credential, runtime, "session", clientIdentity.Device, "key", false); err != nil {
 		t.Fatal(err)
 	}
 	if posts != 2 {
@@ -96,7 +96,7 @@ func TestSessionKeyRequestRelayVerifiesGrantAndRetriesFixedResponse(t *testing.T
 	}))
 	defer completedServer.Close()
 	credential.CloudAPIURL = completedServer.URL
-	if err := deliverSessionKeyRequest(ctx, completedServer.Client(), credential, runtime, "session", clientIdentity.Device, "key"); err == nil {
+	if err := deliverSessionKeyRequest(ctx, completedServer.Client(), credential, runtime, "session", clientIdentity.Device, "key", false); err == nil {
 		t.Fatal("completed relay bypassed request signature verification")
 	}
 }

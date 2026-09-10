@@ -298,7 +298,11 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 		if err := pollSessionInitializations(ctx, client, credential); err != nil {
 			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted initialization poll unavailable")
 		}
-		if err := pollSessionKeyRequests(ctx, client, credential); err != nil {
+		trustedTerminals, trustErr := fetchTrustAccountTerminals(ctx, client, credential)
+		if trustErr != nil {
+			trustedTerminals = false
+		}
+		if err := pollSessionKeyRequests(ctx, client, credential, trustedTerminals); err != nil {
 			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted key request poll unavailable")
 		}
 		claims, retry, err := listPendingMachineClaims(ctx, client, credential)
