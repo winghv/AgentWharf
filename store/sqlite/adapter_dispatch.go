@@ -19,12 +19,28 @@ func (s *Store) ValidateAdapterEffectAdmission(ctx context.Context, sessionID st
 	return s.ValidateAdapterAdmission(ctx, sessionID, admission)
 }
 
-func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (firstSeq int64, err error) {
+func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (int64, error) {
+	return s.appendAdapterEvents(ctx, sessionID, admission, events, false)
+}
+
+// AppendEncryptedAdapterEvents requires the caller to establish required mode.
+// It does not verify endpoint signatures or select trusted keys.
+func (s *Store) AppendEncryptedAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent) (int64, error) {
+	return s.appendAdapterEvents(ctx, sessionID, admission, events, true)
+}
+
+func (s *Store) appendAdapterEvents(ctx context.Context, sessionID string, admission store.AdapterConnectionAdmission, events []store.PendingEvent, encrypted bool) (firstSeq int64, err error) {
 	if s == nil || s.db == nil || len(events) == 0 {
 		return 0, errors.New("invalid sqlite adapter event commit")
 	}
-	for _, event := range events[:len(events)-1] {
-		if sqliteAttentionEventProjection(event).terminal {
+	projections := make([]store.PendingEvent, len(events))
+	for index, event := range events {
+		projection, err := sqliteProjectionEvent(event, encrypted)
+		if err != nil {
+			return 0, err
+		}
+		projections[index] = projection
+		if index < len(events)-1 && sqliteAttentionEventProjection(projection).terminal {
 			return 0, errors.New("terminal adapter event must be final")
 		}
 	}
@@ -51,7 +67,7 @@ func (s *Store) AppendAdapterEvents(ctx context.Context, sessionID string, admis
 		if err != nil {
 			return 0, err
 		}
-		terminal, err = projectSQLiteAttentionEvent(ctx, tx, sessionID, firstSeq+int64(index), event, nowMS)
+		terminal, err = projectSQLiteAttentionEvent(ctx, tx, sessionID, firstSeq+int64(index), projections[index], nowMS)
 		if err != nil {
 			return 0, fmt.Errorf("project adapter attention event: %w", err)
 		}

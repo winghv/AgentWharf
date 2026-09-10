@@ -24,6 +24,12 @@ type SessionAdmissionAuthenticator interface {
 	SessionAdmissionClaim(context.Context, auth.Principal, string) (auth.SessionAdmissionClaim, error)
 }
 
+// SessionContentModeAuthorizer resolves transport policy from authoritative session
+// state. It does not grant endpoint command authority or access to content keys.
+type SessionContentModeAuthorizer interface {
+	SessionContentMode(context.Context, auth.Principal, string) (string, error)
+}
+
 type HandshakeConfig struct {
 	Authenticator          auth.Authenticator
 	AttachGrantVerifier    auth.AttachGrantVerifier
@@ -56,6 +62,7 @@ type AcceptedPeer struct {
 	SessionID       string
 	Provider        string
 	Resume          bool
+	ContentMode     string
 	Subscribed      []protocol.Subscription
 	Admissions      map[string]auth.SessionAdmissionDecision
 	AdmissionClaims map[string]auth.SessionAdmissionClaim
@@ -117,7 +124,7 @@ func (h *Handshake) AuthorizeAttach(ctx context.Context, peer AcceptedPeer, rawG
 }
 
 func (h *Handshake) HandleHello(ctx context.Context, hello *protocol.Hello) (protocol.HelloAck, AcceptedPeer, error) {
-	if hello == nil || hello.Token == "" {
+	if hello == nil || hello.Token == "" || (hello.ContentMode != "" && hello.ContentMode != protocol.ContentModeRequired && hello.ContentMode != protocol.ContentModeLegacy) {
 		return protocol.HelloAck{}, AcceptedPeer{}, ErrInvalidHello
 	}
 	selectedVersion, err := negotiateHelloVersion(hello)
@@ -130,6 +137,9 @@ func (h *Handshake) HandleHello(ctx context.Context, hello *protocol.Hello) (pro
 
 	principal, err := h.authenticator.Authenticate(ctx, hello.Token)
 	if err != nil {
+		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: authentication failed", auth.ErrInvalidToken)
+	}
+	if err := h.authorizeContentMode(ctx, hello, principal, selectedVersion); err != nil {
 		return protocol.HelloAck{}, AcceptedPeer{}, err
 	}
 
@@ -141,6 +151,46 @@ func (h *Handshake) HandleHello(ctx context.Context, hello *protocol.Hello) (pro
 	default:
 		return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: unknown role %q", ErrInvalidHello, hello.Role)
 	}
+}
+
+func (h *Handshake) authorizeContentMode(ctx context.Context, hello *protocol.Hello, principal auth.Principal, version int) error {
+	authorizer, ok := h.authenticator.(SessionContentModeAuthorizer)
+	if !ok {
+		if hello.ContentMode == protocol.ContentModeRequired {
+			return auth.ErrUnauthorized
+		}
+		return nil
+	}
+	sessionIDs := make([]string, 0, len(hello.Subscriptions))
+	if hello.Role == protocol.RoleAdapter {
+		sessionIDs = append(sessionIDs, hello.SessionID)
+	} else {
+		for _, sub := range hello.Subscriptions {
+			sessionIDs = append(sessionIDs, sub.SessionID)
+		}
+	}
+	if len(sessionIDs) == 0 && hello.ContentMode != "" {
+		return auth.ErrUnauthorized
+	}
+	for _, sessionID := range sessionIDs {
+		mode, err := authorizer.SessionContentMode(ctx, principal, sessionID)
+		if err != nil {
+			return auth.ErrUnauthorized
+		}
+		switch mode {
+		case protocol.ContentModeRequired:
+			if hello.ContentMode != mode || version != protocol.ProtocolVersionV2 {
+				return auth.ErrUnauthorized
+			}
+		case protocol.ContentModeLegacy:
+			if hello.ContentMode == protocol.ContentModeRequired {
+				return auth.ErrUnauthorized
+			}
+		default:
+			return auth.ErrUnauthorized
+		}
+	}
+	return nil
 }
 
 func negotiateHelloVersion(hello *protocol.Hello) (int, error) {
@@ -188,11 +238,13 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 	}
 
 	ack := protocol.HelloAck{
+		ContentMode:     hello.ContentMode,
 		ProtocolVersion: selectedVersion,
 		Sessions:        make([]protocol.SessionSummary, 0, len(hello.Subscriptions)),
 	}
 	accepted := AcceptedPeer{
 		Role: protocol.RoleClient, ProtocolVersion: selectedVersion, Principal: principal,
+		ContentMode:     hello.ContentMode,
 		Subscribed:      append([]protocol.Subscription(nil), hello.Subscriptions...),
 		Admissions:      make(map[string]auth.SessionAdmissionDecision, len(hello.Subscriptions)),
 		AdmissionClaims: make(map[string]auth.SessionAdmissionClaim, len(hello.Subscriptions)),
@@ -293,11 +345,12 @@ func (h *Handshake) handleAdapter(ctx context.Context, hello *protocol.Hello, pr
 	}
 
 	return protocol.HelloAck{
+			ContentMode:     hello.ContentMode,
 			ProtocolVersion: selectedVersion,
 			Sessions:        []protocol.SessionSummary{summary},
 		}, AcceptedPeer{
 			Role: protocol.RoleAdapter, ProtocolVersion: selectedVersion, Principal: principal,
-			SessionID: hello.SessionID, Provider: hello.Provider, Resume: hello.Resume,
+			ContentMode: hello.ContentMode, SessionID: hello.SessionID, Provider: hello.Provider, Resume: hello.Resume,
 		}, nil
 }
 

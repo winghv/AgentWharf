@@ -124,7 +124,7 @@ CREATE INDEX session_attention_summaries_projection_state_session_idx
 CREATE TABLE session_pending_commands (
     session_id TEXT NOT NULL CHECK (char_length(session_id) BETWEEN 1 AND 255) REFERENCES agent_sessions(id),
     cmd_id TEXT NOT NULL CHECK (char_length(cmd_id) BETWEEN 1 AND 256),
-    type TEXT NOT NULL CHECK (type IN ('session.send')),
+    type TEXT NOT NULL CHECK (type IN ('session.send', 'session.interrupt', 'session.stop', 'permission.respond', 'session.settings.change', 'session.membership.change', 'session.file.read', 'session.file.list')),
     event_seq BIGINT NOT NULL CHECK (event_seq > 0),
     status TEXT NOT NULL CHECK (status IN ('pending', 'received', 'completed', 'outcome_unknown')),
     expires_at TIMESTAMPTZ NOT NULL,

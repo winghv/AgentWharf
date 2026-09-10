@@ -98,6 +98,8 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		return nil
 	case "upgrade":
 		return runUpgradeCommand(ctx, args[1:], stdin, stdout, stderr)
+	case "pair":
+		return runPairCommand(ctx, args[1:], stdout, stderr)
 	case "serve":
 		return runServeCommand(ctx, args[1:], stdout, stderr)
 	case "hub":
@@ -457,15 +459,21 @@ type wrapConfig struct {
 	HealthMarker       string
 	ProviderCredential *core.ProcessCredential
 	ProtocolVersion    int
-	StartupSmoke       bool
-	PairOnly           bool
-	Session            bool
-	WorkingDirectory   string
-	LaunchSettings     wrapLaunchSettings
-	Stderr             io.Writer
-	Stdin              io.Reader
-	Interactive        bool
-	ForceHeadless      bool
+	// ContentMode is explicit because Own Machine must never infer legacy
+	// plaintext from an unavailable local key or an omitted server field.
+	ContentMode             string
+	verifyLocalProcessStart func(context.Context) error
+	guardLocalProcessStart  func(context.Context, func() error) error
+	e2eeRuntime             *machineE2EERuntime
+	StartupSmoke            bool
+	PairOnly                bool
+	Session                 bool
+	WorkingDirectory        string
+	LaunchSettings          wrapLaunchSettings
+	Stderr                  io.Writer
+	Stdin                   io.Reader
+	Interactive             bool
+	ForceHeadless           bool
 	// ProviderSessionID enables ACP session/load during machine recovery.
 	// OnProviderSession receives the opaque provider id after a successful
 	// session/new or session/load and must only persist it locally.
@@ -1064,6 +1072,14 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		}
 	}
 
+	if cfg.ContentMode == protocol.ContentModeRequired {
+		if cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
+			return cfg, errors.New("encrypted runtime requires protocol v2")
+		}
+		if err := cfg.e2eeRuntime.requireSession(ctx, cfg.SessionID); err != nil {
+			return cfg, err
+		}
+	}
 	conn, _, err := websocket.Dial(ctx, cfg.HubURL, nil)
 	if err != nil {
 		return cfg, fmt.Errorf("connect hub: %w", err)
@@ -1075,11 +1091,13 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		Provider:        cfg.Provider,
 		Token:           cfg.AdapterToken,
 		ProtocolVersion: cfg.ProtocolVersion,
+		ContentMode:     cfg.ContentMode,
 	})
 	if err != nil {
 		return cfg, err
 	}
 	hello := state.Hello()
+	hello.ContentMode = cfg.ContentMode
 	if err := writeCLIProtocolFrame(ctx, conn, &hello); err != nil {
 		return cfg, fmt.Errorf("send adapter hello: %w", err)
 	}
@@ -1318,6 +1336,9 @@ func applyMachineSession(cfg wrapConfig, session machineSessionResponse) (wrapCo
 // user-facing onboarding flow: pair once here, then manage everything from the
 // Console while wharf serve keeps the machine online.
 func runPairCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 && args[0] == "--enroll" {
+		return runMachineEnrollment(ctx, args[1:])
+	}
 	if len(args) > 1 {
 		return errors.New("usage: wharf pair [cloud-api-url]")
 	}
@@ -1700,6 +1721,9 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, connection *hubConnect
 	defer cancel()
 	writeFrame := func(frame protocol.Frame) error { return connection.write(runCtx, frame) }
 	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, connection.read, writeFrame, metrics)
+	if startAdmission != nil {
+		startAdmission.verifyLocal = cfg.verifyLocalProcessStart
+	}
 	var processAdmission core.ProcessStartAdmission
 	if startAdmission != nil {
 		processAdmission = startAdmission
@@ -1717,6 +1741,7 @@ func runWrapProvider(ctx context.Context, cfg wrapConfig, connection *hubConnect
 		Command:        command,
 		MaxRestarts:    maxRestarts,
 		StartAdmission: processAdmission,
+		StartGuard:     cfg.guardLocalProcessStart,
 	}
 	var supervisor *core.ProcessSupervisor
 	var recoveryGroup *core.GroupSupervisor
@@ -1875,6 +1900,9 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 	defer cancel()
 	writeFrame := func(frame protocol.Frame) error { return connection.write(runCtx, frame) }
 	startAdmission := newProviderStartAdmission(cfg.ProtocolVersion, connection.read, writeFrame, metrics)
+	if startAdmission != nil {
+		startAdmission.verifyLocal = cfg.verifyLocalProcessStart
+	}
 	var processAdmission core.ProcessStartAdmission
 	if startAdmission != nil {
 		processAdmission = startAdmission
@@ -1892,6 +1920,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 		Command:        command,
 		MaxRestarts:    maxRestarts,
 		StartAdmission: processAdmission,
+		StartGuard:     cfg.guardLocalProcessStart,
 	}
 	var supervisor *core.ProcessSupervisor
 	var recoveryGroup *core.GroupSupervisor
@@ -2036,7 +2065,13 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 	}
 	settingsTracker := newACPSettingsTracker(sessionResult)
 	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 && cfg.LaunchSettings.requested() {
-		applyACPLaunchSettings(runCtx, settingsTracker, providerSessionID, stdinWriter, scanner, cfg.LaunchSettings, cfg.Stderr)
+		if cfg.ContentMode == protocol.ContentModeRequired {
+			if err := applyRequiredACPLaunchSettingsWithPipes(runCtx, settingsTracker, providerSessionID, stdinWriter, stdoutReader, scanner, cfg.LaunchSettings); err != nil {
+				return err
+			}
+		} else {
+			applyACPLaunchSettings(runCtx, settingsTracker, providerSessionID, stdinWriter, scanner, cfg.LaunchSettings, cfg.Stderr)
+		}
 	}
 	var settingsMu sync.Mutex
 	removeReconnectSettings := connection.setReconnectProposalFactory("settings", func() (*protocol.Event, error) {
@@ -2189,9 +2224,10 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 // exchange owns the socket reader directly; later exchanges are delivered by
 // the command reader so ProcessSupervisor retries cannot race command routing.
 type providerStartAdmission struct {
-	read    func(context.Context) (protocol.Frame, error)
-	write   func(protocol.Frame) error
-	metrics *core.AdapterMetrics
+	read        func(context.Context) (protocol.Frame, error)
+	write       func(protocol.Frame) error
+	metrics     *core.AdapterMetrics
+	verifyLocal func(context.Context) error
 
 	mu             sync.Mutex
 	direct         bool
@@ -2224,6 +2260,11 @@ func (a *providerStartAdmission) receiptFailure(err error) error {
 func (a *providerStartAdmission) PrepareProcessStart(ctx context.Context, attempt int) error {
 	if a == nil || attempt < 1 {
 		return a.receiptFailure(errors.New("provider start admission is unavailable"))
+	}
+	if a.verifyLocal != nil {
+		if err := a.verifyLocal(ctx); err != nil {
+			return a.receiptFailure(errors.New("local process start authorization rejected"))
+		}
 	}
 	a.mu.Lock()
 	direct := a.direct
@@ -2355,6 +2396,11 @@ func (a *providerStartAdmission) VerifyRecoveryStart(ctx context.Context) error 
 	}
 	if _, err := a.RecoveryStartHandle(); err != nil {
 		return err
+	}
+	if a.verifyLocal != nil {
+		if err := a.verifyLocal(ctx); err != nil {
+			return errors.New("local process recovery authorization rejected")
+		}
 	}
 	return nil
 }
@@ -3132,6 +3178,15 @@ func forwardHubCommandsToProvider(ctx context.Context, readFrame func(context.Co
 				return err
 			}
 		case *protocol.Command:
+			if cfg.ContentMode == protocol.ContentModeRequired {
+				if typed.Type == protocol.CommandMembershipChange {
+					if err := deliverEncryptedMembership(ctx, cfg, typed, writeFrame); err != nil {
+						return err
+					}
+					continue
+				}
+				return errors.New("required encrypted command executor is unavailable")
+			}
 			if accepted.Contains(typed.CommandID) {
 				if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
 					return fmt.Errorf("re-ack provider command %s: %w", typed.CommandID, err)
@@ -3243,6 +3298,52 @@ func forwardHubCommandsToACPProvider(ctx context.Context, readFrame func(context
 				return err
 			}
 		case *protocol.Command:
+			if cfg.ContentMode == protocol.ContentModeRequired {
+				if typed.Type == protocol.CommandMembershipChange {
+					if err := deliverEncryptedMembership(ctx, cfg, typed, writeFrame); err != nil {
+						return err
+					}
+					continue
+				}
+				if typed.Type == protocol.CommandSessionStop {
+					if cfg.e2eeRuntime == nil || supervisor == nil {
+						return errors.New("encrypted stop runtime unavailable")
+					}
+					admission, err := cfg.e2eeRuntime.deliverCommand(ctx, cfg.SessionID, typed, func(deliveryCtx context.Context, _ *protocol.Command) error {
+						if stopInProgress != nil {
+							stopInProgress.Store(true)
+						}
+						return supervisor.Stop(deliveryCtx)
+					})
+					if err != nil || admission.State != "completed" {
+						return errors.New("encrypted stop outcome unknown")
+					}
+					if !admission.Execute {
+						return writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckDuplicate})
+					}
+					return acknowledgeRunControl(ctx, typed, readFrame, writeFrame, cfg, "stop", "ended", nil)
+				}
+				if typed.Type == protocol.CommandSettingsChange {
+					if err := deliverEncryptedACPSettings(ctx, cfg, typed, stdin, providerSessionID, &nextID, responses, settingsTracker, settingsMu, writeFrame); err != nil {
+						return err
+					}
+					continue
+				}
+				encryptedAck := writeFrame
+				if typed.Type == protocol.CommandSessionInterrupt {
+					encryptedAck = func(frame protocol.Frame) error {
+						ack, ok := frame.(*protocol.CommandAck)
+						if ok && ack.Status == protocol.AckAccepted {
+							return acknowledgeRunControl(ctx, typed, readFrame, writeFrame, cfg, "interrupt", "ready", nil)
+						}
+						return writeFrame(frame)
+					}
+				}
+				if err := deliverEncryptedACPCommand(ctx, cfg, typed, stdin, providerSessionID, &nextID, pendingPermissions, permissionMu, encryptedAck); err != nil {
+					return err
+				}
+				continue
+			}
 			if accepted.Contains(typed.CommandID) {
 				if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
 					return fmt.Errorf("re-ack acp provider command %s: %w", typed.CommandID, err)

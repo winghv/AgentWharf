@@ -342,6 +342,7 @@ func sameCredentialMetadata(left, right SessionCredentialMetadata) bool {
 }
 
 type AdapterConnectionConfig struct {
+	ContentMode     string
 	SessionID       string
 	Provider        string
 	Token           string
@@ -371,6 +372,12 @@ func NewAdapterConnectionState(cfg AdapterConnectionConfig) (*AdapterConnectionS
 	if cfg.ProtocolVersion != protocol.ProtocolVersion && cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
 		return nil, fmt.Errorf("%w: unsupported protocol version", ErrInvalidAdapterConnectionConfig)
 	}
+	if cfg.ContentMode != "" && cfg.ContentMode != protocol.ContentModeLegacy && cfg.ContentMode != protocol.ContentModeRequired {
+		return nil, ErrInvalidAdapterConnectionConfig
+	}
+	if cfg.ContentMode == protocol.ContentModeRequired && cfg.ProtocolVersion != protocol.ProtocolVersionV2 {
+		return nil, ErrInvalidAdapterConnectionConfig
+	}
 	return &AdapterConnectionState{cfg: cfg}, nil
 }
 
@@ -386,10 +393,14 @@ func (s *AdapterConnectionState) Hello() protocol.Hello {
 		SessionID:       s.cfg.SessionID,
 		Provider:        s.cfg.Provider,
 		Resume:          resume,
+		ContentMode:     s.cfg.ContentMode,
 	}
 }
 
 func (s *AdapterConnectionState) MarkAccepted(ack protocol.HelloAck) (protocol.SessionSummary, error) {
+	if (s.cfg.ContentMode == protocol.ContentModeRequired && ack.ContentMode != protocol.ContentModeRequired) || (s.cfg.ContentMode != protocol.ContentModeRequired && ack.ContentMode != "" && ack.ContentMode != protocol.ContentModeLegacy) {
+		return protocol.SessionSummary{}, ErrInvalidHelloAck
+	}
 	if ack.ProtocolVersion != s.cfg.ProtocolVersion {
 		return protocol.SessionSummary{}, fmt.Errorf("%w: protocol version %d", ErrInvalidHelloAck, ack.ProtocolVersion)
 	}

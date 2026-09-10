@@ -165,6 +165,29 @@ func TestHandshakeAdapterRejectsExpiredAdmissionClaim(t *testing.T) {
 	}
 }
 
+func TestHandshakeNormalizesAuthenticatorFailures(t *testing.T) {
+	t.Parallel()
+
+	privateErr := errors.New("private authenticator failure")
+	core := hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator: fakeAuth{authenticateErr: privateErr},
+		EventStore:    fakeStore{latest: map[string]int64{"ses_1": 0}},
+	})
+
+	_, _, err := core.HandleHello(context.Background(), &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersion,
+		Role:            protocol.RoleClient,
+		Token:           "expired-platform-token",
+		Subscriptions:   []protocol.Subscription{{SessionID: "ses_1"}},
+	})
+	if !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatalf("HandleHello() error = %v, want invalid token", err)
+	}
+	if errors.Is(err, privateErr) || strings.Contains(err.Error(), privateErr.Error()) {
+		t.Fatalf("HandleHello() leaked authenticator error: %v", err)
+	}
+}
+
 func TestHandshakeNegotiatesClientV2AndRetainsVersion(t *testing.T) {
 	t.Parallel()
 	core := hub.NewHandshake(hub.HandshakeConfig{
@@ -608,9 +631,10 @@ func assertSummary(t *testing.T, got protocol.SessionSummary, want protocol.Sess
 }
 
 type fakeAuth struct {
-	token     string
-	principal auth.Principal
-	claim     *auth.SessionAdmissionClaim
+	token           string
+	principal       auth.Principal
+	claim           *auth.SessionAdmissionClaim
+	authenticateErr error
 }
 
 type fakeAttachGrantVerifier struct {
@@ -640,6 +664,9 @@ func (f fakeAttachGrantVerifier) VerifyAttachGrant(_ context.Context, rawGrant, 
 }
 
 func (f fakeAuth) Authenticate(_ context.Context, token string) (auth.Principal, error) {
+	if f.authenticateErr != nil {
+		return auth.Principal{}, f.authenticateErr
+	}
 	if token != f.token {
 		return auth.Principal{}, auth.ErrInvalidToken
 	}

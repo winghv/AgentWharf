@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -231,20 +232,55 @@ func (c *hubConnection) write(ctx context.Context, frame protocol.Frame) error {
 	defer c.writeMu.Unlock()
 
 	if event, ok := frame.(*protocol.Event); ok {
-		if c.cfg.ProtocolVersion == protocol.ProtocolVersionV2 && !isCLIEventEphemeral(event.Type) && event.ProposalID == "" {
-			proposalID, err := randomToken()
-			if err != nil {
-				return fmt.Errorf("generate event proposal id: %w", err)
-			}
-			event.ProposalID = proposalID
-		}
-		if err := validateHubEventFrame(event); err != nil {
+		prepared, err := c.prepareEvent(ctx, event)
+		if err != nil {
 			return err
 		}
-		if c.cfg.ProtocolVersion == protocol.ProtocolVersionV2 && !isCLIEventEphemeral(event.Type) {
-			c.trackProposal(event)
+		frame = prepared
+		if c.cfg.ProtocolVersion == protocol.ProtocolVersionV2 && !isCLIEventEphemeral(prepared.Type) {
+			if err := c.trackProposal(prepared); err != nil {
+				return err
+			}
 		}
 	}
+	return c.writePrepared(ctx, frame)
+}
+
+// prepareEvent is shared by ordinary output and fresh reconnect snapshots.
+// Already tracked proposals bypass it so retries retain exact ciphertext.
+func (c *hubConnection) prepareEvent(ctx context.Context, original *protocol.Event) (*protocol.Event, error) {
+	event := original
+	if c.cfg.ContentMode == protocol.ContentModeRequired {
+		if c.cfg.e2eeRuntime == nil || c.cfg.ProtocolVersion != protocol.ProtocolVersionV2 || event.SessionID != c.cfg.SessionID {
+			return nil, errors.New("required encrypted adapter cannot send plaintext event")
+		}
+		messageID, err := randomToken()
+		if err != nil {
+			return nil, errors.New("generate encrypted event identity")
+		}
+		payload, err := c.cfg.e2eeRuntime.sealEvent(ctx, event.SessionID, messageID, event.Type, event.Payload)
+		if err != nil {
+			return nil, err
+		}
+		// Do not mutate caller-owned plaintext or re-seal proposal retries.
+		sealed := *event
+		sealed.Payload = payload
+		event = &sealed
+	}
+	if c.cfg.ProtocolVersion == protocol.ProtocolVersionV2 && !isCLIEventEphemeral(event.Type) && event.ProposalID == "" {
+		proposalID, err := randomToken()
+		if err != nil {
+			return nil, fmt.Errorf("generate event proposal id: %w", err)
+		}
+		event.ProposalID = proposalID
+	}
+	if err := validateHubEventFrame(event); err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+func (c *hubConnection) writePrepared(ctx context.Context, frame protocol.Frame) error {
 	for {
 		conn := c.current()
 		if conn == nil {
@@ -299,20 +335,38 @@ func (c *hubConnection) read(ctx context.Context) (protocol.Frame, error) {
 	}
 }
 
-func (c *hubConnection) trackProposal(event *protocol.Event) {
+const maxPendingHubProposals = 1024
+
+func (c *hubConnection) trackProposal(event *protocol.Event) error {
 	copy := *event
 	copy.Payload = append([]byte(nil), event.Payload...)
 	c.pendingMu.Lock()
-	if _, exists := c.pending[event.ProposalID]; !exists {
-		c.pendingOrder = append(c.pendingOrder, event.ProposalID)
+	defer c.pendingMu.Unlock()
+	if existing, exists := c.pending[event.ProposalID]; exists {
+		if existing.SessionID != event.SessionID || existing.Type != event.Type || existing.Time != event.Time || !bytes.Equal(existing.Payload, event.Payload) {
+			return errors.New("pending event proposal conflicts with original")
+		}
+		return nil
 	}
+	if len(c.pending) >= maxPendingHubProposals {
+		return errors.New("pending event proposal capacity exceeded")
+	}
+	c.pendingOrder = append(c.pendingOrder, event.ProposalID)
 	c.pending[event.ProposalID] = &copy
-	c.pendingMu.Unlock()
+	return nil
 }
 
 func (c *hubConnection) ackProposal(proposalID string) {
 	c.pendingMu.Lock()
 	delete(c.pending, proposalID)
+	for index, id := range c.pendingOrder {
+		if id == proposalID {
+			copy(c.pendingOrder[index:], c.pendingOrder[index+1:])
+			c.pendingOrder[len(c.pendingOrder)-1] = ""
+			c.pendingOrder = c.pendingOrder[:len(c.pendingOrder)-1]
+			break
+		}
+	}
 	c.pendingMu.Unlock()
 }
 
@@ -391,8 +445,16 @@ func (c *hubConnection) reconnect(ctx context.Context, failed *websocket.Conn) e
 					c.connMu.Unlock()
 					continue
 				}
-				for _, proposal := range proposals {
-					c.trackProposal(proposal)
+				for _, plaintext := range proposals {
+					proposal, err := c.prepareEvent(ctx, plaintext)
+					if err != nil {
+						c.close()
+						return err
+					}
+					if err := c.trackProposal(proposal); err != nil {
+						c.close()
+						return err
+					}
 					if err := writeCLIProtocolFrame(ctx, conn, proposal); err != nil {
 						_ = conn.Close(websocket.StatusGoingAway, "reconnect proposal publish failed")
 						c.connMu.Lock()
@@ -437,7 +499,7 @@ func (c *hubConnection) dialAndResume(ctx context.Context, token string) (*webso
 		_ = conn.Close(websocket.StatusPolicyViolation, "resume rejected")
 		return nil, nil, auth, err
 	}
-	hello := protocol.Hello{ProtocolVersion: c.cfg.ProtocolVersion, Role: protocol.RoleAdapter, Token: token, SessionID: c.cfg.SessionID, Provider: c.cfg.Provider, Resume: true}
+	hello := protocol.Hello{ProtocolVersion: c.cfg.ProtocolVersion, Role: protocol.RoleAdapter, Token: token, SessionID: c.cfg.SessionID, Provider: c.cfg.Provider, ContentMode: c.cfg.ContentMode, Resume: true}
 	if err := writeCLIProtocolFrame(ctx, conn, &hello); err != nil {
 		return fail(err, false)
 	}
@@ -452,7 +514,7 @@ func (c *hubConnection) dialAndResume(ctx context.Context, token string) (*webso
 	if !ok {
 		return fail(fmt.Errorf("read resume hello ack: got %T", frame), false)
 	}
-	state, err := core.NewAdapterConnectionState(core.AdapterConnectionConfig{SessionID: c.cfg.SessionID, Provider: c.cfg.Provider, Token: token, ProtocolVersion: c.cfg.ProtocolVersion})
+	state, err := core.NewAdapterConnectionState(core.AdapterConnectionConfig{SessionID: c.cfg.SessionID, Provider: c.cfg.Provider, Token: token, ProtocolVersion: c.cfg.ProtocolVersion, ContentMode: c.cfg.ContentMode})
 	if err != nil {
 		return fail(err, false)
 	}

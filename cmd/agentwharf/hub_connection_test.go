@@ -15,6 +15,14 @@ import (
 	"nhooyr.io/websocket"
 )
 
+func TestRequiredHubConnectionRejectsPlaintextEvents(t *testing.T) {
+	conn := newHubConnection(wrapConfig{ContentMode: protocol.ContentModeRequired, ProtocolVersion: protocol.ProtocolVersionV2}, nil, nil)
+	err := conn.write(context.Background(), &protocol.Event{Type: "session.message", SessionID: "session", Time: 1, Payload: []byte(`{}`)})
+	if err == nil || !strings.Contains(err.Error(), "required encrypted adapter") {
+		t.Fatalf("write error=%v, want fail-closed plaintext rejection", err)
+	}
+}
+
 func TestHubConnectionReconnectsSameSessionAndReplaysUnconfirmedProposal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

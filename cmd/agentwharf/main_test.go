@@ -3348,6 +3348,41 @@ func TestProviderChildEnvironmentBuildsCodexResponsesConfig(t *testing.T) {
 	}
 }
 
+func TestMachineServeSpawnsCodexWithProfileEnvironment(t *testing.T) {
+	secretDir := t.TempDir()
+	apiKeyPath := filepath.Join(secretDir, "codex_api_key")
+	baseURLPath := filepath.Join(secretDir, "codex_base_url")
+	for path, value := range map[string]string{
+		apiKeyPath:  "test-codex-api-key\n",
+		baseURLPath: "https://responses.example.test/v1\n",
+	} {
+		if err := os.WriteFile(path, []byte(value), 0o400); err != nil {
+			t.Fatalf("write Codex config: %v", err)
+		}
+	}
+	t.Setenv("AGENTWHARF_SECRET_DIR", secretDir)
+	t.Setenv("AGENTWHARF_ACP_CREDENTIAL_HELPER", "codex")
+	t.Setenv("OPENAI_API_KEY", apiKeyPath)
+	t.Setenv("OPENAI_BASE_URL", baseURLPath)
+
+	cfg := serveWrapConfig(machineServeDispatch{SessionID: "session", Provider: "codex"}, false)
+	if cfg.SecretDir != secretDir {
+		t.Fatalf("machine serve secret directory = %q, want configured directory", cfg.SecretDir)
+	}
+	cfg.ProviderCommand = []string{os.Args[0]}
+	command, err := providerProcessCommand(cfg, nil, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("build Provider command: %v", err)
+	}
+	supervisor, err := core.NewProcessSupervisor(core.ProcessConfig{Command: command})
+	if err != nil {
+		t.Fatalf("create Provider supervisor: %v", err)
+	}
+	if err := supervisor.Run(context.Background()); err != nil {
+		t.Fatalf("spawned Codex Provider rejected profile environment: %v", err)
+	}
+}
+
 func TestProviderChildEnvironmentRejectsCodexModelOutsideSecretDir(t *testing.T) {
 	secretDir := t.TempDir()
 	apiKeyPath := filepath.Join(secretDir, "codex_api_key")
@@ -3692,6 +3727,10 @@ func TestMain(m *testing.M) {
 		runWrapACPCredentialProviderHelper()
 		return
 	}
+	if os.Getenv("AGENTWHARF_ACP_CREDENTIAL_HELPER") == "codex" {
+		runWrapACPCodexCredentialProviderHelper()
+		return
+	}
 	if os.Getenv("AGENTWHARF_WRAP_HELPER") == "1" {
 		runWrapProviderHelper()
 		return
@@ -3864,6 +3903,31 @@ func runWrapACPCredentialProviderHelper() {
 		os.Exit(52)
 	}
 	writeACPResponse(sessionNew["id"], map[string]any{"sessionId": "acp_ses_credentials"})
+	os.Exit(0)
+}
+
+func runWrapACPCodexCredentialProviderHelper() {
+	if os.Getenv("OPENAI_API_KEY") != "test-codex-api-key" ||
+		os.Getenv("MODEL_PROVIDER") != "superwhv-profile" ||
+		os.Getenv("NO_BROWSER") != "1" ||
+		os.Getenv("DEFAULT_AUTH_REQUEST") != `{"methodId":"api-key"}` ||
+		os.Getenv("OPENAI_BASE_URL") != "" {
+		os.Exit(70)
+	}
+	var config struct {
+		ModelProviders map[string]struct {
+			BaseURL string `json:"base_url"`
+			EnvKey  string `json:"env_key"`
+			WireAPI string `json:"wire_api"`
+		} `json:"model_providers"`
+	}
+	if err := json.Unmarshal([]byte(os.Getenv("CODEX_CONFIG")), &config); err != nil {
+		os.Exit(71)
+	}
+	provider := config.ModelProviders["superwhv-profile"]
+	if provider.BaseURL != "https://responses.example.test/v1" || provider.EnvKey != "OPENAI_API_KEY" || provider.WireAPI != "responses" {
+		os.Exit(72)
+	}
 	os.Exit(0)
 }
 
@@ -4171,5 +4235,12 @@ func TestPairCommandArgumentHandling(t *testing.T) {
 	}
 	if err := runPairCommand(context.Background(), []string{"  "}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: wharf pair") {
 		t.Fatalf("runPairCommand with blank url = %v, want usage error", err)
+	}
+}
+
+func TestExplicitPairCommandRoutesEnrollment(t *testing.T) {
+	err := runWithInput(context.Background(), []string{"pair", "--enroll"}, nil, io.Discard, io.Discard)
+	if err == nil || err.Error() != "usage: wharf pair --enroll <local-account-binding> <absolute-private-offer-file>" {
+		t.Fatalf("runWithInput(pair --enroll) error = %v, want enrollment usage", err)
 	}
 }

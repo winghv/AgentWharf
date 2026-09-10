@@ -14,7 +14,7 @@ func TestServeWrapConfigCarriesLaunchSettings(t *testing.T) {
 	handoff := machineServeDispatch{
 		ClaimID: "claim_1", SessionID: "session_1", Provider: "claude-code",
 		HubWSURL: "wss://hub.example/ws", AdapterToken: "adapter", ClientToken: "client",
-		FirstInstruction: "build it", WorkingDirectory: "/tmp/repo",
+		EncryptedFirstInstruction: `{"version":1,"scope":"command","key_id":"key","sender":"sender","message_id":"claim_1:command","type":"session.send","packet":{"version":1,"public":{},"encrypted":{"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA","signature":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}}`, WorkingDirectory: "/tmp/repo",
 		ModelID: "reasoning", ReasoningEffortID: "high", PermissionModeID: "acceptEdits",
 		AdapterExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
 		ClientExpiresAt:  time.Now().UTC().Add(time.Minute).Format(time.RFC3339),
@@ -59,7 +59,7 @@ func TestRememberProviderSessionUpdatesWrapConfigForRestart(t *testing.T) {
 	}
 }
 
-func TestExchangeAutoMachineClaimParsesLaunchSettings(t *testing.T) {
+func TestExchangeAutoMachineClaimRejectsUnauthenticatedLaunchSettings(t *testing.T) {
 	now := time.Now().UTC()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/machine-task-claims/claim_1/exchange" {
@@ -72,7 +72,7 @@ func TestExchangeAutoMachineClaimParsesLaunchSettings(t *testing.T) {
 		writeTestJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
 			"session_id": "session_1", "provider": "codex", "hub_ws_url": "wss://hub.example/ws",
 			"adapter_token": "adapter", "client_token": "client",
-			"first_instruction": "build it", "delivery": "auto",
+			"encryption_mode": "required", "encrypted_first_instruction": `{"version":1,"scope":"command","key_id":"key","sender":"sender","message_id":"claim_1:command","type":"session.send","packet":{"version":1,"public":{},"encrypted":{"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA","signature":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}}`, "delivery": "auto",
 			"working_directory": "/tmp/repo",
 			"model_id":          "balanced", "reasoning_effort_id": "medium", "permission_mode_id": "default",
 			"adapter_expires_at": now.Add(24 * time.Hour).Format(time.RFC3339Nano),
@@ -85,14 +85,8 @@ func TestExchangeAutoMachineClaimParsesLaunchSettings(t *testing.T) {
 	handoff, err := exchangeAutoMachineClaim(context.Background(), server.Client(), credential, machinePendingClaim{
 		ClaimID: "claim_1", TaskID: "task_1", RunID: "run_1", SessionID: "session_1", Provider: "codex",
 	})
-	if err != nil {
-		t.Fatalf("exchangeAutoMachineClaim() error = %v", err)
-	}
-	if handoff.ModelID != "balanced" || handoff.ReasoningEffortID != "medium" || handoff.PermissionModeID != "default" {
-		t.Fatalf("handoff launch settings = %+v", handoff)
-	}
-	if handoff.WorkingDirectory != "/tmp/repo" {
-		t.Fatalf("handoff working directory = %q", handoff.WorkingDirectory)
+	if err == nil || !strings.Contains(err.Error(), "unauthenticated launch settings") || handoff != nil {
+		t.Fatalf("untrusted launch settings produced a handoff: error=%v", err)
 	}
 }
 

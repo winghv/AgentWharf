@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/winghv/agentwharf/protocol"
 	"github.com/winghv/agentwharf/store"
 	"github.com/winghv/agentwharf/store/postgres/internal/db"
 )
@@ -204,6 +205,10 @@ func appendEventsInTx(ctx context.Context, tx pgx.Tx, sessionID string, evs []st
 }
 
 func appendEventsLocked(ctx context.Context, queries *db.Queries, sessionID string, evs []store.PendingEvent) (int64, bool, error) {
+	return appendEventsWithModeLocked(ctx, queries, sessionID, evs, false)
+}
+
+func appendEventsWithModeLocked(ctx context.Context, queries *db.Queries, sessionID string, evs []store.PendingEvent, encrypted bool) (int64, bool, error) {
 	latest, err := queries.LatestSessionEventSeq(ctx, sessionID)
 	if err != nil {
 		return 0, false, fmt.Errorf("select latest seq: %w", err)
@@ -212,7 +217,10 @@ func appendEventsLocked(ctx context.Context, queries *db.Queries, sessionID stri
 	terminal := false
 	for index, event := range evs {
 		seq := firstSeq + int64(index)
-		projection := attentionEventProjection(event)
+		projection, err := eventProjection(event, encrypted)
+		if err != nil {
+			return 0, false, err
+		}
 		if err := queries.InsertSessionEvent(ctx, db.InsertSessionEventParams{
 			SessionID: sessionID,
 			Seq:       seq,
@@ -469,6 +477,18 @@ func (s *Store) LatestSeq(ctx context.Context, sessionID string) (int64, error) 
 }
 
 func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, event store.PendingEvent, request store.PendingCommandRequest) (store.PendingCommandCommit, error) {
+	return s.commitPendingCommand(ctx, sessionID, authority, event, request, false)
+}
+
+func (s *Store) CommitEncryptedPendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, event store.PendingEvent, request store.PendingCommandRequest) (store.PendingCommandCommit, error) {
+	return s.commitPendingCommand(ctx, sessionID, authority, event, request, true)
+}
+
+func (s *Store) commitPendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, event store.PendingEvent, request store.PendingCommandRequest, encrypted bool) (store.PendingCommandCommit, error) {
+	validate := validatePendingCommandInput
+	if encrypted {
+		validate = validateEncryptedPendingCommandInput
+	}
 	if s.pool == nil {
 		return store.PendingCommandCommit{}, errors.New("postgres event store pool is nil")
 	}
@@ -485,7 +505,7 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 	if err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("read command Store clock: %w", err)
 	}
-	if err := validatePendingCommandInput(event, request, storeNow.Time); err != nil {
+	if err := validate(event, request, storeNow.Time); err != nil {
 		return store.PendingCommandCommit{}, err
 	}
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
@@ -498,11 +518,17 @@ func (s *Store) CommitPendingCommand(ctx context.Context, sessionID string, auth
 	if err != nil {
 		return store.PendingCommandCommit{}, fmt.Errorf("refresh command Store clock: %w", err)
 	}
-	if err := validatePendingCommandInput(event, request, storeNow.Time); err != nil {
+	if err := validate(event, request, storeNow.Time); err != nil {
 		return store.PendingCommandCommit{}, err
 	}
 	existing, err := queries.PendingCommandByID(ctx, db.PendingCommandByIDParams{SessionID: sessionID, CmdID: request.CommandID})
 	if err == nil {
+		if encrypted {
+			var matches bool
+			if checkErr := tx.QueryRow(ctx, `SELECT type=$3 AND payload=$4::jsonb FROM session_events WHERE session_id=$1 AND seq=$2`, sessionID, existing.EventSeq, event.Type, event.Payload).Scan(&matches); checkErr != nil || !matches || existing.Type != request.Type {
+				return store.PendingCommandCommit{}, errors.New("conflicting encrypted command retry")
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return store.PendingCommandCommit{}, fmt.Errorf("commit duplicate pending command lookup: %w", err)
 		}
@@ -1814,6 +1840,14 @@ func validatePostgresSettingsFinalization(command store.SettingsCommand, capabil
 }
 
 func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {
+	return s.listPendingCommands(ctx, sessionID, authority, false)
+}
+
+func (s *Store) ListEncryptedPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority) ([]store.PendingCommand, error) {
+	return s.listPendingCommands(ctx, sessionID, authority, true)
+}
+
+func (s *Store) listPendingCommands(ctx context.Context, sessionID string, authority store.CommandAuthority, encrypted bool) ([]store.PendingCommand, error) {
 	tx, queries, err := s.beginCommandMutation(ctx, sessionID, authority)
 	if err != nil {
 		return nil, err
@@ -1830,13 +1864,21 @@ func (s *Store) ListPendingCommands(ctx context.Context, sessionID string, autho
 	commands := make([]store.PendingCommand, 0, len(rows))
 	for _, row := range rows {
 		command := pendingCommand(row)
-		if command.SessionID != sessionID || command.Type != "session.send" || command.EventSeq < 1 ||
+		valid := validatePendingCommandInput
+		if encrypted {
+			valid = validateEncryptedPendingCommandInput
+		}
+		expectedEventType := "session.message"
+		if encrypted {
+			expectedEventType = "session.command"
+		}
+		if command.SessionID != sessionID || ((encrypted && command.Type == "") || (!encrypted && command.Type != "session.send")) || command.EventSeq < 1 ||
 			(command.Status != store.PendingCommandPending && command.Status != store.PendingCommandReceived) ||
 			!command.ExpiresAt.After(storeNow.Time) {
 			return nil, errors.New("pending command row is invalid")
 		}
 		event, err := queries.NextSessionEvent(ctx, db.NextSessionEventParams{SessionID: sessionID, Seq: command.EventSeq - 1})
-		if err != nil || event.Seq != command.EventSeq || validatePendingCommandInput(store.PendingEvent{
+		if err != nil || event.Seq != command.EventSeq || event.Type != expectedEventType || valid(store.PendingEvent{
 			Type: event.Type, Time: event.CreatedAt.Time, Payload: event.Payload,
 		}, store.PendingCommandRequest{
 			CommandID: command.CommandID, Type: command.Type, ExpiresAt: command.ExpiresAt,
@@ -1869,7 +1911,23 @@ func upsertAttentionLedger(ctx context.Context, queries *db.Queries, sessionID s
 	return nil
 }
 
+func (s *Store) ClaimEncryptedPendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, commandID string) (store.PendingCommandClaim, error) {
+	return s.claimPendingCommand(ctx, sessionID, authority, commandID, true)
+}
+
+func (s *Store) ResolveEncryptedPendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, commandID string, status store.PendingCommandStatus) (store.PendingCommand, error) {
+	return s.resolvePendingCommand(ctx, sessionID, authority, commandID, status, true)
+}
+
+func (s *Store) ResolveEncryptedPendingCommandUnknown(ctx context.Context, sessionID string, commandID string) (store.PendingCommand, error) {
+	return s.resolvePendingCommandUnknown(ctx, sessionID, commandID, true)
+}
+
 func (s *Store) ClaimPendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, commandID string) (store.PendingCommandClaim, error) {
+	return s.claimPendingCommand(ctx, sessionID, authority, commandID, false)
+}
+
+func (s *Store) claimPendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, commandID string, encrypted bool) (store.PendingCommandClaim, error) {
 	tx, queries, err := s.beginCommandMutation(ctx, sessionID, authority)
 	if err != nil {
 		return store.PendingCommandClaim{}, err
@@ -1880,6 +1938,14 @@ func (s *Store) ClaimPendingCommand(ctx context.Context, sessionID string, autho
 		return store.PendingCommandClaim{}, fmt.Errorf("lock claimable pending command: %w", err)
 	}
 	command := pendingCommand(row)
+	if encrypted {
+		if err := validateEncryptedCommandRow(ctx, tx, command); err != nil {
+			return store.PendingCommandClaim{}, err
+		}
+		if command.Status != store.PendingCommandPending && command.Status != store.PendingCommandReceived {
+			return store.PendingCommandClaim{}, errors.New("encrypted command is not claimable")
+		}
+	}
 	if err := validateCommandAuthorityCurrent(ctx, queries, sessionID, authority); err != nil {
 		return store.PendingCommandClaim{}, err
 	}
@@ -1911,6 +1977,10 @@ func (s *Store) ClaimPendingCommand(ctx context.Context, sessionID string, autho
 }
 
 func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, commandID string, status store.PendingCommandStatus) (store.PendingCommand, error) {
+	return s.resolvePendingCommand(ctx, sessionID, authority, commandID, status, false)
+}
+
+func (s *Store) resolvePendingCommand(ctx context.Context, sessionID string, authority store.CommandAuthority, commandID string, status store.PendingCommandStatus, encrypted bool) (store.PendingCommand, error) {
 	if status != store.PendingCommandCompleted && status != store.PendingCommandOutcomeUnknown {
 		return store.PendingCommand{}, errors.New("invalid pending command outcome")
 	}
@@ -1922,6 +1992,11 @@ func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, aut
 	row, err := queries.LockPendingCommandForResolve(ctx, db.LockPendingCommandForResolveParams{SessionID: sessionID, CmdID: commandID})
 	if err != nil {
 		return store.PendingCommand{}, fmt.Errorf("lock resolvable pending command: %w", err)
+	}
+	if encrypted {
+		if err := validateEncryptedCommandRow(ctx, tx, pendingCommand(row)); err != nil {
+			return store.PendingCommand{}, err
+		}
 	}
 	if store.PendingCommandStatus(row.Status) != store.PendingCommandReceived {
 		return store.PendingCommand{}, errors.New("pending command is not received")
@@ -1955,6 +2030,10 @@ func (s *Store) ResolvePendingCommand(ctx context.Context, sessionID string, aut
 }
 
 func (s *Store) ResolvePendingCommandUnknown(ctx context.Context, sessionID string, commandID string) (store.PendingCommand, error) {
+	return s.resolvePendingCommandUnknown(ctx, sessionID, commandID, false)
+}
+
+func (s *Store) resolvePendingCommandUnknown(ctx context.Context, sessionID string, commandID string, encrypted bool) (store.PendingCommand, error) {
 	if s.pool == nil {
 		return store.PendingCommand{}, errors.New("postgres event store pool is nil")
 	}
@@ -1964,6 +2043,16 @@ func (s *Store) ResolvePendingCommandUnknown(ctx context.Context, sessionID stri
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := db.New(tx)
+	if encrypted {
+		var eventType, commandType string
+		var payload []byte
+		if err := tx.QueryRow(ctx, `SELECT e.type,c.type,e.payload FROM session_pending_commands c JOIN session_events e ON e.session_id=c.session_id AND e.seq=c.event_seq WHERE c.session_id=$1 AND c.cmd_id=$2 FOR UPDATE OF c`, sessionID, commandID).Scan(&eventType, &commandType, &payload); err != nil {
+			return store.PendingCommand{}, err
+		}
+		if _, err := protocol.DecodeEncryptedPacketCarrier(payload, "command", commandType, commandID); err != nil || eventType != "session.command" || !store.ValidEncryptedCommandType(commandType) {
+			return store.PendingCommand{}, errors.New("invalid encrypted pending command")
+		}
+	}
 	updated, err := queries.ResolvePendingCommandUnknown(ctx, db.ResolvePendingCommandUnknownParams{SessionID: sessionID, CmdID: commandID})
 	if err != nil {
 		return store.PendingCommand{}, fmt.Errorf("resolve pending command outcome unknown: %w", err)
@@ -1979,6 +2068,16 @@ func (s *Store) ResolvePendingCommandUnknown(ctx context.Context, sessionID stri
 }
 
 func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, authority store.CommandAuthority, proposal store.ProposedEventRequest) (store.ProposedEventReceipt, error) {
+	return s.commitProposedEvent(ctx, sessionID, authority, proposal, false)
+}
+
+// CommitEncryptedProposedEvent preserves proposal idempotency for opaque events.
+// Required-mode and key/identity lifecycle checks remain the Hub caller's duty.
+func (s *Store) CommitEncryptedProposedEvent(ctx context.Context, sessionID string, authority store.CommandAuthority, proposal store.ProposedEventRequest) (store.ProposedEventReceipt, error) {
+	return s.commitProposedEvent(ctx, sessionID, authority, proposal, true)
+}
+
+func (s *Store) commitProposedEvent(ctx context.Context, sessionID string, authority store.CommandAuthority, proposal store.ProposedEventRequest, encrypted bool) (store.ProposedEventReceipt, error) {
 	if s.pool == nil {
 		return store.ProposedEventReceipt{}, errors.New("postgres event store pool is nil")
 	}
@@ -1987,17 +2086,22 @@ func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, autho
 	if err := validateProposedEventInput(sessionID, authority, proposal.ProposalID, event); err != nil {
 		return store.ProposedEventReceipt{}, err
 	}
+	projection, err := eventProjection(event, encrypted)
+	if err != nil {
+		return store.ProposedEventReceipt{}, err
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return store.ProposedEventReceipt{}, fmt.Errorf("begin proposed event transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := db.New(tx)
-	if err := lockCommandAuthority(ctx, queries, sessionID, authority); err != nil {
-		return store.ProposedEventReceipt{}, err
-	}
+	// Match Adapter append and terminal fencing: stream lock before authority.
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
 		return store.ProposedEventReceipt{}, fmt.Errorf("lock proposed event stream: %w", err)
+	}
+	if err := lockCommandAuthority(ctx, queries, sessionID, authority); err != nil {
+		return store.ProposedEventReceipt{}, err
 	}
 	if err := validateCommandAuthorityCurrent(ctx, queries, sessionID, authority); err != nil {
 		return store.ProposedEventReceipt{}, err
@@ -2030,7 +2134,6 @@ func (s *Store) CommitProposedEvent(ctx context.Context, sessionID string, autho
 	if err != nil {
 		return store.ProposedEventReceipt{}, fmt.Errorf("insert proposed event: %w", err)
 	}
-	projection := attentionEventProjection(event)
 	storeNow, err := queries.AttentionStoreNow(ctx)
 	if err != nil {
 		return store.ProposedEventReceipt{}, fmt.Errorf("read proposed attention Store clock: %w", err)
@@ -3526,6 +3629,16 @@ func pendingCommand(row db.SessionPendingCommand) store.PendingCommand {
 		SessionID: row.SessionID, CommandID: row.CmdID, Type: row.Type, EventSeq: row.EventSeq,
 		Status: store.PendingCommandStatus(row.Status), ExpiresAt: row.ExpiresAt.Time,
 	}
+}
+
+func validateEncryptedPendingCommandInput(event store.PendingEvent, request store.PendingCommandRequest, storeNow time.Time) error {
+	if request.CommandID == "" || len(request.CommandID) > 256 || !store.ValidEncryptedCommandType(request.Type) || event.Type != "session.command" || !request.ExpiresAt.After(storeNow) || request.ExpiresAt.After(storeNow.Add(30*time.Second)) {
+		return errors.New("invalid encrypted pending command")
+	}
+	if _, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "command", request.Type, request.CommandID); err != nil {
+		return errors.New("invalid encrypted pending command")
+	}
+	return nil
 }
 
 func validatePendingCommandInput(event store.PendingEvent, request store.PendingCommandRequest, storeNow time.Time) error {

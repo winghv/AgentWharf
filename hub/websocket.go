@@ -219,10 +219,11 @@ type webSocketHandler struct {
 }
 
 type pendingCommandClient struct {
-	adapter   *adapterConnection
-	peer      *clientConnection
-	commandID string
-	timer     *time.Timer
+	adapter     *adapterConnection
+	peer        *clientConnection
+	commandID   string
+	commandType protocol.CommandType
+	timer       *time.Timer
 }
 
 type attentionSubscription struct {
@@ -293,6 +294,7 @@ type adapterConnection struct {
 	sessionID            string
 	provider             string
 	protocolVersion      int
+	contentMode          string
 	handler              *webSocketHandler
 	admission            store.AdapterConnectionAdmission
 	credentialEvidence   auth.SessionCredentialEvidence
@@ -704,7 +706,7 @@ func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *managedC
 		})
 	}
 	page, err := history.History(ctx, request.SessionID, request.BeforeSeq, request.Limit)
-	if err != nil || !h.validHistoryPage(page, request) ||
+	if err != nil || !h.validHistoryPageMode(page, request, accepted.ContentMode) ||
 		!h.authorizeHistory(ctx, historyToken, accepted.Principal.Subject, request.SessionID) {
 		return h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
 			Code: "history_unavailable", Message: "history is unavailable",
@@ -730,6 +732,20 @@ func (h *webSocketHandler) authorizeHistory(ctx context.Context, token, subject,
 	principal, err := h.handshake.authenticator.Authenticate(ctx, token)
 	return err == nil && principal.Subject == subject && hasExactHistoryAccess(principal, sessionID) &&
 		h.handshake.authenticator.Authorize(ctx, principal, auth.SessionView(sessionID)) == nil
+}
+
+func (h *webSocketHandler) validHistoryPageMode(page store.HistoryPage, request *protocol.HistoryPageRequest, mode string) bool {
+	if !h.validHistoryPage(page, request) {
+		return false
+	}
+	if mode == protocol.ContentModeRequired {
+		for _, event := range page.Events {
+			if validateRequiredReplayEvent(event, request.SessionID) != nil {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (h *webSocketHandler) validHistoryPage(page store.HistoryPage, request *protocol.HistoryPageRequest) bool {
@@ -812,6 +828,11 @@ func (h *webSocketHandler) replayAccepted(ctx context.Context, peer *clientConne
 	for _, sub := range accepted.currentSubscriptions() {
 		if h.events != nil {
 			if err := h.events.Replay(ctx, sub.SessionID, sub.LastSeq, func(ev store.Event) error {
+				if accepted.ContentMode == protocol.ContentModeRequired {
+					if err := validateRequiredReplayEvent(ev, sub.SessionID); err != nil {
+						return err
+					}
+				}
 				seq := ev.Seq
 				return peer.writeReplayEvent(ctx, protocol.Event{
 					Type:      ev.Type,
@@ -821,7 +842,7 @@ func (h *webSocketHandler) replayAccepted(ctx context.Context, peer *clientConne
 					Payload:   ev.Payload,
 				})
 			}); err != nil {
-				_ = peer.writeFrame(ctx, &protocol.Error{Code: "replay_failed", Message: err.Error(), Fatal: true})
+				_ = peer.writeFrame(ctx, &protocol.Error{Code: "replay_failed", Message: "session replay failed", Fatal: true})
 				_ = peer.conn.Close(websocket.StatusInternalError, "replay failed")
 				return err
 			}
@@ -842,6 +863,7 @@ func (h *webSocketHandler) registerPeer(conn *managedConn, accepted AcceptedPeer
 	// replay. Keep every subscription replaying until the ack is on the wire:
 	// sendLiveEvent then buffers concurrent fanout instead of overtaking it.
 	peer := newClientConnection(conn, accepted.ProtocolVersion, current, true, h.publisherEphemeralTypes)
+	peer.contentMode = accepted.ContentMode
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, sub := range current {
@@ -874,9 +896,9 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *managedCon
 	if err != nil {
 		return nil, err
 	}
-	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, protocolVersion: accepted.ProtocolVersion, handler: h, admission: admitted.admission, credentialEvidence: evidence, settingsWriter: admitted.writer}
+	adapter := &adapterConnection{conn: conn, writeGate: newContextWriteGate(), sessionID: accepted.SessionID, provider: accepted.Provider, protocolVersion: accepted.ProtocolVersion, contentMode: accepted.ContentMode, handler: h, admission: admitted.admission, credentialEvidence: evidence, settingsWriter: admitted.writer}
 	if h.events != nil {
-		fencedStore := fencedAdapterEventStore{handler: h, adapter: adapter}
+		fencedStore := fencedAdapterEventStore{handler: h, adapter: adapter, encrypted: accepted.ContentMode == protocol.ContentModeRequired}
 		adapter.events = newAdapterEventBatcher(adapterEventBatcherConfig{
 			Store:     fencedStore,
 			SessionID: accepted.SessionID,
@@ -1208,6 +1230,12 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		return err
 	}
 	durable := !isEphemeralEvent(ev.Type)
+	if accepted.ContentMode == protocol.ContentModeRequired {
+		if _, err := protocol.DecodeEncryptedPacketCarrier(ev.Payload, "event", ev.Type, ""); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: "encrypted event carrier is invalid"})
+			return err
+		}
+	}
 	if accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
 		if durable && (len(ev.ProposalID) == 0 || len(ev.ProposalID) > 255) {
 			err := errors.New("v2 durable adapter events require a bounded proposal_id")
@@ -1249,6 +1277,15 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 		err := errors.New("event store is not configured")
 		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: err.Error()})
 		return err
+	}
+	if accepted.ContentMode == protocol.ContentModeRequired {
+		// Endpoint-owned settings, run-control and file details are opaque. Do
+		// not feed encrypted payloads into legacy Hub domain interpreters.
+		if err := h.commitAdapterProposal(ctx, adapter, out, ev.ProposalID, nil); err != nil {
+			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: "encrypted event persistence failed"})
+			return err
+		}
+		return nil
 	}
 	if ev.Type == "session.file_references.capabilities" {
 		if accepted.ProtocolVersion != protocol.ProtocolVersionV2 {
@@ -1355,6 +1392,14 @@ func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *a
 		return errors.New("proposed event store is not configured")
 	}
 
+	commit := proposals.CommitProposedEvent
+	if adapter.contentMode == protocol.ContentModeRequired {
+		encrypted, ok := h.events.(store.EncryptedProposedEventStore)
+		if !ok {
+			return errors.New("encrypted proposed event store is not configured")
+		}
+		commit = encrypted.CommitEncryptedProposedEvent
+	}
 	receiptWriteFailed := false
 	if err := h.withSessionPublication(ctx, event.SessionID, func() error {
 		adapter.effectMu.Lock()
@@ -1363,20 +1408,13 @@ func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *a
 			return err
 		}
 
-		commitCtx, cancelCommit := context.WithTimeout(ctx, adapterAuthorityPollInterval)
 		authority := store.CommandAuthority{
 			ConnectionEpoch: adapter.admission.ConnectionEpoch, CredentialGeneration: adapter.admission.CredentialGeneration,
 		}
 		request := store.ProposedEventRequest{ProposalID: proposalID, Event: store.PendingEvent{
 			Type: event.Type, Time: time.UnixMilli(event.Time), Payload: clonePayload(event.Payload),
 		}}
-		receipt, err := proposals.CommitProposedEvent(commitCtx, event.SessionID, authority, request)
-		cancelCommit()
-		if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
-			recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), adapterAuthorityPollInterval)
-			receipt, err = proposals.CommitProposedEvent(recoveryCtx, event.SessionID, authority, request)
-			cancelRecovery()
-		}
+		receipt, err := commitProposalWithRecovery(ctx, commit, event.SessionID, authority, request)
 		if err != nil {
 			return fmt.Errorf("commit adapter proposal: %w", err)
 		}
@@ -1414,6 +1452,20 @@ func (h *webSocketHandler) commitAdapterProposal(ctx context.Context, adapter *a
 		h.rejectAdapter(adapter)
 	}
 	return nil
+}
+
+// The selected Store method is retained across ambiguous commit recovery;
+// required-mode retries must never fall back to plaintext persistence.
+func commitProposalWithRecovery(ctx context.Context, commit func(context.Context, string, store.CommandAuthority, store.ProposedEventRequest) (store.ProposedEventReceipt, error), session string, authority store.CommandAuthority, request store.ProposedEventRequest) (store.ProposedEventReceipt, error) {
+	commitCtx, cancel := context.WithTimeout(ctx, adapterAuthorityPollInterval)
+	receipt, err := commit(commitCtx, session, authority, request)
+	cancel()
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), adapterAuthorityPollInterval)
+		defer cancelRecovery()
+		return commit(recoveryCtx, session, authority, request)
+	}
+	return receipt, err
 }
 
 func (h *webSocketHandler) commitSettingsCapabilityProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
@@ -2042,10 +2094,30 @@ func (h *webSocketHandler) handleAdapterCommandAck(ctx context.Context, adapter 
 	return writeClientCommandAck(ctx, client, nil, ack.CommandID, protocol.AckAccepted, "")
 }
 
+// Required endpoints emit duplicate only after their local journal proves a
+// completed delivery. Unknown local outcomes do not emit an acknowledgement.
+func pendingCommandAckCompleted(contentMode string, ack *protocol.CommandAck) bool {
+	return ack != nil && ack.Reason == "" && (ack.Status == protocol.AckAccepted || (contentMode == protocol.ContentModeRequired && ack.Status == protocol.AckDuplicate))
+}
+
+func pendingCommandAckTerminalRejection(contentMode string, commandType protocol.CommandType, ack *protocol.CommandAck) (string, bool) {
+	if contentMode != protocol.ContentModeRequired || (commandType != protocol.CommandFileRead && commandType != protocol.CommandFileList) || ack == nil || ack.Status != protocol.AckRejected {
+		return "", false
+	}
+	switch ack.Reason {
+	case "invalid_file_request", "file_unavailable":
+		return ack.Reason, true
+	default:
+		return "", false
+	}
+}
+
 func (h *webSocketHandler) handlePendingCommandAck(ctx context.Context, adapter *adapterConnection, ack *protocol.CommandAck, key string, client *pendingCommandClient) error {
-	if client.adapter != adapter || ack.Status != protocol.AckAccepted || ack.Reason != "" || h.settingsCurrentAdapter(adapter.sessionID) != adapter {
+	completed := pendingCommandAckCompleted(adapter.contentMode, ack)
+	rejectionReason, terminallyRejected := pendingCommandAckTerminalRejection(adapter.contentMode, client.commandType, ack)
+	if client.adapter != adapter || (!completed && !terminallyRejected) || h.settingsCurrentAdapter(adapter.sessionID) != adapter {
 		h.takePendingCommandClient(key)
-		h.resolvePendingCommandUnknown(adapter.sessionID, ack.CommandID)
+		h.resolvePendingCommandUnknown(adapter.sessionID, ack.CommandID, adapter.contentMode)
 		h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
 		return errors.New("pending command delivery acknowledgement is rejected")
 	}
@@ -2055,14 +2127,24 @@ func (h *webSocketHandler) handlePendingCommandAck(ctx context.Context, adapter 
 		h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckRejected, "internal_error")
 		return errors.New("pending command ledger is not configured")
 	}
+	if adapter.contentMode == protocol.ContentModeRequired {
+		encrypted, ok := h.events.(store.EncryptedCommandLedgerStore)
+		if !ok {
+			return errors.New("encrypted command ledger is unavailable")
+		}
+		ledger = encryptedCommandLedger{encrypted}
+	}
 	authority := store.CommandAuthority{ConnectionEpoch: adapter.admission.ConnectionEpoch, CredentialGeneration: adapter.admission.CredentialGeneration}
 	if _, err := ledger.ResolvePendingCommand(ctx, adapter.sessionID, authority, ack.CommandID, store.PendingCommandCompleted); err != nil {
 		h.takePendingCommandClient(key)
-		h.resolvePendingCommandUnknown(adapter.sessionID, ack.CommandID)
+		h.resolvePendingCommandUnknown(adapter.sessionID, ack.CommandID, adapter.contentMode)
 		h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckRejected, "adapter_delivery_failed")
 		return fmt.Errorf("resolve acknowledged pending command: %w", err)
 	}
 	h.takePendingCommandClient(key)
+	if terminallyRejected {
+		return h.writePendingCommandAck(ctx, client.peer, ack.CommandID, protocol.AckRejected, rejectionReason)
+	}
 	h.commandMu.Lock()
 	h.markCommandAcceptedLocked(ack.CommandID)
 	h.commandMu.Unlock()
@@ -2260,8 +2342,8 @@ func (h *webSocketHandler) takePendingCommandClient(key string) *pendingCommandC
 	return client
 }
 
-func (h *webSocketHandler) addPendingCommandClient(key string, adapter *adapterConnection, peer *clientConnection, commandID string) {
-	client := &pendingCommandClient{adapter: adapter, peer: peer, commandID: commandID}
+func (h *webSocketHandler) addPendingCommandClient(key string, adapter *adapterConnection, peer *clientConnection, commandID string, commandType protocol.CommandType) {
+	client := &pendingCommandClient{adapter: adapter, peer: peer, commandID: commandID, commandType: commandType}
 	client.timer = time.AfterFunc(time.Hour, func() {
 		h.expirePendingCommandClient(key)
 	})
@@ -2277,7 +2359,7 @@ func (h *webSocketHandler) expirePendingCommandClient(key string) {
 	if client == nil {
 		return
 	}
-	h.resolvePendingCommandUnknown(client.adapter.sessionID, client.commandID)
+	h.resolvePendingCommandUnknown(client.adapter.sessionID, client.commandID, client.adapter.contentMode)
 	h.unregisterAdapter(client.adapter)
 	client.adapter.close()
 	if client.peer != nil {
@@ -2303,17 +2385,24 @@ func (h *webSocketHandler) rejectPendingCommandDeliveries(adapter *adapterConnec
 	}
 	h.commandMu.Unlock()
 	for _, client := range clients {
-		h.resolvePendingCommandUnknown(adapter.sessionID, client.commandID)
+		h.resolvePendingCommandUnknown(adapter.sessionID, client.commandID, adapter.contentMode)
 		if client.peer != nil {
 			_ = writeClientCommandAck(context.Background(), client.peer, nil, client.commandID, protocol.AckRejected, reason)
 		}
 	}
 }
 
-func (h *webSocketHandler) resolvePendingCommandUnknown(sessionID, commandID string) {
+func (h *webSocketHandler) resolvePendingCommandUnknown(sessionID, commandID, contentMode string) {
 	ledger, ok := h.events.(store.CommandLedgerStore)
 	if !ok || sessionID == "" || commandID == "" {
 		return
+	}
+	if contentMode == protocol.ContentModeRequired {
+		encrypted, ok := h.events.(store.EncryptedCommandLedgerStore)
+		if !ok {
+			return
+		}
+		ledger = encryptedCommandLedger{encrypted}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), pendingCommandAckTimeout)
 	defer cancel()
@@ -2321,7 +2410,7 @@ func (h *webSocketHandler) resolvePendingCommandUnknown(sessionID, commandID str
 }
 
 func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *managedConn, peer *clientConnection, accepted AcceptedPeer, cmd *protocol.Command) error {
-	if err := validateClientCommand(cmd); err != nil {
+	if err := validateClientCommandMode(cmd, accepted.ContentMode); err != nil {
 		_ = writeCommandAck(ctx, conn, commandID(cmd), protocol.AckRejected, "invalid_command")
 		return err
 	}
@@ -2333,7 +2422,7 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return err
 	}
-	if (cmd.Type == protocol.CommandSettingsChange || isRunControlCommand(cmd.Type)) && !hasLiteralSessionControl(accepted.Principal, cmd.SessionID) {
+	if (cmd.Type == protocol.CommandSettingsChange || cmd.Type == protocol.CommandMembershipChange || isRunControlCommand(cmd.Type)) && !hasLiteralSessionControl(accepted.Principal, cmd.SessionID) {
 		err := errors.New("settings and run-control commands require literal session control scope")
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return err
@@ -2352,6 +2441,13 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 		_ = writeCommandAck(ctx, conn, cmd.CommandID, protocol.AckRejected, "unauthorized")
 		return err
 	}
+	if accepted.ContentMode == protocol.ContentModeRequired {
+		if ledger, ok := h.events.(store.EncryptedCommandLedgerStore); ok {
+			return h.handleDurableSessionSendMode(ctx, conn, peer, cmd, ledger, true)
+		}
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "encrypted_unsupported")
+		return errors.New("encrypted command ledger is not configured")
+	}
 	if cmd.Type == protocol.CommandSettingsChange {
 		return h.handleSettingsChange(ctx, conn, peer, accepted, cmd)
 	}
@@ -2368,7 +2464,7 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 			return h.handleFileReferenceSend(ctx, conn, peer, accepted, cmd, fileReferences)
 		}
 		if ledger, ok := h.events.(store.CommandLedgerStore); ok {
-			return h.handleDurableSessionSend(ctx, conn, peer, cmd, ledger)
+			return h.handleDurableSessionSendMode(ctx, conn, peer, cmd, ledger, false)
 		}
 	}
 
@@ -2431,25 +2527,49 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 	return nil
 }
 
-// handleDurableSessionSend makes the adapter acknowledgement, rather than a
+// handleDurableSessionSendMode makes the adapter acknowledgement, rather than a
 // successful Hub WebSocket write, the delivery boundary for an ordinary user
 // message. A received ledger row is never replayed after reconnect because
 // the local provider may already have consumed the prompt.
-func (h *webSocketHandler) handleDurableSessionSend(ctx context.Context, conn *managedConn, peer *clientConnection, cmd *protocol.Command, ledger store.CommandLedgerStore) error {
+func (h *webSocketHandler) handleDurableSessionSendMode(ctx context.Context, conn *managedConn, peer *clientConnection, cmd *protocol.Command, ledger store.CommandLedgerStore, encrypted bool) error {
+	if encrypted {
+		opaque, ok := ledger.(store.EncryptedCommandLedgerStore)
+		if !ok {
+			return errors.New("encrypted command ledger is unavailable")
+		}
+		ledger = encryptedCommandLedger{opaque}
+	}
 	adapter := h.settingsCurrentAdapter(cmd.SessionID)
 	if adapter == nil {
 		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_offline")
 		return errors.New("session adapter is offline")
 	}
 
-	h.commandMu.Lock()
-	if _, duplicate := h.acceptedCommands[cmd.CommandID]; duplicate {
+	// Required retries must compare the durable carrier and current authority;
+	// an ID-only cache cannot establish that this is the same signed command.
+	if !encrypted {
+		h.commandMu.Lock()
+		_, duplicate := h.acceptedCommands[cmd.CommandID]
 		h.commandMu.Unlock()
-		return writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckDuplicate, "")
+		if duplicate {
+			return writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckDuplicate, "")
+		}
 	}
-	h.commandMu.Unlock()
 
-	eventType, payload, err := commandEventPayload(cmd)
+	if encrypted != (adapter.contentMode == protocol.ContentModeRequired) {
+		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "content_mode_mismatch")
+		return errors.New("client and adapter content modes differ")
+	}
+	var eventType string
+	var payload []byte
+	var err error
+	if encrypted {
+		eventType = "session.command"
+		payload = append([]byte(nil), cmd.Payload...)
+		_, err = protocol.DecodeEncryptedPacketCarrier(payload, "command", string(cmd.Type), cmd.CommandID)
+	} else {
+		eventType, payload, err = commandEventPayload(cmd)
+	}
 	if err != nil {
 		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "invalid_command")
 		return err
@@ -2460,9 +2580,9 @@ func (h *webSocketHandler) handleDurableSessionSend(ctx context.Context, conn *m
 	var commit store.PendingCommandCommit
 	err = h.withSessionPublication(ctx, cmd.SessionID, func() error {
 		var commitErr error
-		commit, commitErr = ledger.CommitPendingCommand(ctx, cmd.SessionID, authority, store.PendingEvent{Type: eventType, Time: eventTime, Payload: payload}, store.PendingCommandRequest{
-			CommandID: cmd.CommandID, Type: string(cmd.Type), ExpiresAt: eventTime.Add(pendingCommandAckTimeout - time.Second),
-		})
+		pendingEvent := store.PendingEvent{Type: eventType, Time: eventTime, Payload: payload}
+		request := store.PendingCommandRequest{CommandID: cmd.CommandID, Type: string(cmd.Type), ExpiresAt: eventTime.Add(pendingCommandAckTimeout - time.Second)}
+		commit, commitErr = ledger.CommitPendingCommand(ctx, cmd.SessionID, authority, pendingEvent, request)
 		if commitErr != nil || commit.Duplicate {
 			return commitErr
 		}
@@ -2481,7 +2601,7 @@ func (h *webSocketHandler) handleDurableSessionSend(ctx context.Context, conn *m
 
 	claim, err := ledger.ClaimPendingCommand(ctx, cmd.SessionID, authority, cmd.CommandID)
 	if err != nil || !claim.Claimed || claim.Command.Status != store.PendingCommandReceived {
-		h.resolvePendingCommandUnknown(cmd.SessionID, cmd.CommandID)
+		h.resolvePendingCommandUnknown(cmd.SessionID, cmd.CommandID, adapter.contentMode)
 		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_delivery_failed")
 		if err == nil {
 			err = errors.New("durable command claim was not acquired")
@@ -2490,11 +2610,11 @@ func (h *webSocketHandler) handleDurableSessionSend(ctx context.Context, conn *m
 	}
 
 	key := settingsCommandKey(cmd.SessionID, cmd.CommandID)
-	h.addPendingCommandClient(key, adapter, peer, cmd.CommandID)
+	h.addPendingCommandClient(key, adapter, peer, cmd.CommandID, cmd.Type)
 	routed := cloneCommand(cmd)
 	if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
 		h.takePendingCommandClient(key)
-		h.resolvePendingCommandUnknown(cmd.SessionID, cmd.CommandID)
+		h.resolvePendingCommandUnknown(cmd.SessionID, cmd.CommandID, adapter.contentMode)
 		h.unregisterAdapter(adapter)
 		adapter.close()
 		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_delivery_failed")
@@ -2775,6 +2895,10 @@ func commandAdmissionAction(commandType protocol.CommandType) auth.SessionAdmiss
 		return auth.SessionAdmissionRunControl
 	case protocol.CommandSettingsChange:
 		return auth.SessionAdmissionSettings
+	case protocol.CommandMembershipChange:
+		return auth.SessionAdmissionRotation
+	case protocol.CommandFileRead, protocol.CommandFileList:
+		return auth.SessionAdmissionSend
 	default:
 		return ""
 	}
@@ -2923,7 +3047,17 @@ func (h *webSocketHandler) hasAdapter(sessionID string) bool {
 }
 
 func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *adapterConnection) error {
-	if ledger, ok := h.events.(store.CommandLedgerStore); ok {
+	var ledger store.CommandLedgerStore
+	if adapter.contentMode == protocol.ContentModeRequired {
+		encryptedLedger, ok := h.events.(store.EncryptedCommandLedgerStore)
+		if !ok {
+			return errors.New("encrypted command ledger is unavailable")
+		}
+		ledger = encryptedCommandLedger{encryptedLedger}
+	} else {
+		ledger, _ = h.events.(store.CommandLedgerStore)
+	}
+	if ledger != nil {
 		authority := store.CommandAuthority{
 			ConnectionEpoch:      adapter.admission.ConnectionEpoch,
 			CredentialGeneration: adapter.admission.CredentialGeneration,
@@ -2946,7 +3080,7 @@ func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *
 				}
 				continue
 			}
-			routed, err := h.commandFromPendingEvent(ctx, claim.Command)
+			routed, err := h.commandFromPendingEvent(ctx, claim.Command, adapter.contentMode == protocol.ContentModeRequired)
 			if err != nil {
 				if _, resolveErr := ledger.ResolvePendingCommandUnknown(ctx, adapter.sessionID, command.CommandID); resolveErr != nil {
 					return fmt.Errorf("resolve malformed durable command %s: %w", command.CommandID, resolveErr)
@@ -2954,7 +3088,7 @@ func (h *webSocketHandler) deliverPendingCommands(ctx context.Context, adapter *
 				continue
 			}
 			key := settingsCommandKey(adapter.sessionID, command.CommandID)
-			h.addPendingCommandClient(key, adapter, nil, command.CommandID)
+			h.addPendingCommandClient(key, adapter, nil, command.CommandID, protocol.CommandType(command.Type))
 			if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
 				h.takePendingCommandClient(key)
 				_, _ = ledger.ResolvePendingCommandUnknown(ctx, adapter.sessionID, command.CommandID)
@@ -3003,7 +3137,8 @@ func (h *webSocketHandler) writeDurableAdapterFrame(ctx context.Context, adapter
 
 var errPendingEventFound = errors.New("pending command event found")
 
-func (h *webSocketHandler) commandFromPendingEvent(ctx context.Context, pending store.PendingCommand) (protocol.Command, error) {
+func (h *webSocketHandler) commandFromPendingEvent(ctx context.Context, pending store.PendingCommand, encryptedMode ...bool) (protocol.Command, error) {
+	encrypted := len(encryptedMode) > 0 && encryptedMode[0]
 	if h.events == nil {
 		return protocol.Command{}, errors.New("event store is not configured")
 	}
@@ -3026,7 +3161,21 @@ func (h *webSocketHandler) commandFromPendingEvent(ctx context.Context, pending 
 	var commandType protocol.CommandType
 	switch event.Type {
 	case "session.message":
+		if encrypted {
+			return protocol.Command{}, errors.New("encrypted command has plaintext event type")
+		}
 		commandType = protocol.CommandSessionSend
+	case "session.command":
+		if !encrypted {
+			return protocol.Command{}, errors.New("legacy command has encrypted event type")
+		}
+		commandType = protocol.CommandType(pending.Type)
+		if !store.ValidEncryptedCommandType(pending.Type) {
+			return protocol.Command{}, errors.New("encrypted pending command type mismatch")
+		}
+		if _, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "command", string(commandType), pending.CommandID); err != nil {
+			return protocol.Command{}, errors.New("invalid encrypted pending command carrier")
+		}
 	default:
 		return protocol.Command{}, fmt.Errorf("durable command event type %q is unsupported", event.Type)
 	}
@@ -3279,13 +3428,24 @@ func (h *webSocketHandler) withSessionPublication(ctx context.Context, sessionID
 	return publish()
 }
 
+func validateClientCommandMode(cmd *protocol.Command, mode string) error {
+	if mode != protocol.ContentModeRequired || (cmd != nil && cmd.Type == protocol.CommandSessionAttach) {
+		return validateClientCommand(cmd)
+	}
+	if cmd == nil || cmd.SessionID == "" || !store.ValidEncryptedCommandType(string(cmd.Type)) {
+		return errors.New("invalid encrypted command")
+	}
+	_, err := protocol.DecodeEncryptedPacketCarrier(cmd.Payload, "command", string(cmd.Type), cmd.CommandID)
+	return err
+}
+
 func validateClientCommand(cmd *protocol.Command) error {
 	if cmd == nil || cmd.CommandID == "" || cmd.Type == "" || cmd.SessionID == "" {
 		return errors.New("command cmd_id, type, and session_id are required")
 	}
 	switch cmd.Type {
 	case protocol.CommandSessionSend, protocol.CommandPermissionRespond, protocol.CommandSessionInterrupt, protocol.CommandSessionStop,
-		protocol.CommandSessionAttach:
+		protocol.CommandMembershipChange, protocol.CommandFileRead, protocol.CommandSessionAttach:
 		return nil
 	case protocol.CommandSettingsChange:
 		_, err := protocol.DecodeSettingsChangePayload(cmd.Payload)
@@ -3468,6 +3628,7 @@ func (h *webSocketHandler) selectEphemeralVariant(version int, eventType string)
 type clientConnection struct {
 	conn                    *managedConn
 	protocolVersion         int
+	contentMode             string
 	publisherEphemeralTypes map[string]struct{}
 	writeGate               contextWriteGate
 
@@ -3540,6 +3701,18 @@ func (c *clientConnection) writeReplayEvent(ctx context.Context, ev protocol.Eve
 }
 
 func (c *clientConnection) sendLiveEvent(ctx context.Context, ev protocol.Event) error {
+	if c.contentMode == protocol.ContentModeRequired {
+		if ev.Seq == nil {
+			if !isEphemeralEvent(ev.Type) {
+				return errors.New("required event lacks sequence")
+			}
+			if _, err := protocol.DecodeEncryptedPacketCarrier(ev.Payload, "event", ev.Type, ""); err != nil {
+				return errors.New("invalid encrypted ephemeral event")
+			}
+		} else if err := validateRequiredReplayEvent(store.Event{SessionID: ev.SessionID, Seq: *ev.Seq, Type: ev.Type, Payload: ev.Payload}, ev.SessionID); err != nil {
+			return err
+		}
+	}
 	if !protocol.EventTypeAllowed(c.protocolVersion, ev.Type, ev.Seq != nil) || (ev.Seq != nil && c.isPublisherEphemeralType(ev.Type)) {
 		c.markSent(ev)
 		return nil

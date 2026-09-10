@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/winghv/agentwharf/experimental/e2ee"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,6 +27,7 @@ import (
 // adapter's interactive session.state to the client socket and records the
 // client command that delivers the first instruction.
 type serveTestHub struct {
+	t      *testing.T
 	Server *httptest.Server
 
 	// silentClientHellos makes the first N client connections receive an
@@ -49,7 +52,7 @@ type recordedCommand struct {
 
 func newServeTestHub(t *testing.T, ctx context.Context, sessionID string) *serveTestHub {
 	t.Helper()
-	hub := &serveTestHub{readyCh: make(chan struct{}), adapterDone: make(chan struct{})}
+	hub := &serveTestHub{t: t, readyCh: make(chan struct{}), adapterDone: make(chan struct{})}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
@@ -78,7 +81,7 @@ func newServeTestHub(t *testing.T, ctx context.Context, sessionID string) *serve
 
 func (h *serveTestHub) serveAdapter(ctx context.Context, conn *websocket.Conn, sessionID string) {
 	defer close(h.adapterDone)
-	if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: sessionID, Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: sessionID, ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_serve", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
+	if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, ContentMode: protocol.ContentModeRequired, Sessions: []protocol.SessionSummary{{SessionID: sessionID, Provider: "claude-code"}}, ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{SessionID: sessionID, ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1, WriterLeaseID: "lease_serve", ExpiresAt: time.Now().Add(time.Minute).UnixMilli()}}); err != nil {
 		return
 	}
 	frame, err := readProviderStartFrame(ctx, conn)
@@ -107,13 +110,18 @@ func (h *serveTestHub) serveAdapter(ctx context.Context, conn *websocket.Conn, s
 		if !ok {
 			continue
 		}
-		if event.Type == "session.state" && event.ProposalID != "" && strings.Contains(string(event.Payload), `"state":"ready"`) {
+		carrier, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "event", event.Type, "")
+		if err != nil {
+			h.t.Errorf("adapter sent non-encrypted event: %v", err)
+			return
+		}
+		if event.Type == "session.state" && event.ProposalID != "" && carrier.Packet.Public.State == "ready" {
 			if err := writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 2, Status: protocol.EventReceiptAccepted}); err != nil {
 				return
 			}
 			h.readyOnce.Do(func() { close(h.readyCh) })
 		}
-		if event.Type == "session.state" && event.ProposalID != "" && strings.Contains(string(event.Payload), `"state":"ended"`) {
+		if event.Type == "session.state" && event.ProposalID != "" && carrier.Packet.Public.State == "ended" {
 			_ = writeFrameToConn(ctx, conn, &protocol.EventReceipt{ProposalID: event.ProposalID, Seq: 3, Status: protocol.EventReceiptAccepted})
 			return
 		}
@@ -132,7 +140,7 @@ func (h *serveTestHub) serveClient(ctx context.Context, conn *websocket.Conn, he
 	if connection < h.silentClientHellos {
 		// Attach-only admission while the Session is `starting`: the hello.ack
 		// carries the non-interactive state and no events are subscribed.
-		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{{SessionID: sessionID, State: "attach_only", Provider: "claude-code"}}}); err != nil {
+		if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, ContentMode: protocol.ContentModeRequired, Sessions: []protocol.SessionSummary{{SessionID: sessionID, State: "attach_only", Provider: "claude-code"}}}); err != nil {
 			return
 		}
 		for {
@@ -145,7 +153,7 @@ func (h *serveTestHub) serveClient(ctx context.Context, conn *websocket.Conn, he
 			}
 		}
 	}
-	if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, Sessions: []protocol.SessionSummary{}}); err != nil {
+	if err := writeFrameToConn(ctx, conn, &protocol.HelloAck{ProtocolVersion: protocol.ProtocolVersionV2, ContentMode: protocol.ContentModeRequired, Sessions: []protocol.SessionSummary{{SessionID: sessionID}}}); err != nil {
 		return
 	}
 	select {
@@ -182,11 +190,12 @@ func (h *serveTestHub) recordedCommands() []recordedCommand {
 	return append([]recordedCommand(nil), h.commands...)
 }
 
-func newServeTestControlPlane(t *testing.T, hubURL, sessionID string, pending int32, refusePending bool) (*httptest.Server, *atomic.Int32, *atomic.Int32, *atomic.Int32) {
+func newServeTestControlPlane(t *testing.T, hubURL, sessionID string, pending int32, refusePending bool, launchOutput ...*string) (*httptest.Server, *atomic.Int32, *atomic.Int32, *atomic.Int32) {
 	t.Helper()
 	var pendingPolls atomic.Int32
 	var exchanges atomic.Int32
 	var refreshes atomic.Int32
+	var launchWire string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/machine-task-claims/pending" && r.Method == http.MethodGet:
@@ -213,7 +222,7 @@ func newServeTestControlPlane(t *testing.T, hubURL, sessionID string, pending in
 			writeTestJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
 				"session_id": sessionID, "provider": "claude-code", "hub_ws_url": hubURL,
 				"adapter_token": "adapter-token", "client_token": "client-token",
-				"first_instruction": "build a login page", "delivery": "auto",
+				"encryption_mode": "required", "encrypted_first_instruction": launchWire, "delivery": "auto",
 				"adapter_expires_at": time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339Nano),
 				"client_expires_at":  time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339Nano),
 			}})
@@ -232,6 +241,67 @@ func newServeTestControlPlane(t *testing.T, hubURL, sessionID string, pending in
 		}
 	}))
 	t.Cleanup(server.Close)
+	credential := machineCredential{MachineID: "machine_serve", CloudAPIURL: server.URL}
+	directory, err := machineEndpointDirectory(credential, "test-account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := openMachineE2EERuntime(context.Background(), directory, credential.MachineID, "test-account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exercise paired-device authorization rather than directly installing grants.
+	client, err := e2ee.NewLocalIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := client.Public()
+	if err != nil {
+		t.Fatal(err)
+	}
+	invitation, offer, err := e2ee.NewPairingInvitation(credential.MachineID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairing, err := e2ee.EncryptPairingIdentity(offer, public, ed25519.NewKeyFromSeed(client.SigningSeed), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.registry.Enroll(context.Background(), invitation, pairing, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	request, err := e2ee.SignSessionInitialization(e2ee.SessionInitialization{Machine: credential.MachineID, Account: "test-account", Session: sessionID, KeyID: "test-key", Device: client.Device}, ed25519.NewKeyFromSeed(client.SigningSeed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.initializeSession(context.Background(), sessionID, wire); err != nil {
+		t.Fatal(err)
+	}
+
+	key, err := runtime.vault.Load(context.Background(), sessionID, "test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(key)
+	packet, err := e2ee.SealPacket(e2ee.Context{Scope: "command", Session: sessionID, KeyID: "test-key", Sender: client.Device, MessageID: "claim_auto:command", Type: "session.send"}, key, ed25519.NewKeyFromSeed(client.SigningSeed), e2ee.PublicMetadata{}, json.RawMessage(`{"content":[{"kind":"text","text":"synthetic launch"}],"launch":{"provider":"claude-code"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	carrier, err := json.Marshal(map[string]any{"version": 1, "scope": "command", "key_id": "test-key", "sender": client.Device, "message_id": "claim_auto:command", "type": "session.send", "packet": packet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	launchWire = string(carrier)
+	if len(launchOutput) > 0 {
+		*launchOutput[0] = launchWire
+	}
+	if err := runtime.database.Close(); err != nil {
+		t.Fatal(err)
+	}
 	return server, &pendingPolls, &exchanges, &refreshes
 }
 
@@ -250,6 +320,7 @@ func setupServeTestEnv(t *testing.T) string {
 		t.Fatalf("write provider helper: %v", err)
 	}
 	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING", "test-account")
 	credentialDir := t.TempDir()
 	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(credentialDir, "machine.json"))
 	return credentialDir
@@ -283,7 +354,7 @@ func TestMachineServeDispatchesAutoClaimEndToEnd(t *testing.T) {
 	if commands[0].CommandID != "claim_auto:command" || commands[0].SessionID != "ses_auto" {
 		t.Fatalf("hub command = %+v", commands[0])
 	}
-	if !strings.Contains(commands[0].Payload, "build a login page") {
+	if commands[0].Payload == "" {
 		t.Fatalf("hub command payload = %s", commands[0].Payload)
 	}
 	if exchanges.Load() != 1 {
@@ -366,7 +437,8 @@ func TestMachineServeResumesPersistedHandoff(t *testing.T) {
 
 	hub := newServeTestHub(t, ctx, "ses_auto")
 	t.Cleanup(hub.Server.Close)
-	controlPlane, _, exchanges, _ := newServeTestControlPlane(t, "ws"+strings.TrimPrefix(hub.Server.URL, "http"), "ses_auto", 0, false)
+	var launchWire string
+	controlPlane, _, exchanges, _ := newServeTestControlPlane(t, "ws"+strings.TrimPrefix(hub.Server.URL, "http"), "ses_auto", 0, false, &launchWire)
 
 	if err := saveMachineCredential(machineCredential{MachineID: "machine_serve", MachineToken: "machine-token", CloudAPIURL: controlPlane.URL, HubWSURL: "ws://unused.invalid", ExpiresAt: time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)}); err != nil {
 		t.Fatalf("save machine credential: %v", err)
@@ -375,7 +447,7 @@ func TestMachineServeResumesPersistedHandoff(t *testing.T) {
 	handoff := machineServeDispatch{
 		ClaimID: "claim_auto", TaskID: "task_auto", RunID: "run_auto", SessionID: "ses_auto",
 		Provider: "claude-code", HubWSURL: "ws" + strings.TrimPrefix(hub.Server.URL, "http"),
-		AdapterToken: "adapter-token", ClientToken: "client-token", FirstInstruction: "build a login page",
+		AdapterToken: "adapter-token", ClientToken: "client-token", EncryptedFirstInstruction: launchWire,
 		AdapterExpiresAt: time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339Nano),
 		ClientExpiresAt:  time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339Nano),
 	}
@@ -430,6 +502,21 @@ func TestMachineServeLoadsPersistedRecoveryHandoff(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(credentialDir, "dispatch", "recovery:ses_recover.json")); err != nil {
 		t.Fatalf("recovery handoff was not persisted: %v", err)
+	}
+}
+
+func TestLoadMachineDispatchesRejectsMalformedEncryptedLaunchCarrier(t *testing.T) {
+	credentialDir := setupServeTestEnv(t)
+	dir := filepath.Join(credentialDir, "dispatch")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("create dispatch directory: %v", err)
+	}
+	data := `{"claim_id":"claim_bad","session_id":"session_bad","adapter_token":"adapter","client_token":"client","first_instruction":"not-an-encrypted-carrier"}`
+	if err := os.WriteFile(filepath.Join(dir, "claim_bad.json"), []byte(data), 0o600); err != nil {
+		t.Fatalf("write malformed dispatch: %v", err)
+	}
+	if _, err := loadMachineDispatches(); err == nil || !strings.Contains(err.Error(), "invalid encrypted launch carrier") {
+		t.Fatalf("load malformed dispatch error = %v", err)
 	}
 }
 

@@ -666,6 +666,32 @@ type CommandLedgerStore interface {
 	ResolvePendingCommandUnknown(ctx context.Context, sessionID string, commandID string) (PendingCommand, error)
 }
 
+// EncryptedCommandLedgerStore keeps endpoint command carriers opaque while
+// reusing the same durable claim/resolve lifecycle. It is intentionally
+// separate so legacy providers cannot silently consume encrypted payloads.
+type EncryptedCommandLedgerStore interface {
+	CommandLedgerStore
+	CommitEncryptedPendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, event PendingEvent, request PendingCommandRequest) (PendingCommandCommit, error)
+	ListEncryptedPendingCommands(ctx context.Context, sessionID string, authority CommandAuthority) ([]PendingCommand, error)
+	ClaimEncryptedPendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, commandID string) (PendingCommandClaim, error)
+	ResolveEncryptedPendingCommand(ctx context.Context, sessionID string, authority CommandAuthority, commandID string, status PendingCommandStatus) (PendingCommand, error)
+	ResolveEncryptedPendingCommandUnknown(ctx context.Context, sessionID string, commandID string) (PendingCommand, error)
+}
+
+// EncryptedProposedEventStore is the opaque counterpart of ProposedEventStore.
+type EncryptedProposedEventStore interface {
+	ProposedEventStore
+	CommitEncryptedProposedEvent(ctx context.Context, sessionID string, authority CommandAuthority, proposal ProposedEventRequest) (ProposedEventReceipt, error)
+}
+
+// EncryptedAdapterEventStore is the opaque counterpart of the fenced adapter
+// append path. The Hub must select it for required-content sessions; the
+// legacy append method remains available only for legacy sessions.
+type EncryptedAdapterEventStore interface {
+	EventStore
+	AppendEncryptedAdapterEvents(ctx context.Context, sessionID string, admission AdapterConnectionAdmission, events []PendingEvent) (int64, error)
+}
+
 type SettingsWriter struct {
 	ConnectionEpoch      int64
 	CredentialGeneration int64
