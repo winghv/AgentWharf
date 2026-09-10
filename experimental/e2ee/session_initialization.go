@@ -104,7 +104,11 @@ func (e *CommandExecutor) InitializeSession(ctx context.Context, registry *Devic
 		return WrappedKey{}, err
 	}
 	defer func() { <-e.lane }()
-	err = e.vault.TransitionSession(ctx, e.journal, request.Session, request.KeyID, 0, []DeviceGrant{{DeviceID: request.Device, VerifyKey: public, Control: true}})
+	grants, err := registry.sessionSeedGrants(ctx, request.Device, public)
+	if err != nil {
+		return WrappedKey{}, err
+	}
+	err = e.vault.TransitionSession(ctx, e.journal, request.Session, request.KeyID, 0, grants)
 	if err != nil && err != ErrConflict {
 		return WrappedKey{}, err
 	}
@@ -137,7 +141,7 @@ func (e *CommandExecutor) VerifyInitializedSession(ctx context.Context, registry
 
 func (e *CommandExecutor) verifyInitializedSession(ctx context.Context, request SessionInitialization, public []byte) error {
 	var count int
-	err := e.journal.db.QueryRowContext(ctx, `SELECT count(*) FROM e2ee_local_sessions s JOIN e2ee_local_grants g ON g.session=s.session WHERE s.session=? AND s.epoch=1 AND s.key_id=? AND g.device=? AND g.verify_key=? AND g.control=1 AND (SELECT count(*) FROM e2ee_local_grants WHERE session=s.session)=1`, request.Session, request.KeyID, request.Device, public).Scan(&count)
+	err := e.journal.db.QueryRowContext(ctx, `SELECT count(*) FROM e2ee_local_sessions s JOIN e2ee_local_grants g ON g.session=s.session WHERE s.session=? AND s.epoch=1 AND s.key_id=? AND g.device=? AND g.verify_key=? AND g.control=1`, request.Session, request.KeyID, request.Device, public).Scan(&count)
 	if err != nil {
 		return ErrJournal
 	}

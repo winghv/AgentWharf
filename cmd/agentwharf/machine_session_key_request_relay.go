@@ -80,24 +80,49 @@ func deliverSessionKeyRequest(ctx context.Context, client *http.Client, credenti
 	if decodeCloudAPIJSON(body, &response) != nil || response.Data.Request == "" || !response.Data.ExpiresAt.After(now) || response.Data.ExpiresAt.After(now.Add(5*time.Minute)) {
 		return errors.New("invalid key request")
 	}
-	signed, err := e2ee.DecodeSessionKeyRequest([]byte(response.Data.Request))
-	if err != nil || signed.Machine != credential.MachineID || signed.Session != session || signed.Device != device || signed.KeyID != keyID {
+	raw := []byte(response.Data.Request)
+	trusted := strings.TrimSpace(os.Getenv("AGENTWHARF_TRUST_ACCOUNT_TERMINALS")) == "1"
+	var wrapped e2ee.WrappedKey
+	if signed, legacyErr := e2ee.DecodeSessionKeyRequest(raw); legacyErr == nil && signed.Machine == credential.MachineID && signed.Session == session && signed.Device == device && signed.KeyID == keyID {
+		if response.Data.State == "completed" {
+			if _, err := runtime.executor.RecoverSessionKey(ctx, runtime.registry, e2ee.SessionKeyRequest(signed)); err != nil {
+				return errors.New("completed key request signature rejected")
+			}
+			return nil
+		}
+		if response.Data.State != "pending" {
+			return errors.New("invalid key request state")
+		}
+		wrapped, err = runtime.executor.RecoverSessionKey(ctx, runtime.registry, e2ee.SessionKeyRequest(signed))
+		if err != nil {
+			return err
+		}
+	} else if v2, trustedErr := e2ee.DecodeTrustedSessionKeyRequest(raw); trustedErr == nil && v2.Machine == credential.MachineID && v2.Session == session && v2.Device == device && v2.KeyID == keyID {
+		if response.Data.State == "completed" {
+			if _, err := runtime.executor.RecoverSessionKeyTrusted(ctx, runtime.registry, v2, trusted); err != nil {
+				return errors.New("completed key request signature rejected")
+			}
+			return nil
+		}
+		if response.Data.State != "pending" {
+			return errors.New("invalid key request state")
+		}
+		wrapped, err = runtime.executor.RecoverSessionKeyTrusted(ctx, runtime.registry, v2, trusted)
+		if err != nil {
+			return err
+		}
+	} else {
 		return errors.New("key request routing mismatch")
 	}
-	if response.Data.State == "completed" {
-		return verifyCompletedSessionKeyRequest(ctx, runtime, signed)
-	}
-	if response.Data.State != "pending" {
-		return errors.New("invalid key request state")
-	}
-	wrapped, err := runtime.executor.RecoverSessionKey(ctx, runtime.registry, e2ee.SessionKeyRequest(signed))
-	if err != nil {
-		return err
+	type wrappedKeyPayload struct {
+		Enc        string               `json:"enc"`
+		Ciphertext string               `json:"ciphertext"`
+		Machine    e2ee.PairingIdentity `json:"machine"`
 	}
 	payload := struct {
-		Request    string          `json:"request"`
-		WrappedKey e2ee.WrappedKey `json:"wrapped_key"`
-	}{response.Data.Request, wrapped}
+		Request    string            `json:"request"`
+		WrappedKey wrappedKeyPayload `json:"wrapped_key"`
+	}{response.Data.Request, wrappedKeyPayload{Enc: wrapped.Enc, Ciphertext: wrapped.Ciphertext, Machine: runtime.public}}
 	ctx, expire := context.WithDeadline(ctx, response.Data.ExpiresAt)
 	defer expire()
 	for {
@@ -116,16 +141,6 @@ func deliverSessionKeyRequest(ctx context.Context, client *http.Client, credenti
 		case <-timer.C:
 		}
 	}
-}
-
-func verifyCompletedSessionKeyRequest(ctx context.Context, runtime *machineE2EERuntime, request e2ee.SessionKeyRequest) error {
-	if runtime == nil || runtime.executor == nil || runtime.registry == nil {
-		return errors.New("key request runtime unavailable")
-	}
-	if _, err := runtime.executor.RecoverSessionKey(ctx, runtime.registry, request); err != nil {
-		return errors.New("completed key request signature rejected")
-	}
-	return nil
 }
 
 var _ = protocol.ErrSessionKeyRequest

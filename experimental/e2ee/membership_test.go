@@ -91,8 +91,8 @@ func TestAuthenticatedMembershipRotationAndRetry(t *testing.T) {
 	if err := executor.ApplyMembership(ctx, registry, request); err == nil {
 		t.Fatal("failed key write reported success")
 	}
-	var epoch, receipts, grants int
-	if err := db.QueryRowContext(ctx, `SELECT epoch,(SELECT count(*) FROM e2ee_membership_receipts),(SELECT count(*) FROM e2ee_local_grants WHERE session='session') FROM e2ee_local_sessions WHERE session='session'`).Scan(&epoch, &receipts, &grants); err != nil || epoch != 1 || receipts != 0 || grants != 1 {
+	var epoch, receipts, grants, devices int
+	if err := db.QueryRowContext(ctx, `SELECT epoch,(SELECT count(*) FROM e2ee_membership_receipts),(SELECT count(*) FROM e2ee_local_grants WHERE session='session'),(SELECT count(*) FROM e2ee_devices) FROM e2ee_local_sessions WHERE session='session'`).Scan(&epoch, &receipts, &grants, &devices); err != nil || epoch != 1 || receipts != 0 || grants != devices {
 		t.Fatal("failed rotation changed authority", err)
 	}
 	if _, err := db.ExecContext(ctx, `DROP TRIGGER reject_membership_key`); err != nil {
