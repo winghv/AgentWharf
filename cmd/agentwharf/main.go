@@ -165,10 +165,12 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		return runMachineLogout(stdout)
 	case "task":
 		return runTaskCommand(ctx, args[1:], stdin, stdout, stderr)
+	case "trusted-terminals":
+		return runTrustedTerminalsCommand(ctx, args[1:], stdout)
 	case "attention-backfill":
 		return runAttentionBackfill(ctx, args[1:], stdout, stderr)
 	default:
-		_, _ = fmt.Fprintf(stdout, "usage: wharf [pair]|serve|hub|wrap|claude|codex|dsh|pi|gemini|logout|version|upgrade|attention-backfill [options]\n")
+		_, _ = fmt.Fprintf(stdout, "usage: wharf [pair]|serve|hub|wrap|claude|codex|dsh|pi|gemini|logout|trusted-terminals|version|upgrade|attention-backfill [options]\n")
 		_, _ = fmt.Fprintln(stdout, "  wharf            pair this machine with the default hub (reuses an existing pairing)")
 		_, _ = fmt.Fprintln(stdout, "  wharf pair [url] pair with a specific cloud API base URL")
 		return nil

@@ -472,7 +472,7 @@ func TestRunUsageMentionsWharfEntrypoint(t *testing.T) {
 	if err := runWithInput(context.Background(), []string{"definitely-not-a-command"}, nil, &stdout, io.Discard); err != nil {
 		t.Fatalf("run() error = %v, want usage output", err)
 	}
-	if !strings.Contains(stdout.String(), "usage: wharf [pair]|serve|hub|wrap|claude|codex|dsh|pi|gemini|logout|version|upgrade|attention-backfill [options]") {
+	if !strings.Contains(stdout.String(), "usage: wharf [pair]|serve|hub|wrap|claude|codex|dsh|pi|gemini|logout|trusted-terminals|version|upgrade|attention-backfill [options]") {
 		t.Fatalf("run() output = %q, want wharf usage", stdout.String())
 	}
 	if strings.Contains(stdout.String(), "usage: agentwharf") {
