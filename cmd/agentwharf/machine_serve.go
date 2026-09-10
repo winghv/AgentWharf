@@ -891,6 +891,7 @@ func serveWrapConfig(handoff machineServeDispatch, startupSmoke bool) wrapConfig
 		Agent:             agent,
 		Provider:          handoff.Provider,
 		AdapterToken:      handoff.AdapterToken,
+		SecretDir:         envOrDefault("AGENTWHARF_SECRET_DIR", ""),
 		Format:            "acp",
 		ForceHeadless:     providerIsBridgeOnly(handoff.Provider),
 		ProviderCommand:   defaultProviderCommand(agent),
