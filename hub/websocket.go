@@ -2527,14 +2527,10 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 	return nil
 }
 
-// handleDurableSessionSend makes the adapter acknowledgement, rather than a
+// handleDurableSessionSendMode makes the adapter acknowledgement, rather than a
 // successful Hub WebSocket write, the delivery boundary for an ordinary user
 // message. A received ledger row is never replayed after reconnect because
 // the local provider may already have consumed the prompt.
-func (h *webSocketHandler) handleDurableSessionSend(ctx context.Context, conn *managedConn, peer *clientConnection, cmd *protocol.Command, ledger store.CommandLedgerStore) error {
-	return h.handleDurableSessionSendMode(ctx, conn, peer, cmd, ledger, false)
-}
-
 func (h *webSocketHandler) handleDurableSessionSendMode(ctx context.Context, conn *managedConn, peer *clientConnection, cmd *protocol.Command, ledger store.CommandLedgerStore, encrypted bool) error {
 	if encrypted {
 		opaque, ok := ledger.(store.EncryptedCommandLedgerStore)
