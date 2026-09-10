@@ -2831,8 +2831,12 @@ func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error)
 
 // piProviderChildEnvironment translates file-path-only profile inputs into the
 // OpenAI credentials consumed by pi-ai. PI_MODEL is a bounded config file.
-// Managed images also receive a fixed wrapper so PI_MODEL is applied as pi's
-// startup --model argument; pi itself does not consume PI_MODEL directly.
+// The managed agent image ships a fixed wrapper so PI_MODEL is applied as pi's
+// startup --model argument and the profile endpoint is wired into pi's
+// models.json; pi itself does not consume PI_MODEL directly. Own Machine hosts
+// normally have no such wrapper, so PI_ACP_PI_COMMAND is left unset and pi-acp
+// falls back to the `pi` executable on PATH instead of trying to exec a
+// container-only path.
 func piProviderChildEnvironment(secretDir string, parent []string) ([]string, error) {
 	if secretDir == "" {
 		return nil, nil
@@ -2864,8 +2868,34 @@ func piProviderChildEnvironment(secretDir string, parent []string) ([]string, er
 		}
 		env = append(env, "PI_MODEL="+strings.TrimSpace(value))
 	}
-	env = append(env, "PI_ACP_PI_COMMAND="+managedPICommandOverride)
+	command, err := resolvePIACPCommand(managedPICommandOverride, environmentValue(parent, "AGENTWHARF_PI_COMMAND"))
+	if err != nil {
+		return nil, err
+	}
+	if command != "" {
+		env = append(env, "PI_ACP_PI_COMMAND="+command)
+	}
 	return env, nil
+}
+
+// resolvePIACPCommand returns the pi executable wrapper handed to pi-acp as
+// PI_ACP_PI_COMMAND. An explicit AGENTWHARF_PI_COMMAND wins and must resolve to
+// an executable; a configured-but-missing override is a hard error instead of a
+// silent fallback. Otherwise the managed image's fixed wrapper is used only
+// when it is actually present, and the empty result leaves the variable unset
+// so pi-acp runs the `pi` executable from PATH.
+func resolvePIACPCommand(managedPath, configured string) (string, error) {
+	if value := strings.TrimSpace(configured); value != "" {
+		resolved, err := exec.LookPath(value)
+		if err != nil {
+			return "", fmt.Errorf("%w: AGENTWHARF_PI_COMMAND=%s is not executable", errProviderCommandNotFound, value)
+		}
+		return resolved, nil
+	}
+	if info, err := os.Stat(managedPath); err == nil && !info.IsDir() {
+		return managedPath, nil
+	}
+	return "", nil
 }
 
 // codexProviderChildEnvironment translates file-path-only profile inputs into

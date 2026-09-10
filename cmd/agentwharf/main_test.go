@@ -3189,12 +3189,16 @@ func TestProviderChildEnvironmentForwardsPiCredentialsForChildOnly(t *testing.T)
 	apiKeyPath := filepath.Join(secretDir, "pi_api_key")
 	baseURLPath := filepath.Join(secretDir, "pi_base_url")
 	modelPath := filepath.Join(secretDir, "pi_model")
+	// A host-provided wrapper (AGENTWHARF_PI_COMMAND) must be forwarded so an
+	// Own Machine can pin PI_MODEL exactly like the managed image does.
+	wrapperPath := filepath.Join(secretDir, "pi-wrapper")
 	for path, value := range map[string]string{
 		apiKeyPath:  "test-pi-api-key\n",
 		baseURLPath: "https://provider.example.test/v1\n",
 		modelPath:   "gpt-5.6-sol\n",
+		wrapperPath: "#!/bin/sh\nexec pi \"$@\"\n",
 	} {
-		if err := os.WriteFile(path, []byte(value), 0o400); err != nil {
+		if err := os.WriteFile(path, []byte(value), 0o700); err != nil {
 			t.Fatalf("write pi config: %v", err)
 		}
 	}
@@ -3202,6 +3206,7 @@ func TestProviderChildEnvironmentForwardsPiCredentialsForChildOnly(t *testing.T)
 		"OPENAI_API_KEY=" + apiKeyPath,
 		"OPENAI_BASE_URL=" + baseURLPath,
 		"PI_MODEL=" + modelPath,
+		"AGENTWHARF_PI_COMMAND=" + wrapperPath,
 	})
 	if err != nil {
 		t.Fatalf("providerChildEnvironment() error = %v", err)
@@ -3210,12 +3215,56 @@ func TestProviderChildEnvironmentForwardsPiCredentialsForChildOnly(t *testing.T)
 		"OPENAI_API_KEY":    "test-pi-api-key",
 		"OPENAI_BASE_URL":   "https://provider.example.test/v1",
 		"PI_MODEL":          "gpt-5.6-sol",
-		"PI_ACP_PI_COMMAND": managedPICommandOverride,
+		"PI_ACP_PI_COMMAND": wrapperPath,
 	}
 	for name, value := range want {
 		if got := environmentValue(env, name); got != value {
 			t.Fatalf("child env %s = %q, want %q", name, got, value)
 		}
+	}
+}
+
+func TestProviderChildEnvironmentOmitsPiCommandWithoutWrapper(t *testing.T) {
+	if _, err := os.Stat(managedPICommandOverride); err == nil {
+		t.Skipf("managed pi wrapper %s is present on this host", managedPICommandOverride)
+	}
+	secretDir := t.TempDir()
+	apiKeyPath := filepath.Join(secretDir, "pi_api_key")
+	if err := os.WriteFile(apiKeyPath, []byte("test-pi-api-key\n"), 0o400); err != nil {
+		t.Fatalf("write pi config: %v", err)
+	}
+	env, err := providerChildEnvironment(wrapConfig{Provider: "pi", SecretDir: secretDir}, []string{
+		"OPENAI_API_KEY=" + apiKeyPath,
+	})
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	if got := environmentValue(env, "PI_ACP_PI_COMMAND"); got != "" {
+		t.Fatalf("PI_ACP_PI_COMMAND = %q, want unset so pi-acp uses pi from PATH", got)
+	}
+	if got := environmentValue(env, "OPENAI_API_KEY"); got != "test-pi-api-key" {
+		t.Fatalf("OPENAI_API_KEY = %q, want translated credential", got)
+	}
+}
+
+func TestResolvePIACPCommand(t *testing.T) {
+	managed := filepath.Join(t.TempDir(), "superwhv-pi")
+	if err := os.WriteFile(managed, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatalf("write managed wrapper: %v", err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing-wrapper")
+
+	if got, err := resolvePIACPCommand(managed, ""); err != nil || got != managed {
+		t.Fatalf("resolvePIACPCommand(managed, \"\") = %q, %v; want %q", got, err, managed)
+	}
+	if got, err := resolvePIACPCommand("", ""); err != nil || got != "" {
+		t.Fatalf("resolvePIACPCommand(\"\", \"\") = %q, %v; want empty", got, err)
+	}
+	if got, err := resolvePIACPCommand("", managed); err != nil || got != managed {
+		t.Fatalf("resolvePIACPCommand(\"\", managed) = %q, %v; want %q", got, err, managed)
+	}
+	if _, err := resolvePIACPCommand("", missing); !errors.Is(err, errProviderCommandNotFound) {
+		t.Fatalf("resolvePIACPCommand(\"\", missing) error = %v, want errProviderCommandNotFound", err)
 	}
 }
 
