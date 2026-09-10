@@ -38,3 +38,48 @@ func TestMachineDispatchCancelsSenderWhenRuntimeUnavailable(t *testing.T) {
 		t.Fatalf("missing runtime failure: %s", diagnostics.String())
 	}
 }
+
+func TestBackgroundRecoveryAdaptersDoNotConsumeDispatchSlots(t *testing.T) {
+	const maxConcurrent = 2
+	sem := make(chan struct{}, maxConcurrent)
+	var workers sync.WaitGroup
+	var adapters sync.WaitGroup
+	adapterStop := make(chan struct{})
+	adapterStarted := make(chan struct{}, maxConcurrent)
+
+	for range maxConcurrent {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			startBackgroundAdapter(&adapters, func() {
+				adapterStarted <- struct{}{}
+				<-adapterStop
+			})
+		}()
+	}
+	for range maxConcurrent {
+		select {
+		case <-adapterStarted:
+		case <-time.After(time.Second):
+			t.Fatal("recovery adapter did not start")
+		}
+	}
+
+	workers.Wait()
+	thirdDispatch := make(chan struct{})
+	go func() {
+		sem <- struct{}{}
+		close(thirdDispatch)
+		<-sem
+	}()
+	select {
+	case <-thirdDispatch:
+	case <-time.After(time.Second):
+		t.Fatal("background recovery adapters consumed every dispatch slot")
+	}
+
+	close(adapterStop)
+	adapters.Wait()
+}

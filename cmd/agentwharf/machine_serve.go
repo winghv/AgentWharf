@@ -278,12 +278,12 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			if isMachineRecoveryDispatch(handoff) {
-				adapters.Add(1)
-				defer adapters.Done()
 				onDone := func() {
 					recoveryGuard.release(handoff.SessionID)
 				}
-				keepAdapterAlive(serveCtx, cfg, &handoff, stdout, stderr, onDone, reportFailure)
+				startBackgroundAdapter(&adapters, func() {
+					keepAdapterAlive(serveCtx, cfg, &handoff, stdout, stderr, onDone, reportFailure)
+				})
 				return
 			}
 			dispatchOutcome(serveCtx, cfg, &handoff, stdout, stderr, &adapters, func() {
@@ -367,11 +367,12 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				workers.Add(1)
 				go func(session machineRecoverableSession, machineCred machineCredential) {
 					defer workers.Done()
-					defer recoveryGuard.release(session.SessionID)
 					reportFailure := machineSessionFailureReporter(func(reportCtx context.Context, sessionID, reason string) error {
 						return reportMachineSessionStartFailure(reportCtx, client, machineCred, sessionID, reason)
 					})
-					dispatchRecovery(serveCtx, cfg, client, machineCred, session, stdout, stderr, &adapters, reportFailure)
+					dispatchRecovery(serveCtx, cfg, client, machineCred, session, stdout, stderr, &adapters, func() {
+						recoveryGuard.release(session.SessionID)
+					}, reportFailure)
 				}(session, credential)
 			}
 		}
@@ -758,19 +759,33 @@ func recoverMachineSession(ctx context.Context, client *http.Client, credential 
 	}, nil
 }
 
-func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, session machineRecoverableSession, stdout, stderr io.Writer, adapters *sync.WaitGroup, reportFailure machineSessionFailureReporter) {
+func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, session machineRecoverableSession, stdout, stderr io.Writer, adapters *sync.WaitGroup, onDone func(), reportFailure machineSessionFailureReporter) {
 	handoff, err := recoverMachineSession(ctx, client, credential, session)
 	if err != nil {
+		if onDone != nil {
+			onDone()
+		}
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: recover session %s: %v\n", session.SessionID, err)
 		return
 	}
 	if err := saveMachineDispatch(*handoff); err != nil {
+		if onDone != nil {
+			onDone()
+		}
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: persist recovery %s: %v\n", session.SessionID, err)
 		return
 	}
+	startBackgroundAdapter(adapters, func() {
+		keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onDone, reportFailure)
+	})
+}
+
+func startBackgroundAdapter(adapters *sync.WaitGroup, run func()) {
 	adapters.Add(1)
-	defer adapters.Done()
-	keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, nil, reportFailure)
+	go func() {
+		defer adapters.Done()
+		run()
+	}()
 }
 
 // maybeRefreshMachineCredential refreshes the machine bearer when it is within
