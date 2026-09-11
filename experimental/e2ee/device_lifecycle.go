@@ -251,3 +251,27 @@ func (v *SessionKeyVault) RevokeTrustedTerminals(ctx context.Context, journal *C
 	}
 	return revoked, nil
 }
+
+// InitializeLocalSession creates a session key owned by the machine's own
+// identity. Endpoint-initiated sessions (a startup smoke or a machine-started
+// run) have no terminal session initialization, so the endpoint authority
+// creates the key and keeps a control grant; terminals can request it later.
+func (v *SessionKeyVault) InitializeLocalSession(ctx context.Context, journal *CommandJournal, session string) (string, error) {
+	if journal == nil || journal.db != v.db || !identifier.MatchString(session) {
+		return "", ErrInvalid
+	}
+	key, err := decode(v.public.SigningKey, 32, 32)
+	if err != nil {
+		return "", err
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", ErrJournal
+	}
+	keyID := hex.EncodeToString(raw)
+	grants := []DeviceGrant{{DeviceID: v.identity.Device, VerifyKey: ed25519.PublicKey(key), Control: true}}
+	if err := v.TransitionSession(ctx, journal, session, keyID, 0, grants); err != nil {
+		return "", err
+	}
+	return keyID, nil
+}

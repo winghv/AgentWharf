@@ -533,8 +533,8 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 			return
 		}
 		defer endpointRuntime.database.Close()
-		if err := endpointRuntime.requireSession(ctx, handoff.SessionID); err != nil {
-			_, _ = fmt.Fprintln(stderr, "wharf machine serve: trusted encrypted session initialization required")
+		if err := endpointRuntime.ensureSession(ctx, handoff.SessionID); err != nil {
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: encrypted session initialization failed: %v\n", err)
 			return err
 		}
 		launchHandoff := *handoff

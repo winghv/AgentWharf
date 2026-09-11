@@ -209,3 +209,36 @@ func TestRevokeTrustedTerminalsRotatesSessions(t *testing.T) {
 		t.Fatalf("revoked device lookup = %v, want ErrUnauthorized", err)
 	}
 }
+
+func TestInitializeLocalSessionCreatesMachineOwnedKey(t *testing.T) {
+	ctx := context.Background()
+	journal, db := openJournal(t, filepath.Join(t.TempDir(), "endpoint.db"))
+	machine, _ := NewLocalIdentity()
+	vault, err := NewSessionKeyVault(ctx, db, machine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyID, err := vault.InitializeLocalSession(ctx, journal, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, storedKeyID, err := journal.SessionState(ctx, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch != 1 || storedKeyID != keyID {
+		t.Fatalf("epoch=%d key=%q want %q", epoch, storedKeyID, keyID)
+	}
+	key, err := vault.Load(ctx, "session", keyID)
+	if err != nil || len(key) != 32 {
+		t.Fatalf("load len=%d err=%v", len(key), err)
+	}
+	clear(key)
+	grants, err := journal.sessionGrants(ctx, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grants) != 1 || grants[0].DeviceID != machine.Device || !grants[0].Control {
+		t.Fatalf("grants = %+v", grants)
+	}
+}

@@ -72,6 +72,24 @@ func (r *machineE2EERuntime) requireSession(ctx context.Context, session string)
 	return nil
 }
 
+// ensureSession verifies the session key and creates an endpoint-owned one when
+// no terminal initialized the session. The machine is the endpoint authority, so
+// a run it starts itself (a startup smoke or an auto claim) still has a key to
+// seal events with; terminals can request it through the key relay afterwards.
+func (r *machineE2EERuntime) ensureSession(ctx context.Context, session string) error {
+	if err := r.requireSession(ctx, session); err == nil {
+		return nil
+	}
+	journal, err := e2ee.NewCommandJournal(ctx, r.database)
+	if err != nil {
+		return err
+	}
+	if _, err := r.vault.InitializeLocalSession(ctx, journal, session); err != nil {
+		return err
+	}
+	return r.requireSession(ctx, session)
+}
+
 // sealEvent selects the locally active epoch. Callers retain the resulting
 // bytes across proposal retries; the Hub remains the sole seq allocator.
 func (r *machineE2EERuntime) sealEvent(ctx context.Context, session, messageID, eventType string, payload json.RawMessage) (json.RawMessage, error) {
