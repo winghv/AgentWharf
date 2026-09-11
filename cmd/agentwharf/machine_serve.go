@@ -252,6 +252,9 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	if err := pollSessionInitializations(ctx, client, credential); err != nil {
 		_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted initialization poll unavailable")
 	}
+	if err := reportTrustedDevicesWithRuntime(ctx, client, credential); err != nil {
+		_, _ = fmt.Fprintln(stderr, "wharf machine serve: trusted device report unavailable")
+	}
 
 	// Crash-resume: re-run each persisted handoff with the stored credentials
 	// instead of re-exchanging. The deterministic command ID makes the resend

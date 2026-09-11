@@ -57,6 +57,12 @@ func pollSessionKeyRequests(ctx context.Context, client *http.Client, credential
 			failure = errors.New("one or more key requests failed")
 		}
 	}
+	// A processed request may have enrolled a terminal; publish the current set
+	// while the runtime is already open. Best effort, but surfaced when nothing
+	// else failed.
+	if reportErr := reportTrustedDevices(ctx, client, credential, runtime.registry); reportErr != nil && failure == nil {
+		failure = errors.New("trusted device report unavailable")
+	}
 	return failure
 }
 
