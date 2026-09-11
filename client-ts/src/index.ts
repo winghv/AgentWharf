@@ -935,7 +935,19 @@ export class AgentWharfClient {
       const ephemeral = event.seq === undefined && isEphemeralSessionEvent(event.type)
       const current = this.cursors.get(event.session_id) ?? 0
       if (!ephemeral && (!Number.isSafeInteger(event.seq) || event.seq !== current + 1)) throw new Error('encrypted event sequence gap')
-      const opened = await withTimeout(this.options.encrypted!.openEvent(event), 10_000, 'encrypted event authentication timed out')
+      let opened: AgentWharfEvent
+      try {
+        opened = await withTimeout(this.options.encrypted!.openEvent(event), 10_000, 'encrypted event authentication timed out')
+      } catch (error) {
+        // A command authored by a terminal this client has no signed member key
+        // for is dropped so one foreign command cannot end the live stream. The
+        // cursor still advances so the next event is not misread as a gap.
+        if (event.type === 'session.command') {
+          if (!ephemeral && Number.isSafeInteger(event.seq)) this.cursors.set(event.session_id, event.seq as number)
+          return
+        }
+        throw error
+      }
       if (state.failed || this.socket !== socket || !this.handshakeReady) return
       if (opened.session_id !== event.session_id || opened.seq !== event.seq || !validOpenedEventType(event, opened)) {
         throw new Error('encrypted event routing changed')
@@ -1020,7 +1032,15 @@ export class AgentWharfClient {
         const events: AgentWharfEvent[] = []
         for (const event of page.events) {
           if (this.socket !== socket || !this.handshakeReady) throw new Error('connection changed during encrypted history authentication')
-          const opened = await this.options.encrypted!.openEvent(event)
+          let opened: AgentWharfEvent
+          try {
+            opened = await this.options.encrypted!.openEvent(event)
+          } catch (error) {
+            // Unverifiable commands are skipped so a stale member key cannot blank
+            // the whole page; machine events stay fatal.
+            if (event.type === 'session.command') continue
+            throw error
+          }
           if (this.socket !== socket || !this.handshakeReady) throw new Error('connection changed during encrypted history authentication')
           if (opened.session_id !== event.session_id || opened.seq !== event.seq || !validOpenedEventType(event, opened)) {
             throw new Error('encrypted history routing changed')

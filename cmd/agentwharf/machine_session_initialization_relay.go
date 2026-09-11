@@ -110,10 +110,20 @@ func deliverSessionInitialization(ctx context.Context, client *http.Client, cred
 	if err != nil {
 		return err
 	}
+	// The creating terminal also receives the endpoint-signed session directory
+	// so it can verify commands another terminal later authors in this session.
+	journal, err := e2ee.NewCommandJournal(ctx, runtime.database)
+	if err != nil {
+		return errors.New("initialization response membership unavailable")
+	}
+	directory, err := runtime.vault.SignSessionMembershipDirectory(ctx, journal, session)
+	if err != nil {
+		return errors.New("initialization response membership unavailable")
+	}
 	payload := struct {
-		Request    string          `json:"request"`
-		WrappedKey e2ee.WrappedKey `json:"wrapped_key"`
-	}{response.Data.Request, wrapped}
+		Request    string                    `json:"request"`
+		WrappedKey wrappedKeyResponsePayload `json:"wrapped_key"`
+	}{response.Data.Request, wrappedKeyResponsePayload{Enc: wrapped.Enc, Ciphertext: wrapped.Ciphertext, Machine: runtime.public, Membership: &directory}}
 	for {
 		status, _, err = postCloudAPIJSON(ctx, client, endpoint, credential.MachineToken, payload)
 		if err == nil && status == http.StatusNoContent {

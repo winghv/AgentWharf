@@ -80,8 +80,10 @@ func (r TrustedSessionKeyRequest) Identity() PairingIdentity {
 
 // RecoverSessionKeyTrusted verifies a v2 request against its embedded signing
 // key, optionally enrolls the device when account-terminal trust is enabled,
-// seeds a view grant for every existing session, and returns the wrapped key.
-func (e *CommandExecutor) RecoverSessionKeyTrusted(ctx context.Context, registry *DeviceRegistry, request TrustedSessionKeyRequest, trustEnabled bool) (WrappedKey, error) {
+// grants the device on every existing session with the requested authority, and
+// returns the wrapped key. Callers pass control=false only for an explicit
+// view-only deployment.
+func (e *CommandExecutor) RecoverSessionKeyTrusted(ctx context.Context, registry *DeviceRegistry, request TrustedSessionKeyRequest, trustEnabled, control bool) (WrappedKey, error) {
 	// The account label is local to the machine binding; a new terminal that
 	// never consumed an offer cannot know it. The relay is already scoped to the
 	// machine owner, so only the machine identity has to match here.
@@ -119,7 +121,7 @@ func (e *CommandExecutor) RecoverSessionKeyTrusted(ctx context.Context, registry
 	} else if registered.SigningKey != identity.SigningKey || registered.WrappingKey != identity.WrappingKey {
 		return WrappedKey{}, ErrConflict
 	}
-	if _, err := e.journal.GrantEnrolledDevice(ctx, request.Device, ed25519.PublicKey(public), false); err != nil {
+	if _, err := e.journal.GrantEnrolledDevice(ctx, request.Device, ed25519.PublicKey(public), control); err != nil {
 		return WrappedKey{}, err
 	}
 	return e.vault.WrapForDevice(ctx, request.Session, request.KeyID, registry, request.Device)

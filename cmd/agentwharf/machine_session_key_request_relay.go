@@ -88,6 +88,9 @@ func deliverSessionKeyRequest(ctx context.Context, client *http.Client, credenti
 	}
 	raw := []byte(response.Data.Request)
 	trusted = trusted || strings.TrimSpace(os.Getenv("AGENTWHARF_TRUST_ACCOUNT_TERMINALS")) == "1"
+	// A trusted terminal is a controller by default so the owner can command from
+	// any browser; a deployment can opt into view-only enrollment instead.
+	control := strings.TrimSpace(os.Getenv("AGENTWHARF_TRUST_ACCOUNT_TERMINALS_VIEW_ONLY")) != "1"
 	var wrapped e2ee.WrappedKey
 	if signed, legacyErr := e2ee.DecodeSessionKeyRequest(raw); legacyErr == nil && signed.Machine == credential.MachineID && signed.Session == session && signed.Device == device && signed.KeyID == keyID {
 		if response.Data.State == "completed" {
@@ -105,7 +108,7 @@ func deliverSessionKeyRequest(ctx context.Context, client *http.Client, credenti
 		}
 	} else if v2, trustedErr := e2ee.DecodeTrustedSessionKeyRequest(raw); trustedErr == nil && v2.Machine == credential.MachineID && v2.Session == session && v2.Device == device && v2.KeyID == keyID {
 		if response.Data.State == "completed" {
-			if _, err := runtime.executor.RecoverSessionKeyTrusted(ctx, runtime.registry, v2, trusted); err != nil {
+			if _, err := runtime.executor.RecoverSessionKeyTrusted(ctx, runtime.registry, v2, trusted, control); err != nil {
 				return errors.New("completed key request signature rejected")
 			}
 			return nil
@@ -113,22 +116,27 @@ func deliverSessionKeyRequest(ctx context.Context, client *http.Client, credenti
 		if response.Data.State != "pending" {
 			return errors.New("invalid key request state")
 		}
-		wrapped, err = runtime.executor.RecoverSessionKeyTrusted(ctx, runtime.registry, v2, trusted)
+		wrapped, err = runtime.executor.RecoverSessionKeyTrusted(ctx, runtime.registry, v2, trusted, control)
 		if err != nil {
 			return err
 		}
 	} else {
 		return errors.New("key request routing mismatch")
 	}
-	type wrappedKeyPayload struct {
-		Enc        string               `json:"enc"`
-		Ciphertext string               `json:"ciphertext"`
-		Machine    e2ee.PairingIdentity `json:"machine"`
+	// The signed directory tells the terminal which device keys may author
+	// commands for this session epoch; the relay never supplies it.
+	journal, err := e2ee.NewCommandJournal(ctx, runtime.database)
+	if err != nil {
+		return errors.New("key response membership unavailable")
+	}
+	directory, err := runtime.vault.SignSessionMembershipDirectory(ctx, journal, session)
+	if err != nil {
+		return errors.New("key response membership unavailable")
 	}
 	payload := struct {
-		Request    string            `json:"request"`
-		WrappedKey wrappedKeyPayload `json:"wrapped_key"`
-	}{response.Data.Request, wrappedKeyPayload{Enc: wrapped.Enc, Ciphertext: wrapped.Ciphertext, Machine: runtime.public}}
+		Request    string                    `json:"request"`
+		WrappedKey wrappedKeyResponsePayload `json:"wrapped_key"`
+	}{response.Data.Request, wrappedKeyResponsePayload{Enc: wrapped.Enc, Ciphertext: wrapped.Ciphertext, Machine: runtime.public, Membership: &directory}}
 	ctx, expire := context.WithDeadline(ctx, response.Data.ExpiresAt)
 	defer expire()
 	for {
@@ -147,6 +155,16 @@ func deliverSessionKeyRequest(ctx context.Context, client *http.Client, credenti
 		case <-timer.C:
 		}
 	}
+}
+
+// wrappedKeyResponsePayload is the authenticated key delivery a terminal opens.
+// The endpoint identity pins the machine; the signed membership directory lists
+// the device keys that may author commands for the same session epoch.
+type wrappedKeyResponsePayload struct {
+	Enc        string                           `json:"enc"`
+	Ciphertext string                           `json:"ciphertext"`
+	Machine    e2ee.PairingIdentity             `json:"machine"`
+	Membership *e2ee.SessionMembershipDirectory `json:"membership,omitempty"`
 }
 
 var _ = protocol.ErrSessionKeyRequest

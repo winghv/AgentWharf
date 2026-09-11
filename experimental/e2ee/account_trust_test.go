@@ -77,7 +77,7 @@ func TestTrustedAccountTerminalEnrollment(t *testing.T) {
 	}
 
 	// Trust disabled: rejected and never enrolled.
-	if _, err := executor.RecoverSessionKeyTrusted(ctx, registry, request, false); err != ErrUnauthorized {
+	if _, err := executor.RecoverSessionKeyTrusted(ctx, registry, request, false, true); err != ErrUnauthorized {
 		t.Fatalf("trust disabled error = %v, want ErrUnauthorized", err)
 	}
 	if _, err := registry.Device(ctx, newbie.Device); err == nil {
@@ -85,12 +85,39 @@ func TestTrustedAccountTerminalEnrollment(t *testing.T) {
 	}
 
 	// Trust enabled: enrolled, granted, and the wrapped key opens to the session key.
-	wrapped, err := executor.RecoverSessionKeyTrusted(ctx, registry, request, true)
+	wrapped, err := executor.RecoverSessionKeyTrusted(ctx, registry, request, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := registry.Device(ctx, newbie.Device); err != nil {
 		t.Fatalf("trusted device not enrolled: %v", err)
+	}
+	var control int
+	if err := db.QueryRowContext(ctx, "SELECT control FROM e2ee_local_grants WHERE session='session' AND device=?", newbie.Device).Scan(&control); err != nil {
+		t.Fatal(err)
+	}
+	if control != 1 {
+		t.Fatal("trusted account terminal was not granted control")
+	}
+	// An already enrolled view grant is upgraded when the terminal re-requests
+	// under account-terminal trust, so a previously added terminal gains control.
+	viewerPublic, err := viewer.Public()
+	if err != nil {
+		t.Fatal(err)
+	}
+	viewerRequest, err := SignTrustedSessionKeyRequest(TrustedSessionKeyRequest{Machine: "machine", Account: "account", Session: "session", KeyID: "key1", Device: viewer.Device, SigningKey: viewerPublic.SigningKey, WrappingKey: viewerPublic.WrappingKey}, ed25519.NewKeyFromSeed(viewer.SigningSeed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executor.RecoverSessionKeyTrusted(ctx, registry, viewerRequest, true, true); err != nil {
+		t.Fatal(err)
+	}
+	var viewerControl int
+	if err := db.QueryRowContext(ctx, "SELECT control FROM e2ee_local_grants WHERE session='session' AND device=?", viewer.Device).Scan(&viewerControl); err != nil {
+		t.Fatal(err)
+	}
+	if viewerControl != 1 {
+		t.Fatal("existing view grant was not upgraded to control")
 	}
 	sessionKey, err := vault.Load(ctx, "session", "key1")
 	if err != nil {
@@ -121,7 +148,7 @@ func TestTrustedAccountTerminalEnrollment(t *testing.T) {
 		t.Fatal(err)
 	}
 	tampered.WrappingKey = ownerPublic.WrappingKey
-	if _, err := executor.RecoverSessionKeyTrusted(ctx, registry, tampered, true); err != ErrUnauthorized {
+	if _, err := executor.RecoverSessionKeyTrusted(ctx, registry, tampered, true, true); err != ErrUnauthorized {
 		t.Fatalf("tampered request error = %v, want ErrUnauthorized", err)
 	}
 

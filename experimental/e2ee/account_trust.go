@@ -70,16 +70,20 @@ func (r *DeviceRegistry) EnrollTrusted(ctx context.Context, identity PairingIden
 	return tx.Commit()
 }
 
-// GrantEnrolledDevice adds a view grant for an enrolled device to every session
-// that already has a current key. It is idempotent, never upgrades an existing
-// control grant, and returns the number of sessions it added.
+// GrantEnrolledDevice adds or upgrades a device grant for every session that
+// already has a current key. It never removes or downgrades an existing control
+// grant, and returns the number of sessions it inserted or upgraded.
 func (j *CommandJournal) GrantEnrolledDevice(ctx context.Context, device string, verifyKey ed25519.PublicKey, control bool) (int, error) {
 	if !identifier.MatchString(device) || len(verifyKey) != ed25519.PublicKeySize {
 		return 0, ErrInvalid
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	result, err := j.db.ExecContext(ctx, "INSERT INTO e2ee_local_grants(session, device, verify_key, control) SELECT session, ?, ?, ? FROM e2ee_local_sessions WHERE 1 ON CONFLICT(session, device) DO NOTHING", device, []byte(verifyKey), control)
+	insert := "INSERT INTO e2ee_local_grants(session, device, verify_key, control) SELECT session, ?, ?, ? FROM e2ee_local_sessions WHERE 1 ON CONFLICT(session, device) DO NOTHING"
+	if control {
+		insert = "INSERT INTO e2ee_local_grants(session, device, verify_key, control) SELECT session, ?, ?, ? FROM e2ee_local_sessions WHERE 1 ON CONFLICT(session, device) DO UPDATE SET control=1 WHERE e2ee_local_grants.control=0"
+	}
+	result, err := j.db.ExecContext(ctx, insert, device, []byte(verifyKey), control)
 	if err != nil {
 		return 0, ErrJournal
 	}
