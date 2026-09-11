@@ -20,6 +20,18 @@ type machineCredential struct {
 	HubWSURL      string `json:"hub_ws_url,omitempty"`
 	ExpiresAt     string `json:"expires_at,omitempty"`
 	CreatedAt     string `json:"created_at"`
+	// LocalAccountBinding namespaces the machine's encrypted endpoint. Pairing
+	// derives it so onboarding needs no environment variable; the environment
+	// still overrides for self-hosted and test use.
+	LocalAccountBinding string `json:"local_account_binding,omitempty"`
+}
+
+// machineLocalAccountBinding resolves the encrypted-endpoint account namespace.
+func machineLocalAccountBinding(credential machineCredential) string {
+	if value := strings.TrimSpace(os.Getenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(credential.LocalAccountBinding)
 }
 
 func loadMachineCredential() (machineCredential, error) {

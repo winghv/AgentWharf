@@ -14,7 +14,7 @@ import (
 )
 
 func pollSessionKeyRequests(ctx context.Context, client *http.Client, credential machineCredential, trusted bool) error {
-	account := strings.TrimSpace(os.Getenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING"))
+	account := machineLocalAccountBinding(credential)
 	if account == "" {
 		return errors.New("local key binding unavailable")
 	}

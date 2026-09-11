@@ -496,14 +496,14 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 	// Every machine-serve dispatch is Own Machine, including recovery handoffs
 	// with no first instruction. Empty content must never select legacy mode.
 	{
-		accountBinding := strings.TrimSpace(os.Getenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING"))
-		if accountBinding == "" {
-			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted Own Machine dispatch requires AGENTWHARF_LOCAL_ACCOUNT_BINDING")
-			return
-		}
 		credential, err := loadMachineCredential()
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "wharf machine serve: load machine credential for encrypted endpoint: %v\n", err)
+			return
+		}
+		accountBinding := machineLocalAccountBinding(credential)
+		if accountBinding == "" {
+			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted Own Machine dispatch requires a paired machine; run wharf pair")
 			return
 		}
 		directory, err := machineEndpointDirectory(credential, accountBinding)

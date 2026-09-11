@@ -34,7 +34,7 @@ func TestMachineDispatchCancelsSenderWhenRuntimeUnavailable(t *testing.T) {
 	if output.Len() != 0 {
 		t.Fatal("unavailable runtime reported successful dispatch")
 	}
-	if !bytes.Contains(diagnostics.Bytes(), []byte("AGENTWHARF_LOCAL_ACCOUNT_BINDING")) {
+	if !bytes.Contains(diagnostics.Bytes(), []byte("machine credential")) {
 		t.Fatalf("missing runtime failure: %s", diagnostics.String())
 	}
 }

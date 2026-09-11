@@ -65,6 +65,9 @@ var (
 	errProviderCommandNotFound   = errors.New("provider command not found")
 	errProviderConfigNotFound    = errors.New("provider config not found")
 	errProviderCredentialMissing = errors.New("provider credential missing")
+	// Onboarding is a single explicit step: wharf pair. Agent entrypoints only
+	// check the pairing; they never create or replace it.
+	errMachinePairingRequired = errors.New("this machine is not paired with SuperWHV yet; run wharf pair once, then run this command again")
 )
 
 func main() {
@@ -1210,46 +1213,33 @@ func claimProtocolErrorRequiresReclaim(protocolErr *protocol.Error) bool {
 
 func prepareManagedWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	if !cfg.Pair {
-		credential, err := loadMachineCredential()
-		switch {
-		case err == nil && sameCloudAPIURL(credential.CloudAPIURL, cfg.CloudAPIURL):
-			session, err := createMachineSession(ctx, client, cfg.CloudAPIURL, credential.MachineToken, cfg.Provider)
-			if err == nil {
-				return applyMachineSession(cfg, session)
-			}
-			if isInvalidMachineCredentialError(err) {
-				// The 24-hour bearer expired while offline. Recover from the
-				// pairing-time refresh secret instead of re-pairing.
-				if recovered, recoverErr := recoverMachineCredential(ctx, client, credential); recoverErr == nil {
-					if session, sessionErr := createMachineSession(ctx, client, cfg.CloudAPIURL, recovered.MachineToken, cfg.Provider); sessionErr == nil {
-						return applyMachineSession(cfg, session)
-					}
+	if cfg.Pair {
+		return cfg, errMachinePairingRequired
+	}
+	credential, err := loadMachineCredential()
+	switch {
+	case err == nil && sameCloudAPIURL(credential.CloudAPIURL, cfg.CloudAPIURL):
+		session, err := createMachineSession(ctx, client, cfg.CloudAPIURL, credential.MachineToken, cfg.Provider)
+		if err == nil {
+			return applyMachineSession(cfg, session)
+		}
+		if isInvalidMachineCredentialError(err) {
+			// The 24-hour bearer expired while offline. Recover from the
+			// pairing-time refresh secret; the pairing itself stays untouched.
+			if recovered, recoverErr := recoverMachineCredential(ctx, client, credential); recoverErr == nil {
+				if session, sessionErr := createMachineSession(ctx, client, cfg.CloudAPIURL, recovered.MachineToken, cfg.Provider); sessionErr == nil {
+					return applyMachineSession(cfg, session)
 				}
-				if deleteErr := deleteMachineCredential(); deleteErr != nil {
-					return cfg, deleteErr
-				}
-				if output != nil {
-					_, _ = fmt.Fprintln(output, "Local machine pairing is no longer valid; pairing again.")
-				}
-				return pairWrapSessionWithClient(ctx, client, cfg, output)
-			}
-			return cfg, err
-		case err == nil:
-			return pairWrapSessionWithClient(ctx, client, cfg, output)
-		case errors.Is(err, errMachineCredentialNotFound):
-			return pairWrapSessionWithClient(ctx, client, cfg, output)
-		default:
-			if deleteErr := deleteMachineCredential(); deleteErr != nil {
-				return cfg, deleteErr
 			}
 			if output != nil {
-				_, _ = fmt.Fprintln(output, "Local machine pairing is unreadable; pairing again.")
+				_, _ = fmt.Fprintln(output, "Local machine pairing is no longer valid.")
 			}
-			return pairWrapSessionWithClient(ctx, client, cfg, output)
+			return cfg, errMachinePairingRequired
 		}
+		return cfg, err
+	default:
+		return cfg, errMachinePairingRequired
 	}
-	return pairWrapSessionWithClient(ctx, client, cfg, output)
 }
 
 func pairWrapSession(ctx context.Context, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
@@ -1308,7 +1298,77 @@ func pairMachineCredential(ctx context.Context, client *http.Client, cfg wrapCon
 	if err := saveMachineCredential(credential); err != nil {
 		return machineCredential{}, err
 	}
+	hydrateMachineOnboarding(ctx, client, &credential, output)
 	return credential, nil
+}
+
+// reuseMachineCredential confirms an existing pairing still authenticates.
+// An expired bearer is refreshed from the pairing-time secret; a revoked or
+// otherwise rejected one reports false so wharf pair re-pairs, keeping a single
+// repair path. Transport and unknown-endpoint outcomes keep the credential.
+func reuseMachineCredential(ctx context.Context, client *http.Client, credential machineCredential) (machineCredential, bool) {
+	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machines/"+url.PathEscape(credential.MachineID)+"/trusted-terminals/endpoint")
+	if err != nil {
+		return credential, true
+	}
+	status, _, err := getCloudAPIJSON(ctx, client, endpoint, credential.MachineToken)
+	if err != nil || (status != http.StatusUnauthorized && status != http.StatusForbidden) {
+		return credential, true
+	}
+	if strings.TrimSpace(credential.RefreshSecret) == "" {
+		return credential, false
+	}
+	recovered, recoverErr := recoverMachineCredential(ctx, client, credential)
+	if recoverErr != nil {
+		return credential, false
+	}
+	return recovered, true
+}
+
+// hydrateMachineOnboarding records the account namespace this machine's
+// encrypted endpoint uses and enables account-terminal trust, so the one
+// explicit pairing step is enough for both the CLI and the Console. Trust is
+// enabled only here, while the pairing is being created: an owner who later
+// turns it off in the Console is not overridden by a repeat of wharf pair.
+// Failures are reported but do not discard a usable credential.
+func hydrateMachineOnboarding(ctx context.Context, client *http.Client, credential *machineCredential, output io.Writer) {
+	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machines/"+url.PathEscape(credential.MachineID)+"/trusted-terminals/endpoint")
+	if err != nil {
+		return
+	}
+	warn := func(message string) {
+		if output != nil {
+			_, _ = fmt.Fprintln(output, message)
+		}
+	}
+	status, body, err := getCloudAPIJSON(ctx, client, endpoint, credential.MachineToken)
+	if err != nil || status != http.StatusOK {
+		warn("wharf pair: trusted-terminal setting unavailable; enable it from the Console Machines page if this browser cannot read sessions")
+		return
+	}
+	var current struct {
+		Data struct {
+			Enabled     bool   `json:"enabled"`
+			OrgID       string `json:"org_id"`
+			OwnerUserID string `json:"owner_user_id"`
+		} `json:"data"`
+	}
+	if decodeCloudAPIJSON(body, &current) != nil {
+		return
+	}
+	if org, owner := strings.TrimSpace(current.Data.OrgID), strings.TrimSpace(current.Data.OwnerUserID); org != "" && owner != "" {
+		credential.LocalAccountBinding = org + "/" + owner
+		if err := saveMachineCredential(*credential); err != nil {
+			warn("wharf pair: could not persist the local account binding")
+		}
+	}
+	if current.Data.Enabled {
+		return
+	}
+	status, _, err = postCloudAPIJSON(ctx, client, endpoint, credential.MachineToken, map[string]any{"enabled": true})
+	if err != nil || (status != http.StatusOK && status != http.StatusNoContent) {
+		warn("wharf pair: could not enable account-terminal trust; enable it from the Console Machines page if this browser cannot read sessions")
+	}
 }
 
 func pairWrapSessionWithClient(ctx context.Context, client *http.Client, cfg wrapConfig, output io.Writer) (wrapConfig, error) {
@@ -1374,7 +1434,11 @@ func runPairOnly(ctx context.Context, cfg wrapConfig, stdout, stderr io.Writer) 
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
 	credential, err := loadMachineCredential()
-	if err != nil || !sameCloudAPIURL(credential.CloudAPIURL, normalized.CloudAPIURL) {
+	alreadyPaired := err == nil && sameCloudAPIURL(credential.CloudAPIURL, normalized.CloudAPIURL)
+	if alreadyPaired {
+		credential, alreadyPaired = reuseMachineCredential(ctx, client, credential)
+	}
+	if !alreadyPaired {
 		credential, err = pairMachineCredential(ctx, client, normalized, stderr)
 		if err != nil {
 			return err
@@ -1385,6 +1449,11 @@ func runPairOnly(ctx context.Context, cfg wrapConfig, stdout, stderr io.Writer) 
 	}
 	if err := ensureBackgroundDaemon(stderr); err != nil {
 		return fmt.Errorf("pairing completed but could not start the background daemon: %w", err)
+	}
+	if alreadyPaired {
+		_, _ = fmt.Fprintln(stdout, "This machine is already paired with SuperWHV; nothing to change.")
+		_, _ = fmt.Fprintln(stdout, "The background daemon (wharf serve) is running; manage tasks from the Console.")
+		return nil
 	}
 	_, _ = fmt.Fprintln(stdout, "Pairing complete. This machine is connected to SuperWHV.")
 	_, _ = fmt.Fprintln(stdout, "The background daemon (wharf serve) is running; you can close this window. Manage tasks from the Console.")

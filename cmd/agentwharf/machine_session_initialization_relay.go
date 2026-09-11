@@ -5,8 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/winghv/agentwharf/experimental/e2ee"
@@ -16,7 +14,7 @@ import (
 func pollSessionInitializations(ctx context.Context, client *http.Client, credential machineCredential) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	account := strings.TrimSpace(os.Getenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING"))
+	account := machineLocalAccountBinding(credential)
 	if account == "" {
 		return errors.New("local initialization binding unavailable")
 	}
