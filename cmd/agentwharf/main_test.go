@@ -954,6 +954,7 @@ func TestPairMachineCredentialRetriesTransientCreateFailure(t *testing.T) {
 	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", credentialFile)
 
 	var pairingRequests int
+	var trustEnabled bool
 	controlPlane := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -968,7 +969,15 @@ func TestPairMachineCredentialRetriesTransientCreateFailure(t *testing.T) {
 		case "/machine-pairing-codes/token":
 			fmt.Fprint(w, `{"data":{"machine":{"id":"machine_retry"},"machine_token":"retry-machine-token","hub_ws_url":"wss://ignored.example/ws","expires_at":"2026-06-19T10:00:00Z"}}`)
 		case "/machines/machine_retry/trusted-terminals/endpoint":
-			fmt.Fprint(w, `{"data":{"enabled":true,"org_id":"org_1","owner_user_id":"user_1"}}`)
+			switch r.Method {
+			case http.MethodGet:
+				fmt.Fprint(w, `{"data":{"enabled":false,"org_id":"org_1","owner_user_id":"user_1"}}`)
+			case http.MethodPut:
+				trustEnabled = true
+				fmt.Fprint(w, `{"data":{"enabled":true,"org_id":"org_1","owner_user_id":"user_1"}}`)
+			default:
+				t.Errorf("trusted-terminals method = %s, want GET or PUT", r.Method)
+			}
 		default:
 			http.NotFound(w, r)
 		}
@@ -989,6 +998,9 @@ func TestPairMachineCredentialRetriesTransientCreateFailure(t *testing.T) {
 	}
 	if credential.MachineID != "machine_retry" || credential.LocalAccountBinding != "org_1/user_1" {
 		t.Fatalf("credential = %+v", credential)
+	}
+	if !trustEnabled {
+		t.Fatal("pairing did not enable account-terminal trust with a PUT")
 	}
 }
 

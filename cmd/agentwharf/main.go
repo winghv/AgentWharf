@@ -1365,7 +1365,7 @@ func hydrateMachineOnboarding(ctx context.Context, client *http.Client, credenti
 	if current.Data.Enabled {
 		return
 	}
-	status, _, err = postCloudAPIJSON(ctx, client, endpoint, credential.MachineToken, map[string]any{"enabled": true})
+	status, _, err = putCloudAPIJSON(ctx, client, endpoint, credential.MachineToken, map[string]any{"enabled": true})
 	if err != nil || (status != http.StatusOK && status != http.StatusNoContent) {
 		warn("wharf pair: could not enable account-terminal trust; enable it from the Console Machines page if this browser cannot read sessions")
 	}
@@ -1590,6 +1590,37 @@ func cloudAPIErrorMessage(body []byte) string {
 
 func postCloudAPIJSON(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any) (int, []byte, error) {
 	return postCloudAPIJSONOnce(ctx, client, endpoint, bearerToken, payload, true)
+}
+
+// putCloudAPIJSON issues a single PUT with the same encoding as
+// postCloudAPIJSON; no retry is needed because callers treat a failure as a
+// non-fatal onboarding warning.
+func putCloudAPIJSON(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any) (int, []byte, error) {
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, fmt.Errorf("marshal cloud api request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return 0, nil, fmt.Errorf("create cloud api request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("put cloud api request: %w", err)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	closeErr := resp.Body.Close()
+	if err != nil {
+		return 0, nil, fmt.Errorf("read cloud api response: %w", err)
+	}
+	if closeErr != nil {
+		return 0, nil, fmt.Errorf("close cloud api response: %w", closeErr)
+	}
+	return resp.StatusCode, data, nil
 }
 
 func postCloudAPIJSONWithRetry(ctx context.Context, client *http.Client, endpoint string, bearerToken string, payload any) (int, []byte, error) {
