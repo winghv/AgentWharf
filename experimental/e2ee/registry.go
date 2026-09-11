@@ -26,6 +26,7 @@ func NewDeviceRegistry(ctx context.Context, db *sql.DB, machine, account string)
  CREATE TABLE IF NOT EXISTS e2ee_devices (
  machine TEXT NOT NULL, account TEXT NOT NULL, device TEXT NOT NULL,
  signing_key TEXT NOT NULL, wrapping_key TEXT NOT NULL,
+ trusted INTEGER NOT NULL DEFAULT 0 CHECK(trusted IN (0, 1)),
  PRIMARY KEY(machine,account,device));
  CREATE TABLE IF NOT EXISTS e2ee_pairing_receipts (
  machine TEXT NOT NULL, account TEXT NOT NULL, invitation TEXT NOT NULL,
@@ -33,6 +34,9 @@ func NewDeviceRegistry(ctx context.Context, db *sql.DB, machine, account string)
  expires_at INTEGER NOT NULL, PRIMARY KEY(machine,account,invitation));`)
 	if err != nil {
 		return nil, ErrJournal
+	}
+	if err := ensureDeviceTrustedColumn(ctx, db); err != nil {
+		return nil, err
 	}
 	return &DeviceRegistry{db, machine, account}, nil
 }
@@ -75,7 +79,7 @@ func (r *DeviceRegistry) Enroll(ctx context.Context, invitation *PairingInvitati
 			return ErrCapacity
 		}
 		// The cleanup write serializes enrollment before identity comparison.
-		_, err = tx.ExecContext(ctx, `INSERT INTO e2ee_devices(machine,account,device,signing_key,wrapping_key) VALUES(?,?,?,?,?) ON CONFLICT(machine,account,device) DO NOTHING`, r.machine, r.account, identity.Device, identity.SigningKey, identity.WrappingKey)
+		_, err = tx.ExecContext(ctx, `INSERT INTO e2ee_devices(machine,account,device,signing_key,wrapping_key,trusted) VALUES(?,?,?,?,?,0) ON CONFLICT(machine,account,device) DO NOTHING`, r.machine, r.account, identity.Device, identity.SigningKey, identity.WrappingKey)
 		if err != nil {
 			return ErrJournal
 		}

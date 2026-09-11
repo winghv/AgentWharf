@@ -50,7 +50,7 @@ func (r *DeviceRegistry) EnrollTrusted(ctx context.Context, identity PairingIden
 		return ErrJournal
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, "INSERT INTO e2ee_devices(machine,account,device,signing_key,wrapping_key) VALUES(?,?,?,?,?) ON CONFLICT(machine,account,device) DO NOTHING", r.machine, r.account, identity.Device, identity.SigningKey, identity.WrappingKey); err != nil {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO e2ee_devices(machine,account,device,signing_key,wrapping_key,trusted) VALUES(?,?,?,?,?,1) ON CONFLICT(machine,account,device) DO NOTHING", r.machine, r.account, identity.Device, identity.SigningKey, identity.WrappingKey); err != nil {
 		return ErrJournal
 	}
 	var count int
