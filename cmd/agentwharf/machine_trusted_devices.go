@@ -60,3 +60,34 @@ func reportTrustedDevicesWithRuntime(ctx context.Context, client *http.Client, c
 	defer runtime.database.Close()
 	return reportTrustedDevices(ctx, client, credential, runtime.registry)
 }
+
+// revokeTrustedTerminalsWithRuntime applies a trust-off transition: it removes
+// the account-terminal-trust devices, rotates every active session to a fresh
+// key, and publishes the reduced device list.
+func revokeTrustedTerminalsWithRuntime(ctx context.Context, client *http.Client, credential machineCredential) ([]string, error) {
+	account := machineLocalAccountBinding(credential)
+	if account == "" {
+		return nil, errors.New("local key binding unavailable")
+	}
+	directory, err := machineEndpointDirectory(credential, account)
+	if err != nil {
+		return nil, err
+	}
+	runtime, err := openMachineE2EERuntime(ctx, directory, credential.MachineID, account)
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.database.Close()
+	journal, err := e2ee.NewCommandJournal(ctx, runtime.database)
+	if err != nil {
+		return nil, err
+	}
+	revoked, err := runtime.vault.RevokeTrustedTerminals(ctx, journal, runtime.registry)
+	if err != nil {
+		return revoked, err
+	}
+	if reportErr := reportTrustedDevices(ctx, client, credential, runtime.registry); reportErr != nil {
+		return revoked, reportErr
+	}
+	return revoked, nil
+}

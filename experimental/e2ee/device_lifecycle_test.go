@@ -133,3 +133,79 @@ func mustPublic(t *testing.T, id LocalIdentity) PairingIdentity {
 	}
 	return public
 }
+
+// Turning account-terminal trust off must revoke the trust-enrolled devices and
+// advance active sessions to a fresh key so those devices lose future content.
+func TestRevokeTrustedTerminalsRotatesSessions(t *testing.T) {
+	ctx := context.Background()
+	journal, db := openJournal(t, filepath.Join(t.TempDir(), "endpoint.db"))
+	machine, _ := NewLocalIdentity()
+	vault, err := NewSessionKeyVault(ctx, db, machine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := NewCommandExecutor(journal, vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewDeviceRegistry(ctx, db, "machine", "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _ := NewLocalIdentity()
+	trusted, _ := NewLocalIdentity()
+	enrollOfferDevice(t, ctx, registry, owner)
+	if err := registry.EnrollTrusted(ctx, mustPublic(t, trusted)); err != nil {
+		t.Fatal(err)
+	}
+	init, err := SignSessionInitialization(SessionInitialization{Machine: "machine", Account: "account", Session: "session", KeyID: "key1", Device: owner.Device}, ed25519.NewKeyFromSeed(owner.SigningSeed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executor.InitializeSession(ctx, registry, init); err != nil {
+		t.Fatal(err)
+	}
+	epochBefore, keyBefore, err := journal.SessionState(ctx, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var grantsBefore int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM e2ee_local_grants WHERE session='session'").Scan(&grantsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if grantsBefore != 2 {
+		t.Fatalf("grants before = %d, want 2", grantsBefore)
+	}
+
+	revoked, err := vault.RevokeTrustedTerminals(ctx, journal, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(revoked) != 1 || revoked[0] != trusted.Device {
+		t.Fatalf("revoked = %v", revoked)
+	}
+	epochAfter, keyAfter, err := journal.SessionState(ctx, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epochAfter != epochBefore+1 || keyAfter == keyBefore {
+		t.Fatalf("rotation epoch %d->%d key %q->%q", epochBefore, epochAfter, keyBefore, keyAfter)
+	}
+	var trustedGrants int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM e2ee_local_grants WHERE session='session' AND device=?", trusted.Device).Scan(&trustedGrants); err != nil {
+		t.Fatal(err)
+	}
+	if trustedGrants != 0 {
+		t.Fatalf("revoked device still has %d grants", trustedGrants)
+	}
+	var ownerControl int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM e2ee_local_grants WHERE session='session' AND device=? AND control=1", owner.Device).Scan(&ownerControl); err != nil {
+		t.Fatal(err)
+	}
+	if ownerControl != 1 {
+		t.Fatal("owner control grant was lost during rotation")
+	}
+	if _, err := registry.Device(ctx, trusted.Device); err != ErrUnauthorized {
+		t.Fatalf("revoked device lookup = %v, want ErrUnauthorized", err)
+	}
+}

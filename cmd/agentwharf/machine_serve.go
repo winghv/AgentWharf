@@ -297,13 +297,26 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 
 	poll := time.NewTicker(cfg.PollInterval)
 	defer poll.Stop()
+	trustedKnown := false
+	trustedTerminals := false
 	for {
 		if err := pollSessionInitializations(ctx, client, credential); err != nil {
 			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted initialization poll unavailable")
 		}
-		trustedTerminals, trustErr := fetchTrustAccountTerminals(ctx, client, credential)
-		if trustErr != nil {
-			trustedTerminals = false
+		trustedNow, trustErr := fetchTrustAccountTerminals(ctx, client, credential)
+		if trustErr == nil {
+			// Turning trust off revokes the auto-enrolled terminals and rotates
+			// active session keys. An unreachable platform keeps the last known
+			// value instead of falsely reporting a transition.
+			if trustedKnown && trustedTerminals && !trustedNow {
+				if revoked, revokeErr := revokeTrustedTerminalsWithRuntime(ctx, client, credential); revokeErr != nil {
+					_, _ = fmt.Fprintln(stderr, "wharf machine serve: trusted terminal revocation unavailable")
+				} else if len(revoked) > 0 {
+					_, _ = fmt.Fprintf(stderr, "wharf machine serve: revoked %d trusted terminals and rotated session keys\n", len(revoked))
+				}
+			}
+			trustedKnown = true
+			trustedTerminals = trustedNow
 		}
 		if err := pollSessionKeyRequests(ctx, client, credential, trustedTerminals); err != nil {
 			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted key request poll unavailable")

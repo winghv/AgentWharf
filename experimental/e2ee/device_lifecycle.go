@@ -2,7 +2,10 @@ package e2ee
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"time"
 )
@@ -107,6 +110,144 @@ func (r *DeviceRegistry) RevokeTrusted(ctx context.Context) ([]string, error) {
 			return revoked, err
 		}
 		revoked = append(revoked, record.Identity.Device)
+	}
+	return revoked, nil
+}
+
+// SessionState returns a session's current epoch and key id.
+func (j *CommandJournal) SessionState(ctx context.Context, session string) (int64, string, error) {
+	if !identifier.MatchString(session) {
+		return 0, "", ErrInvalid
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var epoch int64
+	var keyID string
+	err := j.db.QueryRowContext(ctx, "SELECT epoch, key_id FROM e2ee_local_sessions WHERE session=?", session).Scan(&epoch, &keyID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", ErrUnauthorized
+	}
+	if err != nil {
+		return 0, "", ErrJournal
+	}
+	return epoch, keyID, nil
+}
+
+// ListSessions returns sessions that hold a current key state.
+func (j *CommandJournal) ListSessions(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	rows, err := j.db.QueryContext(ctx, "SELECT session FROM e2ee_local_sessions ORDER BY session")
+	if err != nil {
+		return nil, ErrJournal
+	}
+	defer rows.Close()
+	sessions := make([]string, 0, 16)
+	for rows.Next() {
+		var session string
+		if err := rows.Scan(&session); err != nil {
+			return nil, ErrJournal
+		}
+		sessions = append(sessions, session)
+	}
+	if rows.Err() != nil {
+		return nil, ErrJournal
+	}
+	return sessions, nil
+}
+
+func (j *CommandJournal) sessionGrants(ctx context.Context, session string) ([]DeviceGrant, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	rows, err := j.db.QueryContext(ctx, "SELECT device, verify_key, control FROM e2ee_local_grants WHERE session=? ORDER BY device", session)
+	if err != nil {
+		return nil, ErrJournal
+	}
+	defer rows.Close()
+	grants := make([]DeviceGrant, 0, 32)
+	for rows.Next() {
+		var device string
+		var verify []byte
+		var control int
+		if err := rows.Scan(&device, &verify, &control); err != nil {
+			return nil, ErrJournal
+		}
+		if len(verify) != ed25519.PublicKeySize {
+			continue
+		}
+		grants = append(grants, DeviceGrant{DeviceID: device, VerifyKey: ed25519.PublicKey(append([]byte(nil), verify...)), Control: control == 1})
+	}
+	if rows.Err() != nil {
+		return nil, ErrJournal
+	}
+	return grants, nil
+}
+
+// withMachineControlGrant keeps the machine's own identity as a control member
+// so a session stays locally readable when no terminal remains authorized.
+func (v *SessionKeyVault) withMachineControlGrant(grants []DeviceGrant) ([]DeviceGrant, error) {
+	key, err := decode(v.public.SigningKey, 32, 32)
+	if err != nil {
+		return nil, err
+	}
+	for i := range grants {
+		if grants[i].DeviceID == v.identity.Device {
+			grants[i].Control = true
+			return grants, nil
+		}
+	}
+	if len(grants) >= 32 {
+		return nil, ErrCapacity
+	}
+	return append(grants, DeviceGrant{DeviceID: v.identity.Device, VerifyKey: ed25519.PublicKey(key), Control: true}), nil
+}
+
+// RotateSessionAfterRevoke advances a session to a fresh key whose grants are
+// its current members plus the machine's own control grant. Callers must have
+// already removed the revoked devices' grants; the previous key is never reused.
+func (v *SessionKeyVault) RotateSessionAfterRevoke(ctx context.Context, journal *CommandJournal, session string) (string, error) {
+	epoch, _, err := journal.SessionState(ctx, session)
+	if err != nil {
+		return "", err
+	}
+	grants, err := journal.sessionGrants(ctx, session)
+	if err != nil {
+		return "", err
+	}
+	grants, err = v.withMachineControlGrant(grants)
+	if err != nil {
+		return "", err
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", ErrJournal
+	}
+	newKeyID := hex.EncodeToString(raw)
+	if err := v.TransitionSession(ctx, journal, session, newKeyID, epoch, grants); err != nil {
+		return "", err
+	}
+	return newKeyID, nil
+}
+
+// RevokeTrustedTerminals removes the devices account-terminal trust enrolled and
+// rotates every active session so they cannot read future content. It returns
+// the revoked device IDs.
+func (v *SessionKeyVault) RevokeTrustedTerminals(ctx context.Context, journal *CommandJournal, registry *DeviceRegistry) ([]string, error) {
+	revoked, err := registry.RevokeTrusted(ctx)
+	if err != nil {
+		return revoked, err
+	}
+	if len(revoked) == 0 {
+		return revoked, nil
+	}
+	sessions, err := journal.ListSessions(ctx)
+	if err != nil {
+		return revoked, err
+	}
+	for _, session := range sessions {
+		if _, err := v.RotateSessionAfterRevoke(ctx, journal, session); err != nil {
+			return revoked, err
+		}
 	}
 	return revoked, nil
 }
