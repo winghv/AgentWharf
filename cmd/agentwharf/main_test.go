@@ -4152,10 +4152,10 @@ func TestProviderChildEnvironmentFileLoadsProfileModelMappings(t *testing.T) {
 }
 
 func TestPairCommandArgumentHandling(t *testing.T) {
-	if err := runPairCommand(context.Background(), []string{"https://a.example/v1", "extra"}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: wharf pair") {
+	if err := runPairCommandWithInput(context.Background(), []string{"https://a.example/v1", "extra"}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: wharf pair") {
 		t.Fatalf("runPairCommand with two args = %v, want usage error", err)
 	}
-	if err := runPairCommand(context.Background(), []string{"  "}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: wharf pair") {
+	if err := runPairCommandWithInput(context.Background(), []string{"  "}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "usage: wharf pair") {
 		t.Fatalf("runPairCommand with blank url = %v, want usage error", err)
 	}
 }

@@ -89,7 +89,7 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 		// Bare 'wharf' is the onboarding default: pair this machine with the
 		// default hub. runPairOnly reuses an existing same-hub credential, so
 		// re-running it is a safe "make sure I am paired" command.
-		return runPairCommand(ctx, nil, stdout, stderr)
+		return runPairCommandWithInput(ctx, nil, stdin, stdout, stderr)
 	}
 
 	switch args[0] {
@@ -102,7 +102,7 @@ func runWithInput(ctx context.Context, args []string, stdin io.Reader, stdout io
 	case "upgrade":
 		return runUpgradeCommand(ctx, args[1:], stdin, stdout, stderr)
 	case "pair":
-		return runPairCommand(ctx, args[1:], stdout, stderr)
+		return runPairCommandWithInput(ctx, args[1:], stdin, stdout, stderr)
 	case "serve":
 		return runServeCommand(ctx, args[1:], stdout, stderr)
 	case "hub":
@@ -472,13 +472,16 @@ type wrapConfig struct {
 	e2eeRuntime             *machineE2EERuntime
 	StartupSmoke            bool
 	PairOnly                bool
-	Session                 bool
-	WorkingDirectory        string
-	LaunchSettings          wrapLaunchSettings
-	Stderr                  io.Writer
-	Stdin                   io.Reader
-	Interactive             bool
-	ForceHeadless           bool
+	// TrustScope is the account-terminal trust choice made at pairing:
+	// "account" (default) or "machine" (pair terminals individually).
+	TrustScope       string
+	Session          bool
+	WorkingDirectory string
+	LaunchSettings   wrapLaunchSettings
+	Stderr           io.Writer
+	Stdin            io.Reader
+	Interactive      bool
+	ForceHeadless    bool
 	// ProviderSessionID enables ACP session/load during machine recovery.
 	// OnProviderSession receives the opaque provider id after a successful
 	// session/new or session/load and must only persist it locally.
@@ -1298,7 +1301,7 @@ func pairMachineCredential(ctx context.Context, client *http.Client, cfg wrapCon
 	if err := saveMachineCredential(credential); err != nil {
 		return machineCredential{}, err
 	}
-	hydrateMachineOnboarding(ctx, client, &credential, output)
+	hydrateMachineOnboarding(ctx, client, &credential, cfg.TrustScope != trustScopeMachine, output)
 	return credential, nil
 }
 
@@ -1331,7 +1334,7 @@ func reuseMachineCredential(ctx context.Context, client *http.Client, credential
 // enabled only here, while the pairing is being created: an owner who later
 // turns it off in the Console is not overridden by a repeat of wharf pair.
 // Failures are reported but do not discard a usable credential.
-func hydrateMachineOnboarding(ctx context.Context, client *http.Client, credential *machineCredential, output io.Writer) {
+func hydrateMachineOnboarding(ctx context.Context, client *http.Client, credential *machineCredential, enableTrust bool, output io.Writer) {
 	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machines/"+url.PathEscape(credential.MachineID)+"/trusted-terminals/endpoint")
 	if err != nil {
 		return
@@ -1362,12 +1365,12 @@ func hydrateMachineOnboarding(ctx context.Context, client *http.Client, credenti
 			warn("wharf pair: could not persist the local account binding")
 		}
 	}
-	if current.Data.Enabled {
+	if current.Data.Enabled == enableTrust {
 		return
 	}
-	status, _, err = putCloudAPIJSON(ctx, client, endpoint, credential.MachineToken, map[string]any{"enabled": true})
+	status, _, err = putCloudAPIJSON(ctx, client, endpoint, credential.MachineToken, map[string]any{"enabled": enableTrust})
 	if err != nil || (status != http.StatusOK && status != http.StatusNoContent) {
-		warn("wharf pair: could not enable account-terminal trust; enable it from the Console Machines page if this browser cannot read sessions")
+		warn("wharf pair: could not update account-terminal trust; change it from the Console Machines page")
 	}
 }
 
@@ -1398,27 +1401,82 @@ func applyMachineSession(cfg wrapConfig, session machineSessionResponse) (wrapCo
 // user-facing onboarding flow: pair once here, then manage everything from the
 // Console while wharf serve keeps the machine online.
 func runPairCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return runPairCommandWithInput(ctx, args, os.Stdin, stdout, stderr)
+}
+
+func runPairCommandWithInput(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) > 0 && args[0] == "--enroll" {
 		return runMachineEnrollment(ctx, args[1:])
 	}
-	if len(args) > 1 {
-		return errors.New("usage: wharf pair [cloud-api-url]")
+	trustScope := ""
+	cloudURL := ""
+	for index := 0; index < len(args); index++ {
+		switch arg := args[index]; {
+		case arg == "--trust-scope":
+			if index+1 >= len(args) {
+				return errors.New(pairUsage)
+			}
+			index++
+			trustScope = strings.TrimSpace(args[index])
+		case strings.HasPrefix(arg, "--trust-scope="):
+			trustScope = strings.TrimSpace(strings.TrimPrefix(arg, "--trust-scope="))
+		default:
+			value := strings.TrimSpace(arg)
+			if cloudURL != "" || value == "" {
+				return errors.New(pairUsage)
+			}
+			cloudURL = value
+		}
+	}
+	if trustScope != "" && trustScope != trustScopeAccount && trustScope != trustScopeMachine {
+		return errors.New(pairUsage)
+	}
+	if trustScope == "" {
+		trustScope = promptTrustScope(stdin, stdout)
 	}
 	cfg := wrapConfig{
-		Agent:   "claude",
-		Format:  "acp",
-		Pair:    true,
-		Managed: true,
+		Agent:      "claude",
+		Format:     "acp",
+		Pair:       true,
+		Managed:    true,
+		TrustScope: trustScope,
 	}
 	cfg.CloudAPIURL = envOrDefault("AGENTWHARF_CLOUD_API_URL", envOrDefault("AGENTWHARF_CONTROL_PLANE_URL", defaultManagedCloudAPIURL))
-	if len(args) == 1 {
-		cloudURL := strings.TrimSpace(args[0])
-		if cloudURL == "" {
-			return errors.New("usage: wharf pair [cloud-api-url]")
-		}
+	if cloudURL != "" {
 		cfg.CloudAPIURL = cloudURL
 	}
 	return runPairOnly(ctx, cfg, stdout, stderr)
+}
+
+const (
+	pairUsage         = "usage: wharf pair [--trust-scope account|machine] [cloud-api-url]"
+	trustScopeAccount = "account"
+	trustScopeMachine = "machine"
+)
+
+// promptTrustScope asks the one onboarding question on a real terminal and
+// defaults to account-wide trust. A piped or non-terminal run keeps the default
+// so automation never blocks.
+func promptTrustScope(stdin io.Reader, stdout io.Writer) string {
+	file, ok := stdin.(*os.File)
+	if !ok {
+		return trustScopeAccount
+	}
+	info, err := file.Stat()
+	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return trustScopeAccount
+	}
+	_, _ = fmt.Fprintln(stdout, "Terminals signed into this account can read this machine's future sessions when trust is on.")
+	_, _ = fmt.Fprintln(stdout, "  [1] Trust all terminals on this account (default)")
+	_, _ = fmt.Fprintln(stdout, "  [2] Only terminals paired individually with this machine")
+	_, _ = fmt.Fprint(stdout, "Trust scope [1]: ")
+	line, _ := bufio.NewReader(io.LimitReader(stdin, 64)).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "2", "machine", "only":
+		return trustScopeMachine
+	default:
+		return trustScopeAccount
+	}
 }
 
 func runPairOnly(ctx context.Context, cfg wrapConfig, stdout, stderr io.Writer) error {
