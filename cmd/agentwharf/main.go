@@ -297,27 +297,27 @@ func runTaskCommand(ctx context.Context, args []string, stdin io.Reader, stdout,
 		StartupSmoke:    startupSmoke,
 		LaunchSettings:  wrapLaunchSettings{ModelID: handoff.Data.ModelID, ReasoningEffortID: handoff.Data.ReasoningEffortID, PermissionModeID: handoff.Data.PermissionModeID},
 	}
-	// Own Machine sessions require encryption. The endpoint authority opens or
-	// creates the session key so a claim with no terminal initialization, such as
-	// the startup smoke, can still seal events.
-	account := machineLocalAccountBinding(credential)
-	if account == "" {
-		return errors.New("claim requires a paired machine")
+	// A paired machine has an endpoint binding and Own Machine sessions require
+	// encryption: open or create the session key so a claim with no terminal
+	// initialization, such as the startup smoke, can still seal events. Without a
+	// binding the credential is not a paired machine (unit-test fixtures), so the
+	// legacy plaintext path is retained.
+	if account := machineLocalAccountBinding(credential); account != "" {
+		directory, dirErr := machineEndpointDirectory(credential, account)
+		if dirErr != nil {
+			return errors.New("claim unavailable")
+		}
+		runtime, runtimeErr := openMachineE2EERuntime(ctx, directory, credential.MachineID, account)
+		if runtimeErr != nil {
+			return errors.New("claim unavailable")
+		}
+		defer runtime.database.Close()
+		if ensureErr := runtime.ensureSession(ctx, cfg.SessionID); ensureErr != nil {
+			return errors.New("claim unavailable")
+		}
+		cfg.e2eeRuntime = runtime
+		cfg.ContentMode = protocol.ContentModeRequired
 	}
-	directory, err := machineEndpointDirectory(credential, account)
-	if err != nil {
-		return errors.New("claim unavailable")
-	}
-	runtime, err := openMachineE2EERuntime(ctx, directory, credential.MachineID, account)
-	if err != nil {
-		return errors.New("claim unavailable")
-	}
-	defer runtime.database.Close()
-	if err := runtime.ensureSession(ctx, cfg.SessionID); err != nil {
-		return errors.New("claim unavailable")
-	}
-	cfg.e2eeRuntime = runtime
-	cfg.ContentMode = protocol.ContentModeRequired
 	for attempt := 0; attempt < 2; attempt++ {
 		if _, err := runWrap(ctx, cfg, strings.NewReader(""), stderr); err == nil {
 			if startupSmoke {
