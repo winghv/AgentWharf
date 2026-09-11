@@ -1487,7 +1487,7 @@ func promptTrustScope(stdin io.Reader, stdout io.Writer) string {
 	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
 		return trustScopeAccount
 	}
-	_, _ = fmt.Fprintln(stdout, "Terminals signed into this account can read this machine's future sessions when trust is on.")
+	_, _ = fmt.Fprintln(stdout, "Terminals signed into this account can read and control this machine's future sessions when trust is on.")
 	_, _ = fmt.Fprintln(stdout, "  [1] Trust all terminals on this account (default)")
 	_, _ = fmt.Fprintln(stdout, "  [2] Only terminals paired individually with this machine")
 	_, _ = fmt.Fprint(stdout, "Trust scope [1]: ")
