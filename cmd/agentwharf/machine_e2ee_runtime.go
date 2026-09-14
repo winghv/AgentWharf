@@ -179,6 +179,9 @@ func openMachineE2EERuntime(ctx context.Context, directory, machine, account str
 	if _, err := database.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS e2ee_local_launches(session TEXT PRIMARY KEY CHECK(length(session) BETWEEN 1 AND 128),provider TEXT NOT NULL CHECK(length(provider) BETWEEN 1 AND 128),carrier TEXT NOT NULL CHECK(length(CAST(carrier AS BLOB)) BETWEEN 1 AND 32768))`); err != nil {
 		return nil, errors.New("initialize local launch storage failed")
 	}
+	if _, err := database.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS e2ee_local_launch_recoveries(session TEXT PRIMARY KEY CHECK(length(session) BETWEEN 1 AND 128),provider TEXT NOT NULL CHECK(length(provider) BETWEEN 1 AND 128),settings TEXT NOT NULL CHECK(length(settings) BETWEEN 1 AND 8192))`); err != nil {
+		return nil, errors.New("initialize local launch recovery storage failed")
+	}
 	registry, err := e2ee.NewDeviceRegistry(ctx, database, machine, account)
 	if err != nil {
 		return nil, err

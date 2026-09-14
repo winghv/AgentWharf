@@ -77,7 +77,7 @@ func TestMachineRuntimeDeliveryIsLocallyClaimedAndNotReplayed(t *testing.T) {
 	command := &protocol.Command{SessionID: "session", CommandID: "cmd", Type: protocol.CommandSessionSend, Payload: wire}
 	handoff := machineServeDispatch{SessionID: "session", EncryptedFirstInstruction: string(wire)}
 	var launchCfg wrapConfig
-	if err := applyEncryptedLaunchConfiguration(ctx, runtime, handoff, &launchCfg); err != nil {
+	if _, err := applyEncryptedLaunchConfiguration(ctx, runtime, handoff, &launchCfg); err != nil {
 		t.Fatal(err)
 	}
 	if launchCfg.WorkingDirectory != "/synthetic/private" || launchCfg.LaunchSettings.ModelID != "reasoning" || launchCfg.LaunchSettings.PermissionModeID != "ask" {

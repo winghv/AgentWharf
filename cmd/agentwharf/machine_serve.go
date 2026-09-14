@@ -539,23 +539,14 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 			_, _ = fmt.Fprintf(stderr, "wharf machine serve: encrypted session initialization failed: %v\n", err)
 			return err
 		}
-		launchHandoff := *handoff
-		if launchHandoff.EncryptedFirstInstruction == "" {
-			provider, wire, err := endpointRuntime.loadLaunch(ctx, handoff.SessionID)
-			if err != nil || provider != handoff.Provider {
-				return errors.New("local signed launch required for recovery")
-			}
-			launchHandoff.EncryptedFirstInstruction = wire
+		launchHandoff, resolveErr := resolveEncryptedLaunch(ctx, endpointRuntime, *handoff, &adapterCfg, stderr)
+		if resolveErr != nil {
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: launch configuration for %s unavailable: %v\n", handoff.SessionID, resolveErr)
+			return resolveErr
 		}
 		{
 			commandID, err := decodeEncryptedLaunchCarrier(launchHandoff.EncryptedFirstInstruction)
 			if err != nil {
-				return err
-			}
-			if err := applyEncryptedLaunchConfiguration(ctx, endpointRuntime, launchHandoff, &adapterCfg); err != nil {
-				return err
-			}
-			if err := endpointRuntime.retainLaunch(ctx, launchHandoff.SessionID, launchHandoff.Provider, launchHandoff.EncryptedFirstInstruction); err != nil {
 				return err
 			}
 			launchSession, launchWire := launchHandoff.SessionID, []byte(launchHandoff.EncryptedFirstInstruction)
@@ -566,6 +557,7 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 				return endpointRuntime.executor.VerifyWire(startCtx, launchSession, commandID, "session.send", launchWire)
 			}
 			if err := adapterCfg.verifyLocalProcessStart(ctx); err != nil {
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: process-start authorization for %s rejected\n", handoff.SessionID)
 				return errors.New("encrypted launch signature or local grant rejected")
 			}
 		}
