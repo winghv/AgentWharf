@@ -947,6 +947,54 @@ func TestManagedWrapRequiresExplicitPairing(t *testing.T) {
 	}
 }
 
+func TestAttachMachineE2EESessionUsesStoredEndpointBinding(t *testing.T) {
+	t.Setenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING", "")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(t.TempDir(), "machine.json"))
+	if err := saveMachineCredential(machineCredential{
+		MachineID:           "machine_bind",
+		MachineToken:        "machine-token",
+		CloudAPIURL:         "https://cloud.superwhv.example/v1",
+		LocalAccountBinding: "org/owner",
+	}); err != nil {
+		t.Fatalf("saveMachineCredential() error = %v", err)
+	}
+
+	cfg := wrapConfig{SessionID: "ses_attached", ProtocolVersion: protocol.ProtocolVersionV2}
+	cleanup, err := attachMachineE2EESession(context.Background(), &cfg)
+	if err != nil {
+		t.Fatalf("attachMachineE2EESession() error = %v", err)
+	}
+	defer cleanup()
+	if cfg.ContentMode != protocol.ContentModeRequired || cfg.e2eeRuntime == nil {
+		t.Fatalf("attached cfg = mode %q runtime %v", cfg.ContentMode, cfg.e2eeRuntime != nil)
+	}
+	if err := cfg.e2eeRuntime.requireSession(context.Background(), "ses_attached"); err != nil {
+		t.Fatalf("requireSession() error = %v", err)
+	}
+}
+
+func TestAttachMachineE2EESessionSkipsLegacyCredential(t *testing.T) {
+	t.Setenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING", "")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(t.TempDir(), "machine.json"))
+	if err := saveMachineCredential(machineCredential{
+		MachineID:    "machine_legacy",
+		MachineToken: "machine-token",
+		CloudAPIURL:  "https://cloud.superwhv.example/v1",
+	}); err != nil {
+		t.Fatalf("saveMachineCredential() error = %v", err)
+	}
+
+	cfg := wrapConfig{SessionID: "ses_legacy"}
+	cleanup, err := attachMachineE2EESession(context.Background(), &cfg)
+	if err != nil {
+		t.Fatalf("attachMachineE2EESession() error = %v", err)
+	}
+	cleanup()
+	if cfg.ContentMode != "" || cfg.e2eeRuntime != nil {
+		t.Fatalf("legacy cfg = mode %q runtime %v", cfg.ContentMode, cfg.e2eeRuntime != nil)
+	}
+}
+
 func TestPairMachineCredentialRetriesTransientCreateFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

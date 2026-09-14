@@ -1086,6 +1086,15 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		if err != nil {
 			return cfg, err
 		}
+		// The platform now requires end-to-end encryption for Own Machine
+		// Sessions. A Session this process created through the machine API must
+		// therefore open the endpoint key store before the adapter hello, exactly
+		// as an auto-claimed Session does in the daemon.
+		cleanup, attachErr := attachMachineE2EESession(ctx, &cfg)
+		if attachErr != nil {
+			return cfg, attachErr
+		}
+		defer cleanup()
 		// Keep the machine task consumer alive while an interactive TUI is
 		// running. Starting it only after runWrap returns leaves Console-created
 		// auto claims in `starting` until the local CLI exits.
@@ -1099,6 +1108,11 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		if err != nil {
 			return cfg, err
 		}
+		cleanup, attachErr := attachMachineE2EESession(ctx, &cfg)
+		if attachErr != nil {
+			return cfg, attachErr
+		}
+		defer cleanup()
 	}
 
 	if cfg.ContentMode == protocol.ContentModeRequired {
@@ -1415,6 +1429,40 @@ func applyMachineSession(cfg wrapConfig, session machineSessionResponse) (wrapCo
 	cfg.HubURL = session.Data.HubWSURL
 	cfg.AdapterToken = session.Data.AdapterToken
 	return cfg, nil
+}
+
+// attachMachineE2EESession opens the local endpoint key store for a Session this
+// process created through the machine API and marks the adapter connection
+// encrypted. Own Machine Sessions are zero-knowledge at the platform, so without
+// a local key the Hub rejects the adapter hello instead of accepting plaintext.
+// A credential without an endpoint binding predates encrypted Own Machine
+// Sessions, so it keeps the legacy path used by local fixtures; the returned
+// cleanup closes the store, which runWrap owns until the Provider exits.
+func attachMachineE2EESession(ctx context.Context, cfg *wrapConfig) (func(), error) {
+	noop := func() {}
+	credential, err := loadMachineCredential()
+	if err != nil {
+		return noop, err
+	}
+	account := machineLocalAccountBinding(credential)
+	if account == "" {
+		return noop, nil
+	}
+	directory, err := machineEndpointDirectory(credential, account)
+	if err != nil {
+		return noop, err
+	}
+	runtime, err := openMachineE2EERuntime(ctx, directory, credential.MachineID, account)
+	if err != nil {
+		return noop, err
+	}
+	if err := runtime.ensureSession(ctx, cfg.SessionID); err != nil {
+		_ = runtime.database.Close()
+		return noop, err
+	}
+	cfg.e2eeRuntime = runtime
+	cfg.ContentMode = protocol.ContentModeRequired
+	return func() { _ = runtime.database.Close() }, nil
 }
 
 // runPairOnly pairs the machine (or reuses an existing pairing), prints a
