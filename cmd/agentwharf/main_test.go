@@ -3801,7 +3801,21 @@ func TestMain(m *testing.M) {
 		_ = os.Remove(keyPath)
 		os.Exit(1)
 	}
+	// Tests that exercise the machine credential store must never write the
+	// operator's real ~/.agentwharf/machine.json. Seed an isolated path; a test
+	// that needs its own directory overrides it with t.Setenv.
+	credentialDir, err := os.MkdirTemp("", "agentwharf-test-credential-*")
+	if err != nil {
+		_ = os.Remove(keyPath)
+		os.Exit(1)
+	}
+	if os.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(credentialDir, "machine.json")) != nil {
+		_ = os.RemoveAll(credentialDir)
+		_ = os.Remove(keyPath)
+		os.Exit(1)
+	}
 	code := m.Run()
+	_ = os.RemoveAll(credentialDir)
 	_ = os.Remove(keyPath)
 	os.Exit(code)
 }
