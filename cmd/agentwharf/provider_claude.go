@@ -69,7 +69,7 @@ func (claudeProvider) translateLine(sessionID string, line []byte) ([]protocol.E
 	if message == nil {
 		return nil, nil
 	}
-	role := stringFieldFromAny(message["role"])
+	role := canonicalTranscriptRole(stringFieldFromAny(message["role"]))
 	content := message["content"]
 
 	events := make([]protocol.Event, 0, 4)
@@ -180,6 +180,17 @@ func (claudeProvider) launchSettings(args []string) launchSettings {
 		}
 	}
 	return settings
+}
+
+// canonicalTranscriptRole maps a Provider transcript role to the Hub's
+// session.message role vocabulary. The encrypted public projection accepts only
+// user, agent, and system, and the Provider CLI calls its own replies
+// "assistant".
+func canonicalTranscriptRole(role string) string {
+	if role == "assistant" {
+		return "agent"
+	}
+	return role
 }
 
 // transcriptUserText returns the plain-text body of a Claude user entry.
