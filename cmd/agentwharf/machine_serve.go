@@ -249,7 +249,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 
 	// Recover locally authorized session initialization before starting any
 	// persisted handoff. Relay failure never supplies fallback key authority.
-	if err := pollSessionInitializations(ctx, client, credential); err != nil {
+	if err := pollSessionInitializations(ctx, client, credential, false); err != nil {
 		_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted initialization poll unavailable")
 	}
 	if err := reportTrustedDevicesWithRuntime(ctx, client, credential); err != nil {
@@ -300,7 +300,9 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	trustedKnown := false
 	trustedTerminals := false
 	for {
-		if err := pollSessionInitializations(ctx, client, credential); err != nil {
+		// Use the last known trust value so initialization polling stays ahead of
+		// every other machine request; this iteration refreshes it below.
+		if err := pollSessionInitializations(ctx, client, credential, trustedTerminals); err != nil {
 			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted initialization poll unavailable")
 		}
 		trustedNow, trustErr := fetchTrustAccountTerminals(ctx, client, credential)

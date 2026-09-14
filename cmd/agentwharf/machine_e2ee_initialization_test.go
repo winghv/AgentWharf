@@ -96,7 +96,7 @@ func TestMachineRuntimeSignedInitializationIngress(t *testing.T) {
 		w.WriteHeader(204)
 	}))
 	defer server.Close()
-	if err := deliverSessionInitialization(ctx, server.Client(), machineCredential{CloudAPIURL: server.URL, MachineID: "machine", MachineToken: "test"}, runtime, "session", client.Device); err != nil {
+	if err := deliverSessionInitialization(ctx, server.Client(), machineCredential{CloudAPIURL: server.URL, MachineID: "machine", MachineToken: "test"}, runtime, "session", client.Device, false); err != nil {
 		t.Fatal(err)
 	}
 	if posts != 2 {
@@ -106,7 +106,7 @@ func TestMachineRuntimeSignedInitializationIngress(t *testing.T) {
 	// upload is allowed even though the machine bearer is accepted by HTTP.
 	t.Setenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING", "account")
 	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(t.TempDir(), "machine.json"))
-	if err := pollSessionInitializations(ctx, server.Client(), machineCredential{CloudAPIURL: server.URL, MachineID: "machine", MachineToken: "test"}); err == nil {
+	if err := pollSessionInitializations(ctx, server.Client(), machineCredential{CloudAPIURL: server.URL, MachineID: "machine", MachineToken: "test"}, false); err == nil {
 		t.Fatal("unpaired discovery initialized session")
 	}
 	if posts != 2 {
@@ -136,7 +136,7 @@ func TestMachineRuntimeSignedInitializationIngress(t *testing.T) {
 		t.Fatal(err)
 	}
 	posts = 0
-	if err := pollSessionInitializations(ctx, server.Client(), credential); err != nil {
+	if err := pollSessionInitializations(ctx, server.Client(), credential, true); err != nil {
 		t.Fatal(err)
 	}
 	if posts != 2 {
@@ -185,7 +185,7 @@ func TestMachineRuntimeSignedInitializationIngress(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"request": string(requestBytes), "expires_at": time.Now().Add(time.Minute), "state": "completed"}})
 		}))
-		err = deliverSessionInitialization(ctx, completedServer.Client(), machineCredential{CloudAPIURL: completedServer.URL, MachineID: "machine", MachineToken: "test"}, runtime, "session", client.Device)
+		err = deliverSessionInitialization(ctx, completedServer.Client(), machineCredential{CloudAPIURL: completedServer.URL, MachineID: "machine", MachineToken: "test"}, runtime, "session", client.Device, false)
 		completedServer.Close()
 		if scenario != "valid" && err == nil {
 			t.Fatal("completed relay flag bypassed signature authentication")

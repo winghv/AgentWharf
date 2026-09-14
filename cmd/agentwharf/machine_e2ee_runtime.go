@@ -52,6 +52,24 @@ func (r *machineE2EERuntime) initializeSession(ctx context.Context, session stri
 	return wrapped, nil
 }
 
+// initializeSessionTrusted is the v2 trusted ingress for a terminal that never
+// consumed a local machine offer. The executor, not relay metadata, decides
+// whether account-terminal trust enrolls the device.
+func (r *machineE2EERuntime) initializeSessionTrusted(ctx context.Context, session string, data []byte, trusted, control bool) (e2ee.WrappedKey, error) {
+	if r == nil || r.executor == nil || r.registry == nil {
+		return e2ee.WrappedKey{}, errors.New("encrypted initialization unavailable")
+	}
+	request, err := e2ee.DecodeTrustedSessionKeyRequest(data)
+	if err != nil || request.Session != session {
+		return e2ee.WrappedKey{}, errors.New("invalid encrypted initialization")
+	}
+	wrapped, err := r.executor.InitializeSessionTrusted(ctx, r.registry, request, trusted, control)
+	if err != nil {
+		return e2ee.WrappedKey{}, errors.New("encrypted initialization rejected")
+	}
+	return wrapped, nil
+}
+
 // requireSession verifies local provisioning before a Provider process starts.
 // This does not authorize commands; ExecuteWire still authenticates each one.
 func (r *machineE2EERuntime) requireSession(ctx context.Context, session string) error {

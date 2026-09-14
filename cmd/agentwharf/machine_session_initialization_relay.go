@@ -5,13 +5,15 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/winghv/agentwharf/experimental/e2ee"
 	"github.com/winghv/agentwharf/protocol"
 )
 
-func pollSessionInitializations(ctx context.Context, client *http.Client, credential machineCredential) error {
+func pollSessionInitializations(ctx context.Context, client *http.Client, credential machineCredential, trusted bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	account := machineLocalAccountBinding(credential)
@@ -52,7 +54,7 @@ func pollSessionInitializations(ctx context.Context, client *http.Client, creden
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := deliverSessionInitialization(ctx, client, credential, runtime, item.Session, item.Device); err != nil {
+		if err := deliverSessionInitialization(ctx, client, credential, runtime, item.Session, item.Device, trusted); err != nil {
 			failure = errors.New("one or more initialization requests failed")
 		}
 	}
@@ -61,7 +63,7 @@ func pollSessionInitializations(ctx context.Context, client *http.Client, creden
 
 // deliverSessionInitialization never treats machine bearer authentication as
 // permission to initialize a session. The local runtime verifies paired trust.
-func deliverSessionInitialization(ctx context.Context, client *http.Client, credential machineCredential, runtime *machineE2EERuntime, session, device string) error {
+func deliverSessionInitialization(ctx context.Context, client *http.Client, credential machineCredential, runtime *machineE2EERuntime, session, device string, trusted bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machines/"+url.PathEscape(credential.MachineID)+"/e2ee-sessions/"+url.PathEscape(session)+"/"+url.PathEscape(device)+"/endpoint")
@@ -82,33 +84,57 @@ func deliverSessionInitialization(ctx context.Context, client *http.Client, cred
 	if decodeCloudAPIJSON(body, &response) != nil || !response.Data.ExpiresAt.After(time.Now()) || response.Data.ExpiresAt.After(time.Now().Add(5*time.Minute)) {
 		return errors.New("invalid initialization response")
 	}
-	request, err := protocol.DecodeSessionInitialization([]byte(response.Data.Request), credential.MachineID, session)
-	if err != nil || request.Device != device {
-		return errors.New("initialization routing mismatch")
-	}
-	ctx, expire := context.WithDeadline(ctx, response.Data.ExpiresAt)
-	defer expire()
+	control := strings.TrimSpace(os.Getenv("AGENTWHARF_TRUST_ACCOUNT_TERMINALS_VIEW_ONLY")) != "1"
+	completed := response.Data.State == "completed"
 	// Completed rows need no new response; never re-seal after response loss.
 	// Require the local session, rather than trusting completion from the relay.
-	if response.Data.State == "completed" {
-		if runtime == nil || runtime.registry == nil {
-			return errors.New("initialization runtime unavailable")
+	var wrapped e2ee.WrappedKey
+	if request, legacyErr := protocol.DecodeSessionInitialization([]byte(response.Data.Request), credential.MachineID, session); legacyErr == nil && request.Device == device {
+		ctx, expire := context.WithDeadline(ctx, response.Data.ExpiresAt)
+		defer expire()
+		if completed {
+			if runtime == nil || runtime.registry == nil {
+				return errors.New("initialization runtime unavailable")
+			}
+			signed, err := e2ee.DecodeSessionInitialization([]byte(response.Data.Request))
+			if err != nil {
+				return errors.New("invalid completed initialization")
+			}
+			if err := runtime.executor.VerifyInitializedSession(ctx, runtime.registry, signed); err != nil {
+				return errors.New("completed initialization signature rejected")
+			}
+			return runtime.requireSession(ctx, session)
 		}
-		signed, err := e2ee.DecodeSessionInitialization([]byte(response.Data.Request))
+		if response.Data.State != "pending" {
+			return errors.New("invalid initialization state")
+		}
+		wrapped, err = runtime.initializeSession(ctx, session, []byte(response.Data.Request))
 		if err != nil {
-			return errors.New("invalid completed initialization")
+			return err
 		}
-		if err := runtime.executor.VerifyInitializedSession(ctx, runtime.registry, signed); err != nil {
-			return errors.New("completed initialization signature rejected")
+	} else if v2, trustedErr := e2ee.DecodeTrustedSessionKeyRequest([]byte(response.Data.Request)); trustedErr == nil && v2.Machine == credential.MachineID && v2.Session == session && v2.Device == device {
+		// A terminal without a local machine offer creates the task through the v2
+		// account-terminal-trust initialization.
+		ctx, expire := context.WithDeadline(ctx, response.Data.ExpiresAt)
+		defer expire()
+		if completed {
+			if runtime == nil || runtime.registry == nil {
+				return errors.New("initialization runtime unavailable")
+			}
+			if err := runtime.executor.VerifyInitializedSessionTrusted(ctx, runtime.registry, v2); err != nil {
+				return errors.New("completed initialization signature rejected")
+			}
+			return runtime.requireSession(ctx, session)
 		}
-		return runtime.requireSession(ctx, session)
-	}
-	if response.Data.State != "pending" {
-		return errors.New("invalid initialization state")
-	}
-	wrapped, err := runtime.initializeSession(ctx, session, []byte(response.Data.Request))
-	if err != nil {
-		return err
+		if response.Data.State != "pending" {
+			return errors.New("invalid initialization state")
+		}
+		wrapped, err = runtime.initializeSessionTrusted(ctx, session, []byte(response.Data.Request), trusted, control)
+		if err != nil {
+			return err
+		}
+	} else {
+		return errors.New("initialization routing mismatch")
 	}
 	// The creating terminal also receives the endpoint-signed session directory
 	// so it can verify commands another terminal later authors in this session.
