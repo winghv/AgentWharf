@@ -995,6 +995,88 @@ func TestAttachMachineE2EESessionSkipsLegacyCredential(t *testing.T) {
 	}
 }
 
+func TestManagedWrapSendsEncryptedAdapterHello(t *testing.T) {
+	t.Setenv("AGENTWHARF_LOCAL_ACCOUNT_BINDING", "")
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(t.TempDir(), "machine.json"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	hellos := make(chan protocol.Hello, 1)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/machine-sessions":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"data":{"session":{"id":"ses_enc","host_type":"machine","provider":"claude-code","status":"starting"},"hub_ws_url":%q,"adapter_token":"adapter-token","expires_at":"2030-01-01T00:00:00Z"}}`, "ws"+strings.TrimPrefix(server.URL, "http")+"/hub")
+		case "/hub":
+			conn, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				t.Errorf("accept adapter socket: %v", err)
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "")
+			frame, err := readCLIProtocolFrame(ctx, conn)
+			if err != nil {
+				t.Errorf("read adapter hello: %v", err)
+				return
+			}
+			hello, ok := frame.(*protocol.Hello)
+			if !ok {
+				t.Errorf("first adapter frame = %T", frame)
+				return
+			}
+			hellos <- *hello
+			_ = writeCLIProtocolFrame(ctx, conn, &protocol.HelloAck{
+				ContentMode:     protocol.ContentModeRequired,
+				ProtocolVersion: protocol.ProtocolVersionV2,
+				Sessions:        []protocol.SessionSummary{{SessionID: "ses_enc", State: "ready", Provider: "claude-code"}},
+				ConnectionAuthority: &protocol.ConnectionAuthorityReceipt{
+					SessionID: "ses_enc", ConnectionEpoch: 1, CredentialGeneration: 1, AcceptedFence: 1,
+					WriterLeaseID: "lease_enc", ExpiresAt: time.Now().Add(time.Minute).UnixMilli(),
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	if err := saveMachineCredential(machineCredential{
+		MachineID:           "machine_enc",
+		MachineToken:        "machine-token",
+		CloudAPIURL:         server.URL,
+		LocalAccountBinding: "org/owner",
+	}); err != nil {
+		t.Fatalf("saveMachineCredential() error = %v", err)
+	}
+
+	_, err := runWrap(ctx, wrapConfig{
+		Managed:         true,
+		PairOnly:        true,
+		CloudAPIURL:     server.URL,
+		Agent:           "claude",
+		Provider:        "claude-code",
+		Format:          "jsonstream",
+		ProtocolVersion: protocol.ProtocolVersionV2,
+	}, strings.NewReader(""), io.Discard)
+	if err != nil {
+		t.Fatalf("runWrap() error = %v", err)
+	}
+	select {
+	case hello := <-hellos:
+		if hello.ContentMode != protocol.ContentModeRequired {
+			t.Fatalf("adapter hello content mode = %q, want %q", hello.ContentMode, protocol.ContentModeRequired)
+		}
+		if hello.SessionID != "ses_enc" || hello.Role != protocol.RoleAdapter {
+			t.Fatalf("adapter hello = %+v", hello)
+		}
+	case <-ctx.Done():
+		t.Fatal("adapter hello was not sent")
+	}
+}
+
 func TestPairMachineCredentialRetriesTransientCreateFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
