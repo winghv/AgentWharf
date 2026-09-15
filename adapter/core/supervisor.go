@@ -407,6 +407,8 @@ func (execProcessRunner) Start(command ProcessCommand) (processHandle, error) {
 	if err := applyProcessCredential(cmd, command.Credential); err != nil {
 		return nil, err
 	}
+	// A provider installed as a Windows batch shim cannot be started directly.
+	applyProviderShellShim(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}

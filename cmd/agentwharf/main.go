@@ -652,7 +652,7 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 		cfg.Provider = strings.TrimSpace(cfg.Provider)
 		cfg.Agent = agentForProvider(cfg.Provider)
 		cfg.ProviderCommand = defaultProviderCommand(cfg.Agent)
-		cfg.ForceHeadless = providerIsBridgeOnly(cfg.Provider)
+		cfg.ForceHeadless = providerBridgeRequired(cfg.Provider)
 	}
 	return normalizeWrapConfig(cfg)
 }
@@ -701,7 +701,7 @@ func parseAgentEntrypointConfig(agent string, args []string, stderr io.Writer) (
 		Format:          "acp",
 		SecretDir:       envOrDefault("AGENTWHARF_SECRET_DIR", ""),
 		Managed:         managed,
-		ForceHeadless:   providerIsBridgeOnly(providerForAgent(agent)),
+		ForceHeadless:   providerBridgeRequired(providerForAgent(agent)),
 		ProviderCommand: defaultProviderCommand(agent),
 	}
 	if cfg.Managed {
@@ -905,6 +905,23 @@ func providerIsBridgeOnly(provider string) bool {
 	return provider == "deepseek-harness" || provider == "pi"
 }
 
+// providerBridgeRequired reports whether a Session must run the headless ACP
+// bridge instead of the official terminal CLI on this platform. Providers
+// without an official terminal CLI always do, and so does every provider on
+// Windows: the official path drives the CLI through a PTY and creack/pty has no
+// Windows backend (StartWithSize returns ErrUnsupported), while the ACP bridges
+// the installer already ships speak stdio and need no terminal at all.
+func providerBridgeRequired(provider string) bool {
+	return providerBridgeRequiredForPlatform(provider, runtime.GOOS)
+}
+
+func providerBridgeRequiredForPlatform(provider, goos string) bool {
+	if goos == "windows" {
+		return true
+	}
+	return providerIsBridgeOnly(provider)
+}
+
 func providerForAgent(agent string) string {
 	switch agent {
 	case "claude", "claude-code":
@@ -1063,13 +1080,25 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	// the official claude/codex CLI and mirror its transcript to the Hub. The
 	// nil-stdin default (and pipes) stay headless, and smoke/pair-only never
 	// enter the interactive path.
-	if explicitStdin && !cfg.ForceHeadless && !cfg.StartupSmoke && !cfg.PairOnly {
-		if file, ok := stdin.(*os.File); ok {
-			if info, err := file.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
-				cfg.Interactive = true
-				cfg.Stdin = stdin
-			}
+	terminal := false
+	if file, ok := stdin.(*os.File); ok {
+		if info, err := file.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
+			terminal = true
 		}
+	}
+	if explicitStdin && !cfg.ForceHeadless && !cfg.StartupSmoke && !cfg.PairOnly && terminal {
+		cfg.Interactive = true
+		cfg.Stdin = stdin
+	}
+	// Windows has no PTY backend, so a provider that would have run as an
+	// official terminal CLI runs the headless ACP bridge instead. Say so instead
+	// of appearing to hang in a terminal that will never show the CLI.
+	if terminal && cfg.ForceHeadless && !cfg.Interactive && !cfg.StartupSmoke && !cfg.PairOnly && runtime.GOOS == "windows" {
+		notice := cfg.Stderr
+		if notice == nil {
+			notice = os.Stderr
+		}
+		_, _ = fmt.Fprintln(notice, "wharf: Windows runs this Session through the headless ACP bridge; there is no local terminal UI. Open the Session in the Console to drive it.")
 	}
 	if err := validateProviderCommand(cfg); err != nil {
 		return cfg, err
