@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/winghv/agentwharf/protocol"
+	_ "modernc.org/sqlite"
 	"nhooyr.io/websocket"
 )
 
@@ -638,7 +640,12 @@ func machineServeAdapterShouldRestart(err error, credentialAlive bool, restarts 
 
 type encryptedAdapterError struct{ cause error }
 
-func (encryptedAdapterError) Error() string   { return "encrypted adapter failed" }
+func (e encryptedAdapterError) Error() string {
+	if e.cause != nil {
+		return "encrypted adapter failed: " + e.cause.Error()
+	}
+	return "encrypted adapter failed"
+}
 func (e encryptedAdapterError) Unwrap() error { return e.cause }
 
 func runAdapter(ctx context.Context, cfg wrapConfig, stderr io.Writer) <-chan error {
@@ -788,8 +795,9 @@ func recoverMachineSession(ctx context.Context, client *http.Client, credential 
 // adapter for the Session: it needs a retained signed launch or a recorded
 // launch configuration it can re-seal under the machine's control grant. An
 // empty result skips recovery so the daemon does not fence a live adapter with a
-// recovery it can never complete; a runtime open failure returns true so a
-// transient storage error cannot suppress a legitimate recovery.
+// recovery it can never complete. The check reads the endpoint database
+// read-only: opening the full runtime here would write to the same SQLite file
+// the running adapter uses and could deadlock it.
 func machineSessionHasLaunchEvidence(ctx context.Context, credential machineCredential, sessionID string) bool {
 	account := machineLocalAccountBinding(credential)
 	if account == "" {
@@ -799,15 +807,20 @@ func machineSessionHasLaunchEvidence(ctx context.Context, credential machineCred
 	if err != nil {
 		return false
 	}
-	runtime, err := openMachineE2EERuntime(ctx, directory, credential.MachineID, account)
+	uri := url.URL{Scheme: "file", Path: filepath.Join(directory, "endpoint.db")}
+	uri.RawQuery = url.Values{"mode": {"ro"}, "_pragma": {"busy_timeout(3000)"}}.Encode()
+	database, err := sql.Open("sqlite", uri.String())
 	if err != nil {
+		return true // Unknown: do not suppress a legitimate recovery.
+	}
+	defer database.Close()
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var found int
+	if err := database.QueryRowContext(ctx, `SELECT 1 FROM e2ee_local_launches WHERE session=? LIMIT 1`, sessionID).Scan(&found); err == nil {
 		return true
 	}
-	defer runtime.database.Close()
-	if provider, _, err := runtime.loadLaunch(ctx, sessionID); err == nil && provider != "" {
-		return true
-	}
-	if _, _, err := runtime.loadLaunchRecovery(ctx, sessionID); err == nil {
+	if err := database.QueryRowContext(ctx, `SELECT 1 FROM e2ee_local_launch_recoveries WHERE session=? LIMIT 1`, sessionID).Scan(&found); err == nil {
 		return true
 	}
 	return false
