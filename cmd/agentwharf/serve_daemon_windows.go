@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"syscall"
@@ -39,6 +40,11 @@ const (
 	lockfileFailImmediately = 0x00000001
 )
 
+// serveLockOverlapped backs every LockFileEx call. Windows requires a valid
+// OVERLAPPED (a NULL pointer faults inside kernel32), and the structure must stay
+// reachable while the byte-range lock is held, so it lives for the process.
+var serveLockOverlapped syscall.Overlapped
+
 // processAlive reports whether a Windows process is still running via
 // OpenProcess + GetExitCodeProcess, which is the reliable liveness probe.
 func processAlive(pid int) bool {
@@ -68,6 +74,8 @@ func terminateProcess(pid int) error {
 
 // lockFileExclusive takes a non-blocking exclusive byte-range lock on the
 // file. The lock is released when the handle is closed or the process exits.
+// LockFileEx requires an OVERLAPPED describing the locked range and cannot take
+// us a NULL pointer, so the call passes serveLockOverlapped.
 func lockFileExclusive(file *os.File) error {
 	ret, _, callErr := procLockFileEx.Call(
 		file.Fd(),
@@ -75,9 +83,12 @@ func lockFileExclusive(file *os.File) error {
 		0,
 		1,
 		0,
-		0,
+		uintptr(unsafe.Pointer(&serveLockOverlapped)),
 	)
 	if ret == 0 {
+		if callErr == nil || callErr == syscall.Errno(0) {
+			return errors.New("lock wharf serve daemon file")
+		}
 		return callErr
 	}
 	return nil
