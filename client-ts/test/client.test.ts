@@ -876,3 +876,24 @@ test('encrypted replay within the lane bound is still decoded', async () => {
   assert.equal(client.lastSeq('ses_secure'), 8)
   client.close()
 })
+
+test('refreshes the session token before a reconnect attempt', async () => {
+  const sockets = new FakeSocketFactory()
+  let refreshes = 0
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'stale-token', sessions: [{ sessionId: 'ses_1', lastSeq: 0 }],
+    webSocketFactory: sockets.factory, reconnect: { initialDelayMs: 1, maxDelayMs: 1 },
+    refreshToken: async () => { refreshes += 1; return `fresh-token-${refreshes}` },
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 1, sessions: [{ session_id: 'ses_1', state: 'ready', provider: 'codex', latest_seq: 0, replay_from: 1 }] })
+  await connected
+  sockets.last().close()
+  await waitFor(() => sockets.all.length === 2)
+  sockets.last().open()
+  await waitFor(() => sockets.last().sentFrames().length > 0)
+  assert.equal(refreshes, 1)
+  assert.equal((sockets.last().sentFrames()[0] as HelloFrame).token, 'fresh-token-1')
+  client.close()
+})

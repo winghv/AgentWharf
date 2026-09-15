@@ -353,6 +353,9 @@ export interface AgentWharfClientOptions {
   reconnect?: false | Partial<ReconnectConfig>
   commandIdFactory?: () => string
   encrypted?: EncryptedSessionCodec
+  // Re-issues the session token before a reconnect attempt so an expired token
+  // recovers automatically instead of requiring a page reload.
+  refreshToken?: () => Promise<string>
 }
 
 export interface EncryptedSessionCodec {
@@ -386,6 +389,20 @@ export interface HistoryPageOptions {
 }
 
 type EventHandler = (event: AgentWharfEvent) => void
+
+/**
+ * A transport or handshake failure that the client will retry. Callers should
+ * present a reconnecting state instead of a user-facing error while the
+ * reconnect loop is running.
+ */
+export class HubRetryableError extends Error {
+  readonly retryable = true
+  constructor(message: string) {
+    super(message)
+    this.name = 'HubRetryableError'
+  }
+}
+
 type ErrorHandler = (error: Error | ErrorFrame) => void
 type ConnectHandler = () => void
 type DeliveryStateHandler = (state: CommandDeliveryState) => void
@@ -476,6 +493,7 @@ export class AgentWharfClient {
   private handshakeReady = false
   private encryptedEventState: EncryptedEventState | null = null
   private readonly encryptedSkipTo = new Map<string, number>()
+  private tokenValue: string
 
   constructor(private readonly options: AgentWharfClientOptions) {
     if (options.sessions.length === 0) {
@@ -486,6 +504,7 @@ export class AgentWharfClient {
     this.reconnect = normalizeReconnect(options.reconnect)
     this.reconnectDelayMs = this.reconnect?.initialDelayMs ?? 0
     this.commandIdFactory = options.commandIdFactory ?? (() => `cmd_${Date.now()}_${this.nextCommandNumber++}`)
+    this.tokenValue = options.token
     for (const session of options.sessions) {
       this.cursors.set(session.sessionId, session.lastSeq ?? 0)
     }
@@ -879,7 +898,7 @@ export class AgentWharfClient {
       }
 
       socket.onerror = () => {
-        const error = new Error('websocket error')
+        const error = new HubRetryableError('websocket error')
         this.emitError(error)
         if (!handshakeComplete) {
           reject(error)
@@ -895,7 +914,7 @@ export class AgentWharfClient {
         if (this.encryptedEventState?.socket === socket) this.encryptedEventState = null
         this.encryptedSkipTo.clear()
         if (!handshakeComplete) {
-          reject(new Error('websocket closed before hello.ack'))
+          reject(new HubRetryableError('websocket closed before hello.ack'))
         }
         this.rejectPendingCommands(new Error('websocket closed before command.ack'))
         this.rejectPendingHistoryPages(new Error('websocket closed before history.page'))
@@ -1087,7 +1106,7 @@ export class AgentWharfClient {
       frame: 'hello',
       protocol_version: this.protocolVersion,
       role: 'client',
-      token: this.options.token,
+      token: this.tokenValue,
       ...(this.options.encrypted ? { content_mode: this.options.encrypted.contentMode ?? 'required' } : {}),
       subscriptions: this.options.sessions.map((session) => ({
         session_id: session.sessionId,
@@ -1104,10 +1123,23 @@ export class AgentWharfClient {
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, this.reconnect.maxDelayMs)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
-      this.openSocket().catch((error: unknown) => {
-        this.emitError(normalizeError(error))
-        this.scheduleReconnect()
-      })
+      void (async () => {
+        if (this.options.refreshToken) {
+          try {
+            const token = await this.options.refreshToken()
+            if (token.trim()) this.tokenValue = token
+          } catch {
+            // Keep the previous token; this attempt will decide whether it is
+            // still accepted and the next cycle retries the refresh.
+          }
+        }
+        try {
+          await this.openSocket()
+        } catch (error) {
+          this.emitError(normalizeError(error))
+          this.scheduleReconnect()
+        }
+      })()
     }, delay)
   }
 
