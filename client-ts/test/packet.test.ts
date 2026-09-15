@@ -22,3 +22,23 @@ test('encrypted packet preserves domain payload and authenticates visible state'
   assert.equal(wire.includes('synthetic'), false)
   assert.equal(wire.includes('directory'), false)
 })
+
+test('run-control public projections open with current and legacy shapes', async () => {
+  const keys = await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify']) as CryptoKeyPair
+  const key = crypto.getRandomValues(new Uint8Array(32))
+  const outcomeContext: ContentContext = { scope: 'event', session: 'session', keyId: 'key', sender: 'machine', messageId: 'event_1', type: 'session.run.outcome' }
+  const outcome = { cmd_id: 'cmd_1', operation: 'stop', outcome: 'completed', completion_state: 'ended', reason_code: null }
+  const outcomePacket = await sealPacket(outcomeContext, key, keys.privateKey, { operation: 'stop', outcome: 'completed', completion_state: 'ended' }, outcome)
+  assert.deepEqual(await openPacket(outcomeContext, key, keys.publicKey, outcomePacket), outcome)
+
+  const capabilityContext: ContentContext = { scope: 'event', session: 'session', keyId: 'key', sender: 'machine', messageId: 'event_2', type: 'session.run.capabilities' }
+  const capability = { schema_version: 1, interrupt_supported: true, stop_supported: false }
+  const capabilityPacket = await sealPacket(capabilityContext, key, keys.privateKey, { interrupt_supported: true }, capability)
+  assert.deepEqual(await openPacket(capabilityContext, key, keys.publicKey, capabilityPacket), capability)
+
+  // A legacy endpoint sealed an empty projection for the same payload.
+  const legacyContent = await sealContent(outcomeContext, key, keys.privateKey, new TextEncoder().encode(JSON.stringify({ public: {}, payload: outcome })))
+  const legacy = { version: 1 as const, public: {}, encrypted: legacyContent }
+  assert.deepEqual(await openPacket(outcomeContext, key, keys.publicKey, legacy), outcome)
+  await assert.rejects(sealPacket(outcomeContext, key, keys.privateKey, { operation: 'bogus', outcome: 'completed' }, outcome))
+})
