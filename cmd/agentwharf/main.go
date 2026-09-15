@@ -1460,6 +1460,22 @@ func attachMachineE2EESession(ctx context.Context, cfg *wrapConfig) (func(), err
 		_ = runtime.database.Close()
 		return noop, err
 	}
+	// Record the launch configuration this terminal started with so the daemon can
+	// re-seal it under the machine's own control grant after the interactive
+	// adapter exits. Without local launch evidence the daemon cannot recover the
+	// Session and would fence/no-op on a recovery it can never complete.
+	if cfg.Provider != "" {
+		if err := runtime.retainLaunchRecovery(ctx, cfg.SessionID, cfg.Provider, protocol.EncryptedLaunchSettings{
+			Provider:          cfg.Provider,
+			WorkingDirectory:  cfg.WorkingDirectory,
+			ModelID:           cfg.LaunchSettings.ModelID,
+			ReasoningEffortID: cfg.LaunchSettings.ReasoningEffortID,
+			PermissionModeID:  cfg.LaunchSettings.PermissionModeID,
+		}); err != nil {
+			_ = runtime.database.Close()
+			return noop, err
+		}
+	}
 	cfg.e2eeRuntime = runtime
 	cfg.ContentMode = protocol.ContentModeRequired
 	return func() { _ = runtime.database.Close() }, nil

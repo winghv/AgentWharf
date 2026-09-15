@@ -143,7 +143,27 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 		commandDone <- forwardHubCommandsToOfficialCLI(runCtx, cfg, connection, writeFrame, ptmx, &ptyMu, cmd.Process, &stopInProgress, injected, questions, heartbeats.observe, rotation)
 	}()
 
-	waitErr := cmd.Wait()
+	// The provider owns the terminal; the Hub command loop owns remote control.
+	// If the Hub loop fails fatally while the provider is still running, the
+	// adapter can no longer be driven or observed remotely, so surface it and
+	// stop the local agent instead of leaving an apparently-working CLI that has
+	// silently gone offline.
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	var waitErr error
+	var commandErr error
+	select {
+	case waitErr = <-waitDone:
+	case commandErr = <-commandDone:
+		if commandErr != nil && !errors.Is(commandErr, context.Canceled) {
+			_, _ = fmt.Fprintf(os.Stderr, "\nwharf: hub connection lost (%v); stopping the local agent\n", commandErr)
+		}
+		cancel()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		waitErr = <-waitDone
+	}
 	// The official CLI has exited: stop the mirror/command loops so this returns
 	// promptly instead of hanging on their blocking reads/polls. Wait for the
 	// command reader to release the Hub socket before reading the terminal-state
@@ -154,10 +174,11 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	case <-mirrorDone:
 	case <-ctx.Done():
 	}
-	var commandErr error
-	select {
-	case commandErr = <-commandDone:
-	case <-ctx.Done():
+	if commandErr == nil {
+		select {
+		case commandErr = <-commandDone:
+		case <-ctx.Done():
+		}
 	}
 	if stopInProgress.Load() {
 		if commandErr != nil {

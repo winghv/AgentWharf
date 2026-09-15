@@ -299,6 +299,10 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	defer poll.Stop()
 	trustedKnown := false
 	trustedTerminals := false
+	// Sessions without local launch evidence are skipped once, not retried every
+	// poll: recovering one would fence a live adapter with a recovery this daemon
+	// can never finish.
+	skippedRecovery := make(map[string]bool)
 	for {
 		// Use the last known trust value so initialization polling stays ahead of
 		// every other machine request; this iteration refreshes it below.
@@ -381,6 +385,13 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 		} else {
 			for _, session := range recoverable {
 				if session.SessionID == "" {
+					continue
+				}
+				if !machineSessionHasLaunchEvidence(ctx, credential, session.SessionID) {
+					if !skippedRecovery[session.SessionID] {
+						skippedRecovery[session.SessionID] = true
+						_, _ = fmt.Fprintf(stderr, "wharf machine serve: not recovering %s: no local launch evidence\n", session.SessionID)
+					}
 					continue
 				}
 				if !recoveryGuard.claim(session.SessionID) {
@@ -771,6 +782,35 @@ func recoverMachineSession(ctx context.Context, client *http.Client, credential 
 		AdapterToken:     response.Data.AdapterToken,
 		AdapterExpiresAt: response.Data.ExpiresAt,
 	}, nil
+}
+
+// machineSessionHasLaunchEvidence reports whether this daemon can start an
+// adapter for the Session: it needs a retained signed launch or a recorded
+// launch configuration it can re-seal under the machine's control grant. An
+// empty result skips recovery so the daemon does not fence a live adapter with a
+// recovery it can never complete; a runtime open failure returns true so a
+// transient storage error cannot suppress a legitimate recovery.
+func machineSessionHasLaunchEvidence(ctx context.Context, credential machineCredential, sessionID string) bool {
+	account := machineLocalAccountBinding(credential)
+	if account == "" {
+		return false
+	}
+	directory, err := machineEndpointDirectory(credential, account)
+	if err != nil {
+		return false
+	}
+	runtime, err := openMachineE2EERuntime(ctx, directory, credential.MachineID, account)
+	if err != nil {
+		return true
+	}
+	defer runtime.database.Close()
+	if provider, _, err := runtime.loadLaunch(ctx, sessionID); err == nil && provider != "" {
+		return true
+	}
+	if _, _, err := runtime.loadLaunchRecovery(ctx, sessionID); err == nil {
+		return true
+	}
+	return false
 }
 
 func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, session machineRecoverableSession, stdout, stderr io.Writer, adapters *sync.WaitGroup, onDone func(), reportFailure machineSessionFailureReporter) {

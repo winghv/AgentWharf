@@ -17,6 +17,14 @@ import (
 const (
 	hubReconnectMinDelay = 250 * time.Millisecond
 	hubReconnectMaxDelay = 15 * time.Second
+	// A half-open WebSocket can accept a write into the kernel buffer until it
+	// fills and then block forever, holding writeMu and wedging the whole
+	// adapter. Bound every frame write so a dead transport always surfaces as an
+	// error and triggers the normal resume handshake.
+	hubWriteTimeout = 15 * time.Second
+	// Bound one dial/resume handshake so a black-holed network cannot leave the
+	// reconnect loop stuck before it can retry.
+	hubDialTimeout = 15 * time.Second
 )
 
 type adapterCredentialSet struct {
@@ -289,13 +297,21 @@ func (c *hubConnection) writePrepared(ctx context.Context, frame protocol.Frame)
 			}
 			continue
 		}
-		if err := writeCLIProtocolFrame(ctx, conn, frame); err == nil {
+		if err := writeHubFrameBounded(ctx, conn, frame); err == nil {
 			return nil
 		}
 		if err := c.reconnect(ctx, conn); err != nil {
 			return err
 		}
 	}
+}
+
+// writeHubFrameBounded bounds one frame write so a half-open transport cannot
+// block the write path indefinitely.
+func writeHubFrameBounded(ctx context.Context, conn *websocket.Conn, frame protocol.Frame) error {
+	writeCtx, cancel := context.WithTimeout(ctx, hubWriteTimeout)
+	defer cancel()
+	return writeCLIProtocolFrame(writeCtx, conn, frame)
 }
 
 func validateHubEventFrame(event *protocol.Event) error {
@@ -424,7 +440,7 @@ func (c *hubConnection) reconnect(ctx context.Context, failed *websocket.Conn) e
 				_ = old.Close(websocket.StatusGoingAway, "replaced")
 			}
 			for _, proposal := range c.proposals() {
-				if err := writeCLIProtocolFrame(ctx, conn, proposal); err != nil {
+				if err := writeHubFrameBounded(ctx, conn, proposal); err != nil {
 					_ = conn.Close(websocket.StatusGoingAway, "proposal replay failed")
 					c.connMu.Lock()
 					if c.conn == conn {
@@ -455,7 +471,7 @@ func (c *hubConnection) reconnect(ctx context.Context, failed *websocket.Conn) e
 						c.close()
 						return err
 					}
-					if err := writeCLIProtocolFrame(ctx, conn, proposal); err != nil {
+					if err := writeHubFrameBounded(ctx, conn, proposal); err != nil {
 						_ = conn.Close(websocket.StatusGoingAway, "reconnect proposal publish failed")
 						c.connMu.Lock()
 						if c.conn == conn {
@@ -491,19 +507,23 @@ func (c *hubConnection) reconnect(ctx context.Context, failed *websocket.Conn) e
 }
 
 func (c *hubConnection) dialAndResume(ctx context.Context, token string) (*websocket.Conn, *protocol.ConnectionAuthorityReceipt, bool, error) {
-	conn, _, err := websocket.Dial(ctx, c.cfg.HubURL, nil)
+	dialCtx, cancelDial := context.WithTimeout(ctx, hubDialTimeout)
+	defer cancelDial()
+	conn, _, err := websocket.Dial(dialCtx, c.cfg.HubURL, nil)
 	if err != nil {
 		return nil, nil, false, err
 	}
+	// The dial timeout covers only the handshake; the accepted connection must
+	// outlive the dial context for later frames.
 	fail := func(err error, auth bool) (*websocket.Conn, *protocol.ConnectionAuthorityReceipt, bool, error) {
 		_ = conn.Close(websocket.StatusPolicyViolation, "resume rejected")
 		return nil, nil, auth, err
 	}
 	hello := protocol.Hello{ProtocolVersion: c.cfg.ProtocolVersion, Role: protocol.RoleAdapter, Token: token, SessionID: c.cfg.SessionID, Provider: c.cfg.Provider, ContentMode: c.cfg.ContentMode, Resume: true}
-	if err := writeCLIProtocolFrame(ctx, conn, &hello); err != nil {
+	if err := writeHubFrameBounded(dialCtx, conn, &hello); err != nil {
 		return fail(err, false)
 	}
-	frame, err := readCLIProtocolFrame(ctx, conn)
+	frame, err := readCLIProtocolFrame(dialCtx, conn)
 	if err != nil {
 		return fail(err, false)
 	}
