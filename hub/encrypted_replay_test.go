@@ -92,3 +92,15 @@ func TestEncryptedRunControlOutcomeMapping(t *testing.T) {
 		t.Fatal("unknown run-control outcome accepted")
 	}
 }
+
+func TestRequiredReplayAllowsOnlyTheStoreRecoveryOutcomeAsPlaintext(t *testing.T) {
+	event := store.Event{SessionID: "session", Seq: 1, Type: "session.run.outcome", Payload: []byte(`{"cmd_id":"cmd","operation":"stop","outcome":"outcome_unknown","completion_state":null,"reason_code":"recovery_unconfirmed"}`)}
+	if err := validateRequiredReplayEvent(event, "session"); err != nil {
+		t.Fatalf("plaintext recovery outcome rejected: %v", err)
+	}
+	event.Type = "session.state"
+	event.Payload = []byte(`{"state":"ready"}`)
+	if err := validateRequiredReplayEvent(event, "session"); err == nil {
+		t.Fatal("plaintext session state accepted")
+	}
+}

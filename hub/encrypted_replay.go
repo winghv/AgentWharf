@@ -28,9 +28,29 @@ func validateRequiredReplayEvent(event store.Event, session string) error {
 		}
 		return nil
 	}
+	// Internal lifecycle events (state/capabilities/outcome) may be Store-generated
+	// plaintext records with no content (for example a recovered reservation
+	// outcome). They must replay so the client sees no sequence gap; content
+	// events still require a sealed carrier.
+	if internalLifecycleEvent(event.Type) {
+		if _, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "event", event.Type, ""); err == nil {
+			return nil
+		}
+		var plain map[string]json.RawMessage
+		if json.Unmarshal(event.Payload, &plain) == nil {
+			return nil
+		}
+		return errors.New("invalid encrypted event history")
+	}
 	_, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "event", event.Type, "")
 	if err != nil {
 		return errors.New("invalid encrypted event history")
 	}
 	return nil
+}
+
+func internalLifecycleEvent(eventType string) bool {
+	// Only the Store-generated recovery outcome is plaintext today; state and
+	// capability events for a required Session stay sealed.
+	return eventType == "session.run.outcome"
 }
