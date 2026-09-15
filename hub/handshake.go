@@ -405,9 +405,11 @@ func (h *Handshake) clientAdmission(ctx context.Context, principal auth.Principa
 		decision, err := auth.EvaluateSessionAdmission(auth.SessionAdmissionRequest{Principal: principal, Claim: claim, Truth: truth})
 		return claim, decision, err
 	}
-	if access != auth.AccessView || !truth.Exists || !truth.Complete || truth.Terminal || truth.Conflicting || !truth.Live {
+	if access != auth.AccessView || !truth.Exists || !truth.Complete || truth.Conflicting {
 		return auth.SessionAdmissionClaim{}, auth.SessionAdmissionDecision{}, auth.ErrUnauthorized
 	}
+	// A view credential may read a terminal Session's retained history; only
+	// control/adapter admission requires a live Session.
 	return claim, auth.SessionAdmissionDecision{Mode: auth.SessionAdmissionCurrent}, nil
 }
 

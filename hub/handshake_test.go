@@ -741,3 +741,20 @@ func terminalBootstrapConnection() store.AdapterConnection {
 	connection.TerminalAt = &at
 	return connection
 }
+
+func TestHandshakeAllowsTerminalViewSubscription(t *testing.T) {
+	t.Parallel()
+	core := hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator: fakeAuth{token: "token", principal: auth.Principal{Subject: "view", Scopes: []auth.Scope{auth.SessionView("ses_1")}}},
+		EventStore: fakeStore{latest: map[string]int64{"ses_1": 3}, truth: map[string]store.SessionAdmissionTruth{
+			"ses_1": {SessionID: "ses_1", Provider: "claude-code", Exists: true, Complete: true, Terminal: true},
+		}},
+	})
+	ack, _, err := core.HandleHello(context.Background(), &protocol.Hello{ProtocolVersion: 2, Role: protocol.RoleClient, Token: "token", Subscriptions: []protocol.Subscription{{SessionID: "ses_1"}}})
+	if err != nil {
+		t.Fatalf("terminal view subscription rejected: %v", err)
+	}
+	if len(ack.Sessions) != 1 || ack.Sessions[0].SessionID != "ses_1" {
+		t.Fatalf("terminal view ack = %+v", ack.Sessions)
+	}
+}
