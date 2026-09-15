@@ -414,6 +414,12 @@ interface EncryptedEventState {
   failed: boolean
 }
 
+// A replay whose gap to the latest durable seq exceeds this bound would overflow
+// the serial encrypted lane and force repeated reconnect/replay cycles. Beyond
+// it the client starts live from the latest seq and lets the caller hydrate the
+// visible tail from bounded history pages.
+const encryptedReplaySkipThreshold = 64
+
 export function encodeFrame(frame: AgentWharfFrame): string {
   return JSON.stringify(frame)
 }
@@ -469,6 +475,7 @@ export class AgentWharfClient {
   private lastHelloAck: HelloAckFrame | null = null
   private handshakeReady = false
   private encryptedEventState: EncryptedEventState | null = null
+  private readonly encryptedSkipTo = new Map<string, number>()
 
   constructor(private readonly options: AgentWharfClientOptions) {
     if (options.sessions.length === 0) {
@@ -840,6 +847,15 @@ export class AgentWharfClient {
             handshakeComplete = true
             this.handshakeReady = true
             this.lastHelloAck = ack
+            this.encryptedSkipTo.clear()
+            if (this.options.encrypted !== undefined) {
+              const summary = ack.sessions[0]
+              const cursor = this.cursors.get(summary.session_id) ?? 0
+              if (summary.latest_seq - cursor > encryptedReplaySkipThreshold) {
+                this.cursors.set(summary.session_id, summary.latest_seq)
+                this.encryptedSkipTo.set(summary.session_id, summary.latest_seq)
+              }
+            }
             this.reconnectDelayMs = this.reconnect?.initialDelayMs ?? 0
             this.emitConnect()
             resolve(ack)
@@ -877,6 +893,7 @@ export class AgentWharfClient {
         this.socket = null
         this.handshakeReady = false
         if (this.encryptedEventState?.socket === socket) this.encryptedEventState = null
+        this.encryptedSkipTo.clear()
         if (!handshakeComplete) {
           reject(new Error('websocket closed before hello.ack'))
         }
@@ -923,6 +940,15 @@ export class AgentWharfClient {
   private enqueueEncryptedEvent(event: AgentWharfEvent, socket: WebSocketLike): void {
     const state = this.encryptedEventState
     if (state === null || state.socket !== socket || state.failed) return
+    const skipTo = this.encryptedSkipTo.get(event.session_id)
+    if (skipTo !== undefined && event.seq !== undefined) {
+      if (event.seq <= skipTo) {
+        // A skipped replay frame is intentionally not decoded; the cursor was
+        // already advanced to skipTo at handshake.
+        return
+      }
+      this.encryptedSkipTo.delete(event.session_id)
+    }
     if (state.count >= 128) {
       this.emitError(new Error('encrypted event queue capacity reached'))
       state.failed = true

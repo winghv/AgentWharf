@@ -830,3 +830,49 @@ async function waitFor(predicate: () => boolean): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
 }
+
+test('encrypted replay behind the lane bound starts live from the latest seq', async () => {
+  const sockets = new FakeSocketFactory()
+  const opened: number[] = []
+  const seen: AgentWharfEvent[] = []
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure', lastSeq: 0 }],
+    encrypted: { contentMode: 'required', openEvent: async (event) => { opened.push(event.seq as number); return event }, sealCommand: async () => ({}) },
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  client.onEvent((event) => seen.push(event))
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 1000 }] })
+  await connected
+  for (let seq = 1; seq <= 200; seq++) {
+    sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq, time: seq, payload: { opaque: true } })
+  }
+  sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq: 1001, time: 1001, payload: { opaque: true } })
+  await waitFor(() => seen.length === 1)
+  assert.deepEqual(opened, [1001])
+  assert.equal(client.lastSeq('ses_secure'), 1001)
+  assert.equal(sockets.last().isClosed(), false)
+  client.close()
+})
+
+test('encrypted replay within the lane bound is still decoded', async () => {
+  const sockets = new FakeSocketFactory()
+  const opened: number[] = []
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure', lastSeq: 0 }],
+    encrypted: { contentMode: 'required', openEvent: async (event) => { opened.push(event.seq as number); return event }, sealCommand: async () => ({}) },
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 8 }] })
+  await connected
+  for (let seq = 1; seq <= 8; seq++) {
+    sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq, time: seq, payload: { opaque: true } })
+  }
+  await waitFor(() => opened.length === 8)
+  assert.deepEqual(opened, [1, 2, 3, 4, 5, 6, 7, 8])
+  assert.equal(client.lastSeq('ses_secure'), 8)
+  client.close()
+})
