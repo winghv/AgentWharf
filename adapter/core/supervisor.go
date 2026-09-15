@@ -424,10 +424,11 @@ func providerEnvironment(path string, explicit []string) []string {
 		if !ok || !safeProviderEnvName(name) {
 			return
 		}
-		if _, exists := seen[name]; exists {
+		key := canonicalProviderEnvName(name)
+		if _, exists := seen[key]; exists {
 			return
 		}
-		seen[name] = struct{}{}
+		seen[key] = struct{}{}
 		values = append(values, item)
 	}
 	for _, item := range explicit {
@@ -452,7 +453,7 @@ func inheritedProviderEnvName(name string, testHelper bool) bool {
 	case "AGENTWHARF_WRAP_HELPER", "AGENTWHARF_ACP_HELPER", "AGENTWHARF_ACP_IDLE_HELPER", "AGENTWHARF_ACP_PERMISSION_HELPER", "AGENTWHARF_ACP_RECOVERY_HELPER", "AGENTWHARF_ACP_CREDENTIAL_HELPER", "AGENTWHARF_RESTART_CRASH_HELPER", "AGENTWHARF_START_BLOCK_HELPER", "AGENTWHARF_START_BLOCK_MARKER", "AGENTWHARF_EXPECTED_AUTH_TOKEN", "AGENTWHARF_EXPECTED_BASE_URL":
 		return testHelper
 	default:
-		return false
+		return platformInheritedProviderEnvName(name)
 	}
 }
 
