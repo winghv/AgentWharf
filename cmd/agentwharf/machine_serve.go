@@ -807,9 +807,14 @@ func machineSessionHasLaunchEvidence(ctx context.Context, credential machineCred
 	if err != nil {
 		return false
 	}
-	uri := url.URL{Scheme: "file", Path: filepath.Join(directory, "endpoint.db")}
-	uri.RawQuery = url.Values{"mode": {"ro"}, "_pragma": {"busy_timeout(3000)"}}.Encode()
-	database, err := sql.Open("sqlite", uri.String())
+	databasePath := filepath.Join(directory, "endpoint.db")
+	if _, err := os.Stat(databasePath); err != nil {
+		return false
+	}
+	// A plain path keeps a Windows drive letter out of SQLite's URI parser while
+	// query_only still makes the probing connection read-only.
+	query := url.Values{"_pragma": {"busy_timeout(3000)", "query_only(1)"}}.Encode()
+	database, err := sql.Open("sqlite", databasePath+"?"+query)
 	if err != nil {
 		return true // Unknown: do not suppress a legitimate recovery.
 	}
