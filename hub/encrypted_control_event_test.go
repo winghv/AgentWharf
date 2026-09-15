@@ -43,7 +43,15 @@ func TestEncryptedControlProposalBypassesPlaintextParsers(t *testing.T) {
 	}
 	for _, kind := range []string{"session.settings.capabilities", "session.settings.effective", "session.run.capabilities", "session.run.outcome", "session.file_references.capabilities", "session.file_references.outcome"} {
 		t.Run(kind, func(t *testing.T) {
-			packet, err := e2ee.SealPacket(e2ee.Context{Scope: "event", Session: "session", Sender: "machine", KeyID: "key", MessageID: "message", Type: kind}, make([]byte, 32), private, e2ee.PublicMetadata{}, json.RawMessage(`{"private":"endpoint-owned"}`))
+			payload := json.RawMessage(`{"private":"endpoint-owned"}`)
+			if kind == "session.run.outcome" {
+				payload = json.RawMessage(`{"cmd_id":"command","operation":"stop","outcome":"completed","completion_state":"ended","reason_code":null}`)
+			}
+			public, err := e2ee.ProjectPublicMetadata(kind, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			packet, err := e2ee.SealPacket(e2ee.Context{Scope: "event", Session: "session", Sender: "machine", KeyID: "key", MessageID: "message", Type: kind}, make([]byte, 32), private, public, payload)
 			if err != nil {
 				t.Fatal(err)
 			}

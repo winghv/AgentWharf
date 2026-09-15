@@ -1024,20 +1024,23 @@ func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID str
 	} else if finalize.Writer != nil || (finalize.Outcome == store.RunControlTimeout && reservation.Deadline.After(now)) {
 		return store.RunControlReservation{}, errors.New("run-control unbound finalization is fenced")
 	}
+	encryptedTerminal := finalize.EncryptedTerminalSeq != nil
 	if finalize.Outcome == store.RunControlCompleted {
 		if err := validatePostgresRunControlPreState(ctx, tx, sessionID, store.RunControlRequest{Operation: reservation.Operation, PreControlState: reservation.PreControlState, PreControlStateSeq: reservation.PreControlStateSeq}); err != nil {
 			return store.RunControlReservation{}, err
 		}
 		state := "ready"
 		terminal := false
-		payload := `{"state":"ready"}`
+		statePayload := []byte(`{"state":"ready"}`)
 		if reservation.Operation == store.RunControlStop {
 			state = "ended"
 			terminal = true
-			payload = `{"state":"ended","reason":"user_stop"}`
+			statePayload = []byte(`{"state":"ended","reason":"user_stop"}`)
 		}
-		if _, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.state", []byte(payload), now); err != nil {
-			return store.RunControlReservation{}, err
+		if !encryptedTerminal {
+			if _, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.state", statePayload, now); err != nil {
+				return store.RunControlReservation{}, err
+			}
 		}
 		if _, err := queries.ProjectAgentSessionState(ctx, db.ProjectAgentSessionStateParams{
 			Status: state, Terminal: terminal, ObservedAt: pgtype.Timestamptz{Time: now, Valid: true}, SessionID: sessionID,
@@ -1063,9 +1066,15 @@ func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID str
 	if err != nil {
 		return store.RunControlReservation{}, err
 	}
-	terminalSeq, err := appendPostgresRunControlEvent(ctx, tx, sessionID, "session.run.outcome", payload, now)
-	if err != nil {
-		return store.RunControlReservation{}, err
+	var terminalSeq int64
+	if finalize.EncryptedTerminalSeq != nil {
+		// The caller already committed the sealed terminal event; only record it.
+		terminalSeq = *finalize.EncryptedTerminalSeq
+	} else {
+		terminalSeq, err = appendPostgresRunControlEvent(ctx, tx, sessionID, "session.run.outcome", payload, now)
+		if err != nil {
+			return store.RunControlReservation{}, err
+		}
 	}
 	result, err := tx.Exec(ctx, `UPDATE session_run_controls SET status=$1,terminal_event_seq=$2,updated_at=clock_timestamp() WHERE session_id=$3 AND cmd_id=$4 AND reservation_version=$5 AND status='pending' AND terminal_event_seq IS NULL`, finalize.Outcome, terminalSeq, sessionID, commandID, finalize.ReservationVersion)
 	if err != nil || result.RowsAffected() != 1 {
@@ -1441,13 +1450,27 @@ func validatePostgresRunControlPreState(ctx context.Context, tx pgx.Tx, sessionI
 	if err := tx.QueryRow(ctx, `SELECT type,payload FROM session_events WHERE session_id=$1 AND seq=$2`, sessionID, request.PreControlStateSeq).Scan(&eventType, &payload); err != nil || eventType != "session.state" {
 		return errors.New("run-control pre-control state is not durable")
 	}
-	var state struct {
-		State string `json:"state"`
-	}
-	if json.Unmarshal(payload, &state) != nil || state.State != request.PreControlState || !validPostgresRunControlState(request.Operation, state.State) {
+	resolved, ok := postgresRunControlState(payload)
+	if !ok || resolved != request.PreControlState || !validPostgresRunControlState(request.Operation, resolved) {
 		return errors.New("run-control pre-control state is invalid")
 	}
 	return nil
+}
+
+// postgresRunControlState reads a plaintext legacy state event or the minimal
+// public projection of a required-mode sealed session.state carrier.
+func postgresRunControlState(payload []byte) (string, bool) {
+	var plain struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(payload, &plain) == nil && plain.State != "" {
+		return plain.State, true
+	}
+	carrier, err := protocol.DecodeEncryptedPacketCarrier(payload, "event", "session.state", "")
+	if err != nil || carrier.Packet.Public.State == "" {
+		return "", false
+	}
+	return carrier.Packet.Public.State, true
 }
 
 func appendPostgresRunControlEvent(ctx context.Context, tx pgx.Tx, sessionID, eventType string, payload []byte, now time.Time) (int64, error) {

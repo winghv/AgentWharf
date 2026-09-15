@@ -12,6 +12,41 @@ import (
 	"github.com/winghv/agentwharf/protocol"
 )
 
+func TestEncryptedRunControlOutcomeProjectionRejectsInvalidPublicFields(t *testing.T) {
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{"cmd_id":"message","operation":"stop","outcome":"completed","completion_state":"ended","reason_code":null}`)
+	packet, err := e2ee.SealPacket(e2ee.Context{Scope: "event", Session: "session", Sender: "device", KeyID: "key", MessageID: "message", Type: "session.run.outcome"}, key, private, e2ee.PublicMetadata{Operation: "stop", Outcome: "completed", CompletionState: "ended"}, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, public := range map[string]e2ee.PublicMetadata{
+		"unknown operation": {Outcome: "completed"},
+		"missing operation": {Outcome: "completed"},
+		"missing outcome":   {Operation: "stop"},
+		"unknown outcome":   {Operation: "stop", Outcome: "bogus"},
+		"foreign field":     {Operation: "stop", Outcome: "completed", State: "ready"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tampered := packet
+			tampered.Public = public
+			wire, err := json.Marshal(map[string]any{"version": 1, "scope": "event", "key_id": "key", "sender": "device", "message_id": "message", "type": "session.run.outcome", "packet": tampered})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := protocol.DecodeEncryptedPacketCarrier(wire, "event", "session.run.outcome", ""); err == nil {
+				t.Fatal("invalid run-control projection accepted")
+			}
+		})
+	}
+}
+
 func TestEncryptedCarrierAcceptsRealEndpointPacketsWithoutPlaintext(t *testing.T) {
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -27,6 +62,7 @@ func TestEncryptedCarrierAcceptsRealEndpointPacketsWithoutPlaintext(t *testing.T
 		{"event", "session.state", `{"state":"ready","reason":"private canary"}`},
 		{"event", "permission.request", `{"request_id":"request","action":"private canary"}`},
 		{"command", "permission.respond", `{"request_id":"request","decision":"approve"}`},
+		{"event", "session.run.outcome", `{"cmd_id":"message","operation":"stop","outcome":"completed","completion_state":"ended","reason_code":null}`},
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
 			ctx := e2ee.Context{Scope: tc.scope, Session: "session", Sender: "device", KeyID: "key", MessageID: "message", Type: tc.kind}

@@ -2958,6 +2958,27 @@ func acknowledgeRunControl(ctx context.Context, command *protocol.Command, readF
 	if err := waitEventReceipt(receiptCtx, readFrame, writeFrame, proposalID, "run-control outcome "+command.CommandID); err != nil {
 		return err
 	}
+	if operationErr == nil && cfg.ContentMode == protocol.ContentModeRequired {
+		// The Hub is zero-knowledge: for a required Session it finalizes the
+		// reservation from the sealed outcome projection but cannot append a
+		// plaintext terminal state, so the endpoint publishes the sealed state
+		// after the outcome has been accepted.
+		stateProposal, err := randomToken()
+		if err != nil {
+			return err
+		}
+		if err := writeFrame(&protocol.Event{
+			Type: "session.state", SessionID: cfg.SessionID,
+			Time: time.Now().UTC().UnixMilli(), Payload: json.RawMessage(`{"state":"` + completionState + `"}`), ProposalID: stateProposal,
+		}); err != nil {
+			return fmt.Errorf("publish run-control terminal state %s: %w", command.CommandID, err)
+		}
+		stateCtx, stateCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer stateCancel()
+		if err := waitEventReceipt(stateCtx, readFrame, writeFrame, stateProposal, "run-control terminal state "+command.CommandID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

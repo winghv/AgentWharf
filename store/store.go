@@ -863,6 +863,11 @@ type RunControlFinalize struct {
 	Writer             *RunControlWriter
 	Outcome            RunControlOutcome
 	ReasonCode         *string
+	// EncryptedTerminalSeq carries the seq of a sealed terminal event the caller
+	// already committed. When set the Store records it as the reservation's
+	// terminal event and projects the Session state, but appends no plaintext
+	// lifecycle events (the endpoint owns the sealed state/outcome content).
+	EncryptedTerminalSeq *int64
 }
 
 // RunControlStore owns the durable capability/reservation/outcome ledger.

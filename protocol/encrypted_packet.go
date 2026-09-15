@@ -30,6 +30,17 @@ type EncryptedProjection struct {
 	Role      string `json:"role,omitempty"`
 	RequestID string `json:"request_id,omitempty"`
 	Decision  string `json:"decision,omitempty"`
+	// Run-control outcomes expose only minimal lifecycle control fields so the
+	// zero-knowledge Hub can finalize its reservation and project the Session
+	// state; the endpoint-owned payload stays sealed.
+	Operation       string `json:"operation,omitempty"`
+	Outcome         string `json:"outcome,omitempty"`
+	CompletionState string `json:"completion_state,omitempty"`
+	ReasonCode      string `json:"reason_code,omitempty"`
+	// Run-control capabilities expose only the supported operations so the Hub
+	// can register the endpoint's current capability without the sealed payload.
+	InterruptSupported bool `json:"interrupt_supported,omitempty"`
+	StopSupported      bool `json:"stop_supported,omitempty"`
 }
 type OpaqueContentEnvelope struct {
 	Nonce      string `json:"nonce"`
@@ -90,6 +101,21 @@ func validateEncryptedProjection(contentType string, data []byte) error {
 	if err != nil {
 		return ErrEncryptedPacket
 	}
+	if contentType == "session.run.outcome" {
+		return validateRunControlOutcomeProjection(fields)
+	}
+	if contentType == "session.run.capabilities" {
+		for name, raw := range fields {
+			if name != "interrupt_supported" && name != "stop_supported" {
+				return ErrEncryptedPacket
+			}
+			var value bool
+			if json.Unmarshal(raw, &value) != nil {
+				return ErrEncryptedPacket
+			}
+		}
+		return nil
+	}
 	var names []string
 	switch contentType {
 	case "session.state":
@@ -129,6 +155,61 @@ func validateEncryptedProjection(contentType string, data []byte) error {
 				return ErrEncryptedPacket
 			}
 		}
+	}
+	return nil
+}
+
+// validateRunControlOutcomeProjection accepts the minimal run-control lifecycle
+// fields. operation and outcome are required; completion_state and reason_code
+// are present only for their respective outcomes.
+func validateRunControlOutcomeProjection(fields map[string]json.RawMessage) error {
+	for name := range fields {
+		switch name {
+		case "operation", "outcome", "completion_state", "reason_code":
+		default:
+			return ErrEncryptedPacket
+		}
+	}
+	read := func(name string) (string, bool, error) {
+		raw, ok := fields[name]
+		if !ok {
+			return "", false, nil
+		}
+		var value string
+		if json.Unmarshal(raw, &value) != nil || value == "" {
+			return "", false, ErrEncryptedPacket
+		}
+		return value, true, nil
+	}
+	operation, ok, err := read("operation")
+	if err != nil || !ok {
+		return ErrEncryptedPacket
+	}
+	if operation != "interrupt" && operation != "stop" {
+		return ErrEncryptedPacket
+	}
+	outcome, ok, err := read("outcome")
+	if err != nil || !ok {
+		return ErrEncryptedPacket
+	}
+	switch outcome {
+	case "completed", "rejected", "timeout", "outcome_unknown":
+	default:
+		return ErrEncryptedPacket
+	}
+	completion, hasCompletion, err := read("completion_state")
+	if err != nil {
+		return ErrEncryptedPacket
+	}
+	if hasCompletion && completion != "ready" && completion != "ended" {
+		return ErrEncryptedPacket
+	}
+	reason, hasReason, err := read("reason_code")
+	if err != nil {
+		return ErrEncryptedPacket
+	}
+	if hasReason && !validProtocolIdentifier(reason) {
+		return ErrEncryptedPacket
 	}
 	return nil
 }

@@ -1123,6 +1123,7 @@ func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID str
 	} else if finalize.Writer != nil || (finalize.Outcome == store.RunControlTimeout && reservation.Deadline.UnixMilli() > nowMS) {
 		return store.RunControlReservation{}, errors.New("run-control unbound finalization is fenced")
 	}
+	encryptedTerminal := finalize.EncryptedTerminalSeq != nil
 	if finalize.Outcome == store.RunControlCompleted {
 		if err := validateRunControlPreState(ctx, tx, sessionID, store.RunControlRequest{Operation: reservation.Operation, PreControlState: reservation.PreControlState, PreControlStateSeq: reservation.PreControlStateSeq}); err != nil {
 			return store.RunControlReservation{}, err
@@ -1131,8 +1132,10 @@ func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID str
 		if reservation.Operation == store.RunControlStop {
 			statePayload = `{"state":"ended","reason":"user_stop"}`
 		}
-		if _, err := appendRunControlEventTx(ctx, tx, sessionID, "session.state", statePayload, nowMS); err != nil {
-			return store.RunControlReservation{}, err
+		if !encryptedTerminal {
+			if _, err := appendRunControlEventTx(ctx, tx, sessionID, "session.state", statePayload, nowMS); err != nil {
+				return store.RunControlReservation{}, err
+			}
 		}
 	}
 	completionState := (*string)(nil)
@@ -1153,9 +1156,14 @@ func (s *Store) RunControlFinalize(ctx context.Context, sessionID, commandID str
 	if err != nil {
 		return store.RunControlReservation{}, err
 	}
-	terminalSeq, err := appendRunControlEventTx(ctx, tx, sessionID, "session.run.outcome", string(payload), nowMS)
-	if err != nil {
-		return store.RunControlReservation{}, err
+	var terminalSeq int64
+	if encryptedTerminal {
+		terminalSeq = *finalize.EncryptedTerminalSeq
+	} else {
+		terminalSeq, err = appendRunControlEventTx(ctx, tx, sessionID, "session.run.outcome", string(payload), nowMS)
+		if err != nil {
+			return store.RunControlReservation{}, err
+		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE session_run_controls SET status=?,terminal_event_seq=?,updated_at_ms=? WHERE session_id=? AND cmd_id=? AND reservation_version=? AND status='pending' AND terminal_event_seq IS NULL`, finalize.Outcome, terminalSeq, nowMS, sessionID, commandID, finalize.ReservationVersion)
 	if err != nil {
@@ -3500,13 +3508,27 @@ func validateRunControlPreState(ctx context.Context, tx *sql.Tx, sessionID strin
 	if err := tx.QueryRowContext(ctx, `SELECT type,payload FROM session_events WHERE session_id=? AND seq=?`, sessionID, request.PreControlStateSeq).Scan(&eventType, &payload); err != nil || eventType != "session.state" {
 		return errors.New("run-control pre-control state is not durable")
 	}
-	var state struct {
-		State string `json:"state"`
-	}
-	if json.Unmarshal([]byte(payload), &state) != nil || state.State != request.PreControlState || !validRunControlState(request.Operation, state.State) {
+	resolved, ok := sqliteRunControlState([]byte(payload))
+	if !ok || resolved != request.PreControlState || !validRunControlState(request.Operation, resolved) {
 		return errors.New("run-control pre-control state is invalid")
 	}
 	return nil
+}
+
+// sqliteRunControlState reads a plaintext legacy state event or the minimal
+// public projection of a required-mode sealed session.state carrier.
+func sqliteRunControlState(payload []byte) (string, bool) {
+	var plain struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(payload, &plain) == nil && plain.State != "" {
+		return plain.State, true
+	}
+	carrier, err := protocol.DecodeEncryptedPacketCarrier(payload, "event", "session.state", "")
+	if err != nil || carrier.Packet.Public.State == "" {
+		return "", false
+	}
+	return carrier.Packet.Public.State, true
 }
 
 func appendRunControlEventTx(ctx context.Context, tx *sql.Tx, sessionID, eventType, payload string, nowMS int64) (int64, error) {

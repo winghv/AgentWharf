@@ -1280,7 +1280,15 @@ func (h *webSocketHandler) handleAdapterEvent(ctx context.Context, adapter *adap
 	}
 	if accepted.ContentMode == protocol.ContentModeRequired {
 		// Endpoint-owned settings, run-control and file details are opaque. Do
-		// not feed encrypted payloads into legacy Hub domain interpreters.
+		// not feed encrypted payloads into legacy Hub domain interpreters. The
+		// run-control outcome is the one lifecycle transition the Hub must
+		// finalize; it reads only the sealed carrier's public control projection.
+		if ev.Type == "session.run.outcome" {
+			return h.commitEncryptedRunControlOutcome(ctx, adapter, out, ev.ProposalID)
+		}
+		if ev.Type == "session.run.capabilities" {
+			return h.commitEncryptedRunControlCapabilityProposal(ctx, adapter, out, ev.ProposalID)
+		}
 		if err := h.commitAdapterProposal(ctx, adapter, out, ev.ProposalID, nil); err != nil {
 			_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: "encrypted event persistence failed"})
 			return err
@@ -1781,13 +1789,11 @@ func (h *webSocketHandler) currentRunControlState(ctx context.Context, sessionID
 		if event.Type != "session.state" {
 			return nil
 		}
-		var payload struct {
-			State string `json:"state"`
-		}
-		if json.Unmarshal(event.Payload, &payload) != nil || payload.State == "" {
+		resolved, ok := durableSessionState(event.Payload)
+		if !ok {
 			return errors.New("invalid durable session state")
 		}
-		state, stateSeq = payload.State, event.Seq
+		state, stateSeq = resolved, event.Seq
 		return nil
 	})
 	if err != nil || stateSeq < 1 {
@@ -1797,6 +1803,133 @@ func (h *webSocketHandler) currentRunControlState(ctx context.Context, sessionID
 		return "", 0, err
 	}
 	return state, stateSeq, nil
+}
+
+// durableSessionState reads the Session state from a plaintext legacy event or
+// from the minimal public projection of a required-mode sealed carrier. The Hub
+// cannot decrypt endpoint content, so lifecycle control relies on that projection.
+func durableSessionState(payload []byte) (string, bool) {
+	var plain struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(payload, &plain) == nil && plain.State != "" {
+		return plain.State, true
+	}
+	carrier, err := protocol.DecodeEncryptedPacketCarrier(payload, "event", "session.state", "")
+	if err != nil || carrier.Packet.Public.State == "" {
+		return "", false
+	}
+	return carrier.Packet.Public.State, true
+}
+
+// commitEncryptedRunControlCapabilityProposal registers the endpoint's current
+// run-control capability from the sealed carrier's public projection and commits
+// the carrier as the opaque durable capability event.
+func (h *webSocketHandler) commitEncryptedRunControlCapabilityProposal(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	carrier, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "event", "session.run.capabilities", "")
+	if err != nil {
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: "invalid run-control capability projection"})
+		return errors.New("invalid encrypted run-control capability projection")
+	}
+	if adapter == nil {
+		return errors.New("run-control store is not configured")
+	}
+	return h.commitAdapterProposal(ctx, adapter, event, proposalID, func(commitCtx context.Context, seq int64) ([]protocol.Event, error) {
+		ledger, ok := h.events.(store.RunControlStore)
+		if !ok {
+			return nil, errors.New("run-control store is not configured")
+		}
+		if _, err := ledger.PublishRunControlCapability(commitCtx, event.SessionID, store.RunControlCapabilityUpdate{
+			EventSeq: seq, InterruptSupported: carrier.Packet.Public.InterruptSupported, StopSupported: carrier.Packet.Public.StopSupported, Writer: adapter.settingsWriter,
+		}); err != nil {
+			return nil, fmt.Errorf("publish run-control capability: %w", err)
+		}
+		pending, err := ledger.PendingRunControls(commitCtx, event.SessionID)
+		if err != nil {
+			return nil, fmt.Errorf("list pending run controls: %w", err)
+		}
+		recovered := make([]protocol.Event, 0, len(pending))
+		for _, reservation := range pending {
+			if reservation.Writer == adapter.settingsWriter {
+				continue
+			}
+			finalized, err := ledger.RecoverRunControl(commitCtx, event.SessionID, reservation.CommandID, "recovery_unconfirmed")
+			if err != nil {
+				return nil, fmt.Errorf("recover run control: %w", err)
+			}
+			events, err := h.runControlTerminalEvents(commitCtx, event.SessionID, finalized)
+			if err != nil {
+				return nil, err
+			}
+			recovered = append(recovered, events...)
+		}
+		return recovered, nil
+	})
+}
+
+// commitEncryptedRunControlOutcome commits the sealed endpoint outcome as an
+// opaque durable event and, in the same adapter effect, finalizes the Hub's
+// run-control reservation from the carrier's minimal public projection. The Hub
+// never decrypts the payload; the endpoint owns the sealed state/outcome content.
+func (h *webSocketHandler) commitEncryptedRunControlOutcome(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
+	carrier, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "event", "session.run.outcome", "")
+	if err != nil || carrier.Packet.Public.Operation == "" || carrier.Packet.Public.Outcome == "" {
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "invalid_event", Message: "invalid run-control outcome projection"})
+		return errors.New("invalid encrypted run-control outcome projection")
+	}
+	err = h.commitAdapterProposal(ctx, adapter, event, proposalID, func(effectCtx context.Context, seq int64) ([]protocol.Event, error) {
+		if err := h.finalizeEncryptedRunControl(effectCtx, adapter, event.SessionID, carrier, seq); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
+	if err != nil {
+		_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{Code: "persist_failed", Message: "encrypted event persistence failed"})
+	}
+	return err
+}
+
+func (h *webSocketHandler) finalizeEncryptedRunControl(ctx context.Context, adapter *adapterConnection, sessionID string, carrier protocol.EncryptedPacketCarrier, terminalSeq int64) error {
+	ledger, ok := h.events.(store.RunControlStore)
+	if !ok || adapter == nil || terminalSeq < 1 {
+		return errors.New("run-control store is not configured")
+	}
+	outcome, err := encryptedRunControlOutcome(carrier.Packet.Public.Outcome)
+	if err != nil {
+		return err
+	}
+	reservation, err := ledger.RunControl(ctx, sessionID, carrier.MessageID)
+	if err != nil {
+		return fmt.Errorf("run-control reservation unavailable: %w", err)
+	}
+	writer := adapter.settingsWriter
+	var reason *string
+	if value := carrier.Packet.Public.ReasonCode; value != "" {
+		reason = &value
+	}
+	_, err = ledger.RunControlFinalize(ctx, sessionID, carrier.MessageID, store.RunControlFinalize{
+		ReservationVersion:   reservation.ReservationVersion,
+		Writer:               &writer,
+		Outcome:              outcome,
+		ReasonCode:           reason,
+		EncryptedTerminalSeq: &terminalSeq,
+	})
+	return err
+}
+
+func encryptedRunControlOutcome(value string) (store.RunControlOutcome, error) {
+	switch value {
+	case string(store.RunControlCompleted):
+		return store.RunControlCompleted, nil
+	case string(store.RunControlRejected):
+		return store.RunControlRejected, nil
+	case string(store.RunControlTimeout):
+		return store.RunControlTimeout, nil
+	case string(store.RunControlOutcomeUnknown):
+		return store.RunControlOutcomeUnknown, nil
+	default:
+		return "", errors.New("invalid encrypted run-control outcome")
+	}
 }
 
 func (h *webSocketHandler) finalizeRunControlOutcome(ctx context.Context, adapter *adapterConnection, event protocol.Event, proposalID string) error {
@@ -2442,6 +2575,11 @@ func (h *webSocketHandler) handleClientCommand(ctx context.Context, conn *manage
 		return err
 	}
 	if accepted.ContentMode == protocol.ContentModeRequired {
+		// Run-control is a Hub-owned lifecycle transition: reserve it before
+		// delivery so the sealed outcome can finalize and project the Session.
+		if isRunControlCommand(cmd.Type) && accepted.ProtocolVersion == protocol.ProtocolVersionV2 {
+			return h.handleRunControl(ctx, conn, peer, accepted, cmd)
+		}
 		if ledger, ok := h.events.(store.EncryptedCommandLedgerStore); ok {
 			return h.handleDurableSessionSendMode(ctx, conn, peer, cmd, ledger, true)
 		}

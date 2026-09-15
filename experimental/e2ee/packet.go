@@ -10,10 +10,16 @@ import (
 // PublicMetadata is an explicit projection, never arbitrary Provider metadata.
 // Fields not required for Hub scheduling/permission routing remain encrypted.
 type PublicMetadata struct {
-	State     string `json:"state,omitempty"`
-	Role      string `json:"role,omitempty"`
-	RequestID string `json:"request_id,omitempty"`
-	Decision  string `json:"decision,omitempty"`
+	State              string `json:"state,omitempty"`
+	Role               string `json:"role,omitempty"`
+	RequestID          string `json:"request_id,omitempty"`
+	Decision           string `json:"decision,omitempty"`
+	Operation          string `json:"operation,omitempty"`
+	Outcome            string `json:"outcome,omitempty"`
+	CompletionState    string `json:"completion_state,omitempty"`
+	ReasonCode         string `json:"reason_code,omitempty"`
+	InterruptSupported bool   `json:"interrupt_supported,omitempty"`
+	StopSupported      bool   `json:"stop_supported,omitempty"`
 }
 
 type ContentPacket struct {
@@ -56,6 +62,25 @@ func (p PublicMetadata) validate(eventType string) error {
 		if p.Decision != "approve" && p.Decision != "deny" && p.Decision != "expired" {
 			return ErrInvalid
 		}
+	case "session.run.outcome":
+		if (p.Operation != "interrupt" && p.Operation != "stop") || p.State != "" || p.Role != "" || p.RequestID != "" || p.Decision != "" {
+			return ErrInvalid
+		}
+		switch p.Outcome {
+		case "completed", "rejected", "timeout", "outcome_unknown":
+		default:
+			return ErrInvalid
+		}
+		if p.CompletionState != "" && p.CompletionState != "ready" && p.CompletionState != "ended" {
+			return ErrInvalid
+		}
+		if p.ReasonCode != "" && !identifier.MatchString(p.ReasonCode) {
+			return ErrInvalid
+		}
+	case "session.run.capabilities":
+		if p.State != "" || p.Role != "" || p.RequestID != "" || p.Decision != "" || p.Operation != "" || p.Outcome != "" || p.CompletionState != "" || p.ReasonCode != "" {
+			return ErrInvalid
+		}
 	default:
 		if p != (PublicMetadata{}) {
 			return ErrInvalid
@@ -78,6 +103,28 @@ func ProjectPublicMetadata(eventType string, payload json.RawMessage) (PublicMet
 		}
 		return nil
 	}
+	// An optional public field may be absent or JSON null; an empty string is
+	// omitted from the projection.
+	readOptional := func(name string, target *string) error {
+		raw := fields[name]
+		if raw == nil || string(raw) == "null" {
+			*target = ""
+			return nil
+		}
+		if json.Unmarshal(raw, target) != nil {
+			return ErrInvalid
+		}
+		return nil
+	}
+	// A capability boolean projection omits false, so absence means unsupported.
+	readBool := func(name string, target *bool) error {
+		raw := fields[name]
+		if raw == nil || string(raw) == "null" {
+			*target = false
+			return nil
+		}
+		return json.Unmarshal(raw, target)
+	}
 	switch eventType {
 	case "session.state":
 		err = read("state", &result.State)
@@ -89,6 +136,22 @@ func ProjectPublicMetadata(eventType string, payload json.RawMessage) (PublicMet
 		err = read("request_id", &result.RequestID)
 		if err == nil {
 			err = read("decision", &result.Decision)
+		}
+	case "session.run.outcome":
+		err = read("operation", &result.Operation)
+		if err == nil {
+			err = read("outcome", &result.Outcome)
+		}
+		if err == nil {
+			err = readOptional("completion_state", &result.CompletionState)
+		}
+		if err == nil {
+			err = readOptional("reason_code", &result.ReasonCode)
+		}
+	case "session.run.capabilities":
+		err = readBool("interrupt_supported", &result.InterruptSupported)
+		if err == nil {
+			err = readBool("stop_supported", &result.StopSupported)
 		}
 	}
 	if err != nil || result.validate(eventType) != nil {
@@ -197,6 +260,28 @@ func decodePublicMetadata(eventType string, data []byte) (PublicMetadata, error)
 			target = &public.RequestID
 		case "decision":
 			target = &public.Decision
+		case "operation":
+			target = &public.Operation
+		case "outcome":
+			target = &public.Outcome
+		case "completion_state":
+			target = &public.CompletionState
+		case "reason_code":
+			target = &public.ReasonCode
+		case "interrupt_supported":
+			var supported bool
+			if json.Unmarshal(value, &supported) != nil {
+				return PublicMetadata{}, ErrInvalid
+			}
+			public.InterruptSupported = supported
+			continue
+		case "stop_supported":
+			var supported bool
+			if json.Unmarshal(value, &supported) != nil {
+				return PublicMetadata{}, ErrInvalid
+			}
+			public.StopSupported = supported
+			continue
 		default:
 			return PublicMetadata{}, ErrInvalid
 		}
