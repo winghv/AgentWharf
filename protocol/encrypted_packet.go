@@ -37,6 +37,10 @@ type EncryptedProjection struct {
 	Outcome         string `json:"outcome,omitempty"`
 	CompletionState string `json:"completion_state,omitempty"`
 	ReasonCode      string `json:"reason_code,omitempty"`
+	// CommandID binds the outcome to the Hub's run-control reservation. It is
+	// optional because endpoint builds sealed outcomes before it existed, and the
+	// Hub then falls back to its own pending reservation.
+	CommandID string `json:"command_id,omitempty"`
 	// Run-control capabilities expose only the supported operations so the Hub
 	// can register the endpoint's current capability without the sealed payload.
 	InterruptSupported bool `json:"interrupt_supported,omitempty"`
@@ -165,7 +169,7 @@ func validateEncryptedProjection(contentType string, data []byte) error {
 func validateRunControlOutcomeProjection(fields map[string]json.RawMessage) error {
 	for name := range fields {
 		switch name {
-		case "operation", "outcome", "completion_state", "reason_code":
+		case "operation", "outcome", "completion_state", "reason_code", "command_id":
 		default:
 			return ErrEncryptedPacket
 		}
@@ -209,6 +213,13 @@ func validateRunControlOutcomeProjection(fields map[string]json.RawMessage) erro
 		return ErrEncryptedPacket
 	}
 	if hasReason && !validProtocolIdentifier(reason) {
+		return ErrEncryptedPacket
+	}
+	commandID, hasCommand, err := read("command_id")
+	if err != nil {
+		return ErrEncryptedPacket
+	}
+	if hasCommand && !validProtocolIdentifier(commandID) {
 		return ErrEncryptedPacket
 	}
 	return nil

@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -102,5 +103,32 @@ func TestRequiredReplayAllowsOnlyTheStoreRecoveryOutcomeAsPlaintext(t *testing.T
 	event.Payload = []byte(`{"state":"ready"}`)
 	if err := validateRequiredReplayEvent(event, "session"); err == nil {
 		t.Fatal("plaintext session state accepted")
+	}
+}
+
+func TestResolveEncryptedRunControlCommandIDPrefersTheProjectionThenFallsBack(t *testing.T) {
+	ctx := context.Background()
+	writer := store.RunControlWriter{LeaseID: "lease"}
+	pending := pendingRunControlStore{pending: []store.RunControlReservation{
+		{CommandID: "stop-1", Operation: store.RunControlStop, Writer: writer},
+		{CommandID: "stop-other", Operation: store.RunControlStop, Writer: store.RunControlWriter{LeaseID: "other"}},
+		{CommandID: "interrupt-1", Operation: store.RunControlInterrupt, Writer: writer},
+	}}
+	handler := &webSocketHandler{}
+	if got, err := handler.resolveEncryptedRunControlCommandID(ctx, pending, "session", "stop", writer, "stop-1"); err != nil || got != "stop-1" {
+		t.Fatalf("projected command id = %q, %v", got, err)
+	}
+	if got, err := handler.resolveEncryptedRunControlCommandID(ctx, pending, "session", "stop", writer, ""); err != nil || got != "stop-1" {
+		t.Fatalf("fallback command id = %q, %v", got, err)
+	}
+	ambiguous := pendingRunControlStore{pending: []store.RunControlReservation{
+		{CommandID: "a", Operation: store.RunControlStop, Writer: writer},
+		{CommandID: "b", Operation: store.RunControlStop, Writer: writer},
+	}}
+	if _, err := handler.resolveEncryptedRunControlCommandID(ctx, ambiguous, "session", "stop", writer, ""); err == nil {
+		t.Fatal("ambiguous pending reservation accepted")
+	}
+	if _, err := handler.resolveEncryptedRunControlCommandID(ctx, pendingRunControlStore{}, "session", "stop", writer, ""); err == nil {
+		t.Fatal("missing reservation accepted")
 	}
 }

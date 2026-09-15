@@ -18,6 +18,7 @@ type PublicMetadata struct {
 	Outcome            string `json:"outcome,omitempty"`
 	CompletionState    string `json:"completion_state,omitempty"`
 	ReasonCode         string `json:"reason_code,omitempty"`
+	CommandID          string `json:"command_id,omitempty"`
 	InterruptSupported bool   `json:"interrupt_supported,omitempty"`
 	StopSupported      bool   `json:"stop_supported,omitempty"`
 }
@@ -66,6 +67,9 @@ func (p PublicMetadata) validate(eventType string) error {
 		if (p.Operation != "interrupt" && p.Operation != "stop") || p.State != "" || p.Role != "" || p.RequestID != "" || p.Decision != "" {
 			return ErrInvalid
 		}
+		if p.CommandID != "" && !identifier.MatchString(p.CommandID) {
+			return ErrInvalid
+		}
 		switch p.Outcome {
 		case "completed", "rejected", "timeout", "outcome_unknown":
 		default:
@@ -78,7 +82,7 @@ func (p PublicMetadata) validate(eventType string) error {
 			return ErrInvalid
 		}
 	case "session.run.capabilities":
-		if p.State != "" || p.Role != "" || p.RequestID != "" || p.Decision != "" || p.Operation != "" || p.Outcome != "" || p.CompletionState != "" || p.ReasonCode != "" {
+		if p.State != "" || p.Role != "" || p.RequestID != "" || p.Decision != "" || p.Operation != "" || p.Outcome != "" || p.CompletionState != "" || p.ReasonCode != "" || p.CommandID != "" {
 			return ErrInvalid
 		}
 	default:
@@ -138,7 +142,10 @@ func ProjectPublicMetadata(eventType string, payload json.RawMessage) (PublicMet
 			err = read("decision", &result.Decision)
 		}
 	case "session.run.outcome":
-		err = read("operation", &result.Operation)
+		err = readOptional("cmd_id", &result.CommandID)
+		if err == nil {
+			err = read("operation", &result.Operation)
+		}
 		if err == nil {
 			err = read("outcome", &result.Outcome)
 		}
@@ -164,7 +171,7 @@ func ProjectPublicMetadata(eventType string, payload json.RawMessage) (PublicMet
 // A caller supplies only the control projection approved for the event type.
 func SealPacket(ctx Context, key []byte, signer ed25519.PrivateKey, public PublicMetadata, payload json.RawMessage) (ContentPacket, error) {
 	projected, err := ProjectPublicMetadata(ctx.Type, payload)
-	if err != nil || public != projected {
+	if err != nil || !sameControlProjection(public, projected) || (public.CommandID != "" && public.CommandID != projected.CommandID) {
 		return ContentPacket{}, ErrInvalid
 	}
 	plaintext, err := json.Marshal(packetContent{public, payload})
@@ -237,10 +244,19 @@ func openPacketPlaintext(eventType string, expected PublicMetadata, plaintext []
 		return nil, err
 	}
 	projected, err := ProjectPublicMetadata(eventType, fields["payload"])
-	if err != nil || projected != public || public != expected {
+	if err != nil || !sameControlProjection(projected, public) || public != expected || (public.CommandID != "" && public.CommandID != projected.CommandID) {
 		return nil, ErrInvalid
 	}
 	return append(json.RawMessage(nil), fields["payload"]...), nil
+}
+
+// sameControlProjection compares a derived projection with a supplied or sealed
+// one. command_id is an optional Hub routing hint introduced after endpoints had
+// already sealed outcomes, so its absence is not a projection mismatch. The
+// authenticated copy and the transport projection still compare exactly.
+func sameControlProjection(left, right PublicMetadata) bool {
+	left.CommandID, right.CommandID = "", ""
+	return left == right
 }
 
 func decodePublicMetadata(eventType string, data []byte) (PublicMetadata, error) {
@@ -268,6 +284,8 @@ func decodePublicMetadata(eventType string, data []byte) (PublicMetadata, error)
 			target = &public.CompletionState
 		case "reason_code":
 			target = &public.ReasonCode
+		case "command_id":
+			target = &public.CommandID
 		case "interrupt_supported":
 			var supported bool
 			if json.Unmarshal(value, &supported) != nil {

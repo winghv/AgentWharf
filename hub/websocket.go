@@ -1749,7 +1749,16 @@ func (h *webSocketHandler) handleRunControl(ctx context.Context, conn *managedCo
 	if err := h.writeDurableAdapterFrame(ctx, adapter, &routed); err != nil {
 		h.removeRunControlClient(key)
 		h.unregisterAdapter(adapter)
-		_, _ = ledger.RecoverRunControl(ctx, cmd.SessionID, cmd.CommandID, "adapter_disconnected")
+		// The endpoint never answered, so the reservation is recovered as
+		// unconfirmed. The recovered terminal event has a Hub seq, so it must be
+		// broadcast like any other event or a live client sees a sequence gap.
+		if finalized, recoverErr := ledger.RecoverRunControl(ctx, cmd.SessionID, cmd.CommandID, "adapter_disconnected"); recoverErr == nil {
+			if events, eventsErr := h.runControlTerminalEvents(ctx, cmd.SessionID, finalized); eventsErr == nil {
+				for _, recovered := range events {
+					h.broadcastEvent(ctx, recovered)
+				}
+			}
+		}
 		_ = writeClientCommandAck(ctx, peer, conn, cmd.CommandID, protocol.AckRejected, "adapter_delivery_failed")
 		return fmt.Errorf("deliver run-control reservation: %w", err)
 	}
@@ -1898,7 +1907,11 @@ func (h *webSocketHandler) finalizeEncryptedRunControl(ctx context.Context, adap
 	if err != nil {
 		return err
 	}
-	reservation, err := ledger.RunControl(ctx, sessionID, carrier.MessageID)
+	commandID, err := h.resolveEncryptedRunControlCommandID(ctx, ledger, sessionID, carrier.Packet.Public.Operation, adapter.settingsWriter, carrier.Packet.Public.CommandID)
+	if err != nil {
+		return err
+	}
+	reservation, err := ledger.RunControl(ctx, sessionID, commandID)
 	if err != nil {
 		return fmt.Errorf("run-control reservation unavailable: %w", err)
 	}
@@ -1907,7 +1920,7 @@ func (h *webSocketHandler) finalizeEncryptedRunControl(ctx context.Context, adap
 	if value := carrier.Packet.Public.ReasonCode; value != "" {
 		reason = &value
 	}
-	_, err = ledger.RunControlFinalize(ctx, sessionID, carrier.MessageID, store.RunControlFinalize{
+	_, err = ledger.RunControlFinalize(ctx, sessionID, commandID, store.RunControlFinalize{
 		ReservationVersion:   reservation.ReservationVersion,
 		Writer:               &writer,
 		Outcome:              outcome,
@@ -1915,6 +1928,34 @@ func (h *webSocketHandler) finalizeEncryptedRunControl(ctx context.Context, adap
 		EncryptedTerminalSeq: &terminalSeq,
 	})
 	return err
+}
+
+// resolveEncryptedRunControlCommandID binds a sealed outcome to the reservation it
+// answers. A current endpoint publishes the command id in the outcome projection;
+// an endpoint sealed before that field existed has none, so the Hub falls back to
+// its own single pending reservation for the same endpoint and operation.
+func (h *webSocketHandler) resolveEncryptedRunControlCommandID(ctx context.Context, ledger store.RunControlStore, sessionID, operation string, writer store.RunControlWriter, projected string) (string, error) {
+	if projected != "" {
+		return projected, nil
+	}
+	pending, err := ledger.PendingRunControls(ctx, sessionID)
+	if err != nil {
+		return "", fmt.Errorf("list pending run controls: %w", err)
+	}
+	matched := ""
+	for _, reservation := range pending {
+		if reservation.Writer != writer || string(reservation.Operation) != operation {
+			continue
+		}
+		if matched != "" {
+			return "", errors.New("run-control outcome is ambiguous")
+		}
+		matched = reservation.CommandID
+	}
+	if matched == "" {
+		return "", errors.New("run-control reservation is unavailable")
+	}
+	return matched, nil
 }
 
 func encryptedRunControlOutcome(value string) (store.RunControlOutcome, error) {

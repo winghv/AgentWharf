@@ -3,7 +3,7 @@ import { openContent, sealContent, type ContentContext, type ContentEnvelope, ty
 
 export interface PublicMetadata {
   state?: string; role?: string; request_id?: string; decision?: string
-  operation?: string; outcome?: string; completion_state?: string; reason_code?: string
+  operation?: string; outcome?: string; completion_state?: string; reason_code?: string; command_id?: string
   interrupt_supported?: boolean; stop_supported?: boolean
 }
 export interface ContentPacket { version: 1; public: PublicMetadata; encrypted: ContentEnvelope }
@@ -29,12 +29,13 @@ function validatePublic(type: string, value: PublicMetadata): void {
     case 'session.run.outcome': {
       // A legacy endpoint sealed an empty projection; either shape is accepted.
       if (keys === '') return
-      const allowed = new Set(['operation', 'outcome', 'completion_state', 'reason_code'])
+      const allowed = new Set(['operation', 'outcome', 'completion_state', 'reason_code', 'command_id'])
       for (const key of Object.keys(value)) if (!allowed.has(key)) invalid()
       if (!['interrupt', 'stop'].includes(value.operation ?? '')) invalid()
       if (!['completed', 'rejected', 'timeout', 'outcome_unknown'].includes(value.outcome ?? '')) invalid()
       if (value.completion_state !== undefined && !['ready', 'ended'].includes(value.completion_state)) invalid()
       if (value.reason_code !== undefined && !validId(value.reason_code)) invalid()
+      if (value.command_id !== undefined && !validId(value.command_id)) invalid()
       return
     }
     case 'session.run.capabilities': {
@@ -53,8 +54,15 @@ function normalized(value: PublicMetadata): string {
   return JSON.stringify([
     value.state ?? '', value.role ?? '', value.request_id ?? '', value.decision ?? '',
     value.operation ?? '', value.outcome ?? '', value.completion_state ?? '', value.reason_code ?? '',
+    value.command_id ?? '',
     value.interrupt_supported === true, value.stop_supported === true,
   ])
+}
+// command_id is an optional Hub routing hint introduced after endpoints had
+// already sealed outcomes, so a missing one is not a projection mismatch. The
+// authenticated copy and the transport projection still compare exactly.
+function sameProjection(left: PublicMetadata, right: PublicMetadata): boolean {
+  return normalized({ ...left, command_id: undefined }) === normalized({ ...right, command_id: undefined })
 }
 export function projectPublicMetadata(type: string, payload: unknown): PublicMetadata {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) invalid()
@@ -68,6 +76,7 @@ export function projectPublicMetadata(type: string, payload: unknown): PublicMet
     case 'permission.respond': projection = { request_id: fields.request_id as string, decision: fields.decision as string }; break
     case 'session.run.outcome': {
       projection = { operation: fields.operation as string, outcome: fields.outcome as string }
+      if (fields.cmd_id !== undefined && fields.cmd_id !== null) projection.command_id = fields.cmd_id as string
       if (fields.completion_state !== undefined && fields.completion_state !== null) projection.completion_state = fields.completion_state as string
       if (fields.reason_code !== undefined && fields.reason_code !== null) projection.reason_code = fields.reason_code as string
       break
@@ -86,7 +95,9 @@ function projectRunControlCapabilities(projection: PublicMetadata, fields: Recor
 }
 export async function sealPacket(context: ContentContext, key: ContentKey, signer: CryptoKey, publicMetadata: PublicMetadata, payload: unknown): Promise<ContentPacket> {
   validatePublic(context.type, publicMetadata)
-  if (normalized(projectPublicMetadata(context.type, payload)) !== normalized(publicMetadata)) invalid()
+  const projected = projectPublicMetadata(context.type, payload)
+  if (!sameProjection(projected, publicMetadata)) invalid()
+  if (publicMetadata.command_id !== undefined && publicMetadata.command_id !== projected.command_id) invalid()
   const projection = { ...publicMetadata }
   const plaintext = new TextEncoder().encode(JSON.stringify({ public: projection, payload }))
   return { version: 1, public: projection, encrypted: await sealContent(context, key, signer, plaintext) }
@@ -111,7 +122,8 @@ export async function openPacket(context: ContentContext, key: ContentKey, signe
       // payload still drives the endpoint-owned outcome, so accept the empty
       // public only for those types instead of rejecting valid history.
       const legacyRunControlProjection = runControlTypes.has(context.type) && Object.keys(packet.public).length === 0
-      if (!legacyRunControlProjection && normalized(projectPublicMetadata(context.type, content.payload)) !== normalized(content.public)) invalid()
+      const projected = projectPublicMetadata(context.type, content.payload)
+      if (!legacyRunControlProjection && (!sameProjection(projected, content.public) || (content.public.command_id !== undefined && content.public.command_id !== projected.command_id))) invalid()
       return content.payload
     } finally { plaintext.fill(0) }
   } catch { return invalid() }

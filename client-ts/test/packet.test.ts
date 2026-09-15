@@ -30,6 +30,10 @@ test('run-control public projections open with current and legacy shapes', async
   const outcome = { cmd_id: 'cmd_1', operation: 'stop', outcome: 'completed', completion_state: 'ended', reason_code: null }
   const outcomePacket = await sealPacket(outcomeContext, key, keys.privateKey, { operation: 'stop', outcome: 'completed', completion_state: 'ended' }, outcome)
   assert.deepEqual(await openPacket(outcomeContext, key, keys.publicKey, outcomePacket), outcome)
+  const bound = await sealPacket(outcomeContext, key, keys.privateKey, { operation: 'stop', outcome: 'completed', completion_state: 'ended', command_id: 'cmd_1' }, outcome)
+  assert.equal(bound.public.command_id, 'cmd_1')
+  assert.deepEqual(await openPacket(outcomeContext, key, keys.publicKey, bound), outcome)
+  await assert.rejects(sealPacket(outcomeContext, key, keys.privateKey, { operation: 'stop', outcome: 'completed', completion_state: 'ended', command_id: 'other' }, outcome))
 
   const capabilityContext: ContentContext = { scope: 'event', session: 'session', keyId: 'key', sender: 'machine', messageId: 'event_2', type: 'session.run.capabilities' }
   const capability = { schema_version: 1, interrupt_supported: true, stop_supported: false }

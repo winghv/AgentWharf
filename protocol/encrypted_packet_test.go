@@ -22,7 +22,7 @@ func TestEncryptedRunControlOutcomeProjectionRejectsInvalidPublicFields(t *testi
 		t.Fatal(err)
 	}
 	payload := json.RawMessage(`{"cmd_id":"message","operation":"stop","outcome":"completed","completion_state":"ended","reason_code":null}`)
-	packet, err := e2ee.SealPacket(e2ee.Context{Scope: "event", Session: "session", Sender: "device", KeyID: "key", MessageID: "message", Type: "session.run.outcome"}, key, private, e2ee.PublicMetadata{Operation: "stop", Outcome: "completed", CompletionState: "ended"}, payload)
+	packet, err := e2ee.SealPacket(e2ee.Context{Scope: "event", Session: "session", Sender: "device", KeyID: "key", MessageID: "message", Type: "session.run.outcome"}, key, private, e2ee.PublicMetadata{Operation: "stop", Outcome: "completed", CompletionState: "ended", CommandID: "message"}, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,6 +32,7 @@ func TestEncryptedRunControlOutcomeProjectionRejectsInvalidPublicFields(t *testi
 		"missing outcome":   {Operation: "stop"},
 		"unknown outcome":   {Operation: "stop", Outcome: "bogus"},
 		"foreign field":     {Operation: "stop", Outcome: "completed", State: "ready"},
+		"bad command id":    {Operation: "stop", Outcome: "completed", CommandID: "bad id"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			tampered := packet
