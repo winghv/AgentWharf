@@ -3650,11 +3650,30 @@ func forwardHubCommandsToACPProvider(ctx context.Context, readFrame func(context
 						}
 						return supervisor.Stop(deliveryCtx)
 					})
-					if err != nil || admission.State != "completed" {
-						return errors.New("encrypted stop outcome unknown")
+					if err != nil {
+						return fmt.Errorf("encrypted stop delivery: %w", err)
 					}
 					if !admission.Execute {
 						return writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckDuplicate})
+					}
+					if admission.State != "completed" {
+						// The Provider cleanup was not confirmed inside the command
+						// budget. That is an honest unknown outcome, not a reason to
+						// tear down the whole Adapter: exiting here ended the Adapter,
+						// the daemon restarted it with a fresh credential that fenced
+						// the previous connection, and every later stop failed as
+						// adapter_delivery_failed -- the Session could never reach a
+						// terminal state. Publish the unknown outcome, keep the
+						// Adapter serving, and leave the Session live so a later stop
+						// can still succeed.
+						cleanupErr := errors.New("provider cleanup was not confirmed")
+						if err := acknowledgeRunControl(ctx, typed, readFrame, writeFrame, cfg, "stop", "ended", cleanupErr); err != nil {
+							return err
+						}
+						if stopInProgress != nil {
+							stopInProgress.Store(false)
+						}
+						continue
 					}
 					return acknowledgeRunControl(ctx, typed, readFrame, writeFrame, cfg, "stop", "ended", nil)
 				}
