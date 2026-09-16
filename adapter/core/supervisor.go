@@ -419,6 +419,8 @@ func (execProcessRunner) Start(command ProcessCommand) (processHandle, error) {
 	}
 	// A provider installed as a Windows batch shim cannot be started directly.
 	applyProviderShellShim(cmd)
+	// Provider children are headless and must never own a console window.
+	applyProviderConsolePolicy(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}

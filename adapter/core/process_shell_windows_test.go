@@ -40,3 +40,24 @@ func TestApplyProviderShellShimWrapsBatchProvidersOnly(t *testing.T) {
 		t.Fatalf("native executable command line was rewritten: %q", exe.SysProcAttr.CmdLine)
 	}
 }
+
+// Windows allocates a new console for a console-subsystem child whenever the
+// parent has none. The daemon is detached, so without CREATE_NO_WINDOW every
+// provider child opened a visible console window and closing that window killed
+// the running Session.
+func TestApplyProviderConsolePolicyHidesTheProviderConsole(t *testing.T) {
+	cmd := exec.Command(`C:\Windows\System32\cmd.exe`, "/d", "/s", "/c", "claude-agent-acp.cmd")
+	applyProviderConsolePolicy(cmd)
+	if cmd.SysProcAttr == nil {
+		t.Fatal("provider console policy left no process attributes")
+	}
+	if cmd.SysProcAttr.CreationFlags&createNoWindow == 0 {
+		t.Fatalf("creation flags = %#x, want CREATE_NO_WINDOW", cmd.SysProcAttr.CreationFlags)
+	}
+	if !cmd.SysProcAttr.HideWindow {
+		t.Fatal("provider window is not hidden")
+	}
+	if cmd.SysProcAttr.CreationFlags&detachedProcess != 0 {
+		t.Fatal("CREATE_NO_WINDOW is mutually exclusive with DETACHED_PROCESS")
+	}
+}

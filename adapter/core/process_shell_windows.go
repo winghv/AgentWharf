@@ -10,6 +10,27 @@ import (
 	"syscall"
 )
 
+// createNoWindow keeps a console-subsystem child from allocating a new console.
+// The wharf serve daemon runs detached, so without this every provider child
+// (the cmd.exe shim and its Node bridge) opens a visible console window, and
+// closing that window kills the provider and the whole Session.
+const (
+	createNoWindow = 0x08000000
+	// detachedProcess cannot be combined with CREATE_NO_WINDOW.
+	detachedProcess = 0x00000008
+)
+
+// applyProviderConsolePolicy runs provider children without a console window.
+// CREATE_NO_WINDOW cannot be combined with DETACHED_PROCESS or
+// CREATE_NEW_CONSOLE, so only this flag and STARTF_USESHOWWINDOW are set.
+func applyProviderConsolePolicy(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= createNoWindow
+	cmd.SysProcAttr.HideWindow = true
+}
+
 // applyProviderShellShim routes an npm/batch provider wrapper through cmd.exe.
 // CreateProcess cannot execute a .cmd or .bat image, and the ACP provider
 // bridges are installed as npm shims on Windows, so without this every
