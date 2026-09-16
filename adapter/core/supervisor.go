@@ -24,6 +24,9 @@ const (
 )
 
 type ProcessCommand struct {
+	// ExactEnv is an already-isolated environment supplied by the local endpoint.
+	// It must not be enabled by managed runtime callers.
+	ExactEnv   bool
 	Path       string
 	Args       []string
 	Env        []string
@@ -397,9 +400,16 @@ func sleepContext(ctx context.Context, duration time.Duration) error {
 }
 
 func (execProcessRunner) Start(command ProcessCommand) (processHandle, error) {
+	if command.ExactEnv && command.Credential != nil {
+		return nil, ErrInvalidProcessConfig
+	}
 	cmd := exec.Command(command.Path, command.Args...)
 	cmd.Dir = command.Dir
-	cmd.Env = providerEnvironment(command.Path, command.Env)
+	if command.ExactEnv {
+		cmd.Env = append([]string{}, command.Env...)
+	} else {
+		cmd.Env = providerEnvironment(command.Path, command.Env)
+	}
 	cmd.ExtraFiles = nil
 	cmd.Stdin = command.Stdin
 	cmd.Stdout = command.Stdout

@@ -67,6 +67,9 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 
 	launchTime := time.Now()
 	cmd := exec.CommandContext(ctx, provider.command(), args...)
+	if ownMachineProviderEnvironment(cfg) {
+		cmd.Env = localProviderEnvironment(cfg, os.Environ())
+	}
 	cmd.Dir = cfg.WorkingDirectory
 	ptmx, err := pty.Start(cmd)
 	if err != nil {

@@ -167,7 +167,40 @@ try {
     }
 
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-    Copy-Item -LiteralPath $binary -Destination (Join-Path $installDir "wharf.exe") -Force
+    # Windows permits renaming a running image, but not overwriting it. Stage
+    # beside the destination so publication is a same-volume rename. Retain the
+    # old image if a running CLI/daemon still holds it; never terminate it here.
+    $destination = Join-Path $installDir "wharf.exe"
+    $suffix = [guid]::NewGuid().ToString("N")
+    $stagedBinary = Join-Path $installDir "wharf-$suffix.new.exe"
+    $previousBinary = Join-Path $installDir "wharf-$suffix.old.exe"
+    Copy-Item -LiteralPath $binary -Destination $stagedBinary
+    $movedPrevious = $false
+    try {
+        if (Test-Path -LiteralPath $destination) {
+            Move-Item -LiteralPath $destination -Destination $previousBinary
+            $movedPrevious = $true
+        }
+        try {
+            Move-Item -LiteralPath $stagedBinary -Destination $destination
+        } catch {
+            if ($movedPrevious) {
+                Move-Item -LiteralPath $previousBinary -Destination $destination
+            }
+            throw
+        }
+    } finally {
+        if (Test-Path -LiteralPath $stagedBinary) {
+            Remove-Item -LiteralPath $stagedBinary -Force
+        }
+    }
+    if ($movedPrevious) {
+        try {
+            Remove-Item -LiteralPath $previousBinary -Force
+        } catch {
+            Say "previous executable is still in use; after stopping old Wharf processes, remove $previousBinary"
+        }
+    }
     if (-not $skipBridges) {
         foreach ($bridge in @("claude-agent-acp", "codex-acp")) {
             $bridgePath = Join-Path $providerDir "node_modules/.bin/$bridge.cmd"

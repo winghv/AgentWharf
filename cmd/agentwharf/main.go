@@ -1187,7 +1187,7 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	if _, err := state.MarkAccepted(*ack); err != nil {
 		return cfg, err
 	}
-	masker, err := eventMaskerFromSecretDir(cfg.SecretDir)
+	masker, err := providerEventMasker(cfg, os.Environ())
 	if err != nil {
 		return cfg, err
 	}
@@ -3052,7 +3052,7 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 	if err != nil {
 		return core.ProcessCommand{}, err
 	}
-	return core.ProcessCommand{Path: cfg.ProviderCommand[0], Args: cfg.ProviderCommand[1:], Env: env, Stdin: stdin, Stdout: stdout, Stderr: stderr}, nil
+	return core.ProcessCommand{Path: cfg.ProviderCommand[0], Args: cfg.ProviderCommand[1:], Env: env, ExactEnv: ownMachineProviderEnvironment(cfg), Stdin: stdin, Stdout: stdout, Stderr: stderr}, nil
 }
 
 // providerChildEnvironment forwards provider credential environment to the
@@ -3069,6 +3069,9 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 // otherwise passed through verbatim, so the sandbox environment stays
 // file-path-only for injected secrets.
 func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
+	if ownMachineProviderEnvironment(cfg) {
+		return localProviderEnvironment(cfg, parent), nil
+	}
 	if cfg.Provider == "pi" && cfg.SecretDir == "" {
 		env := make([]string, 0, 4)
 		for _, name := range []string{"OPENAI_API_KEY", "OPENAI_BASE_URL", "PI_MODEL"} {
@@ -3345,6 +3348,13 @@ func readProviderCredentialFile(secretDir string, valuePath string, requireMinSe
 		return "", fmt.Errorf("credential file must contain at least %d bytes of text", masking.MinSecretLength)
 	}
 	return value, nil
+}
+
+func providerEventMasker(cfg wrapConfig, parent []string) (*core.EventMasker, error) {
+	if ownMachineProviderEnvironment(cfg) {
+		return core.NewEventMasker(localProviderSecrets(cfg, parent)), nil
+	}
+	return eventMaskerFromSecretDir(cfg.SecretDir)
 }
 
 func eventMaskerFromSecretDir(dir string) (*core.EventMasker, error) {
