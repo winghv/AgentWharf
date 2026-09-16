@@ -15,6 +15,14 @@ import (
 var (
 	ErrInvalidProcessConfig = errors.New("invalid process supervisor config")
 	ErrRestartLimitExceeded = errors.New("process restart limit exceeded")
+	// ErrInterruptUnsupported reports that the platform cannot deliver a
+	// graceful interrupt signal to a Provider child at all: Windows has no
+	// os.Interrupt implementation, so Signal(os.Interrupt) fails for every
+	// live process. Stop must fall back to Kill when it sees this error.
+	// Without the fallback every Console-driven stop of a machine-hosted
+	// Session fails, the Hub recovers the reservation as outcome_unknown, and
+	// the Session can never reach the terminal state its archive requires.
+	ErrInterruptUnsupported = errors.New("graceful interrupt is not supported on this platform")
 )
 
 const (
@@ -128,6 +136,11 @@ type execProcessRunner struct{}
 
 type execProcessHandle struct {
 	cmd *exec.Cmd
+	// killTree, when set, terminates the whole Provider process tree. On
+	// Windows the entry process can be a cmd.exe shim whose Node bridge and
+	// provider CLI children would otherwise survive a plain Process.Kill and
+	// keep running with their session-scoped credentials.
+	killTree func() error
 }
 
 func NewProcessSupervisor(cfg ProcessConfig) (*ProcessSupervisor, error) {
@@ -210,11 +223,19 @@ func (s *ProcessSupervisor) Stop(ctx context.Context) error {
 	}
 
 	killed := false
-	if err := process.handle.Interrupt(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return fmt.Errorf("interrupt provider process: %w", err)
+	interruptErr := process.handle.Interrupt()
+	grace := s.cfg.GracePeriod
+	if interruptErr != nil && !errors.Is(interruptErr, os.ErrProcessDone) {
+		if !errors.Is(interruptErr, ErrInterruptUnsupported) {
+			return fmt.Errorf("interrupt provider process: %w", interruptErr)
+		}
+		// The platform cannot deliver a graceful interrupt at all, so waiting
+		// the grace period cannot achieve anything. Skip it and let the Kill
+		// escalation below terminate the Provider immediately.
+		grace = 0
 	}
 
-	timer := time.NewTimer(s.cfg.GracePeriod)
+	timer := time.NewTimer(grace)
 	defer timer.Stop()
 
 	select {
@@ -424,7 +445,15 @@ func (execProcessRunner) Start(command ProcessCommand) (processHandle, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	return &execProcessHandle{cmd: cmd}, nil
+	killTree, err := bindProviderProcessTree(cmd)
+	if err != nil {
+		// A child the kill path cannot fully terminate must never be left
+		// running, so binding failure fails the start instead of leaking it.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, err
+	}
+	return &execProcessHandle{cmd: cmd, killTree: killTree}, nil
 }
 
 func providerEnvironment(path string, explicit []string) []string {
@@ -512,10 +541,13 @@ func (h *execProcessHandle) Interrupt() error {
 	if h.cmd.Process == nil {
 		return nil
 	}
-	return h.cmd.Process.Signal(os.Interrupt)
+	return interruptProcess(h.cmd.Process)
 }
 
 func (h *execProcessHandle) Kill() error {
+	if h.killTree != nil {
+		return h.killTree()
+	}
 	if h.cmd.Process == nil {
 		return nil
 	}

@@ -509,10 +509,11 @@ type fakeProcessHandle struct {
 	done chan struct{}
 	once sync.Once
 
-	mu         sync.Mutex
-	err        error
-	interrupts int
-	kills      int
+	mu           sync.Mutex
+	err          error
+	interruptErr error
+	interrupts   int
+	kills        int
 }
 
 func newFakeProcessRunner() *fakeProcessRunner {
@@ -553,7 +554,7 @@ func (h *fakeProcessHandle) Interrupt() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.interrupts++
-	return nil
+	return h.interruptErr
 }
 
 func (h *fakeProcessHandle) Kill() error {
