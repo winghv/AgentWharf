@@ -211,7 +211,12 @@ test('encrypted command retries reuse the original opaque carrier', async () => 
   client.close()
 })
 
-test('encrypted event sequence gaps fail closed before reducer delivery', async () => {
+test('encrypted sequence gaps resync the cursor instead of bricking the connection', async () => {
+  // The durable Store is the contiguous authority; a cursor desync used to
+  // fail closed, and every reconnect replayed the same stream, hit the same
+  // desync, and tore the connection down before any run-control command could
+  // be acknowledged -- permanently bricking the Session's transcript, stop,
+  // and archive. The gap now resyncs to Store truth and keeps the socket.
   const sockets = new FakeSocketFactory()
   const errors: string[] = []
   const seen: AgentWharfEvent[] = []
@@ -227,10 +232,62 @@ test('encrypted event sequence gaps fail closed before reducer delivery', async 
   sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }] })
   await connected
   sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq: 2, time: 2, payload: { opaque: true } })
+  await waitFor(() => seen.length === 1)
+  assert.deepEqual(seen.map((event) => event.seq), [2])
+  assert.equal(client.lastSeq('ses_secure'), 2)
+  assert.equal(sockets.last().isClosed(), false)
+  // A later contiguous frame still decodes and advances the cursor.
+  sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq: 3, time: 3, payload: { opaque: true } })
+  await waitFor(() => seen.length === 2)
+  assert.equal(client.lastSeq('ses_secure'), 3)
+  assert.deepEqual(errors, [])
+  client.close()
+})
+
+test('stale encrypted frames are dropped without rewinding the cursor', async () => {
+  const sockets = new FakeSocketFactory()
+  const seen: AgentWharfEvent[] = []
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure' }],
+    encrypted: { contentMode: 'required', openEvent: async (event) => event, sealCommand: async () => ({}) },
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  client.onEvent((event) => seen.push(event))
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }] })
+  await connected
+  sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq: 1, time: 1, payload: { opaque: true } })
+  await waitFor(() => seen.length === 1)
+  // A replayed tail the cursor has already passed must neither re-deliver nor
+  // rewind the cursor, or the next live frame would look like a gap again.
+  sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq: 1, time: 1, payload: { opaque: true } })
+  sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', seq: 2, time: 2, payload: { opaque: true } })
+  await waitFor(() => seen.length === 2)
+  assert.deepEqual(seen.map((event) => event.seq), [1, 2])
+  assert.equal(client.lastSeq('ses_secure'), 2)
+  assert.equal(sockets.last().isClosed(), false)
+  client.close()
+})
+
+test('a durable-type frame without a sequence still fails closed', async () => {
+  const sockets = new FakeSocketFactory()
+  const errors: string[] = []
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_secure' }],
+    encrypted: { contentMode: 'required', openEvent: async (event) => event, sealCommand: async () => ({}) },
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  client.onError((error) => errors.push(error.message))
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required', sessions: [{ session_id: 'ses_secure', state: 'ready', provider: 'codex', latest_seq: 0 }] })
+  await connected
+  // A durable event type that arrives without a sequence is a protocol
+  // violation, not a cursor desync, so it must keep failing closed.
+  sockets.last().receive({ frame: 'event', type: 'session.message', session_id: 'ses_secure', time: 1, payload: { opaque: true } })
   await waitFor(() => errors.length === 1)
   assert.match(errors[0], /encrypted event sequence gap/)
-  assert.deepEqual(seen, [])
-  assert.equal(client.lastSeq('ses_secure'), 0)
   assert.equal(sockets.last().isClosed(), true)
 })
 

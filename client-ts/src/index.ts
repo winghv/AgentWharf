@@ -978,8 +978,28 @@ export class AgentWharfClient {
     state.lane = state.lane.then(async () => {
       if (state.failed || this.socket !== socket || !this.handshakeReady) return
       const ephemeral = event.seq === undefined && isEphemeralSessionEvent(event.type)
-      const current = this.cursors.get(event.session_id) ?? 0
-      if (!ephemeral && (!Number.isSafeInteger(event.seq) || event.seq !== current + 1)) throw new Error('encrypted event sequence gap')
+      if (!ephemeral) {
+        if (!Number.isSafeInteger(event.seq)) throw new Error('encrypted event sequence gap: frame carries no sequence')
+        const current = this.cursors.get(event.session_id) ?? 0
+        const seq = event.seq as number
+        if (seq <= current) {
+          // Stale redelivery of an already-decoded frame (a duplicate replay
+          // tail or a cursor that moved ahead of this connection). Dropping it
+          // keeps the connection alive; the transcript reducer ignores seqs it
+          // has already rendered.
+          return
+        }
+        if (seq !== current + 1 && typeof console !== 'undefined') {
+          // The durable Store is the contiguous authority, so a hole here means
+          // the client cursor desynced, not that Store events went missing.
+          // Fail-closed here permanently bricked Sessions: every reconnect
+          // replayed the same stream, hit the same desync, and tore the
+          // connection down before any run-control command could be
+          // acknowledged. Resync the cursor to Store truth instead; missed live
+          // frames remain available through bounded history pages.
+          console.warn(`agentwharf: encrypted cursor desynced (cursor ${current}, received ${seq}); resyncing`)
+        }
+      }
       let opened: AgentWharfEvent
       try {
         opened = await withTimeout(this.options.encrypted!.openEvent(event), 10_000, 'encrypted event authentication timed out')
