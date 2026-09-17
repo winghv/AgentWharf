@@ -10,14 +10,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/creack/pty"
+	ptylib "github.com/aymanbagabas/go-pty"
 	"github.com/winghv/agentwharf/adapter/core"
 	"github.com/winghv/agentwharf/protocol"
 	"golang.org/x/term"
@@ -66,22 +65,35 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	args = append(args, provider.sessionArgs(sessionID)...)
 
 	launchTime := time.Now()
-	cmd := exec.CommandContext(ctx, provider.command(), args...)
+	ptmx, err := ptylib.New()
+	if err != nil {
+		return fmt.Errorf("create official agent terminal: %w", err)
+	}
+	defer ptmx.Close()
+	restoreTerminalOutput, err := enableOfficialTerminalOutput()
+	if err != nil {
+		return err
+	}
+	defer restoreTerminalOutput()
+
+	cmd := ptmx.CommandContext(ctx, provider.command(), args...)
 	if ownMachineProviderEnvironment(cfg) {
 		cmd.Env = localProviderEnvironment(cfg, os.Environ())
 	}
 	cmd.Dir = cfg.WorkingDirectory
-	ptmx, err := pty.Start(cmd)
-	if err != nil {
+	if err := applyOfficialProviderShellShim(cmd); err != nil {
+		return fmt.Errorf("prepare official agent %s: %w", provider.command(), err)
+	}
+	// Size the pseudo terminal before process creation. This matters on Windows:
+	// ConPTY gives the child its initial viewport as part of startup.
+	if width, height, sizeErr := term.GetSize(int(os.Stdin.Fd())); sizeErr == nil {
+		_ = ptmx.Resize(width, height)
+	}
+	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start official agent %s: %w", provider.command(), err)
 	}
-	defer ptmx.Close()
 
-	// Match the PTY to the user's terminal so the official TUI adapts its
-	// layout, then keep it in sync on window resize.
-	if width, height, sizeErr := term.GetSize(int(os.Stdin.Fd())); sizeErr == nil {
-		_ = pty.Setsize(ptmx, &pty.Winsize{Rows: uint16(height), Cols: uint16(width)})
-	}
+	// Keep the provider TUI aligned with the user's terminal as it resizes.
 	stopResize := watchTerminalResize(ptmx)
 	defer stopResize()
 
@@ -213,7 +225,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 // instructions into the running official CLI's PTY, so the Hub can drive the
 // same session the user is operating locally. It acks the command after the
 // prompt is written and keeps the proposal/credential machinery healthy.
-func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx *os.File, ptyMu *sync.Mutex, process *os.Process, stopInProgress *atomic.Bool, injected *injectedPromptTracker, questions *questionCache, observePong func(string), rotation *credentialRotationManager) error {
+func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connection *hubConnection, writeFrame func(protocol.Frame) error, ptmx io.Writer, ptyMu *sync.Mutex, process *os.Process, stopInProgress *atomic.Bool, injected *injectedPromptTracker, questions *questionCache, observePong func(string), rotation *credentialRotationManager) error {
 	accepted := newAcceptedCommandSet(2048)
 	if ptyMu == nil {
 		ptyMu = &sync.Mutex{}
@@ -458,7 +470,7 @@ func stopOfficialCLI(command *protocol.Command, readFrame func(context.Context) 
 //
 // UNTESTED against the live claude TUI: the exact navigation may differ across
 // claude versions.
-func forwardQuestionAnswer(ptmx *os.File, questions *questionCache, payload json.RawMessage) error {
+func forwardQuestionAnswer(ptmx io.Writer, questions *questionCache, payload json.RawMessage) error {
 	var req struct {
 		RequestID string            `json:"request_id"`
 		Decision  string            `json:"decision"`

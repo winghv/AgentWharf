@@ -906,19 +906,10 @@ func providerIsBridgeOnly(provider string) bool {
 }
 
 // providerBridgeRequired reports whether a Session must run the headless ACP
-// bridge instead of the official terminal CLI on this platform. Providers
-// without an official terminal CLI always do, and so does every provider on
-// Windows: the official path drives the CLI through a PTY and creack/pty has no
-// Windows backend (StartWithSize returns ErrUnsupported), while the ACP bridges
-// the installer already ships speak stdio and need no terminal at all.
+// bridge instead of an official terminal CLI. Claude and Codex can use the
+// native PTY path on Unix and Windows (ConPTY); providers without an official
+// terminal CLI remain bridge-only everywhere.
 func providerBridgeRequired(provider string) bool {
-	return providerBridgeRequiredForPlatform(provider, runtime.GOOS)
-}
-
-func providerBridgeRequiredForPlatform(provider, goos string) bool {
-	if goos == "windows" {
-		return true
-	}
 	return providerIsBridgeOnly(provider)
 }
 
@@ -1089,16 +1080,6 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	if explicitStdin && !cfg.ForceHeadless && !cfg.StartupSmoke && !cfg.PairOnly && terminal {
 		cfg.Interactive = true
 		cfg.Stdin = stdin
-	}
-	// Windows has no PTY backend, so a provider that would have run as an
-	// official terminal CLI runs the headless ACP bridge instead. Say so instead
-	// of appearing to hang in a terminal that will never show the CLI.
-	if terminal && cfg.ForceHeadless && !cfg.Interactive && !cfg.StartupSmoke && !cfg.PairOnly && runtime.GOOS == "windows" {
-		notice := cfg.Stderr
-		if notice == nil {
-			notice = os.Stderr
-		}
-		_, _ = fmt.Fprintln(notice, "wharf: Windows runs this Session through the headless ACP bridge; there is no local terminal UI. Open the Session in the Console to drive it.")
 	}
 	if err := validateProviderCommand(cfg); err != nil {
 		return cfg, err

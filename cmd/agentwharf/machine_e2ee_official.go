@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -17,7 +18,7 @@ import (
 // official CLI PTY. It mirrors deliverEncryptedACPCommand for the interactive
 // transcript-mirroring entrypoint, which otherwise cannot accept a command from
 // the Console once Own Machine requires encryption.
-func deliverEncryptedOfficialCommand(ctx context.Context, cfg wrapConfig, connection *hubConnection, command *protocol.Command, writeFrame func(protocol.Frame) error, ptmx *os.File, ptyMu *sync.Mutex, process *os.Process, stopInProgress *atomic.Bool, injected *injectedPromptTracker, questions *questionCache) error {
+func deliverEncryptedOfficialCommand(ctx context.Context, cfg wrapConfig, connection *hubConnection, command *protocol.Command, writeFrame func(protocol.Frame) error, ptmx io.Writer, ptyMu *sync.Mutex, process *os.Process, stopInProgress *atomic.Bool, injected *injectedPromptTracker, questions *questionCache) error {
 	if cfg.e2eeRuntime == nil || connection == nil {
 		return errors.New("required encrypted command executor is unavailable")
 	}

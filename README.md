@@ -25,6 +25,8 @@ Prerequisites:
   requires your own `DEEPSEEK_API_KEY`.
 - Node.js 22 or newer and `npm` are available so the installer can install the
   Claude, Codex, and DeepSeek Harness ACP bridges used by AgentWharf.
+- Interactive Claude/Codex sessions on Windows require Windows 10 version 1809
+  or newer because Wharf uses the operating system's ConPTY API.
 
 Install Wharf on macOS or Linux:
 
@@ -108,6 +110,12 @@ $ wharf codex
 # or:
 $ wharf dsh
 ```
+
+In a real terminal, `wharf claude` and `wharf codex` open the official local TUI
+while mirroring the same provider process to the Agent Workbench. Prompts from
+either surface stay in one session. On Windows this uses ConPTY; if the host is
+too old or ConPTY cannot start, Wharf reports the error instead of silently
+opening a Workbench-only session.
 
 `wharf dsh` uses the installed user-level policy patch with the official DSH ACP
 profile. No manual DSH bridge installation or system path configuration is

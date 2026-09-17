@@ -5,21 +5,34 @@ package main
 import (
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
-	"github.com/creack/pty"
+	ptylib "github.com/aymanbagabas/go-pty"
 	"golang.org/x/term"
 )
 
-func watchTerminalResize(ptmx *os.File) func() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGWINCH)
+func watchTerminalResize(ptmx ptylib.Pty) func() {
+	resized := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	var once sync.Once
+	signal.Notify(resized, syscall.SIGWINCH)
 	go func() {
-		for range ch {
-			if width, height, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
-				_ = pty.Setsize(ptmx, &pty.Winsize{Rows: uint16(height), Cols: uint16(width)})
+		for {
+			select {
+			case <-done:
+				return
+			case <-resized:
+				if width, height, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
+					_ = ptmx.Resize(width, height)
+				}
 			}
 		}
 	}()
-	return func() { signal.Stop(ch) }
+	return func() {
+		once.Do(func() {
+			signal.Stop(resized)
+			close(done)
+		})
+	}
 }
