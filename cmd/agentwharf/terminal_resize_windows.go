@@ -11,6 +11,16 @@ import (
 	"golang.org/x/term"
 )
 
+// Windows' GetConsoleScreenBufferInfo requires an output console handle;
+// stdin is an input handle and cannot be used to query the viewport size.
+func officialTerminalSize() (int, int, error) {
+	return term.GetSize(officialTerminalSizeFD(os.Stdout.Fd()))
+}
+
+func officialTerminalSizeFD(outputFD uintptr) int {
+	return int(outputFD)
+}
+
 // Windows does not deliver SIGWINCH. Poll the console viewport so ConPTY keeps
 // the official provider TUI aligned with Windows Terminal, PowerShell, or cmd.
 func watchTerminalResize(ptmx ptylib.Pty) func() {
@@ -25,7 +35,7 @@ func watchTerminalResize(ptmx ptylib.Pty) func() {
 			case <-done:
 				return
 			case <-ticker.C:
-				width, height, err := term.GetSize(int(os.Stdin.Fd()))
+				width, height, err := officialTerminalSize()
 				if err == nil && width > 0 && height > 0 && (width != lastWidth || height != lastHeight) {
 					_ = ptmx.Resize(width, height)
 					lastWidth, lastHeight = width, height

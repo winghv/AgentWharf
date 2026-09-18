@@ -115,7 +115,10 @@ In a real terminal, `wharf claude` and `wharf codex` open the official local TUI
 while mirroring the same provider process to the Agent Workbench. Prompts from
 either surface stay in one session. On Windows this uses ConPTY; if the host is
 too old or ConPTY cannot start, Wharf reports the error instead of silently
-opening a Workbench-only session.
+opening a Workbench-only session. Codex's default alternate-screen view can be
+browsed with `Ctrl+T` (then `PageUp`/`PageDown`, `Ctrl+B`/`Ctrl+F`, `Home`, or
+`End`). To use the terminal emulator's normal scrollback instead, run
+`wharf codex --no-alt-screen`.
 
 `wharf dsh` uses the installed user-level policy patch with the official DSH ACP
 profile. No manual DSH bridge installation or system path configuration is

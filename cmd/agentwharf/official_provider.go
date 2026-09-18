@@ -86,7 +86,7 @@ func runOfficialProvider(ctx context.Context, cfg wrapConfig, connection *hubCon
 	}
 	// Size the pseudo terminal before process creation. This matters on Windows:
 	// ConPTY gives the child its initial viewport as part of startup.
-	if width, height, sizeErr := term.GetSize(int(os.Stdin.Fd())); sizeErr == nil {
+	if width, height, sizeErr := officialTerminalSize(); sizeErr == nil {
 		_ = ptmx.Resize(width, height)
 	}
 	if err := cmd.Start(); err != nil {

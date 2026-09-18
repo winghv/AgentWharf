@@ -12,6 +12,10 @@ import (
 	"golang.org/x/term"
 )
 
+func officialTerminalSize() (int, int, error) {
+	return term.GetSize(int(os.Stdin.Fd()))
+}
+
 func watchTerminalResize(ptmx ptylib.Pty) func() {
 	resized := make(chan os.Signal, 1)
 	done := make(chan struct{})
