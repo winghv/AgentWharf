@@ -16,6 +16,21 @@ function Write-ProviderWrapper([string]$Path, [string]$Target) {
     [IO.File]::WriteAllText($Path, $content, [Text.UTF8Encoding]::new($false))
 }
 
+function Invoke-NpmInstall([string]$NpmPath, [string]$Prefix, [string[]]$Packages) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell turns native stderr into an error record. npm uses
+        # stderr for non-fatal notices, so capture it without treating it as a
+        # terminating PowerShell error; the native exit code remains authoritative.
+        $ErrorActionPreference = "Continue"
+        $output = @(& $NpmPath install --prefix $Prefix --omit=dev --loglevel=error $Packages 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    [pscustomobject]@{ Output = $output; ExitCode = $exitCode }
+}
+
 $repo = Get-EnvOrDefault "AGENTWHARF_REPO" "winghv/agentwharf"
 $version = Get-EnvOrDefault "AGENTWHARF_VERSION" "latest"
 $providerDir = Get-EnvOrDefault "AGENTWHARF_PROVIDER_DIR" (Join-Path $HOME ".agentwharf/providers")
@@ -147,8 +162,9 @@ try {
         if ($null -eq $npm) { throw "missing required command: npm (install Node.js 22 or newer)" }
         Say "installing ACP provider bridges in $providerDir"
         New-Item -ItemType Directory -Path $providerDir -Force | Out-Null
-        $npmOutput = @(& $npm.Source install --prefix $providerDir --omit=dev --loglevel=error $claudeAcpPackage $codexAcpPackage 2>&1)
-        $npmExitCode = $LASTEXITCODE
+        $npmResult = Invoke-NpmInstall $npm.Source $providerDir @($claudeAcpPackage, $codexAcpPackage)
+        $npmOutput = $npmResult.Output
+        $npmExitCode = $npmResult.ExitCode
         if ($npmExitCode -ne 0) {
             Say "npm provider bridge installation failed (exit code $npmExitCode)"
             $npmOutput | Select-Object -Last 20 | ForEach-Object { Say ([string]$_) }
@@ -156,8 +172,9 @@ try {
         }
         if ($installDsh) {
             New-Item -ItemType Directory -Path $dshRuntimeDir -Force | Out-Null
-            $npmOutput = @(& $npm.Source install --prefix $dshRuntimeDir --omit=dev --loglevel=error $dshPackage 2>&1)
-            $npmExitCode = $LASTEXITCODE
+            $npmResult = Invoke-NpmInstall $npm.Source $dshRuntimeDir @($dshPackage)
+            $npmOutput = $npmResult.Output
+            $npmExitCode = $npmResult.ExitCode
             if ($npmExitCode -ne 0) {
                 Say "npm DSH installation failed (exit code $npmExitCode)"
                 $npmOutput | Select-Object -Last 20 | ForEach-Object { Say ([string]$_) }

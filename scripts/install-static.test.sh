@@ -114,6 +114,9 @@ grep -F "Get-FileHash" scripts/install.ps1 >/dev/null
 grep -F "Node.js 22 or newer is required" scripts/install.ps1 >/dev/null
 grep -F "Get-Command npm.cmd" scripts/install.ps1 >/dev/null
 grep -F 'npm provider bridge installation failed (exit code' scripts/install.ps1 >/dev/null
+grep -F 'function Invoke-NpmInstall' scripts/install.ps1 >/dev/null
+grep -F '$ErrorActionPreference = "Continue"' scripts/install.ps1 >/dev/null
+grep -F '$exitCode = $LASTEXITCODE' scripts/install.ps1 >/dev/null
 grep -F "Node.js 22 or newer" README.md >/dev/null
 grep -F "@agentclientprotocol/claude-agent-acp" scripts/install.sh >/dev/null
 grep -F "@agentclientprotocol/codex-acp@1.8.0" scripts/install.sh >/dev/null
