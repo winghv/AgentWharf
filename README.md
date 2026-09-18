@@ -42,9 +42,10 @@ irm https://github.com/winghv/agentwharf/releases/latest/download/install.ps1 | 
 
 The Windows installer downloads the matching `.exe` release, installs `wharf.exe`
 under `%USERPROFILE%\.local\bin` by default, and installs the `.cmd` ACP
-provider bridges. Add that directory to `PATH` when the installer reports that
-it is missing. `install.sh` is a Unix shell script and must not be pasted into
-CMD or PowerShell; Git Bash detects Windows and prints the PowerShell command.
+provider bridges. The installer adds the directory to the current PowerShell
+session and to the current user's `PATH`; new terminals inherit it automatically.
+`install.sh` is a Unix shell script and must not be pasted into CMD or PowerShell;
+Git Bash detects Windows and prints the PowerShell command.
 
 The installer downloads the matching prebuilt binary from GitHub Releases,
 installs the `wharf` command, and installs the Claude/Codex ACP bridge wrappers

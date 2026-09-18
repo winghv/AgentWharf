@@ -31,6 +31,36 @@ function Invoke-NpmInstall([string]$NpmPath, [string]$Prefix, [string[]]$Package
     [pscustomobject]@{ Output = $output; ExitCode = $exitCode }
 }
 
+function Test-PathEntry([string]$PathValue, [string]$Directory) {
+    if ([string]::IsNullOrEmpty($PathValue)) { return $false }
+    $target = $Directory.TrimEnd('\\')
+    foreach ($entry in ($PathValue -split ';')) {
+        if ([string]::Equals($entry.Trim().TrimEnd('\\'), $target, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Ensure-InstallDirOnPath([string]$Directory) {
+    if (-not (Test-PathEntry $env:Path $Directory)) {
+        if ([string]::IsNullOrEmpty($env:Path)) { $env:Path = $Directory }
+        else { $env:Path = "$Directory;$env:Path" }
+        Say "added $Directory to the current PowerShell PATH"
+    }
+
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (Test-PathEntry $userPath $Directory) { return }
+    try {
+        if ([string]::IsNullOrEmpty($userPath)) { $updatedUserPath = $Directory }
+        else { $updatedUserPath = "$userPath;$Directory" }
+        [Environment]::SetEnvironmentVariable("Path", $updatedUserPath, "User")
+        Say "added $Directory to the user PATH; new terminals will inherit it"
+    } catch {
+        Say "could not persist $Directory in the user PATH; the current shell can use it, but new terminals need a manual PATH update"
+    }
+}
+
 $repo = Get-EnvOrDefault "AGENTWHARF_REPO" "winghv/agentwharf"
 $version = Get-EnvOrDefault "AGENTWHARF_VERSION" "latest"
 $providerDir = Get-EnvOrDefault "AGENTWHARF_PROVIDER_DIR" (Join-Path $HOME ".agentwharf/providers")
@@ -243,9 +273,7 @@ try {
             Say "installed $(Join-Path $providerDir 'dsh/cordis.yml')"
         }
     }
-    if (($env:Path -split ';') -notcontains $installDir) {
-        Say "$installDir is not on PATH; add it before running wharf"
-    }
+    Ensure-InstallDirOnPath $installDir
 } finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }
