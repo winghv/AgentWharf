@@ -122,6 +122,9 @@ func deliverEncryptedFileRead(ctx context.Context, cfg wrapConfig, command *prot
 		return emitEncryptedFileResult(decoded, payload, writeFrame)
 	})
 	if err != nil {
+		if encryptedEpochStale(err) {
+			return writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckRejected, Reason: "epoch_stale"})
+		}
 		return errors.New("encrypted file read failed")
 	}
 	if admission.State != "completed" {
@@ -217,6 +220,9 @@ func deliverEncryptedFileList(ctx context.Context, cfg wrapConfig, command *prot
 		return emitEncryptedFileResult(decoded, payload, writeFrame)
 	})
 	if err != nil {
+		if encryptedEpochStale(err) {
+			return writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckRejected, Reason: "epoch_stale"})
+		}
 		return errors.New("encrypted file list failed")
 	}
 	if admission.State != "completed" {

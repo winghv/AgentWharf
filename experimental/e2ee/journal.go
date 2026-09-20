@@ -17,6 +17,7 @@ var (
 	ErrUnauthorized = errors.New("endpoint command unauthorized")
 	ErrConflict     = errors.New("endpoint command conflict")
 	ErrCapacity     = errors.New("endpoint command capacity exhausted")
+	ErrEpochStale   = errors.New("endpoint command epoch stale")
 	ErrJournal      = errors.New("endpoint journal unavailable")
 )
 
@@ -129,7 +130,10 @@ func replaceGrantsTx(ctx context.Context, tx *sql.Tx, session, keyID string, exp
 	if expectedEpoch == 0 {
 		result, err = tx.ExecContext(ctx, `INSERT INTO e2ee_local_sessions(session, epoch, key_id) VALUES (?, 1, ?) ON CONFLICT(session) DO NOTHING`, session, keyID)
 	} else {
-		result, err = tx.ExecContext(ctx, `UPDATE e2ee_local_sessions SET epoch = epoch + 1, key_id = ? WHERE session = ? AND epoch = ? AND key_id <> ?`, keyID, session, expectedEpoch, keyID)
+		// A new epoch also renews the per-epoch command admission budget: the
+		// bound is a resource guard on one content key, and rotation is its
+		// only renewal path. Command dedup rows are separate and never reset.
+		result, err = tx.ExecContext(ctx, `UPDATE e2ee_local_sessions SET epoch = epoch + 1, key_id = ?, command_count = 0 WHERE session = ? AND epoch = ? AND key_id <> ?`, keyID, session, expectedEpoch, keyID)
 	}
 	if err != nil {
 		return ErrJournal
@@ -186,6 +190,15 @@ func (j *CommandJournal) admitValidated(ctx context.Context, command Context, ke
 		return CommandAdmission{}, nil, ErrJournal
 	}
 	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		if err == nil && command.KeyID != "" {
+			// The session exists but is keyed by a different epoch. A stale
+			// sender gets a distinguishable, content-free recovery signal so a
+			// terminal can refresh its key epoch and resend.
+			var current int
+			if scanErr := tx.QueryRowContext(ctx, `SELECT count(*) FROM e2ee_local_sessions WHERE session=?`, command.Session).Scan(&current); scanErr == nil && current == 1 {
+				return CommandAdmission{}, nil, ErrEpochStale
+			}
+		}
 		return CommandAdmission{}, nil, ErrUnauthorized
 	}
 	var publicKey []byte

@@ -21,6 +21,14 @@ type machineE2EERuntime struct {
 	public   e2ee.PairingIdentity
 }
 
+// encryptedEpochStale reports whether a durable command admission failed
+// because the sender sealed under a stale key epoch. The wire ack then carries
+// the content-free reason "epoch_stale" so an encrypted terminal can refresh
+// its epoch and resend; every other failure keeps the existing behavior.
+func encryptedEpochStale(err error) bool {
+	return errors.Is(err, e2ee.ErrEpochStale)
+}
+
 // deliverCommand releases plaintext only inside the durable executor callback.
 // The provider callback must finish accepting the command before returning and
 // must not retain the temporary payload buffer.
@@ -108,21 +116,64 @@ func (r *machineE2EERuntime) ensureSession(ctx context.Context, session string) 
 	return r.requireSession(ctx, session)
 }
 
+// rotateSessionKeys rekeys the session to a fresh key epoch. ErrConflict means
+// another path already rotated; that is success for the caller's purpose.
+func (r *machineE2EERuntime) rotateSessionKeys(ctx context.Context, session string) error {
+	journal, err := e2ee.NewCommandJournal(ctx, r.database)
+	if err != nil {
+		return err
+	}
+	_, err = r.vault.RotateSessionKeysForBudget(ctx, journal, session)
+	return err
+}
+
 // sealEvent selects the locally active epoch. Callers retain the resulting
 // bytes across proposal retries; the Hub remains the sole seq allocator.
+// The durable per-key seal budget never resets within one epoch, so the sealer
+// rekeys proactively at the rotation threshold and once more on a hard
+// capacity or stale-epoch failure. Without this, a long-running session hits
+// the bound and wedges its adapter in a permanent restart loop.
 func (r *machineE2EERuntime) sealEvent(ctx context.Context, session, messageID, eventType string, payload json.RawMessage) (json.RawMessage, error) {
 	if r == nil || r.vault == nil {
 		return nil, errors.New("encrypted event runtime unavailable")
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	var keyID string
-	if err := r.database.QueryRowContext(ctx, `SELECT key_id FROM e2ee_local_sessions WHERE session=?`, session).Scan(&keyID); err != nil {
+	journal, err := e2ee.NewCommandJournal(ctx, r.database)
+	if err != nil {
 		return nil, errors.New("local encrypted session unavailable")
 	}
-	event, err := r.vault.SealEventWire(ctx, e2ee.Context{Scope: "event", Session: session, KeyID: keyID, Sender: r.public.Device, MessageID: messageID, Type: eventType}, payload)
-	if err != nil {
-		return nil, err
+	currentKeyID := func() string {
+		var keyID string
+		if err := r.database.QueryRowContext(ctx, `SELECT key_id FROM e2ee_local_sessions WHERE session=?`, session).Scan(&keyID); err != nil {
+			return ""
+		}
+		return keyID
+	}
+	keyID := currentKeyID()
+	if keyID == "" {
+		return nil, errors.New("local encrypted session unavailable")
+	}
+	if used, budgetErr := r.vault.SealsUsed(ctx, session); budgetErr == nil && used >= e2ee.SealRotationThreshold {
+		// A conflict means a concurrent seal already rotated; either way the
+		// next read picks up the winning epoch.
+		_, _ = r.vault.RotateSessionKeysForBudget(ctx, journal, session)
+		if keyID = currentKeyID(); keyID == "" {
+			return nil, errors.New("local encrypted session unavailable")
+		}
+	}
+	event, sealErr := r.vault.SealEventWire(ctx, e2ee.Context{Scope: "event", Session: session, KeyID: keyID, Sender: r.public.Device, MessageID: messageID, Type: eventType}, payload)
+	if sealErr != nil && (errors.Is(sealErr, e2ee.ErrCapacity) || errors.Is(sealErr, e2ee.ErrUnauthorized)) {
+		if _, rotErr := r.vault.RotateSessionKeysForBudget(ctx, journal, session); rotErr != nil && !errors.Is(rotErr, e2ee.ErrConflict) {
+			return nil, sealErr
+		}
+		if keyID = currentKeyID(); keyID == "" {
+			return nil, errors.New("local encrypted session unavailable")
+		}
+		event, sealErr = r.vault.SealEventWire(ctx, e2ee.Context{Scope: "event", Session: session, KeyID: keyID, Sender: r.public.Device, MessageID: messageID, Type: eventType}, payload)
+	}
+	if sealErr != nil {
+		return nil, sealErr
 	}
 	return json.Marshal(event)
 }

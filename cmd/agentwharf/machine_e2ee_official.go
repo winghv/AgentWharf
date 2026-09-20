@@ -89,7 +89,11 @@ func deliverEncryptedOfficialCommand(ctx context.Context, cfg wrapConfig, connec
 		return nil
 	})
 	if err != nil {
-		if writeErr := writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckRejected, Reason: err.Error()}); writeErr != nil {
+		reason := err.Error()
+		if encryptedEpochStale(err) {
+			reason = "epoch_stale"
+		}
+		if writeErr := writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckRejected, Reason: reason}); writeErr != nil {
 			return writeErr
 		}
 		return nil

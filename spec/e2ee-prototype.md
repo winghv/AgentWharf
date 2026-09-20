@@ -82,15 +82,47 @@ The registry stores no invitation secrets, content keys or content. It caps devi
 
 `Admit` verifies scope, exact current session/key, current device control permission, signature and decryption before committing a command reservation. Its SQLite writer transaction serializes admission and membership changes across connections. Only the first committed reservation returns plaintext and `Execute=true`; same-ID changed envelopes conflict. Retries reuse the exact envelope. A claimed command seen again returns `outcome_unknown`, including after restart, and cannot execute automatically again. This is at-most-once admission, not exactly-once Provider execution or proof of completion.
 
-Only the local executor calls `Finish`; platform receipts never do. Terminal outcomes are idempotent but cannot overwrite one another. Storage errors, cancellation and failed transactions return no execution permission or plaintext. Calls have a five-second context bound; the database owner must configure bounded driver busy waits. Each Session accepts at most 4096 new command IDs across epochs, then fails explicitly. This is an experimental resource bound, not an approved production Session limit. The journal does not create Hub seq values.
+Only the local executor calls `Finish`; platform receipts never do. Terminal outcomes are idempotent but cannot overwrite one another. Storage errors, cancellation and failed transactions return no execution permission or plaintext. Calls have a five-second context bound; the database owner must configure bounded driver busy waits. Each Session accepts at most 4096 new command IDs per key epoch, then fails explicitly; an epoch transition renews the budget (see "Coordinated seal-budget rotation"). This is an experimental resource bound, not an approved production Session limit. The journal does not create Hub seq values.
 
 Residual prerequisites before runtime integration: authenticated membership transition delivery; private database provisioning and corruption/rollback detection; fresh key material; serialized membership/execution lifecycle; signed command expiration/admission freshness; cleanup after permanently fencing a session. A command admitted before a concurrent revocation may still execute unless the eventual local executor provides that serialization. None of these are advertised as solved by this journal.
 
 ## Endpoint Event Sealing Budget
 
-`SessionKeyVault.SealEvent` loads the local wrapped key, validates the event projection, checks the current Session epoch and commits a usage reservation before encryption. Its local per-key bound is 16384 seals. It accepts only event scope signed by this machine identity. Failed/canceled attempts after reservation consume their allocation; no ciphertext is returned on storage failure. Old epoch keys remain available for history decryption but cannot be used for new events through this API. It does not allocate seq or implement an event outbox; retries must retain the original packet. Tests cover reopen near exhaustion, two independent database connections competing for the last reservation, rotation and injected reservation failure.
+`SessionKeyVault.SealEvent` loads the local wrapped key, validates the event projection, checks the current Session epoch and commits a usage reservation before encryption. Its local per-key bound is 16384 seals. It accepts only event scope signed by this machine identity. Failed/canceled attempts after reservation consume their allocation; no ciphertext is returned on storage failure. Old epoch keys remain available for history decryption but cannot be used for new events through this API. It does not allocate seq or implement an event outbox; retries must retain the original packet. Tests cover reopen near exhaustion, two independent database connections competing for the last reservation, rotation and injected reservation failure. The machine runtime seals at `SealRotationThreshold`-driven rotation; see "Coordinated seal-budget rotation" below.
 
-This is not yet the complete aggregate 2^20 budget: trusted-client persistence/enforcement and a bound on distinct writers over an epoch's entire membership history remain outstanding. Raw `Seal`/`SealPacket` remain unbudgeted primitives and must not be production sending paths. Production event dispatch, retry outbox and coordinated rotation are not integrated.
+This is not yet the complete aggregate 2^20 budget: trusted-client persistence/enforcement and a bound on distinct writers over an epoch's entire membership history remain outstanding. Raw `Seal`/`SealPacket` remain unbudgeted primitives and must not be production sending paths. Retry outbox integration remains outstanding.
+
+## Coordinated seal-budget rotation
+
+The machine endpoint owns the event-seal path, so it also owns budget
+recovery. `SessionKeyVault.SealsUsed` reports the current epoch's durable
+usage, and `SessionKeyVault.RotateSessionKeysForBudget` rekeys the session at
+`SealRotationThreshold` (12288 of 16384): a fresh key epoch with unchanged
+grants (plus the machine control grant, which only preserves existing local
+authority — the machine already seals every event and holds every content
+key), a reset per-epoch command admission budget, and full retention of
+historical keys for replay, all in one SQLite transaction guarded by the epoch
+CAS. Membership itself still changes only through a controller-signed
+membership request. A losing concurrent rotation fails with `ErrConflict` and
+the caller reloads the winning epoch; the hard bound stays as the backstop,
+and one seal failure on capacity or stale epoch triggers the same rotation and
+a single bounded retry.
+
+Because every epoch transition resets the command admission budget, the
+journal's 4096-command bound is a per-epoch resource guard, not a session
+lifetime limit; command dedup rows are separate and never reset.
+
+Command admission distinguishes a retired key epoch from a genuine
+authorization failure: `journal.Admit` returns `ErrEpochStale` when the
+session exists but the sender sealed under a non-current key, and the
+daemon's encrypted delivery paths surface it as the content-free wire reason
+`epoch_stale` in a rejected ack instead of tearing down the Adapter. An
+encrypted terminal recovers by pulling the endpoint-signed membership
+directory, requesting the current wrapped key, and resending once; inbound
+events already converge because the wire carries the current `key_id` and the
+endpoint wraps the current key for every granted device. A terminal never
+moves its binding to an epoch older than the newest endpoint-signed directory
+it has verified, so replayed historical key responses cannot downgrade it.
 
 ## Composed Endpoint Command Execution
 

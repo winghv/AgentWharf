@@ -52,7 +52,13 @@ func deliverEncryptedACPSettings(ctx context.Context, cfg wrapConfig, command *p
 		}
 		return nil
 	})
-	if err != nil || admission.State != "completed" {
+	if err != nil {
+		if encryptedEpochStale(err) {
+			return writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckRejected, Reason: "epoch_stale"})
+		}
+		return errors.New("encrypted settings delivery failed")
+	}
+	if admission.State != "completed" {
 		return errors.New("encrypted settings delivery failed")
 	}
 	status := protocol.AckAccepted

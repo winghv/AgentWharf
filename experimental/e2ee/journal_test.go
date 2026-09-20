@@ -97,7 +97,7 @@ func TestJournalRestartReplayAndRoles(t *testing.T) {
 	if err := journal.ReplaceGrants(ctx, "session", "epoch_2", 1, []DeviceGrant{{"reader", public, false}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := journal.Admit(ctx, command, key, envelope); !errors.Is(err, ErrUnauthorized) {
+	if _, _, err := journal.Admit(ctx, command, key, envelope); !errors.Is(err, ErrEpochStale) {
 		t.Fatal("old epoch admitted", err)
 	}
 	if err := journal.ReplaceGrants(ctx, "session", "epoch_3", 1, grants); !errors.Is(err, ErrConflict) {
