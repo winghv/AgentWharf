@@ -116,17 +116,6 @@ func (r *machineE2EERuntime) ensureSession(ctx context.Context, session string) 
 	return r.requireSession(ctx, session)
 }
 
-// rotateSessionKeys rekeys the session to a fresh key epoch. ErrConflict means
-// another path already rotated; that is success for the caller's purpose.
-func (r *machineE2EERuntime) rotateSessionKeys(ctx context.Context, session string) error {
-	journal, err := e2ee.NewCommandJournal(ctx, r.database)
-	if err != nil {
-		return err
-	}
-	_, err = r.vault.RotateSessionKeysForBudget(ctx, journal, session)
-	return err
-}
-
 // sealEvent selects the locally active epoch. Callers retain the resulting
 // bytes across proposal retries; the Hub remains the sole seq allocator.
 // The durable per-key seal budget never resets within one epoch, so the sealer
