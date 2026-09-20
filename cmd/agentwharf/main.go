@@ -2300,6 +2300,11 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 		return errors.New("provider_session_resume_failed: original provider session could not be loaded; refusing to create a new context")
 	}
 	providerSessionID := stringFieldFromAny(sessionResult["sessionId"])
+	if sessionMethod == "session/load" {
+		// ACP LoadSessionResponse does not allocate or return a session ID.
+		// Successful load restores precisely the ID supplied in the request.
+		providerSessionID = cfg.ProviderSessionID
+	}
 	if providerSessionID == "" {
 		cancel()
 		return errors.New("acp session/new response missing sessionId")

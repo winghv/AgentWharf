@@ -3962,7 +3962,8 @@ func runWrapACPRecoveryProviderHelper() {
 		}
 		writeACPResponse(fresh["id"], map[string]any{"sessionId": "acp_ses_fresh"})
 	} else {
-		writeACPResponse(load["id"], map[string]any{"sessionId": "acp_ses_existing"})
+		// ACP LoadSessionResponse carries modes/models, not a new session ID.
+		writeACPResponse(load["id"], map[string]any{})
 	}
 	for {
 		time.Sleep(time.Hour)
