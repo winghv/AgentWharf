@@ -267,8 +267,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	}
 	for _, handoff := range handoffs {
 		if !dispatchCredentialAlive(handoff) {
-			_, _ = fmt.Fprintf(stderr, "wharf machine serve: dropping expired handoff for claim %s\n", handoff.ClaimID)
-			_ = removeMachineDispatch(handoff.ClaimID)
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: retaining expired handoff for recovery of claim %s\n", handoff.ClaimID)
 			continue
 		}
 		if !recoveryGuard.claim(handoff.SessionID) {
@@ -522,6 +521,10 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 	if onDone != nil {
 		defer onDone()
 	}
+	if isMachineRecoveryDispatch(*handoff) && handoff.ProviderSessionID == "" {
+		_, _ = fmt.Fprintln(stderr, "wharf machine serve: provider_session_resume_failed: original provider session id is missing")
+		return errors.New("provider_session_resume_failed")
+	}
 	adapterCfg := serveWrapConfig(*handoff, cfg.StartupSmoke)
 	var endpointRuntime *machineE2EERuntime
 	// Every machine-serve dispatch is Own Machine, including recovery handoffs
@@ -603,7 +606,9 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 						_, _ = fmt.Fprintf(stderr, "wharf machine serve: report provider start failure for %s: %v\n", handoff.SessionID, reportErr)
 					}
 				}
-				_ = removeMachineDispatch(handoff.ClaimID)
+				if handoff.ProviderSessionID == "" {
+					_ = removeMachineDispatch(handoff.ClaimID)
+				}
 				return
 			}
 			if cfg.StartupSmoke {
@@ -612,8 +617,8 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 			}
 			credentialAlive := dispatchCredentialAlive(*handoff)
 			if !machineServeAdapterShouldRestart(err, credentialAlive, restarts) {
-				_ = removeMachineDispatch(handoff.ClaimID)
 				if err == nil {
+					_ = removeMachineDispatch(handoff.ClaimID)
 					_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended normally; not restarting\n", handoff.SessionID)
 					return nil
 				}
@@ -766,6 +771,25 @@ func listRecoverableMachineSessions(ctx context.Context, client *http.Client, cr
 }
 
 func recoverMachineSession(ctx context.Context, client *http.Client, credential machineCredential, session machineRecoverableSession) (*machineServeDispatch, error) {
+	// Credentials may expire, but native history identity must survive. Read it
+	// before refreshing authority so missing history cannot fence a live peer.
+	dispatches, err := loadMachineDispatches()
+	if err != nil {
+		return nil, err
+	}
+	providerSessionID := ""
+	for _, prior := range dispatches {
+		if prior.SessionID != session.SessionID || prior.Provider != session.Provider || prior.HubWSURL != credential.HubWSURL || prior.ProviderSessionID == "" {
+			continue
+		}
+		if providerSessionID != "" && providerSessionID != prior.ProviderSessionID {
+			return nil, errors.New("provider_session_resume_failed: conflicting native session identities")
+		}
+		providerSessionID = prior.ProviderSessionID
+	}
+	if providerSessionID == "" {
+		return nil, errors.New("provider_session_resume_failed: original provider session id is missing")
+	}
 	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machine-sessions/"+url.PathEscape(session.SessionID)+"/recover")
 	if err != nil {
 		return nil, err
@@ -778,16 +802,17 @@ func recoverMachineSession(ctx context.Context, client *http.Client, credential 
 	if err := decodeCloudAPIJSON(body, &response); err != nil {
 		return nil, fmt.Errorf("decode session recovery: %w", err)
 	}
-	if response.Data.Session.ID == "" || response.Data.HubWSURL == "" || response.Data.AdapterToken == "" || response.Data.EncryptionMode != "required" || response.Data.ExpiresAt == "" {
+	if response.Data.Session.ID != session.SessionID || response.Data.Session.Provider != session.Provider || response.Data.HubWSURL != credential.HubWSURL || response.Data.AdapterToken == "" || response.Data.EncryptionMode != "required" || response.Data.ExpiresAt == "" {
 		return nil, errors.New("session recovery response is incomplete")
 	}
 	return &machineServeDispatch{
-		ClaimID:          "recovery:" + response.Data.Session.ID,
-		SessionID:        response.Data.Session.ID,
-		Provider:         response.Data.Session.Provider,
-		HubWSURL:         response.Data.HubWSURL,
-		AdapterToken:     response.Data.AdapterToken,
-		AdapterExpiresAt: response.Data.ExpiresAt,
+		ClaimID:           "recovery:" + response.Data.Session.ID,
+		SessionID:         response.Data.Session.ID,
+		Provider:          response.Data.Session.Provider,
+		HubWSURL:          response.Data.HubWSURL,
+		AdapterToken:      response.Data.AdapterToken,
+		AdapterExpiresAt:  response.Data.ExpiresAt,
+		ProviderSessionID: providerSessionID,
 	}, nil
 }
 
