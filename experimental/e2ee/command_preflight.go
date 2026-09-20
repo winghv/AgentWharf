@@ -32,7 +32,8 @@ func (e *CommandExecutor) InspectWire(ctx context.Context, session, id, kind str
 	}
 	defer func() { <-e.lane }()
 	var public []byte
-	err = e.journal.db.QueryRowContext(ctx, `SELECT g.verify_key FROM e2ee_local_sessions s JOIN e2ee_local_grants g ON g.session=s.session WHERE s.session=? AND s.key_id=? AND g.device=? AND g.control=1`, session, command.KeyID, command.Sender).Scan(&public)
+	var currentKeyID string
+	err = e.journal.db.QueryRowContext(ctx, `SELECT g.verify_key, s.key_id FROM e2ee_local_sessions s JOIN e2ee_local_grants g ON g.session=s.session WHERE s.session=? AND g.device=? AND g.control=1`, session, command.Sender).Scan(&public, &currentKeyID)
 	if err != nil {
 		return ErrUnauthorized
 	}
@@ -45,6 +46,9 @@ func (e *CommandExecutor) InspectWire(ctx context.Context, session, id, kind str
 	defer clear(payload)
 	if err != nil {
 		return err
+	}
+	if currentKeyID != command.KeyID {
+		return ErrEpochStale
 	}
 	return inspect(payload)
 }

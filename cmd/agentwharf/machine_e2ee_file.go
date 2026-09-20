@@ -40,7 +40,9 @@ func rejectUnavailableEncryptedFileCommand(ctx context.Context, cfg wrapConfig, 
 		return false, nil
 	}
 	reason := ""
-	if errors.Is(err, errInvalidEncryptedFileRequest) {
+	if encryptedEpochStale(err) {
+		reason = "epoch_stale"
+	} else if errors.Is(err, errInvalidEncryptedFileRequest) {
 		reason = "invalid_file_request"
 	} else if errors.Is(err, errEncryptedFileUnavailable) {
 		reason = "file_unavailable"
