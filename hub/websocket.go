@@ -2275,7 +2275,15 @@ func pendingCommandAckCompleted(contentMode string, ack *protocol.CommandAck) bo
 }
 
 func pendingCommandAckTerminalRejection(contentMode string, commandType protocol.CommandType, ack *protocol.CommandAck) (string, bool) {
-	if contentMode != protocol.ContentModeRequired || (commandType != protocol.CommandFileRead && commandType != protocol.CommandFileList) || ack == nil || ack.Status != protocol.AckRejected {
+	if contentMode != protocol.ContentModeRequired || ack == nil || ack.Status != protocol.AckRejected {
+		return "", false
+	}
+	// A stale key is rejected before endpoint execution. Resolve this delivery
+	// definitively so the terminal can recover the key and submit a new command.
+	if ack.Reason == "epoch_stale" {
+		return ack.Reason, true
+	}
+	if commandType != protocol.CommandFileRead && commandType != protocol.CommandFileList {
 		return "", false
 	}
 	switch ack.Reason {

@@ -23,6 +23,11 @@ func TestHubEncryptedLedgerWithSQLite(t *testing.T) {
 			t.Run(kind+"/"+string(status), func(t *testing.T) { testHubEncryptedLedgerWithSQLite(t, kind, status, "") })
 		}
 	}
+	for _, kind := range []string{"session.send", "session.interrupt", "session.stop", "permission.respond", "session.settings.change", "session.file.read", "session.file.list"} {
+		t.Run(kind+"/epoch_stale", func(t *testing.T) {
+			testHubEncryptedLedgerWithSQLite(t, kind, protocol.AckRejected, "epoch_stale")
+		})
+	}
 	for _, reason := range []string{"invalid_file_request", "file_unavailable", "private_adapter_detail"} {
 		t.Run("session.file.read/rejected/"+reason, func(t *testing.T) {
 			testHubEncryptedLedgerWithSQLite(t, "session.file.read", protocol.AckRejected, reason)
@@ -101,7 +106,7 @@ func testHubEncryptedLedgerWithSQLite(t *testing.T, kind string, status protocol
 	handler.pendingCommandClients = map[string]*pendingCommandClient{"pending": client}
 	handler.acceptedCommands = make(map[string]struct{})
 	err = handler.handlePendingCommandAck(ctx, adapter, &protocol.CommandAck{CommandID: "command", Status: status, Reason: reason}, "pending", client)
-	terminallyRejected := status == protocol.AckRejected && (reason == "invalid_file_request" || reason == "file_unavailable")
+	terminallyRejected := status == protocol.AckRejected && (reason == "epoch_stale" || reason == "invalid_file_request" || reason == "file_unavailable")
 	if (err != nil) != (status == protocol.AckRejected && !terminallyRejected) {
 		t.Fatalf("ack result: %v", err)
 	}

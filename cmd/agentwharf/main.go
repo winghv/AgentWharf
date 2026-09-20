@@ -2294,21 +2294,10 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 			cancel()
 			return err
 		}
-		// A provider may not implement loadSession, or the opaque id may have
-		// expired. Consume that error and start a fresh provider context while
-		// keeping the same Hub Session and durable transcript.
-		if cfg.Stderr != nil {
-			_, _ = fmt.Fprintf(cfg.Stderr, "agentwharf: provider session load failed; starting a new provider context\n")
-		}
-		if err := writeACPRequest(stdinWriter, 3, "session/new", map[string]any{"cwd": cwd, "mcpServers": []any{}}); err != nil {
-			cancel()
-			return err
-		}
-		sessionResult, err = readACPResponse(runCtx, scanner, 3)
-		if err != nil {
-			cancel()
-			return err
-		}
+		// Recovery must preserve the provider's native history. A fresh context
+		// under the same Hub Session would make its transcript misleading.
+		cancel()
+		return errors.New("provider_session_resume_failed: original provider session could not be loaded; refusing to create a new context")
 	}
 	providerSessionID := stringFieldFromAny(sessionResult["sessionId"])
 	if providerSessionID == "" {

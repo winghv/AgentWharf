@@ -2322,7 +2322,7 @@ func TestRunWrapACPProviderRecoversProviderSession(t *testing.T) {
 		wantFallback  bool
 	}{
 		{name: "load", mode: "load", wantSessionID: "acp_ses_existing"},
-		{name: "fallback", mode: "fallback", wantSessionID: "acp_ses_fresh", wantFallback: true},
+		{name: "load failure blocks recovery", mode: "fallback", wantFallback: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2379,6 +2379,23 @@ func TestRunWrapACPProviderRecoversProviderSession(t *testing.T) {
 				}, nil, nil)
 				runDone <- err
 			}()
+
+			if tc.wantFallback {
+				select {
+				case err := <-runDone:
+					if err == nil || !strings.Contains(err.Error(), "provider_session_resume_failed") {
+						t.Fatalf("expected explicit recovery failure, got %v", err)
+					}
+				case <-ctx.Done():
+					t.Fatal("failed recovery silently started a new context")
+				}
+				select {
+				case <-providerSession:
+					t.Fatal("failed recovery replaced the persisted provider session")
+				default:
+				}
+				return
+			}
 
 			var ready *protocol.Event
 			for ready == nil {
