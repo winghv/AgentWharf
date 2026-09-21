@@ -973,3 +973,63 @@ func TestNewestCodexRollout(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, recent)
 	}
 }
+
+// The mirror derives the authoritative busy/ready Session state from the
+// transcript turn lifecycle so the rail spinner no longer depends on Console
+// event heuristics. A user prompt opens the turn and a turn boundary closes it.
+func TestAppendOfficialTurnStateEvents(t *testing.T) {
+	cfg := wrapConfig{SessionID: "ses_1", Provider: "claude"}
+	userMessage := protocol.Event{Type: "session.message", Payload: []byte(`{"role":"user"}`)}
+	agentMessage := protocol.Event{Type: "session.message", Payload: []byte(`{"role":"agent"}`)}
+	turnCompleted := protocol.Event{Type: "agent.activity", Payload: []byte(`{"kind":"turn_completed"}`)}
+	toolCall := protocol.Event{Type: "session.tool_call", Payload: []byte(`{"tool_call_id":"t1"}`)}
+
+	// A user prompt entry opens the turn.
+	events := appendOfficialTurnStateEvents(cfg, claudeProvider{}, []protocol.Event{userMessage})
+	if len(events) != 2 || !isOfficialStateEvent(t, events[1], "busy") {
+		t.Fatalf("user entry events = %+v", events)
+	}
+
+	// The turn_duration boundary closes it.
+	events = appendOfficialTurnStateEvents(cfg, claudeProvider{}, []protocol.Event{turnCompleted})
+	if len(events) != 2 || !isOfficialStateEvent(t, events[1], "ready") {
+		t.Fatalf("turn completion events = %+v", events)
+	}
+
+	// Claude assistant text blocks do not close the turn on their own and
+	// must not append a state event.
+	events = appendOfficialTurnStateEvents(cfg, claudeProvider{}, []protocol.Event{agentMessage, toolCall})
+	if len(events) != 2 {
+		t.Fatalf("claude agent entry must not emit state, got %+v", events)
+	}
+	if events[1].Type != "session.tool_call" {
+		t.Fatalf("claude agent entry must not append state, got %+v", events)
+	}
+
+	// Codex has no turn_duration entry, so a final agent message closes the
+	// turn the same way the Console execution heuristic does.
+	events = appendOfficialTurnStateEvents(cfg, codexProvider{}, []protocol.Event{agentMessage})
+	if len(events) != 2 || !isOfficialStateEvent(t, events[1], "ready") {
+		t.Fatalf("codex agent entry events = %+v", events)
+	}
+
+	// Non-turn events stay untouched.
+	events = appendOfficialTurnStateEvents(cfg, claudeProvider{}, []protocol.Event{toolCall})
+	if len(events) != 1 {
+		t.Fatalf("tool call events = %+v", events)
+	}
+}
+
+func isOfficialStateEvent(t *testing.T, event protocol.Event, state string) bool {
+	t.Helper()
+	if event.Type != "session.state" {
+		return false
+	}
+	var payload struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload.State == state
+}

@@ -341,6 +341,11 @@ func forwardHubCommandsToOfficialCLI(ctx context.Context, cfg wrapConfig, connec
 			if err := writeFrame(&protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}); err != nil {
 				return err
 			}
+			// The CLI turn is starting; publish the authoritative busy state so
+			// status surfaces do not depend on the Console's event heuristics.
+			if err := writeFrame(officialSessionStateEvent(cfg, "busy")); err != nil {
+				return err
+			}
 			// After a long idle the TUI may be on a recap/pager, so the first
 			// write lands but is not submitted. Confirm via transcript without
 			// blocking Ping handling on this loop.
@@ -582,6 +587,7 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 			if err != nil {
 				continue
 			}
+			events = appendOfficialTurnStateEvents(cfg, provider, events)
 			for _, event := range events {
 				cacheAskUserQuestionEvent(questions, &event)
 				if err := writeFrame(&event); err != nil {
@@ -601,6 +607,60 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
+}
+
+// officialSessionStateEvent builds a durable session.state transition for
+// official-CLI sessions. State payloads carry no secrets; the hubConnection
+// seals the event itself when the Session requires E2EE.
+func officialSessionStateEvent(cfg wrapConfig, state string) *protocol.Event {
+	payload, err := json.Marshal(map[string]any{"state": state, "provider": cfg.Provider})
+	if err != nil {
+		payload = []byte(`{"state":"` + state + `"}`)
+	}
+	return &protocol.Event{
+		Type:      "session.state",
+		SessionID: cfg.SessionID,
+		Time:      time.Now().UTC().UnixMilli(),
+		Payload:   payload,
+	}
+}
+
+// appendOfficialTurnStateEvents derives the authoritative busy/ready state
+// from the transcript turn lifecycle: a user prompt entry opens a turn (busy)
+// and a turn-completion boundary closes it (ready). Codex transcripts have no
+// turn_duration entry, so a final agent message closes the turn the same way
+// the Console's execution heuristic does.
+func appendOfficialTurnStateEvents(cfg wrapConfig, provider agentProvider, events []protocol.Event) []protocol.Event {
+	if len(events) == 0 {
+		return events
+	}
+	state := ""
+	for _, event := range events {
+		if event.Type == "session.message" {
+			var payload struct {
+				Role string `json:"role"`
+			}
+			if json.Unmarshal(event.Payload, &payload) == nil {
+				_, isClaude := provider.(claudeProvider)
+				if payload.Role == "user" && state == "" {
+					state = "busy"
+				} else if payload.Role == "agent" && !isClaude {
+					state = "ready"
+				}
+			}
+		} else if event.Type == "agent.activity" {
+			var payload struct {
+				Kind string `json:"kind"`
+			}
+			if json.Unmarshal(event.Payload, &payload) == nil && payload.Kind == "turn_completed" {
+				state = "ready"
+			}
+		}
+	}
+	if state == "" {
+		return events
+	}
+	return append(events, *officialSessionStateEvent(cfg, state))
 }
 
 // transcriptTailCursor identifies the already mirrored prefix without storing

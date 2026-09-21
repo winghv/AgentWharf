@@ -162,7 +162,21 @@ func TestMachineRuntimeDeliveryIsLocallyClaimedAndNotReplayed(t *testing.T) {
 	var stdin bytes.Buffer
 	nextID := int64(10)
 	acknowledged := false
+	stateEventSeen := false
 	err = deliverEncryptedACPPrompt(ctx, wrapConfig{SessionID: "session", e2eeRuntime: runtime}, &protocol.Command{SessionID: "session", CommandID: "acp-cmd", Type: protocol.CommandSessionSend, Payload: acpWire}, &stdin, "provider-session", &nextID, func(frame protocol.Frame) error {
+		if event, ok := frame.(*protocol.Event); ok {
+			if event.Type != "session.state" {
+				t.Fatalf("unexpected event %s", event.Type)
+			}
+			var statePayload struct {
+				State string `json:"state"`
+			}
+			if err := json.Unmarshal(event.Payload, &statePayload); err != nil || statePayload.State != "busy" {
+				t.Fatalf("state event = %s %s", event.Type, event.Payload)
+			}
+			stateEventSeen = true
+			return nil
+		}
 		ack, ok := frame.(*protocol.CommandAck)
 		if !ok || ack.Status != protocol.AckAccepted {
 			t.Fatal("invalid ACP acknowledgement")
@@ -176,6 +190,9 @@ func TestMachineRuntimeDeliveryIsLocallyClaimedAndNotReplayed(t *testing.T) {
 	})
 	if err != nil || !acknowledged || nextID != 11 {
 		t.Fatalf("ACP delivery: %v", err)
+	}
+	if !stateEventSeen {
+		t.Fatal("missing busy state event after ACP prompt delivery")
 	}
 	var rpc struct {
 		Method string

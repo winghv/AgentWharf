@@ -70,5 +70,13 @@ func deliverEncryptedACPCommand(ctx context.Context, cfg wrapConfig, command *pr
 	if !admission.Execute {
 		status = protocol.AckDuplicate
 	}
-	return writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: status})
+	if err := writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: status}); err != nil {
+		return err
+	}
+	// The Provider turn is now running; publish the authoritative busy state
+	// (the mapper publishes ready when the prompt RPC response arrives).
+	if status == protocol.AckAccepted && command.Type == protocol.CommandSessionSend {
+		return publishACPWorkingState(writeFrame, cfg, providerSessionID, "busy")
+	}
+	return nil
 }

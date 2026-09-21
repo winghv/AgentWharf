@@ -2863,6 +2863,31 @@ func waitEventReceipt(ctx context.Context, readFrame func(context.Context) (prot
 	}
 }
 
+// publishACPWorkingState emits a durable session.state transition for ACP
+// sessions. State payloads carry no secrets; the hubConnection seals the event
+// itself when the Session requires E2EE, and the Hub's attention projection
+// derives the user-visible Session state from it.
+func publishACPWorkingState(writeFrame func(protocol.Frame) error, cfg wrapConfig, providerSessionID, state string) error {
+	payload := map[string]any{"state": state, "provider": cfg.Provider}
+	if providerSessionID != "" {
+		payload["provider_session_id"] = providerSessionID
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal acp %s state: %w", state, err)
+	}
+	event := protocol.Event{
+		Type:      "session.state",
+		SessionID: cfg.SessionID,
+		Time:      time.Now().UTC().UnixMilli(),
+		Payload:   encoded,
+	}
+	if err := writeFrame(&event); err != nil {
+		return fmt.Errorf("send acp %s state: %w", state, err)
+	}
+	return nil
+}
+
 func publishRunControlCapability(ctx context.Context, conn *websocket.Conn, cfg wrapConfig, writeFrame func(protocol.Frame) error) error {
 	event, err := newRunControlCapabilityEvent(cfg)
 	if err != nil || event == nil {
@@ -3709,6 +3734,13 @@ func forwardHubCommandsToACPProvider(ctx context.Context, readFrame func(context
 				ack := protocol.CommandAck{CommandID: typed.CommandID, Status: protocol.AckAccepted}
 				if err := writeFrame(&ack); err != nil {
 					return fmt.Errorf("ack acp provider command %s: %w", typed.CommandID, err)
+				}
+				// The Provider turn is now running. Publish the authoritative busy
+				// state so status surfaces (rail spinner, attention summaries) do
+				// not depend on the Console's event heuristics. The mapper publishes
+				// the matching ready state when the prompt RPC response arrives.
+				if err := publishACPWorkingState(writeFrame, cfg, providerSessionID, "busy"); err != nil {
+					return err
 				}
 			case protocol.CommandPermissionRespond:
 				pending, result, err := acpPermissionResult(typed.Payload, pendingPermissions, permissionMu)

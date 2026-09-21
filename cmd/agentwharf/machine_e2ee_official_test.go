@@ -71,12 +71,26 @@ func TestDeliverEncryptedOfficialCommandInjectsPrompt(t *testing.T) {
 	if err := deliverEncryptedOfficialCommand(ctx, cfg, &hubConnection{}, command, writeFrame, pty, &sync.Mutex{}, nil, &atomic.Bool{}, nil, nil); err != nil {
 		t.Fatalf("deliverEncryptedOfficialCommand() error = %v", err)
 	}
-	if len(acks) != 1 {
-		t.Fatalf("acks = %d, want 1", len(acks))
+	if len(acks) != 2 {
+		t.Fatalf("acks = %d, want 2 (ack + busy state event)", len(acks))
 	}
 	ack, ok := acks[0].(*protocol.CommandAck)
 	if !ok || ack.CommandID != "cmd" || ack.Status != protocol.AckAccepted {
 		t.Fatalf("ack = %+v", acks[0])
+	}
+	stateEvent, ok := acks[1].(*protocol.Event)
+	if !ok || stateEvent.Type != "session.state" {
+		t.Fatalf("second frame = %+v, want session.state", acks[1])
+	}
+	var statePayload struct {
+		State    string `json:"state"`
+		Provider string `json:"provider"`
+	}
+	if err := json.Unmarshal(stateEvent.Payload, &statePayload); err != nil {
+		t.Fatal(err)
+	}
+	if statePayload.State != "busy" {
+		t.Fatalf("state payload = %+v, want busy", statePayload)
 	}
 	if _, err := pty.Seek(0, 0); err != nil {
 		t.Fatal(err)

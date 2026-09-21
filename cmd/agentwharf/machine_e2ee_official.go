@@ -107,6 +107,13 @@ func deliverEncryptedOfficialCommand(ctx context.Context, cfg wrapConfig, connec
 	if err := writeFrame(&protocol.CommandAck{CommandID: command.CommandID, Status: protocol.AckAccepted}); err != nil {
 		return err
 	}
+	if command.Type == protocol.CommandSessionSend {
+		// The CLI turn is starting; publish the authoritative busy state so
+		// status surfaces do not depend on the Console's event heuristics.
+		if err := writeFrame(officialSessionStateEvent(cfg, "busy")); err != nil {
+			return err
+		}
+	}
 	if promptToConfirm != "" {
 		go confirmOfficialCLIPrompt(ctx, ptmx, ptyMu, cfg.SessionID, promptToConfirm, injected, writeFrame, defaultOfficialPromptInjection)
 	}
