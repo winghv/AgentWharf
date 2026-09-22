@@ -31,10 +31,10 @@ func deliverEncryptedACPCommand(ctx context.Context, cfg wrapConfig, command *pr
 			return err
 		}
 		if decoded.Type == protocol.CommandSessionInterrupt {
-			if err := writeACPRequest(stdin, *nextID, "session/cancel", map[string]any{"sessionId": providerSessionID}); err != nil {
+			// Notification form per ACP (see writeACPNotification).
+			if err := writeACPNotification(stdin, "session/cancel", map[string]any{"sessionId": providerSessionID}); err != nil {
 				return err
 			}
-			*nextID++
 			return nil
 		}
 		if decoded.Type == protocol.CommandPermissionRespond {

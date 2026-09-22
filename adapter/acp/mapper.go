@@ -168,8 +168,38 @@ func (m *Mapper) mapFrame(raw map[string]any, providerSessionID string) []protoc
 		if responseSessionID := sessionIDFromResponse(raw); responseSessionID != "" {
 			return []protocol.Event{m.stateEvent("ready", responseSessionID, copyWithout(raw, "type", "method", "session_id", "sessionId"))}
 		}
+		// A successful session/prompt response carries only {stopReason} — no
+		// sessionId — so the response-frame path above cannot recognize it.
+		// That response is the turn boundary: without publishing ready here the
+		// session stays busy forever (the adapter publishes busy at prompt
+		// delivery). Initialize/session/new results carry sessionId and are
+		// matched by the path above; error responses are handled before this.
+		if stopReasonFrame(raw) {
+			return []protocol.Event{m.stateEvent("ready", m.providerSessionID, copyWithout(raw, "type", "method", "session_id", "sessionId"))}
+		}
 		return m.mapUpdate(raw, providerSessionID)
 	}
+}
+
+// stopReasonFrame reports whether a JSON-RPC frame is a successful response
+// carrying a prompt stopReason (session/prompt result). Both the top-level
+// shape and the nested result shape are recognized.
+func stopReasonFrame(value map[string]any) bool {
+	if _, ok := value["stopReason"]; ok {
+		return true
+	}
+	if _, ok := value["stop_reason"]; ok {
+		return true
+	}
+	if result := objectField(value, "result"); result != nil {
+		if _, ok := result["stopReason"]; ok {
+			return true
+		}
+		if _, ok := result["stop_reason"]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // jsonRPCErrorEvents turns an unmatched Provider JSON-RPC error into visible

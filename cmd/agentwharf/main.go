@@ -3706,10 +3706,12 @@ func forwardHubCommandsToACPProvider(ctx context.Context, readFrame func(context
 			}
 			switch typed.Type {
 			case protocol.CommandSessionInterrupt:
-				if err := writeACPRequest(stdin, nextID, "session/cancel", map[string]any{"sessionId": providerSessionID}); err != nil {
+				// session/cancel is a notification per ACP; bridges such as
+				// pi-acp register it notification-only, so the request form
+				// answers "Method not found" instead of cancelling.
+				if err := writeACPNotification(stdin, "session/cancel", map[string]any{"sessionId": providerSessionID}); err != nil {
 					return fmt.Errorf("write acp provider interrupt %s: %w", typed.CommandID, err)
 				}
-				nextID++
 				accepted.Add(typed.CommandID)
 				if err := acknowledgeRunControl(ctx, typed, readFrame, writeFrame, cfg, "interrupt", "ready", nil); err != nil {
 					return err
@@ -4462,4 +4464,23 @@ func (s localSessionStore) SessionAdmissionTruth(_ context.Context, sessionID st
 		return store.SessionAdmissionTruth{}, auth.ErrUnauthorized
 	}
 	return store.SessionAdmissionTruth{SessionID: sessionID, Exists: true, Complete: true, Live: true}, nil
+}
+
+// writeACPNotification sends a JSON-RPC notification (no id). ACP session
+// lifecycle notifications — session/cancel in particular — are notifications
+// per spec, and bridges such as pi-acp register them notification-only, so
+// sending the request form answers "Method not found" instead of cancelling.
+func writeACPNotification(stdin io.Writer, method string, params map[string]any) error {
+	encoded, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		return fmt.Errorf("encode acp notification %s: %w", method, err)
+	}
+	if _, err := stdin.Write(append(encoded, '\n')); err != nil {
+		return fmt.Errorf("write acp notification %s: %w", method, err)
+	}
+	return nil
 }
