@@ -328,6 +328,13 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 		if err := pollSessionKeyRequests(ctx, client, credential, trustedTerminals); err != nil {
 			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted key request poll unavailable")
 		}
+		workers.Add(1)
+		go func(machineCred machineCredential) {
+			defer workers.Done()
+			if err := pollMachineProviderSettingsProbe(serveCtx, client, machineCred, stderr); err != nil && serveCtx.Err() == nil {
+				_, _ = fmt.Fprintln(stderr, "wharf machine serve: provider settings probe poll unavailable")
+			}
+		}(credential)
 		claims, retry, err := listPendingMachineClaims(ctx, client, credential)
 		if err != nil {
 			if retry {

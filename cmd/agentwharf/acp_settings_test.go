@@ -73,6 +73,54 @@ func TestACPSettingsTrackerDoesNotInventMissingProviderControls(t *testing.T) {
 	}
 }
 
+func TestACPSettingsPolicyKeepsProviderPermissionsReadOnly(t *testing.T) {
+	configOptions := []any{
+		map[string]any{
+			"id": "model", "category": "model", "type": "select", "currentValue": "openai/gpt-5",
+			"options": []any{
+				map[string]any{"value": "openai/gpt-5", "name": "GPT-5"},
+				map[string]any{"value": "openai/gpt-5-mini", "name": "GPT-5 mini"},
+			},
+		},
+		map[string]any{
+			"id": "thought_level", "category": "thought_level", "type": "select", "currentValue": "medium",
+			"options": []any{
+				map[string]any{"value": "low", "name": "Low"},
+				map[string]any{"value": "medium", "name": "Medium"},
+				map[string]any{"value": "high", "name": "High"},
+			},
+		},
+		map[string]any{
+			"id": "mode", "category": "mode", "type": "select", "currentValue": "ask",
+			"options": []any{map[string]any{"value": "ask", "name": "Ask"}, map[string]any{"value": "never", "name": "Never"}},
+		},
+	}
+	for _, provider := range []string{"pi", "deepseek-harness"} {
+		tracker := newACPSettingsTracker(map[string]any{"configOptions": configOptions}, acpSettingsPolicyForProvider(provider))
+		state, ok := tracker.Current()
+		if !ok {
+			t.Fatalf("%s settings capability unavailable", provider)
+		}
+		if state.Capability.ModelChange != "allowed" || state.Capability.ReasoningEffortChange != "allowed" ||
+			state.Capability.EffectiveModelID != "openai/gpt-5" || state.Capability.EffectiveReasoningEffortID == nil || *state.Capability.EffectiveReasoningEffortID != "medium" {
+			t.Fatalf("%s capability lost provider choices: %+v", provider, state.Capability)
+		}
+		if state.Capability.PermissionChange != "read_only" || state.Capability.PermissionReadOnlyReason == nil ||
+			*state.Capability.PermissionReadOnlyReason != "platform_policy" || state.PermissionConfigID != "" || len(state.Capability.PermissionModes) != 1 {
+			t.Fatalf("%s permission policy is not read-only: %+v", provider, state)
+		}
+		change := protocol.SettingsChange{CapabilityFingerprint: state.Capability.Fingerprint}
+		requestedPermission := state.Capability.EffectivePermissionModeID
+		change.RequestedPermissionModeID = &requestedPermission
+		if reason := validateACPSettingsChange(state, change); reason == "" {
+			t.Fatalf("%s accepted a policy-only permission change", provider)
+		}
+	}
+	if _, err := acpSettingsStateFromConfigOptions(configOptions[:2]); err == nil {
+		t.Fatal("provider without an explicit settings policy accepted missing permission config option")
+	}
+}
+
 func TestACPSettingsMapsAndChangesProviderThoughtLevelWithoutInventingChoices(t *testing.T) {
 	tracker := newACPSettingsTracker(map[string]any{"configOptions": testACPConfigOptions("balanced", "ask", "medium")})
 	reserved, ok := tracker.Current()

@@ -43,6 +43,7 @@ type acpSettingsState struct {
 type acpSettingsTracker struct {
 	mu               sync.Mutex
 	current          *acpSettingsState
+	policy           acpSettingsPolicy
 	mutation         *acpSettingsMutation
 	mutationSequence uint64
 	sourceSequence   uint64
@@ -60,9 +61,28 @@ type acpSettingsMutationHandle struct {
 	once     sync.Once
 }
 
-func newACPSettingsTracker(sessionResult map[string]any) *acpSettingsTracker {
+type acpSettingsPolicy struct {
+	permissionID    string
+	permissionLabel string
+}
+
+func acpSettingsPolicyForProvider(provider string) acpSettingsPolicy {
+	switch provider {
+	case "pi":
+		return acpSettingsPolicy{permissionID: "acp_approval_flow", permissionLabel: "ACP approval flow (managed)"}
+	case "deepseek-harness":
+		return acpSettingsPolicy{permissionID: "workspace-write:ask", permissionLabel: "workspace-write + ask (managed)"}
+	default:
+		return acpSettingsPolicy{}
+	}
+}
+
+func newACPSettingsTracker(sessionResult map[string]any, policies ...acpSettingsPolicy) *acpSettingsTracker {
 	tracker := &acpSettingsTracker{}
-	if state, err := acpSettingsStateFromConfigOptions(sessionResult["configOptions"]); err == nil {
+	if len(policies) > 0 {
+		tracker.policy = policies[0]
+	}
+	if state, err := acpSettingsStateFromConfigOptions(sessionResult["configOptions"], tracker.policy); err == nil {
 		tracker.current = &state
 	}
 	return tracker
@@ -138,7 +158,7 @@ func (t *acpSettingsTracker) UpdateFromResult(result map[string]any, sourceSeque
 	if sourceSequence == 0 {
 		return acpSettingsState{}, false, errors.New("acp settings response sequence is invalid")
 	}
-	state, err := acpSettingsStateFromConfigOptions(result["configOptions"])
+	state, err := acpSettingsStateFromConfigOptions(result["configOptions"], t.policy)
 	if err != nil {
 		return acpSettingsState{}, false, err
 	}
@@ -175,7 +195,7 @@ func (t *acpSettingsTracker) ObserveProviderLine(line []byte, providerSessionID 
 	}
 	switch stringFieldFromAny(update["sessionUpdate"]) {
 	case "config_option_update":
-		state, err := acpSettingsStateFromConfigOptions(update["configOptions"])
+		state, err := acpSettingsStateFromConfigOptions(update["configOptions"], t.policy)
 		if err != nil {
 			return acpSettingsState{}, false, err
 		}
@@ -254,33 +274,53 @@ func (t *acpSettingsTracker) MarkReadOnly(reason string) (acpSettingsState, bool
 	return cloneACPSettingsState(state), true
 }
 
-func acpSettingsStateFromConfigOptions(value any) (acpSettingsState, error) {
+func acpSettingsStateFromConfigOptions(value any, policies ...acpSettingsPolicy) (acpSettingsState, error) {
 	options := objectSlice(value)
 	if len(options) == 0 {
 		return acpSettingsState{}, errors.New("acp settings config options are unavailable")
 	}
 	modelOption := findACPSelectOption(options, acpModelCategory)
 	permissionOption := findACPSelectOption(options, acpPermissionCategory)
-	if modelOption == nil || permissionOption == nil {
-		return acpSettingsState{}, errors.New("acp model or permission config option is unavailable")
+	if modelOption == nil {
+		return acpSettingsState{}, errors.New("acp model config option is unavailable")
+	}
+	var policyPermission *acpSettingsPolicy
+	if len(policies) > 0 && acpSettingsIdentifier.MatchString(policies[0].permissionID) && policies[0].permissionLabel != "" {
+		policyPermission = &policies[0]
+	} else if permissionOption == nil {
+		return acpSettingsState{}, errors.New("acp permission config option is unavailable")
 	}
 	modelID := stringFieldFromAny(modelOption["currentValue"])
-	permissionID := stringFieldFromAny(permissionOption["currentValue"])
 	modelConfigID := stringFieldFromAny(modelOption["id"])
-	permissionConfigID := stringFieldFromAny(permissionOption["id"])
-	if !acpSettingsIdentifier.MatchString(modelConfigID) || !acpSettingsIdentifier.MatchString(permissionConfigID) || modelConfigID == permissionConfigID {
+	permissionID := ""
+	permissionConfigID := ""
+	if policyPermission != nil {
+		permissionID = policyPermission.permissionID
+	} else {
+		permissionID = stringFieldFromAny(permissionOption["currentValue"])
+		permissionConfigID = stringFieldFromAny(permissionOption["id"])
+	}
+	if !acpSettingsIdentifier.MatchString(modelConfigID) || (permissionConfigID != "" && (!acpSettingsIdentifier.MatchString(permissionConfigID) || modelConfigID == permissionConfigID)) {
 		return acpSettingsState{}, errors.New("acp settings config ids are invalid")
 	}
 	models, err := normalizedACPSettingsChoices(modelOption["options"], modelID, 32)
 	if err != nil {
 		return acpSettingsState{}, fmt.Errorf("acp model settings: %w", err)
 	}
-	permissions, err := normalizedACPSettingsChoices(permissionOption["options"], permissionID, 16)
-	if err != nil {
-		return acpSettingsState{}, fmt.Errorf("acp permission settings: %w", err)
+	var permissions []protocol.SettingsCapabilityChoice
+	var permissionChange string
+	var permissionReason *string
+	if policyPermission != nil {
+		permissions = []protocol.SettingsCapabilityChoice{{ID: permissionID, Label: policyPermission.permissionLabel}}
+		permissionChange, permissionReason = "read_only", stringPointer("platform_policy")
+	} else {
+		permissions, err = normalizedACPSettingsChoices(permissionOption["options"], permissionID, 16)
+		if err != nil {
+			return acpSettingsState{}, fmt.Errorf("acp permission settings: %w", err)
+		}
+		permissionChange, permissionReason = acpSettingsChangeMode(len(permissions))
 	}
 	modelChange, modelReason := acpSettingsChangeMode(len(models))
-	permissionChange, permissionReason := acpSettingsChangeMode(len(permissions))
 	reasoningEfforts := make([]protocol.SettingsCapabilityChoice, 0)
 	var effectiveReasoningEffortID *string
 	reasoningChange := "unsupported"
