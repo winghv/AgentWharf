@@ -4023,10 +4023,25 @@ func writeACPResult(stdin io.Writer, id any, result map[string]any) error {
 }
 
 func readACPResponse(ctx context.Context, scanner *bufio.Scanner, id int64) (map[string]any, error) {
+	type response struct {
+		value map[string]any
+		err   error
+	}
+	result := make(chan response, 1)
+	go func() {
+		value, err := readACPResponseFromScanner(scanner, id)
+		result <- response{value: value, err: err}
+	}()
+	select {
+	case result := <-result:
+		return result.value, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func readACPResponseFromScanner(scanner *bufio.Scanner, id int64) (map[string]any, error) {
 	for scanner.Scan() {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(scanner.Bytes(), &fields); err != nil {
 			return nil, fmt.Errorf("decode acp response %d: %w", id, err)

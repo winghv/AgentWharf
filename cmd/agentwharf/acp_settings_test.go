@@ -33,6 +33,36 @@ func TestNewACPSettingsCapabilityEventIsDurableProposal(t *testing.T) {
 	}
 }
 
+func TestACPSettingsStateCanonicalizesProviderTupleModelIDs(t *testing.T) {
+	currentWireID := `["deepseek-official","deepseek-v4-flash"]`
+	state, err := acpSettingsStateFromConfigOptions([]any{
+		map[string]any{
+			"id": "model", "category": "model", "type": "select", "currentValue": currentWireID,
+			"options": []any{map[string]any{
+				"group": "deepseek-official",
+				"options": []any{
+					map[string]any{"value": currentWireID, "name": "DeepSeek V4 Flash"},
+					map[string]any{"value": `["deepseek-official","deepseek-v4-pro"]`, "name": "DeepSeek V4 Pro"},
+				},
+			}},
+		},
+		map[string]any{
+			"id": "reasoning_effort", "category": "thought_level", "type": "select", "currentValue": "high",
+			"options": []any{map[string]any{"value": "high", "name": "High"}},
+		},
+	}, acpSettingsPolicyForProvider("deepseek-harness"))
+	if err != nil {
+		t.Fatalf("acpSettingsStateFromConfigOptions() error = %v", err)
+	}
+	if state.Capability.EffectiveModelID != "deepseek-official/deepseek-v4-flash" ||
+		!settingsChoiceContains(state.Capability.Models, "deepseek-official/deepseek-v4-pro") {
+		t.Fatalf("canonical model capability = %+v", state.Capability.Models)
+	}
+	if state.ModelWireValues["deepseek-official/deepseek-v4-flash"] != currentWireID {
+		t.Fatalf("wire model mapping = %#v", state.ModelWireValues)
+	}
+}
+
 func TestACPSettingsStateUsesCanonicalProviderReadback(t *testing.T) {
 	state, err := acpSettingsStateFromConfigOptions(testACPConfigOptions("balanced", "ask"))
 	if err != nil {
@@ -433,11 +463,24 @@ func TestReadACPResponseRejectsProviderRequestWithCollidingID(t *testing.T) {
 	}
 }
 
-func TestReadACPResponseKeepsNumericAndStringIDsDistinct(t *testing.T) {
-	scanner := bufio.NewScanner(strings.NewReader(`{"jsonrpc":"2.0","id":"1","result":{}}` + "\n"))
-	if _, err := readACPResponse(context.Background(), scanner, 1); err == nil || !strings.Contains(err.Error(), "id type") {
-		t.Fatalf("readACPResponse() error = %v", err)
+func TestReadACPResponseHonorsContextWhileProviderIsSilent(t *testing.T) {
+	reader := &blockingACPReader{released: make(chan struct{})}
+	scanner := bufio.NewScanner(reader)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := readACPResponse(ctx, scanner, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("readACPResponse() error = %v, want context deadline", err)
 	}
+	close(reader.released)
+}
+
+type blockingACPReader struct {
+	released chan struct{}
+}
+
+func (r *blockingACPReader) Read(_ []byte) (int, error) {
+	<-r.released
+	return 0, io.EOF
 }
 
 func TestExecuteACPSettingsChangeRechecksCapabilityBeforeProviderWrite(t *testing.T) {

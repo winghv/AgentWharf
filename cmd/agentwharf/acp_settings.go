@@ -38,6 +38,7 @@ type acpSettingsState struct {
 	ModelConfigID      string
 	ReasoningConfigID  string
 	PermissionConfigID string
+	ModelWireValues    map[string]string
 }
 
 type acpSettingsTracker struct {
@@ -53,12 +54,14 @@ type acpSettingsMutation struct {
 	sequence      uint64
 	kind          string
 	expectedValue string
+	providerValue string
 }
 
 type acpSettingsMutationHandle struct {
-	tracker  *acpSettingsTracker
-	sequence uint64
-	once     sync.Once
+	tracker       *acpSettingsTracker
+	sequence      uint64
+	providerValue string
+	once          sync.Once
 }
 
 type acpSettingsPolicy struct {
@@ -133,9 +136,15 @@ func (t *acpSettingsTracker) beginProviderMutation(expectedFingerprint, kind, va
 	if !acpSettingsIdentifier.MatchString(configID) {
 		return nil, current, "", errors.New("acp settings config id is unavailable")
 	}
+	providerValue := value
+	if kind == acpModelCategory {
+		if wireValue := current.ModelWireValues[value]; wireValue != "" {
+			providerValue = wireValue
+		}
+	}
 	t.mutationSequence++
-	t.mutation = &acpSettingsMutation{sequence: t.mutationSequence, kind: kind, expectedValue: value}
-	return &acpSettingsMutationHandle{tracker: t, sequence: t.mutationSequence}, current, configID, nil
+	t.mutation = &acpSettingsMutation{sequence: t.mutationSequence, kind: kind, expectedValue: value, providerValue: providerValue}
+	return &acpSettingsMutationHandle{tracker: t, sequence: t.mutationSequence, providerValue: providerValue}, current, configID, nil
 }
 
 func (h *acpSettingsMutationHandle) finish() {
@@ -303,9 +312,16 @@ func acpSettingsStateFromConfigOptions(value any, policies ...acpSettingsPolicy)
 	if !acpSettingsIdentifier.MatchString(modelConfigID) || (permissionConfigID != "" && (!acpSettingsIdentifier.MatchString(permissionConfigID) || modelConfigID == permissionConfigID)) {
 		return acpSettingsState{}, errors.New("acp settings config ids are invalid")
 	}
-	models, err := normalizedACPSettingsChoices(modelOption["options"], modelID, 32)
+	models, modelWireValues, err := normalizedACPSettingsChoicesWithWireValues(modelOption["options"], modelID, 32)
 	if err != nil {
 		return acpSettingsState{}, fmt.Errorf("acp model settings: %w", err)
+	}
+	modelID, currentModelWireValue, ok := canonicalACPSettingID(modelID)
+	if !ok {
+		return acpSettingsState{}, errors.New("acp model effective value is invalid")
+	}
+	if currentModelWireValue != "" {
+		modelWireValues[modelID] = currentModelWireValue
 	}
 	var permissions []protocol.SettingsCapabilityChoice
 	var permissionChange string
@@ -314,7 +330,7 @@ func acpSettingsStateFromConfigOptions(value any, policies ...acpSettingsPolicy)
 		permissions = []protocol.SettingsCapabilityChoice{{ID: permissionID, Label: policyPermission.permissionLabel}}
 		permissionChange, permissionReason = "read_only", stringPointer("platform_policy")
 	} else {
-		permissions, err = normalizedACPSettingsChoices(permissionOption["options"], permissionID, 16)
+		permissions, _, err = normalizedACPSettingsChoicesWithWireValues(permissionOption["options"], permissionID, 16)
 		if err != nil {
 			return acpSettingsState{}, fmt.Errorf("acp permission settings: %w", err)
 		}
@@ -367,6 +383,7 @@ func acpSettingsStateFromConfigOptions(value any, policies ...acpSettingsPolicy)
 		ModelConfigID:      modelConfigID,
 		ReasoningConfigID:  reasoningConfigID,
 		PermissionConfigID: permissionConfigID,
+		ModelWireValues:    modelWireValues,
 	}, nil
 }
 
@@ -404,10 +421,17 @@ func findACPReasoningOption(options []map[string]any) map[string]any {
 }
 
 func normalizedACPSettingsChoices(value any, currentID string, maximum int) ([]protocol.SettingsCapabilityChoice, error) {
-	if !acpSettingsIdentifier.MatchString(currentID) {
-		return nil, errors.New("effective value is invalid")
+	choices, _, err := normalizedACPSettingsChoicesWithWireValues(value, currentID, maximum)
+	return choices, err
+}
+
+func normalizedACPSettingsChoicesWithWireValues(value any, currentID string, maximum int) ([]protocol.SettingsCapabilityChoice, map[string]string, error) {
+	currentID, _, ok := canonicalACPSettingID(currentID)
+	if !ok {
+		return nil, nil, errors.New("effective value is invalid")
 	}
 	choicesByID := make(map[string]protocol.SettingsCapabilityChoice)
+	wireValues := make(map[string]string)
 	var visit func(any)
 	visit = func(raw any) {
 		for _, option := range objectSlice(raw) {
@@ -415,19 +439,22 @@ func normalizedACPSettingsChoices(value any, currentID string, maximum int) ([]p
 				visit(nested)
 				continue
 			}
-			id := stringFieldFromAny(option["value"])
-			if !acpSettingsIdentifier.MatchString(id) {
+			id, wireValue, valid := canonicalACPSettingID(stringFieldFromAny(option["value"]))
+			if !valid {
 				continue
 			}
 			label := normalizedACPSettingsLabel(stringFieldFromAny(option["name"]), id)
 			if _, exists := choicesByID[id]; !exists {
 				choicesByID[id] = protocol.SettingsCapabilityChoice{ID: id, Label: label}
+				if wireValue != "" {
+					wireValues[id] = wireValue
+				}
 			}
 		}
 	}
 	visit(value)
 	if _, found := choicesByID[currentID]; !found {
-		return nil, errors.New("effective value is not in the advertised options")
+		return nil, wireValues, errors.New("effective value is not in the advertised options")
 	}
 	ids := make([]string, 0, len(choicesByID))
 	for id := range choicesByID {
@@ -453,7 +480,23 @@ func normalizedACPSettingsChoices(value any, currentID string, maximum int) ([]p
 	for _, id := range ids {
 		choices = append(choices, choicesByID[id])
 	}
-	return choices, nil
+	return choices, wireValues, nil
+}
+
+func canonicalACPSettingID(value string) (string, string, bool) {
+	if acpSettingsIdentifier.MatchString(value) {
+		return value, "", true
+	}
+	var tuple []string
+	if json.Unmarshal([]byte(value), &tuple) != nil || len(tuple) != 2 ||
+		!acpSettingsIdentifier.MatchString(tuple[0]) || !acpSettingsIdentifier.MatchString(tuple[1]) {
+		return "", "", false
+	}
+	canonical := tuple[0] + "/" + tuple[1]
+	if !acpSettingsIdentifier.MatchString(canonical) {
+		return "", "", false
+	}
+	return canonical, value, true
 }
 
 func normalizedACPSettingsLabel(value, fallback string) string {
@@ -492,6 +535,12 @@ func cloneACPSettingsState(state acpSettingsState) acpSettingsState {
 	}
 	if state.Capability.PermissionReadOnlyReason != nil {
 		clone.Capability.PermissionReadOnlyReason = stringPointer(*state.Capability.PermissionReadOnlyReason)
+	}
+	if state.ModelWireValues != nil {
+		clone.ModelWireValues = make(map[string]string, len(state.ModelWireValues))
+		for id, wireValue := range state.ModelWireValues {
+			clone.ModelWireValues[id] = wireValue
+		}
 	}
 	return clone
 }
@@ -731,7 +780,7 @@ func executeACPSettingsChange(
 		if err := writeACPRequest(stdin, id, acpSetConfigOptionMethod, map[string]any{
 			"sessionId": providerSessionID,
 			"configId":  configID,
-			"value":     value,
+			"value":     mutation.providerValue,
 		}); err != nil {
 			cancelResponse()
 			mutation.finish()
