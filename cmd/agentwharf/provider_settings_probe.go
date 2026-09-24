@@ -17,7 +17,10 @@ import (
 	"github.com/winghv/agentwharf/internal/buildinfo"
 )
 
-const providerSettingsProbeTimeout = 45 * time.Second
+const (
+	providerSettingsProbeTimeout     = 45 * time.Second
+	providerSettingsProbeStopTimeout = 2 * time.Second
+)
 
 func runProviderSettingsProbe(ctx context.Context, args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("probe-settings", flag.ContinueOnError)
@@ -78,12 +81,26 @@ func runProviderSettingsProbe(ctx context.Context, args []string, stdout io.Writ
 		return fmt.Errorf("start ACP provider probe: %w", err)
 	}
 	waited := false
-	defer func() {
-		if !waited {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
+	stopProbe := func() {
+		if waited {
+			return
 		}
-	}()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		waitDone := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(waitDone)
+		}()
+		select {
+		case <-waitDone:
+			waited = true
+		case <-time.After(providerSettingsProbeStopTimeout):
+			// A broken child pipe must not hold the machine probe poll open indefinitely.
+		}
+	}
+	defer stopProbe()
 	scanner := bufio.NewScanner(stdoutPipe)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	if err := writeACPRequest(stdin, 1, "initialize", map[string]any{
@@ -129,8 +146,7 @@ func runProviderSettingsProbe(ctx context.Context, args []string, stdout io.Writ
 			return fmt.Errorf("stop ACP settings probe provider: %w", err)
 		}
 	case <-time.After(2 * time.Second):
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		stopProbe()
 		waited = true
 	case <-probeCtx.Done():
 		return fmt.Errorf("ACP settings probe timed out: %w", probeCtx.Err())
