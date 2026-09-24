@@ -60,6 +60,7 @@ type WebSocketConfig struct {
 	SessionCredentialLifecycle        auth.SessionCredentialLifecycle
 	SessionCredentialEvidenceResolver auth.SessionCredentialEvidenceResolver
 	EphemeralEventVariants            map[string]map[int]string
+	Metrics                           *HubMetrics
 	// Deprecated: credential delivery is always the Hub-owned pending target
 	// socket. Retained only to avoid a source-incompatible config removal.
 	WarmAttachCredentialHandoff WarmAttachCredentialHandoff
@@ -115,6 +116,7 @@ func NewWebSocketHandler(cfg WebSocketConfig) EphemeralBroadcaster {
 		sessionCredentialLifecycle:        cfg.SessionCredentialLifecycle,
 		sessionCredentialEvidenceResolver: evidenceResolver,
 		warmAttachCredentialHandoff:       cfg.WarmAttachCredentialHandoff,
+		metrics:                           cfg.Metrics,
 		adapterAuthority:                  newAdapterDispatchAuthority(cfg.Handshake, cfg.EventStore),
 		ephemeralEventVariants:            copyEphemeralEventVariants(cfg.EphemeralEventVariants),
 		adapterAdmissionLocks:             make(map[string]chan struct{}),
@@ -191,6 +193,7 @@ type webSocketHandler struct {
 	sessionCredentialEvidenceResolver auth.SessionCredentialEvidenceResolver
 	warmAttachCredentialHandoff       WarmAttachCredentialHandoff
 	activityDispatcher                *ActivityDispatcher
+	metrics                           *HubMetrics
 	activityDispatcherErr             error
 
 	mu                      sync.Mutex
@@ -357,6 +360,12 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, frame protocol.Frame, adapterOut **adapterConnection) (AcceptedPeer, string, *protocol.HelloAck, error) {
+	started := time.Now()
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.ObserveHandshake(started)
+		}
+	}()
 	hello, ok := frame.(*protocol.Hello)
 	if !ok {
 		_ = writeProtocolError(ctx, conn, "invalid_hello", "first frame must be hello", true)
@@ -692,6 +701,12 @@ func (h *webSocketHandler) discardRotationCredential(ctx context.Context, prepar
 }
 
 func (h *webSocketHandler) handleHistoryPage(ctx context.Context, conn *managedConn, accepted AcceptedPeer, historyToken string, peer *clientConnection, adapter *adapterConnection, request *protocol.HistoryPageRequest) error {
+	started := time.Now()
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.ObserveHistory(started)
+		}
+	}()
 	history, ready := h.events.(store.HistoryStore)
 	if accepted.Role != protocol.RoleClient || accepted.ProtocolVersion != protocol.ProtocolVersionV2 || !ready {
 		return h.writeConnectionFrame(ctx, conn, peer, adapter, &protocol.Error{
@@ -822,6 +837,12 @@ func writePongFrame(ctx context.Context, conn *managedConn, peer *clientConnecti
 }
 
 func (h *webSocketHandler) replayAccepted(ctx context.Context, peer *clientConnection, accepted AcceptedPeer) error {
+	started := time.Now()
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.ObserveReplay(started)
+		}
+	}()
 	if accepted.Role != protocol.RoleClient || peer == nil {
 		return nil
 	}
@@ -904,6 +925,7 @@ func (h *webSocketHandler) registerAdapter(ctx context.Context, conn *managedCon
 			SessionID: accepted.SessionID,
 			Window:    adapterEventBatchWindow,
 			MaxEvents: adapterEventBatchMaxEvents,
+			Metrics:   h.metrics,
 			Broadcast: h.broadcastEvent,
 			ReportError: func(ctx context.Context, err error) {
 				_ = h.writeAdapterFrame(ctx, adapter, &protocol.Error{
@@ -3396,6 +3418,12 @@ func (h *webSocketHandler) markDecisionAcceptedLocked(requestID string) {
 }
 
 func (h *webSocketHandler) broadcastEvent(ctx context.Context, ev protocol.Event) {
+	started := time.Now()
+	defer func() {
+		if h.metrics != nil {
+			h.metrics.ObserveFanout(started)
+		}
+	}()
 	h.mu.Lock()
 	targets := make([]*clientConnection, 0, len(h.subscribers[ev.SessionID]))
 	for client := range h.subscribers[ev.SessionID] {
@@ -3412,6 +3440,12 @@ func (h *webSocketHandler) broadcastEvent(ctx context.Context, ev protocol.Event
 		err := client.sendLiveEvent(writeCtx, out)
 		cancel()
 		if err != nil {
+			if errors.Is(err, errReplayBufferOverflow) && h.metrics != nil {
+				h.metrics.IncBufferOverflow()
+			}
+			if h.metrics != nil && errors.Is(err, context.DeadlineExceeded) {
+				h.metrics.IncSlowWrite()
+			}
 			h.unregisterClient(client)
 			// A failed live write means the transport is no longer usable. Keep
 			// the socket lifecycle consistent with the subscription membership so

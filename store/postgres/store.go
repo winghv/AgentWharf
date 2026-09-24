@@ -24,6 +24,7 @@ type Store struct {
 	pool         *pgxpool.Pool
 	connectionTx pgx.Tx
 	eventTx      pgx.Tx
+	metrics      *Metrics
 }
 
 var _ store.SessionAdmissionTruthStore = (*Store)(nil)
@@ -32,13 +33,20 @@ const maxHistoryPageSize = 100
 const maxAttachAttemptTTL = 5 * time.Minute
 
 func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+	return NewWithMetrics(pool, NewMetrics())
+}
+
+func NewWithMetrics(pool *pgxpool.Pool, metrics *Metrics) *Store {
+	if metrics == nil {
+		metrics = NewMetrics()
+	}
+	return &Store{pool: pool, metrics: metrics}
 }
 
 // NewAdapterConnectionTx binds connection operations to a caller-owned
 // transaction. The caller alone commits or rolls it back.
 func NewAdapterConnectionTx(tx pgx.Tx) *Store {
-	return &Store{connectionTx: tx}
+	return &Store{connectionTx: tx, metrics: NewMetrics()}
 }
 
 // NewEventStoreTx binds EventStore mutations to a caller-owned transaction.
@@ -46,8 +54,10 @@ func NewAdapterConnectionTx(tx pgx.Tx) *Store {
 // a platform-owned lifecycle transition must commit its durable Session event
 // and companion rows atomically.
 func NewEventStoreTx(tx pgx.Tx) *Store {
-	return &Store{eventTx: tx}
+	return &Store{eventTx: tx, metrics: NewMetrics()}
 }
+
+func (s *Store) Metrics() *Metrics { return s.metrics }
 
 func (s *Store) SessionAdmissionTruth(ctx context.Context, sessionID string) (store.SessionAdmissionTruth, error) {
 	return s.sessionAdmissionTruth(ctx, sessionID, false)
@@ -159,6 +169,13 @@ func (s *Store) AttentionSummaryPage(ctx context.Context, request store.Attentio
 }
 
 func (s *Store) Append(ctx context.Context, sessionID string, evs []store.PendingEvent) (firstSeq int64, err error) {
+	started := time.Now()
+	if s.metrics != nil {
+		defer func() {
+			s.metrics.ObserveAppend(started, len(evs), pendingEventBytes(evs))
+			s.metrics.ObserveProjection()
+		}()
+	}
 	if len(evs) == 0 {
 		return 0, nil
 	}
@@ -185,6 +202,14 @@ func (s *Store) Append(ctx context.Context, sessionID string, evs []store.Pendin
 		return 0, fmt.Errorf("commit append transaction: %w", err)
 	}
 	return firstSeq, nil
+}
+
+func pendingEventBytes(events []store.PendingEvent) uint64 {
+	var total uint64
+	for _, event := range events {
+		total += uint64(len(event.Payload))
+	}
+	return total
 }
 
 func appendEventsInTx(ctx context.Context, tx pgx.Tx, sessionID string, evs []store.PendingEvent) (firstSeq int64, err error) {
@@ -338,6 +363,10 @@ func attentionEventProjection(event store.PendingEvent) attentionProjection {
 }
 
 func (s *Store) Replay(ctx context.Context, sessionID string, afterSeq int64, fn func(store.Event) error) (err error) {
+	started := time.Now()
+	if s.metrics != nil {
+		defer func() { s.metrics.ObserveReplay(started) }()
+	}
 	if fn == nil {
 		return errors.New("replay callback is nil")
 	}
@@ -382,6 +411,10 @@ func (s *Store) Replay(ctx context.Context, sessionID string, afterSeq int64, fn
 }
 
 func (s *Store) History(ctx context.Context, sessionID string, beforeSeq *int64, limit int) (store.HistoryPage, error) {
+	started := time.Now()
+	if s.metrics != nil {
+		defer func() { s.metrics.ObserveHistory(started) }()
+	}
 	if limit < 1 || limit > maxHistoryPageSize {
 		return store.HistoryPage{}, errors.New("history limit is out of range")
 	}

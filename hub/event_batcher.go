@@ -59,6 +59,7 @@ type adapterEventBatcherConfig struct {
 	Broadcast   func(context.Context, protocol.Event)
 	ReportError func(context.Context, error)
 	Publish     func(context.Context, []pendingAdapterEvent) error
+	Metrics     *HubMetrics
 }
 
 type adapterEventBatcher struct {
@@ -74,6 +75,7 @@ type adapterEventBatcher struct {
 	broadcast   func(context.Context, protocol.Event)
 	reportError func(context.Context, error)
 	publish     func(context.Context, []pendingAdapterEvent) error
+	metrics     *HubMetrics
 }
 
 type pendingAdapterEvent struct {
@@ -103,6 +105,7 @@ func newAdapterEventBatcher(cfg adapterEventBatcherConfig) *adapterEventBatcher 
 		broadcast:   cfg.Broadcast,
 		reportError: cfg.ReportError,
 		publish:     cfg.Publish,
+		metrics:     cfg.Metrics,
 	}
 	go b.run()
 	return b
@@ -200,9 +203,13 @@ func (b *adapterEventBatcher) run() {
 }
 
 func (b *adapterEventBatcher) flush(ctx context.Context, batch []pendingAdapterEvent) {
+	started := time.Now()
 	if b.publish != nil {
 		if err := b.publish(ctx, batch); err != nil && b.reportError != nil {
 			b.reportError(ctx, fmt.Errorf("persist event: %w", err))
+		}
+		if b.metrics != nil {
+			b.metrics.ObserveAppend(started)
 		}
 		return
 	}
@@ -210,13 +217,15 @@ func (b *adapterEventBatcher) flush(ctx context.Context, batch []pendingAdapterE
 	for i, item := range batch {
 		pending[i] = item.pending
 	}
-
 	firstSeq, err := b.store.Append(ctx, b.sessionID, pending)
 	if err != nil {
 		if b.reportError != nil {
 			b.reportError(ctx, fmt.Errorf("persist event: %w", err))
 		}
 		return
+	}
+	if b.metrics != nil {
+		b.metrics.ObserveAppend(started)
 	}
 	for i, item := range batch {
 		seq := firstSeq + int64(i)

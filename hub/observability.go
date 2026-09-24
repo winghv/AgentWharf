@@ -13,12 +13,17 @@ import (
 // NewObservabilityHandler adds the host-side diagnostic surface without
 // exposing metrics or profiles to a client-facing WebSocket listener.
 func NewObservabilityHandler(token string, next http.Handler) http.Handler {
-	return &observabilityHandler{token: token, next: next}
+	return NewObservabilityHandlerWithMetrics(token, NewHubMetrics(), next)
+}
+
+func NewObservabilityHandlerWithMetrics(token string, metrics *HubMetrics, next http.Handler) http.Handler {
+	return &observabilityHandler{token: token, metrics: metrics, next: next}
 }
 
 type observabilityHandler struct {
-	token string
-	next  http.Handler
+	token   string
+	metrics *HubMetrics
+	next    http.Handler
 }
 
 func (h *observabilityHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -65,6 +70,7 @@ func (h *observabilityHandler) authorized(r *http.Request) bool {
 func (h *observabilityHandler) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, _ = fmt.Fprintf(w, "# HELP agentwharf_hub_info Static Hub build identity.\n# TYPE agentwharf_hub_info gauge\nagentwharf_hub_info{module=\"hub\",role=\"host\"} 1\n")
+	_, _ = fmt.Fprint(w, h.metrics.Snapshot().Prometheus())
 	_, _ = fmt.Fprintf(w, "# HELP agentwharf_hub_goroutines Current Go goroutine count.\n# TYPE agentwharf_hub_goroutines gauge\nagentwharf_hub_goroutines %d\n", runtime.NumGoroutine())
 	var stats runtime.MemStats
 	runtime.ReadMemStats(&stats)
