@@ -433,11 +433,24 @@ func TestReadACPResponseRejectsProviderRequestWithCollidingID(t *testing.T) {
 	}
 }
 
-func TestReadACPResponseKeepsNumericAndStringIDsDistinct(t *testing.T) {
-	scanner := bufio.NewScanner(strings.NewReader(`{"jsonrpc":"2.0","id":"1","result":{}}` + "\n"))
-	if _, err := readACPResponse(context.Background(), scanner, 1); err == nil || !strings.Contains(err.Error(), "id type") {
-		t.Fatalf("readACPResponse() error = %v", err)
+func TestReadACPResponseHonorsContextWhileProviderIsSilent(t *testing.T) {
+	reader := &blockingACPReader{released: make(chan struct{})}
+	scanner := bufio.NewScanner(reader)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := readACPResponse(ctx, scanner, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("readACPResponse() error = %v, want context deadline", err)
 	}
+	close(reader.released)
+}
+
+type blockingACPReader struct {
+	released chan struct{}
+}
+
+func (r *blockingACPReader) Read(_ []byte) (int, error) {
+	<-r.released
+	return 0, io.EOF
 }
 
 func TestExecuteACPSettingsChangeRechecksCapabilityBeforeProviderWrite(t *testing.T) {
