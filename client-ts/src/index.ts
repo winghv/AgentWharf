@@ -62,6 +62,9 @@ export type MessagePart = TextMessagePart | FileReferencePart
 export interface Subscription {
   session_id: string
   last_seq: number
+  // A first-open tail subscription deliberately skips durable replay; the
+  // client follows it with a bounded history.page request.
+  skip_replay?: boolean
 }
 
 export type HelloFrame =
@@ -353,6 +356,10 @@ export interface AgentWharfClientOptions {
   reconnect?: false | Partial<ReconnectConfig>
   commandIdFactory?: () => string
   encrypted?: EncryptedSessionCodec
+  // Skip durable replay on the first handshake when the caller will hydrate a
+  // bounded visible window through history.page. Reconnects still replay from
+  // the live cursor.
+  skipReplayOnce?: boolean
   // Re-issues the session token before a reconnect attempt so an expired token
   // recovers automatically instead of requiring a page reload.
   refreshToken?: () => Promise<string>
@@ -418,6 +425,8 @@ interface PendingCommand {
 }
 
 interface PendingHistoryPage {
+  sessionId: string
+  beforeSeq?: number
   resolve: (page: HistoryPageResponseFrame) => void
   reject: (error: Error) => void
   signal?: AbortSignal
@@ -494,6 +503,8 @@ export class AgentWharfClient {
   private encryptedEventState: EncryptedEventState | null = null
   private readonly encryptedSkipTo = new Map<string, number>()
   private tokenValue: string
+  private skipReplayOnce: boolean
+  private readonly tailHydrationSessions = new Set<string>()
 
   constructor(private readonly options: AgentWharfClientOptions) {
     if (options.sessions.length === 0) {
@@ -505,6 +516,7 @@ export class AgentWharfClient {
     this.reconnectDelayMs = this.reconnect?.initialDelayMs ?? 0
     this.commandIdFactory = options.commandIdFactory ?? (() => `cmd_${Date.now()}_${this.nextCommandNumber++}`)
     this.tokenValue = options.token
+    this.skipReplayOnce = options.skipReplayOnce === true
     for (const session of options.sessions) {
       this.cursors.set(session.sessionId, session.lastSeq ?? 0)
     }
@@ -828,7 +840,7 @@ export class AgentWharfClient {
       const abort = () => {
         if (this.pendingHistoryPages.delete(requestId)) reject(new Error('history page request aborted'))
       }
-      this.pendingHistoryPages.set(requestId, { resolve, reject, signal: options.signal, abort })
+      this.pendingHistoryPages.set(requestId, { sessionId, beforeSeq: options.beforeSeq, resolve, reject, signal: options.signal, abort })
       options.signal?.addEventListener('abort', abort, { once: true })
       try {
         socket.send(encodeFrame(request))
@@ -870,7 +882,7 @@ export class AgentWharfClient {
             if (this.options.encrypted !== undefined) {
               const summary = ack.sessions[0]
               const cursor = this.cursors.get(summary.session_id) ?? 0
-              if (summary.latest_seq - cursor > encryptedReplaySkipThreshold) {
+              if (!this.tailHydrationSessions.has(summary.session_id) && summary.latest_seq - cursor > encryptedReplaySkipThreshold) {
                 this.cursors.set(summary.session_id, summary.latest_seq)
                 this.encryptedSkipTo.set(summary.session_id, summary.latest_seq)
               }
@@ -913,6 +925,7 @@ export class AgentWharfClient {
         this.handshakeReady = false
         if (this.encryptedEventState?.socket === socket) this.encryptedEventState = null
         this.encryptedSkipTo.clear()
+        this.tailHydrationSessions.clear()
         if (!handshakeComplete) {
           reject(new HubRetryableError('websocket closed before hello.ack'))
         }
@@ -982,14 +995,14 @@ export class AgentWharfClient {
         if (!Number.isSafeInteger(event.seq)) throw new Error('encrypted event sequence gap: frame carries no sequence')
         const current = this.cursors.get(event.session_id) ?? 0
         const seq = event.seq as number
-        if (seq <= current) {
+        if (seq <= current && !this.tailHydrationSessions.has(event.session_id)) {
           // Stale redelivery of an already-decoded frame (a duplicate replay
           // tail or a cursor that moved ahead of this connection). Dropping it
           // keeps the connection alive; the transcript reducer ignores seqs it
           // has already rendered.
           return
         }
-        if (seq !== current + 1 && typeof console !== 'undefined') {
+        if (seq !== current + 1 && !this.tailHydrationSessions.has(event.session_id) && typeof console !== 'undefined') {
           // The durable Store is the contiguous authority, so a hole here means
           // the client cursor desynced, not that Store events went missing.
           // Fail-closed here permanently bricked Sessions: every reconnect
@@ -1085,43 +1098,71 @@ export class AgentWharfClient {
   private resolveHistoryPage(page: HistoryPageResponseFrame, socket: WebSocketLike): void {
     const pending = this.pendingHistoryPages.get(page.request_id)
     if (pending === undefined) return
-    this.pendingHistoryPages.delete(page.request_id)
-    pending.signal?.removeEventListener('abort', pending.abort)
+    const finish = (opened: HistoryPageResponseFrame) => {
+      if (this.socket !== socket || !this.handshakeReady || this.pendingHistoryPages.get(page.request_id) !== pending) return
+      // Only the newest page completing an explicit tail subscription can
+      // acknowledge skipped history. Older pages never acknowledge live events.
+      if (pending.beforeSeq === undefined && this.tailHydrationSessions.delete(page.session_id)) {
+        this.cursors.set(page.session_id, Math.max(this.lastSeq(page.session_id), page.latest_seq))
+      }
+      this.pendingHistoryPages.delete(page.request_id)
+      pending.signal?.removeEventListener('abort', pending.abort)
+      pending.resolve(opened)
+    }
+    const fail = (error: unknown) => {
+      if (this.pendingHistoryPages.get(page.request_id) !== pending) return
+      this.pendingHistoryPages.delete(page.request_id)
+      pending.signal?.removeEventListener('abort', pending.abort)
+      pending.reject(normalizeError(error))
+    }
     try {
       validateHistoryPage(page)
+      if (page.session_id !== pending.sessionId || page.events.some((event) => pending.beforeSeq !== undefined && event.seq! >= pending.beforeSeq)) {
+        throw new Error('history page does not match request')
+      }
       if (this.options.encrypted === undefined) {
-        pending.resolve(page)
+        finish(page)
         return
       }
-      const openedPage = (async () => {
+      const state = this.encryptedEventState
+      if (state === null || state.socket !== socket || state.failed) throw new Error('encrypted connection is unavailable')
+      const openPage = async () => {
         const events: AgentWharfEvent[] = []
         for (const event of page.events) {
-          if (this.socket !== socket || !this.handshakeReady) throw new Error('connection changed during encrypted history authentication')
+          if (this.socket !== socket || !this.handshakeReady || pending.signal?.aborted) throw new Error('connection changed during encrypted history authentication')
           let opened: AgentWharfEvent
           try {
             opened = await this.options.encrypted!.openEvent(event)
           } catch (error) {
-            // Unverifiable commands are skipped so a stale member key cannot blank
-            // the whole page; machine events stay fatal.
+            // Unverifiable commands are skipped; machine events stay fatal.
             if (event.type === 'session.command') continue
             throw error
           }
-          if (this.socket !== socket || !this.handshakeReady) throw new Error('connection changed during encrypted history authentication')
           if (opened.session_id !== event.session_id || opened.seq !== event.seq || !validOpenedEventType(event, opened)) {
             throw new Error('encrypted history routing changed')
           }
           events.push(opened)
         }
-        if (this.socket !== socket || !this.handshakeReady) throw new Error('connection changed during encrypted history authentication')
-        pending.resolve({ ...page, events })
-      })()
-      withTimeout(openedPage, 10_000, 'encrypted history authentication timed out').catch((error) => pending.reject(normalizeError(error)))
+        return { ...page, events }
+      }
+      // Share the live decryption lane: a fast history response must not move
+      // the cursor past earlier live frames that are still being authenticated.
+      state.lane = state.lane.then(async () => {
+        if (state.failed) throw new Error('encrypted connection is unavailable')
+        finish(await withTimeout(openPage(), 10_000, 'encrypted history authentication timed out'))
+      }).catch(fail)
     } catch (error) {
-      pending.reject(normalizeError(error))
+      fail(error)
     }
   }
 
   private helloFrame(): HelloFrame {
+    const skipReplay = this.skipReplayOnce
+    this.skipReplayOnce = false
+    this.tailHydrationSessions.clear()
+    if (skipReplay) {
+      for (const session of this.options.sessions) this.tailHydrationSessions.add(session.sessionId)
+    }
     return {
       frame: 'hello',
       protocol_version: this.protocolVersion,
@@ -1131,6 +1172,7 @@ export class AgentWharfClient {
       subscriptions: this.options.sessions.map((session) => ({
         session_id: session.sessionId,
         last_seq: this.lastSeq(session.sessionId),
+        ...(skipReplay ? { skip_replay: true } : {}),
       })),
     }
   }

@@ -336,6 +336,10 @@ func (h *webSocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	peer := h.registerPeer(conn, accepted)
 	if peer != nil {
 		defer h.unregisterClient(peer)
+		if err := h.prepareTailBootstrap(ctx, peer, &accepted, ack); err != nil {
+			_ = peer.writeFrame(ctx, &protocol.Error{Code: "replay_failed", Message: "session bootstrap failed", Fatal: true})
+			return
+		}
 	}
 	if ack != nil {
 		if err := h.writeConnectionFrame(ctx, conn, peer, nil, ack); err != nil {
@@ -384,6 +388,14 @@ func (h *webSocketHandler) acceptPeer(ctx context.Context, conn *managedConn, fr
 		_ = writeProtocolError(ctx, conn, code, err.Error(), true)
 		_ = conn.Close(websocket.StatusPolicyViolation, code)
 		return AcceptedPeer{}, "", nil, err
+	}
+	for _, sub := range accepted.currentSubscriptions() {
+		if sub.SkipReplay {
+			if _, ok := h.events.(store.BootstrapStore); !ok {
+				_ = writeProtocolError(ctx, conn, "history_unsupported", "bounded session bootstrap is unavailable", true)
+				return AcceptedPeer{}, "", nil, ErrInvalidHello
+			}
+		}
 	}
 	if accepted.Role == protocol.RoleClient && accepted.ProtocolVersion == protocol.ProtocolVersionV2 &&
 		len(accepted.currentSubscriptions()) > 0 {
@@ -847,6 +859,16 @@ func (h *webSocketHandler) replayAccepted(ctx context.Context, peer *clientConne
 		return nil
 	}
 	for _, sub := range accepted.currentSubscriptions() {
+		if sub.SkipReplay {
+			if err := h.replayBootstrap(ctx, peer, accepted, sub); err != nil {
+				_ = peer.writeFrame(ctx, &protocol.Error{Code: "replay_failed", Message: "session bootstrap failed", Fatal: true})
+				return err
+			}
+			if err := peer.finishReplay(ctx, sub.SessionID); err != nil {
+				return err
+			}
+			continue
+		}
 		if h.events != nil {
 			if err := h.events.Replay(ctx, sub.SessionID, sub.LastSeq, func(ev store.Event) error {
 				if accepted.ContentMode == protocol.ContentModeRequired {

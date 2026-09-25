@@ -35,6 +35,17 @@ func TestDecodeClientHelloExample(t *testing.T) {
 	}
 }
 
+func TestDecodeClientHelloSkipReplay(t *testing.T) {
+	raw := []byte(`{"frame":"hello","protocol_version":2,"role":"client","token":"client-token","subscriptions":[{"session_id":"ses_01H8X","last_seq":0,"skip_replay":true}]}`)
+	frame, err := Decode(raw)
+	if err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	hello := frame.(*Hello)
+	if !hello.Subscriptions[0].SkipReplay {
+		t.Fatal("skip_replay was not decoded")
+	}
+}
 func TestDecodeFileReferenceSendPayload(t *testing.T) {
 	maxBytes := int64(10485760)
 	reason := "provider_unsupported"

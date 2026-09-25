@@ -250,8 +250,8 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 		AdmissionClaims: make(map[string]auth.SessionAdmissionClaim, len(hello.Subscriptions)),
 	}
 
-	for _, sub := range hello.Subscriptions {
-		if sub.SessionID == "" || sub.LastSeq < 0 {
+	for index, sub := range hello.Subscriptions {
+		if sub.SessionID == "" || sub.LastSeq < 0 || (sub.SkipReplay && selectedVersion != protocol.ProtocolVersionV2) {
 			return protocol.HelloAck{}, AcceptedPeer{}, fmt.Errorf("%w: invalid subscription", ErrInvalidHello)
 		}
 		access := exactSessionAccess(principal, sub.SessionID)
@@ -277,6 +277,10 @@ func (h *Handshake) handleClient(ctx context.Context, hello *protocol.Hello, pri
 		}
 		if decision.Mode == auth.SessionAdmissionAttachOnly && summary.LatestSeq != 0 {
 			return protocol.HelloAck{}, AcceptedPeer{}, auth.ErrUnauthorized
+		}
+		if sub.SkipReplay {
+			accepted.Subscribed[index].LastSeq = summary.LatestSeq
+			summary.ReplayFrom = summary.LatestSeq + 1
 		}
 		ack.Sessions = append(ack.Sessions, summary)
 		accepted.Admissions[sub.SessionID] = decision

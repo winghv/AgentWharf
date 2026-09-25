@@ -13,6 +13,49 @@ import (
 	"github.com/winghv/agentwharf/store"
 )
 
+func TestHandshakeClientHelloSkipReplay(t *testing.T) {
+	t.Parallel()
+
+	core := hub.NewHandshake(hub.HandshakeConfig{
+		Authenticator: fakeAuth{
+			token: "client-token",
+			principal: auth.Principal{
+				Subject: "client_1",
+				Scopes:  []auth.Scope{auth.SessionView("ses_1")},
+			},
+		},
+		EventStore: fakeStore{latest: map[string]int64{"ses_1": 57}},
+	})
+
+	ack, accepted, err := core.HandleHello(context.Background(), &protocol.Hello{
+		ProtocolVersion: protocol.ProtocolVersionV2,
+		Role:            protocol.RoleClient,
+		Token:           "client-token",
+		Subscriptions: []protocol.Subscription{{
+			SessionID:  "ses_1",
+			SkipReplay: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("HandleHello() error = %v", err)
+	}
+	if ack.Sessions[0].LatestSeq != 57 || ack.Sessions[0].ReplayFrom != 58 || !accepted.Subscribed[0].SkipReplay || accepted.Subscribed[0].LastSeq != 57 {
+		t.Fatalf("skip replay subscription = ack:%+v accepted:%+v", ack.Sessions[0], accepted.Subscribed[0])
+	}
+	for _, input := range []struct {
+		version   int
+		sessionID string
+	}{{1, "ses_1"}, {2, "ses_other"}} {
+		_, _, err := core.HandleHello(context.Background(), &protocol.Hello{
+			ProtocolVersion: input.version, Role: protocol.RoleClient, Token: "client-token",
+			Subscriptions: []protocol.Subscription{{SessionID: input.sessionID, SkipReplay: true}},
+		})
+		if err == nil {
+			t.Fatalf("accepted unsupported/unauthorized tail subscription: %+v", input)
+		}
+	}
+}
+
 func TestHandshakeClientHello(t *testing.T) {
 	t.Parallel()
 

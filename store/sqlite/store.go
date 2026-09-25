@@ -4277,6 +4277,9 @@ CREATE TABLE IF NOT EXISTS session_events (
 	UNIQUE (session_id, seq)
 );
 
+CREATE INDEX IF NOT EXISTS session_events_session_type_seq_idx
+ON session_events (session_id, type, seq);
+
 CREATE INDEX IF NOT EXISTS session_events_session_seq_idx
 ON session_events (session_id, seq);
 

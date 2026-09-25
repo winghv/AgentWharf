@@ -138,6 +138,47 @@ test('connect sends client hello with the current replay cursor', async () => {
   client.close()
 })
 
+test('connect can skip the first durable replay for bounded first-open hydration', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws',
+    token: 'control-token',
+    sessions: [{ sessionId: 'ses_1', lastSeq: 0 }],
+    skipReplayOnce: true,
+    webSocketFactory: sockets.factory,
+    reconnect: { initialDelayMs: 1, maxDelayMs: 1 },
+  })
+
+  const ackPromise = client.connect()
+  sockets.last().open()
+  assert.deepEqual(sockets.last().sentFrames()[0].subscriptions, [{
+    session_id: 'ses_1',
+    last_seq: 0,
+    skip_replay: true,
+  }])
+  sockets.last().receive({
+    frame: 'hello.ack',
+    protocol_version: 2,
+    sessions: [{ session_id: 'ses_1', state: 'ready', provider: 'claude-code', latest_seq: 100, replay_from: 1 }],
+  })
+  await ackPromise
+  assert.equal(client.lastSeq('ses_1'), 0)
+  const history = client.historyPage('ses_1', { requestId: 'tail' })
+  sockets.last().receive({
+    frame: 'history.page', request_id: 'tail', session_id: 'ses_1', latest_seq: 100,
+    events: [{ frame: 'event', type: 'session.message', session_id: 'ses_1', seq: 100, time: 1, payload: {} }],
+    next_before_seq: 100, retention_state: 'complete',
+  })
+  await history
+  assert.equal(client.lastSeq('ses_1'), 100)
+  sockets.last().serverClose()
+  await waitFor(() => sockets.all.length === 2)
+  sockets.last().open()
+  assert.deepEqual(sockets.last().sentFrames()[0].subscriptions, [{ session_id: 'ses_1', last_seq: 100 }])
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, sessions: [] })
+  client.close()
+})
+
 test('encrypted sessions negotiate required content mode and reject downgrade acknowledgements', async () => {
   const sockets = new FakeSocketFactory()
   const codec = {
@@ -367,6 +408,76 @@ test('requests typed reverse history pages and validates cursors', async () => {
   const page = await pagePromise
   assert.equal(page.events.length, 2)
   assert.equal(page.next_before_seq, 5)
+  assert.equal(client.lastSeq('ses_1'), 0, 'ordinary older history must not acknowledge unseen live events')
+  client.close()
+})
+
+test('tail hydration authenticates earlier live frames before advancing the encrypted cursor', async () => {
+  const sockets = new FakeSocketFactory()
+  let release!: () => void
+  const delayed = new Promise<void>((resolve) => { release = resolve })
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_1' }],
+    skipReplayOnce: true, webSocketFactory: sockets.factory, reconnect: false,
+    encrypted: { contentMode: 'required', sealCommand: async () => ({}), openEvent: async (event) => {
+      if (event.seq === 101) await delayed
+      return event
+    } },
+  })
+  const seen: number[] = []
+  client.onEvent((event) => seen.push(event.seq!))
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required',
+    sessions: [{ session_id: 'ses_1', state: 'ready', provider: 'codex', latest_seq: 100 }] })
+  await connected
+  assert.equal(client.lastSeq('ses_1'), 0, 'tail bootstrap waits for authenticated data')
+  const event = (seq: number) => ({ frame: 'event', type: 'session.message', session_id: 'ses_1', seq, time: seq, payload: {} })
+  sockets.last().receive(event(101))
+  const history = client.historyPage('ses_1', { requestId: 'tail' })
+  sockets.last().receive({ frame: 'history.page', request_id: 'tail', session_id: 'ses_1',
+    latest_seq: 205, events: [event(205)], next_before_seq: 205, retention_state: 'complete' })
+  sockets.last().receive(event(206))
+  release()
+  await history
+  await waitFor(() => seen.includes(206))
+  assert.deepEqual(seen, [101, 206])
+  assert.equal(client.lastSeq('ses_1'), 206)
+  const older = client.historyPage('ses_1', { beforeSeq: 100, requestId: 'older' })
+  sockets.last().receive({ frame: 'history.page', request_id: 'older', session_id: 'ses_1',
+    latest_seq: 300, events: [event(99)], next_before_seq: 99, retention_state: 'complete' })
+  await older
+  sockets.last().receive(event(207))
+  await waitFor(() => seen.includes(207))
+  assert.equal(client.lastSeq('ses_1'), 207)
+  client.close()
+})
+
+test('aborted encrypted tail hydration cannot later advance the cursor', async () => {
+  const sockets = new FakeSocketFactory()
+  let release!: () => void
+  const delayed = new Promise<void>((resolve) => { release = resolve })
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'control-token', sessions: [{ sessionId: 'ses_1' }],
+    skipReplayOnce: true, webSocketFactory: sockets.factory, reconnect: false,
+    encrypted: { contentMode: 'required', sealCommand: async () => ({}), openEvent: async (event) => { await delayed; return event } },
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, content_mode: 'required',
+    sessions: [{ session_id: 'ses_1', state: 'ready', provider: 'codex', latest_seq: 100 }] })
+  await connected
+  const controller = new AbortController()
+  const history = client.historyPage('ses_1', { requestId: 'tail', signal: controller.signal })
+  sockets.last().receive({ frame: 'history.page', request_id: 'tail', session_id: 'ses_1',
+    latest_seq: 100, events: [{ frame: 'event', type: 'session.message', session_id: 'ses_1', seq: 100, time: 1, payload: {} }],
+    next_before_seq: 100, retention_state: 'complete' })
+  await Promise.resolve()
+  controller.abort()
+  await assert.rejects(history, /aborted/)
+  release()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(client.lastSeq('ses_1'), 0)
   client.close()
 })
 

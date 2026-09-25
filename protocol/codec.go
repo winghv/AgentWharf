@@ -188,8 +188,9 @@ func (*CredentialRotationActivation) FrameName() FrameName { return FrameCredent
 func (*Hello) FrameName() FrameName { return FrameHello }
 
 type Subscription struct {
-	SessionID string `json:"session_id"`
-	LastSeq   int64  `json:"last_seq"`
+	SessionID  string `json:"session_id"`
+	LastSeq    int64  `json:"last_seq"`
+	SkipReplay bool   `json:"skip_replay,omitempty"`
 }
 
 type HelloAck struct {

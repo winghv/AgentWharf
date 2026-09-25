@@ -21,6 +21,7 @@ CREATE TABLE session_events (
 );
 
 CREATE INDEX session_events_session_seq_idx ON session_events (session_id, seq);
+CREATE INDEX session_events_session_type_seq_idx ON session_events (session_id, type, seq);
 CREATE UNIQUE INDEX session_events_proposal_id_idx
     ON session_events (session_id, proposal_id) WHERE proposal_id IS NOT NULL;
 
