@@ -954,6 +954,9 @@ export class AgentWharfClient {
         this.socket?.send(encodeFrame({ frame: 'pong', nonce: frame.nonce }))
         return
       case 'error':
+        if (frame.code === 'history_unsupported' || frame.code === 'history_unavailable') {
+          this.rejectPendingHistoryPages(new Error(`${frame.code}: ${frame.message}`))
+        }
         this.emitError(frame)
         return
       case 'history.page':

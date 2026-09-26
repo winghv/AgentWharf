@@ -412,6 +412,22 @@ test('requests typed reverse history pages and validates cursors', async () => {
   client.close()
 })
 
+test('rejects pending history pages when Hub reports a history error', async () => {
+  const sockets = new FakeSocketFactory()
+  const client = new AgentWharfClient({
+    url: 'ws://hub.local/ws', token: 'view-token', sessions: [{ sessionId: 'ses_1' }],
+    webSocketFactory: sockets.factory, reconnect: false,
+  })
+  const connected = client.connect()
+  sockets.last().open()
+  sockets.last().receive({ frame: 'hello.ack', protocol_version: 2, sessions: [{ session_id: 'ses_1', state: 'ended', provider: 'codex', latest_seq: 0 }] })
+  await connected
+  const page = client.historyPage('ses_1', { requestId: 'history_error' })
+  sockets.last().receive({ frame: 'error', code: 'history_unavailable', message: 'history unavailable' })
+  await assert.rejects(page, /history_unavailable/)
+  client.close()
+})
+
 test('tail hydration authenticates earlier live frames before advancing the encrypted cursor', async () => {
   const sockets = new FakeSocketFactory()
   let release!: () => void
