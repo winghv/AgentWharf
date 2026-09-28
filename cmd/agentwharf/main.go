@@ -2314,7 +2314,7 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 	if cfg.OnProviderSession != nil {
 		cfg.OnProviderSession(providerSessionID)
 	}
-	settingsTracker := newACPSettingsTracker(sessionResult, acpSettingsPolicyForProvider(cfg.Provider))
+	settingsTracker := newACPSettingsTracker(sessionResult, acpSettingsPolicyForProviderWithModelScope(cfg.Provider))
 	if cfg.ProtocolVersion == protocol.ProtocolVersionV2 && cfg.LaunchSettings.requested() {
 		if cfg.ContentMode == protocol.ContentModeRequired {
 			if err := applyRequiredACPLaunchSettingsWithPipes(runCtx, settingsTracker, providerSessionID, stdinWriter, stdoutReader, scanner, cfg.LaunchSettings); err != nil {

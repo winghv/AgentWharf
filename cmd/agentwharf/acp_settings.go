@@ -67,6 +67,7 @@ type acpSettingsMutationHandle struct {
 type acpSettingsPolicy struct {
 	permissionID    string
 	permissionLabel string
+	modelPatterns   []string
 }
 
 func acpSettingsPolicyForProvider(provider string) acpSettingsPolicy {
@@ -78,6 +79,14 @@ func acpSettingsPolicyForProvider(provider string) acpSettingsPolicy {
 	default:
 		return acpSettingsPolicy{}
 	}
+}
+
+func acpSettingsPolicyForProviderWithModelScope(provider string) acpSettingsPolicy {
+	policy := acpSettingsPolicyForProvider(provider)
+	if provider == "pi" {
+		policy.modelPatterns = piEnabledModelPatterns()
+	}
+	return policy
 }
 
 func newACPSettingsTracker(sessionResult map[string]any, policies ...acpSettingsPolicy) *acpSettingsTracker {
@@ -284,6 +293,10 @@ func (t *acpSettingsTracker) MarkReadOnly(reason string) (acpSettingsState, bool
 }
 
 func acpSettingsStateFromConfigOptions(value any, policies ...acpSettingsPolicy) (acpSettingsState, error) {
+	policy := acpSettingsPolicy{}
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
 	options := objectSlice(value)
 	if len(options) == 0 {
 		return acpSettingsState{}, errors.New("acp settings config options are unavailable")
@@ -312,7 +325,7 @@ func acpSettingsStateFromConfigOptions(value any, policies ...acpSettingsPolicy)
 	if !acpSettingsIdentifier.MatchString(modelConfigID) || (permissionConfigID != "" && (!acpSettingsIdentifier.MatchString(permissionConfigID) || modelConfigID == permissionConfigID)) {
 		return acpSettingsState{}, errors.New("acp settings config ids are invalid")
 	}
-	models, modelWireValues, err := normalizedACPSettingsChoicesWithWireValues(modelOption["options"], modelID, 32)
+	models, modelWireValues, err := normalizedACPSettingsChoicesWithWireValuesAndScope(modelOption["options"], modelID, 32, policy.modelPatterns)
 	if err != nil {
 		return acpSettingsState{}, fmt.Errorf("acp model settings: %w", err)
 	}
@@ -426,6 +439,10 @@ func normalizedACPSettingsChoices(value any, currentID string, maximum int) ([]p
 }
 
 func normalizedACPSettingsChoicesWithWireValues(value any, currentID string, maximum int) ([]protocol.SettingsCapabilityChoice, map[string]string, error) {
+	return normalizedACPSettingsChoicesWithWireValuesAndScope(value, currentID, maximum, nil)
+}
+
+func normalizedACPSettingsChoicesWithWireValuesAndScope(value any, currentID string, maximum int, modelPatterns []string) ([]protocol.SettingsCapabilityChoice, map[string]string, error) {
 	currentID, _, ok := canonicalACPSettingID(currentID)
 	if !ok {
 		return nil, nil, errors.New("effective value is invalid")
@@ -455,6 +472,10 @@ func normalizedACPSettingsChoicesWithWireValues(value any, currentID string, max
 	visit(value)
 	if _, found := choicesByID[currentID]; !found {
 		return nil, wireValues, errors.New("effective value is not in the advertised options")
+	}
+	// Filter first so scoped choices outside the catalogue's sorted prefix survive the transport cap.
+	if scoped, applied := filterPiACPModelChoices(choicesByID, currentID, modelPatterns); applied {
+		choicesByID = scoped
 	}
 	ids := make([]string, 0, len(choicesByID))
 	for id := range choicesByID {

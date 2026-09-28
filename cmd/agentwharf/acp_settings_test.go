@@ -91,6 +91,62 @@ func TestACPSettingsStateUsesCanonicalProviderReadback(t *testing.T) {
 	}
 }
 
+func TestACPSettingsStateFiltersPiModelsToConfiguredScope(t *testing.T) {
+	options := make([]any, 0, 40)
+	for index := 0; index < 40; index++ {
+		modelID := fmt.Sprintf("pi-provider/model-%02d", index)
+		options = append(options, map[string]any{"value": modelID, "name": fmt.Sprintf("Model %02d", index)})
+	}
+	configOptions := []any{map[string]any{
+		"id": "model", "category": "model", "type": "select", "currentValue": "pi-provider/model-00",
+		"options": options,
+	}}
+	policy := acpSettingsPolicy{
+		permissionID:    "acp_approval_flow",
+		permissionLabel: "ACP approval flow (managed)",
+		modelPatterns:   []string{"pi-provider/model-37", "pi-provider/model-39"},
+	}
+	state, err := acpSettingsStateFromConfigOptions(configOptions, policy)
+	if err != nil {
+		t.Fatalf("acpSettingsStateFromConfigOptions() error = %v", err)
+	}
+	got := make(map[string]bool, len(state.Capability.Models))
+	for _, model := range state.Capability.Models {
+		got[model.ID] = true
+	}
+	want := []string{"pi-provider/model-00", "pi-provider/model-37", "pi-provider/model-39"}
+	if len(got) != len(want) {
+		t.Fatalf("scoped models = %v, want %v", got, want)
+	}
+	for _, modelID := range want {
+		if !got[modelID] {
+			t.Errorf("scoped models omitted %q: %v", modelID, got)
+		}
+	}
+}
+
+func TestFilterPiACPModelChoicesUsesPiPatternMatching(t *testing.T) {
+	choices := map[string]protocol.SettingsCapabilityChoice{
+		"anthropic/claude-sonnet-4-20250101": {ID: "anthropic/claude-sonnet-4-20250101", Label: "anthropic/Claude Sonnet 4"},
+		"anthropic/claude-sonnet-4-20250201": {ID: "anthropic/claude-sonnet-4-20250201", Label: "anthropic/Claude Sonnet 4"},
+		"anthropic/claude-sonnet-4":          {ID: "anthropic/claude-sonnet-4", Label: "anthropic/Claude Sonnet 4"},
+		"anthropic/claude-opus-4":            {ID: "anthropic/claude-opus-4", Label: "anthropic/Claude Opus 4"},
+	}
+	fuzzy, applied := filterPiACPModelChoices(choices, "", []string{"SONNET"})
+	_, hasFuzzyAlias := fuzzy["anthropic/claude-sonnet-4"]
+	if !applied || len(fuzzy) != 1 || !hasFuzzyAlias {
+		t.Fatalf("fuzzy model scope = %v, applied=%t", fuzzy, applied)
+	}
+	glob, applied := filterPiACPModelChoices(choices, "", []string{"anthropic/claude-sonnet-4-????????"})
+	_, hasFirstDatedModel := glob["anthropic/claude-sonnet-4-20250101"]
+	if !applied || len(glob) != 2 || !hasFirstDatedModel {
+		t.Fatalf("glob model scope = %v, applied=%t", glob, applied)
+	}
+	if filtered, applied := filterPiACPModelChoices(choices, "", []string{"missing-model"}); applied || filtered != nil {
+		t.Fatalf("unmatched scope unexpectedly filtered models: %v, applied=%t", filtered, applied)
+	}
+}
+
 func TestACPSettingsTrackerDoesNotInventMissingProviderControls(t *testing.T) {
 	tracker := newACPSettingsTracker(map[string]any{"configOptions": []any{
 		map[string]any{

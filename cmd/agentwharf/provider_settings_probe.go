@@ -124,7 +124,7 @@ func runProviderSettingsProbe(ctx context.Context, args []string, stdout io.Writ
 	if sessionID == "" {
 		return errors.New("ACP settings probe response omitted sessionId")
 	}
-	tracker := newACPSettingsTracker(session, acpSettingsPolicyForProvider(cfg.Provider))
+	tracker := newACPSettingsTracker(session, acpSettingsPolicyForProviderWithModelScope(cfg.Provider))
 	state, ok := tracker.Current()
 	if !ok {
 		return errors.New("ACP settings probe provider did not expose a valid capability")
