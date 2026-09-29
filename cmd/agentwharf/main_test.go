@@ -4218,27 +4218,29 @@ func TestCwdEventBasenameIsIdempotent(t *testing.T) {
 	}
 }
 
-// The emitted payload must carry only the basename, and must omit the key
-// outright when no safe segment exists rather than sending an empty string.
+// The emitted payload must carry only the basename plus an opaque identity, and
+// must omit both when no safe segment exists rather than sending a path.
 func TestACPProviderReadyEventCarriesOnlyCwdBasename(t *testing.T) {
 	t.Parallel()
 
+	const directoryID = "dir_v1_AAECAwQFBgcICQoLDA0ODw"
 	for _, tc := range []struct {
 		name      string
 		cwd       string
 		wantValue string
 		wantKey   bool
+		wantID    bool
 	}{
-		{"absolute path is reduced", "/Users/alice/VscodeProjects/superwhv", "superwhv", true},
-		{"unreducible path omits the key", "/", "", false},
-		{"traversal-terminal path omits the key", "/Users/alice/..", "", false},
+		{"absolute path is reduced", "/Users/alice/VscodeProjects/superwhv", "superwhv", true, true},
+		{"unreducible path omits metadata", "/", "", false, false},
+		{"traversal-terminal path omits metadata", "/Users/alice/..", "", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			// Call the production payload builder, not a local copy of it, so a
 			// regression to the raw path fails here.
-			payload, err := acpProviderReadyPayload("claude-code", "acp_ses_1", tc.cwd)
+			payload, err := acpProviderReadyPayload("claude-code", "acp_ses_1", tc.cwd, directoryID)
 			if err != nil {
 				t.Fatalf("acpProviderReadyPayload() error = %v", err)
 			}
@@ -4254,6 +4256,13 @@ func TestACPProviderReadyEventCarriesOnlyCwdBasename(t *testing.T) {
 			}
 			if tc.wantKey && value != tc.wantValue {
 				t.Fatalf("cwd = %v, want %q", value, tc.wantValue)
+			}
+			id, hasID := decodedMetadata["cwd_id"]
+			if hasID != tc.wantID {
+				t.Fatalf("cwd_id present = %v, want %v (payload %s)", hasID, tc.wantID, string(payload))
+			}
+			if tc.wantID && id != directoryID {
+				t.Fatalf("cwd_id = %v, want %q", id, directoryID)
 			}
 			// Whatever the input, no ancestor segment and no separator may
 			// survive into the serialized durable event.

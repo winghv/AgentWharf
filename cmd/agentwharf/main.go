@@ -2774,12 +2774,13 @@ func cwdEventBasename(raw string) string {
 // a websocket: a test that rebuilt this map itself would assert only against its
 // own copy and would keep passing if the real payload regressed to the full
 // path.
-func acpProviderReadyPayload(provider string, providerSessionID string, cwd string) ([]byte, error) {
-	// Omit the key entirely when the path cannot be reduced safely, so a
-	// consumer sees an absent field rather than an empty or misleading one.
+func acpProviderReadyPayload(provider string, providerSessionID string, cwd string, directoryID string) ([]byte, error) {
 	metadata := map[string]any{}
 	if basename := cwdEventBasename(cwd); basename != "" {
 		metadata["cwd"] = basename
+		if validDirectoryIdentityID(directoryID) {
+			metadata["cwd_id"] = directoryID
+		}
 	}
 	return json.Marshal(map[string]any{
 		"state":               "ready",
@@ -2791,7 +2792,9 @@ func acpProviderReadyPayload(provider string, providerSessionID string, cwd stri
 }
 
 func sendACPProviderReadyEvent(ctx context.Context, writeFrame func(protocol.Frame) error, cfg wrapConfig, providerSessionID string, cwd string, masker *core.EventMasker, metrics *core.AdapterMetrics) (string, error) {
-	payload, err := acpProviderReadyPayload(cfg.Provider, providerSessionID, cwd)
+	directoryMetadata := sessionDirectoryMetadata(cwd)
+	directoryID, _ := directoryMetadata["cwd_id"].(string)
+	payload, err := acpProviderReadyPayload(cfg.Provider, providerSessionID, cwd, directoryID)
 	if err != nil {
 		return "", fmt.Errorf("marshal acp ready event: %w", err)
 	}
@@ -2870,11 +2873,14 @@ func waitEventReceipt(ctx context.Context, readFrame func(context.Context) (prot
 // itself when the Session requires E2EE, and the Hub's attention projection
 // derives the user-visible Session state from it.
 func publishACPWorkingState(writeFrame func(protocol.Frame) error, cfg wrapConfig, providerSessionID, state string) error {
-	payload := map[string]any{"state": state, "provider": cfg.Provider}
+	metadata := map[string]any{"state": state, "provider": cfg.Provider}
 	if providerSessionID != "" {
-		payload["provider_session_id"] = providerSessionID
+		metadata["provider_session_id"] = providerSessionID
 	}
-	encoded, err := json.Marshal(payload)
+	if directory := sessionDirectoryMetadata(cfg.WorkingDirectory); directory != nil {
+		metadata["metadata"] = directory
+	}
+	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("marshal acp %s state: %w", state, err)
 	}
