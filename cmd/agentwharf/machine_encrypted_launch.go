@@ -78,11 +78,15 @@ func resolveEncryptedLaunch(ctx context.Context, runtime *machineE2EERuntime, ha
 	if provider, wire, err := runtime.loadLaunch(ctx, handoff.SessionID); err == nil && provider == handoff.Provider && wire != handoff.EncryptedFirstInstruction {
 		carriers = append(carriers, wire)
 	}
+	var directoryIdentityErr error
 	for _, carrier := range carriers {
 		probe := handoff
 		probe.EncryptedFirstInstruction = carrier
 		launch, err := applyEncryptedLaunchConfiguration(ctx, runtime, probe, cfg)
 		if err != nil {
+			if errors.Is(err, errEncryptedWorkingDirectoryUnavailable) {
+				directoryIdentityErr = err
+			}
 			continue
 		}
 		if err := runtime.retainLaunch(ctx, probe.SessionID, probe.Provider, carrier); err != nil {
@@ -95,6 +99,9 @@ func resolveEncryptedLaunch(ctx context.Context, runtime *machineE2EERuntime, ha
 	}
 	provider, settings, err := runtime.loadLaunchRecovery(ctx, handoff.SessionID)
 	if err != nil || provider != handoff.Provider || settings.Provider != handoff.Provider {
+		if directoryIdentityErr != nil {
+			return handoff, directoryIdentityErr
+		}
 		return handoff, errors.New("encrypted launch configuration rejected")
 	}
 	wire, err := runtime.authorizeMachineLaunch(ctx, handoff.SessionID, handoff.Provider, settings)
