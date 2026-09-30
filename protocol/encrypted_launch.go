@@ -8,12 +8,15 @@ import (
 
 // EncryptedLaunchSettings is endpoint-only configuration carried inside a
 // signed session.send payload, never as relay-visible launch metadata.
+// WorkingDirectoryID is resolved only by the local AgentWharf registry. The
+// platform and Hub carry the launch payload as endpoint-encrypted content.
 type EncryptedLaunchSettings struct {
-	Provider          string `json:"provider,omitempty"`
-	WorkingDirectory  string `json:"working_directory,omitempty"`
-	ModelID           string `json:"model_id,omitempty"`
-	ReasoningEffortID string `json:"reasoning_effort_id,omitempty"`
-	PermissionModeID  string `json:"permission_mode_id,omitempty"`
+	Provider           string `json:"provider,omitempty"`
+	WorkingDirectory   string `json:"working_directory,omitempty"`
+	WorkingDirectoryID string `json:"working_directory_id,omitempty"`
+	ModelID            string `json:"model_id,omitempty"`
+	ReasoningEffortID  string `json:"reasoning_effort_id,omitempty"`
+	PermissionModeID   string `json:"permission_mode_id,omitempty"`
 }
 
 func DecodeEncryptedLaunchSettings(payload json.RawMessage) (EncryptedLaunchSettings, error) {
@@ -46,6 +49,11 @@ func DecodeEncryptedLaunchSettings(payload json.RawMessage) (EncryptedLaunchSett
 				return result, errors.New("invalid encrypted working directory")
 			}
 			result.WorkingDirectory = text
+		case "working_directory_id":
+			if !validDirectoryIdentityID(text) {
+				return result, errors.New("invalid encrypted working directory identity")
+			}
+			result.WorkingDirectoryID = text
 		case "model_id", "reasoning_effort_id", "permission_mode_id":
 			if !validSettingsIdentifier(text) {
 				return result, errors.New("invalid encrypted launch identifier")
@@ -62,5 +70,23 @@ func DecodeEncryptedLaunchSettings(payload json.RawMessage) (EncryptedLaunchSett
 			return result, errors.New("unknown encrypted launch setting")
 		}
 	}
+	if result.WorkingDirectory != "" && result.WorkingDirectoryID != "" {
+		return result, errors.New("encrypted working directory and identity are mutually exclusive")
+	}
 	return result, nil
+}
+
+func validDirectoryIdentityID(value string) bool {
+	const prefix = "dir_v1_"
+	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+22 {
+		return false
+	}
+	for _, character := range strings.TrimPrefix(value, prefix) {
+		if (character < 'A' || character > 'Z') &&
+			(character < 'a' || character > 'z') &&
+			(character < '0' || character > '9') && character != '_' && character != '-' {
+			return false
+		}
+	}
+	return true
 }

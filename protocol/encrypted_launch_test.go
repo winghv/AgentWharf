@@ -7,14 +7,19 @@ import (
 )
 
 func TestEncryptedLaunchSettingsStrictPayload(t *testing.T) {
-	settings, err := protocol.DecodeEncryptedLaunchSettings(json.RawMessage(`{"content":[],"launch":{"working_directory":"/workspace/private","model_id":"model","reasoning_effort_id":"high","permission_mode_id":"ask"}}`))
+	settings, err := protocol.DecodeEncryptedLaunchSettings(json.RawMessage(`{"content":[],"launch":{"working_directory_id":"dir_v1_AAECAwQFBgcICQoLDA0ODw","model_id":"model","reasoning_effort_id":"high","permission_mode_id":"ask"}}`))
+	if err != nil || settings.WorkingDirectoryID != "dir_v1_AAECAwQFBgcICQoLDA0ODw" || settings.ModelID != "model" || settings.ReasoningEffortID != "high" || settings.PermissionModeID != "ask" {
+		t.Fatalf("launch handle decode: %+v %v", settings, err)
+	}
+	settings, err = protocol.DecodeEncryptedLaunchSettings(json.RawMessage(`{"content":[],"launch":{"working_directory":"/workspace/private","model_id":"model","reasoning_effort_id":"high","permission_mode_id":"ask"}}`))
 	if err != nil || settings.WorkingDirectory != "/workspace/private" || settings.ModelID != "model" || settings.ReasoningEffortID != "high" || settings.PermissionModeID != "ask" {
 		t.Fatalf("launch decode: %+v %v", settings, err)
 	}
 	for _, payload := range []string{
 		`{"launch":null}`, `{"launch":{"model_id":"a","model_id":"b"}}`,
 		`{"launch":{},"launch":{}}`, `{"launch":{"env":{"TOKEN":"private"}}}`,
-		`{"launch":{"working_directory":"/workspace\u0000"}}`, `{"launch":{"model_id":null}}`,
+		`{"launch":{"working_directory":"/workspace/private","working_directory_id":"dir_v1_AAECAwQFBgcICQoLDA0ODw"}}`,
+		`{"launch":{"working_directory_id":"dir_v1_invalid"}}`,
 	} {
 		if _, err := protocol.DecodeEncryptedLaunchSettings(json.RawMessage(payload)); err == nil {
 			t.Fatal("ambiguous or unsupported launch accepted")

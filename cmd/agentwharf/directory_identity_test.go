@@ -83,6 +83,66 @@ func TestConcurrentDirectoryIdentityKeyCreationConverges(t *testing.T) {
 	}
 }
 
+func TestDirectoryIdentityRegistryResolvesLocallyAndKeepsPathsOffTheHandle(t *testing.T) {
+	directory := t.TempDir()
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(directory, "machine.json"))
+	path := filepath.Join(directory, "workspace")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	otherPath := filepath.Join(directory, "another", "workspace")
+	if err := os.MkdirAll(otherPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keyPath, err := directoryIdentityKeyFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := loadOrCreateDirectoryIdentityKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := directoryIdentityForPath(path, key)
+	otherID := directoryIdentityForPath(otherPath, key)
+	if id == otherID {
+		t.Fatal("same-basename directories received the same identity")
+	}
+	if err := rememberDirectoryIdentity(id, path); err != nil {
+		t.Fatalf("remember directory identity: %v", err)
+	}
+	if err := rememberDirectoryIdentity(otherID, otherPath); err != nil {
+		t.Fatalf("remember second directory identity: %v", err)
+	}
+	resolved, err := resolveDirectoryIdentity(id)
+	if err != nil || resolved != path {
+		t.Fatalf("resolved directory = %q, err=%v, want %q", resolved, err, path)
+	}
+	resolvedOther, err := resolveDirectoryIdentity(otherID)
+	if err != nil || resolvedOther != otherPath {
+		t.Fatalf("resolved second directory = %q, err=%v, want %q", resolvedOther, err, otherPath)
+	}
+	if bytes.Contains([]byte(id), []byte(path)) {
+		t.Fatal("directory handle contains the absolute path")
+	}
+	registryPath, err := directoryIdentityRegistryFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("directory identity registry permissions = %o, want owner-only", info.Mode().Perm())
+	}
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveDirectoryIdentity(id); err == nil {
+		t.Fatal("removed directory identity path resolved successfully")
+	}
+}
+
 func TestDirectoryIdentityRejectsInvalidKeyOrRelativePath(t *testing.T) {
 	t.Parallel()
 

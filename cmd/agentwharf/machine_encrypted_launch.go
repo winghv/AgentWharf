@@ -10,6 +10,8 @@ import (
 	"github.com/winghv/agentwharf/protocol"
 )
 
+var errEncryptedWorkingDirectoryUnavailable = errors.New("encrypted working directory identity unavailable")
+
 // Decrypted launch configuration is held only by the in-memory wrap config.
 // The persisted dispatch retains the original opaque carrier for recovery.
 func applyEncryptedLaunchConfiguration(ctx context.Context, runtime *machineE2EERuntime, handoff machineServeDispatch, cfg *wrapConfig) (protocol.EncryptedLaunchSettings, error) {
@@ -32,13 +34,27 @@ func applyEncryptedLaunchConfiguration(ctx context.Context, runtime *machineE2EE
 	if launch.Provider != handoff.Provider {
 		return protocol.EncryptedLaunchSettings{}, errors.New("encrypted launch provider mismatch")
 	}
-	setLaunchConfiguration(cfg, launch)
+	if err := setLaunchConfiguration(cfg, launch); err != nil {
+		return protocol.EncryptedLaunchSettings{}, err
+	}
 	return launch, nil
 }
 
-func setLaunchConfiguration(cfg *wrapConfig, launch protocol.EncryptedLaunchSettings) {
-	cfg.WorkingDirectory = launch.WorkingDirectory
+func setLaunchConfiguration(cfg *wrapConfig, launch protocol.EncryptedLaunchSettings) error {
+	if cfg == nil {
+		return errors.New("encrypted launch configuration target unavailable")
+	}
+	workingDirectory := launch.WorkingDirectory
+	if launch.WorkingDirectoryID != "" {
+		resolved, err := resolveDirectoryIdentity(launch.WorkingDirectoryID)
+		if err != nil {
+			return errEncryptedWorkingDirectoryUnavailable
+		}
+		workingDirectory = resolved
+	}
+	cfg.WorkingDirectory = workingDirectory
 	cfg.LaunchSettings = wrapLaunchSettings{ModelID: launch.ModelID, ReasoningEffortID: launch.ReasoningEffortID, PermissionModeID: launch.PermissionModeID}
+	return nil
 }
 
 // resolveEncryptedLaunch returns a carrier that validates against the session's

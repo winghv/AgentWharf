@@ -958,6 +958,8 @@ func defaultDSHConfigPath() string {
 
 func providerStartFailureReason(err error) string {
 	switch {
+	case errors.Is(err, errEncryptedWorkingDirectoryUnavailable):
+		return "working_directory_unavailable"
 	case errors.Is(err, errProviderCommandNotFound):
 		return "provider_command_unavailable"
 	case errors.Is(err, errProviderConfigNotFound):

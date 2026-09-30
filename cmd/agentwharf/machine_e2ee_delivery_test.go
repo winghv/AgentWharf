@@ -35,6 +35,35 @@ func (w *failingEncryptedACPWriter) Write([]byte) (int, error) {
 	return 0, errors.New("synthetic provider failure")
 }
 
+func TestEncryptedLaunchDirectoryIdentityResolvesBeforeProviderStart(t *testing.T) {
+	directory := t.TempDir()
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(directory, "machine.json"))
+	workspace := filepath.Join(directory, "workspace")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id := "dir_v1_AAECAwQFBgcICQoLDA0ODw"
+	if err := rememberDirectoryIdentity(id, workspace); err != nil {
+		t.Fatal(err)
+	}
+	var cfg wrapConfig
+	if err := setLaunchConfiguration(&cfg, protocol.EncryptedLaunchSettings{Provider: "claude-code", WorkingDirectoryID: id}); err != nil {
+		t.Fatalf("resolve launch directory: %v", err)
+	}
+	if cfg.WorkingDirectory != workspace {
+		t.Fatalf("working directory = %q, want %q", cfg.WorkingDirectory, workspace)
+	}
+	if err := setLaunchConfiguration(&cfg, protocol.EncryptedLaunchSettings{Provider: "claude-code", WorkingDirectoryID: "dir_v1_AAECAwQFBgcICQoLDA0ODw"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(workspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := setLaunchConfiguration(&cfg, protocol.EncryptedLaunchSettings{Provider: "claude-code", WorkingDirectoryID: id}); err == nil {
+		t.Fatal("missing directory handle was accepted")
+	}
+}
+
 func TestMachineRuntimeDeliveryIsLocallyClaimedAndNotReplayed(t *testing.T) {
 	ctx := context.Background()
 	directory := filepath.Join(t.TempDir(), "endpoint")

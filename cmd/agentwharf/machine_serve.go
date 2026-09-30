@@ -565,6 +565,14 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 		launchHandoff, resolveErr := resolveEncryptedLaunch(ctx, endpointRuntime, *handoff, &adapterCfg, stderr)
 		if resolveErr != nil {
 			_, _ = fmt.Fprintf(stderr, "wharf machine serve: launch configuration for %s unavailable: %v\n", handoff.SessionID, resolveErr)
+			if reportFailure == nil {
+				return resolveErr
+			}
+			if reportErr := reportFailure(ctx, handoff.SessionID, providerStartFailureReason(resolveErr)); reportErr != nil {
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: report launch failure for %s: %v\n", handoff.SessionID, reportErr)
+				return resolveErr
+			}
+			_ = removeMachineDispatch(handoff.ClaimID)
 			return resolveErr
 		}
 		{

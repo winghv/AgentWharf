@@ -407,6 +407,12 @@ func TestStartServeRejectsSessionCredentialSignerSymlink(t *testing.T) {
 	}
 }
 
+func TestProviderStartFailureReasonDistinguishesUnavailableDirectory(t *testing.T) {
+	if got := providerStartFailureReason(errEncryptedWorkingDirectoryUnavailable); got != "working_directory_unavailable" {
+		t.Fatalf("directory failure reason = %q, want working_directory_unavailable", got)
+	}
+}
+
 func TestParseServeConfigRejectsNonPositiveSessionCredentialSignerKeyVersion(t *testing.T) {
 	for _, version := range []string{"0", "-1"} {
 		if _, err := parseServeConfig([]string{"--session-credential-signer-key-version", version}, io.Discard); err == nil || !strings.Contains(err.Error(), "must be positive") {
