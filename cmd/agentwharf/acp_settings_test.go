@@ -147,6 +147,48 @@ func TestFilterPiACPModelChoicesUsesPiPatternMatching(t *testing.T) {
 	}
 }
 
+func TestACPSettingsStateKeepsModelCatalogWhenReasoningEffectiveValueIsUnadvertised(t *testing.T) {
+	configOptions := []any{
+		map[string]any{
+			"id": "model", "category": "model", "type": "select", "currentValue": "openai/gpt-5",
+			"options": []any{
+				map[string]any{"value": "openai/gpt-5", "name": "GPT-5"},
+				map[string]any{"value": "openai/gpt-5-mini", "name": "GPT-5 mini"},
+			},
+		},
+		map[string]any{
+			"id": "mode", "category": "mode", "type": "select", "currentValue": "ask",
+			"options": []any{map[string]any{"value": "ask", "name": "Ask"}, map[string]any{"value": "never", "name": "Never"}},
+		},
+		map[string]any{
+			"id": "thought_level", "category": "thought_level", "type": "select", "currentValue": "xhigh",
+			"options": []any{map[string]any{"value": "high", "name": "High"}},
+		},
+	}
+
+	state, err := acpSettingsStateFromConfigOptions(configOptions)
+	if err != nil {
+		t.Fatalf("acpSettingsStateFromConfigOptions() error = %v", err)
+	}
+	if len(state.Capability.Models) != 2 || state.Capability.ModelChange != "allowed" || state.Capability.EffectiveModelID != "openai/gpt-5" {
+		t.Fatalf("model capability was lost: %+v", state.Capability)
+	}
+	if len(state.Capability.PermissionModes) != 2 || state.Capability.EffectivePermissionModeID != "ask" {
+		t.Fatalf("permission capability was lost: %+v", state.Capability)
+	}
+	if len(state.Capability.ReasoningEfforts) != 0 || state.Capability.EffectiveReasoningEffortID != nil ||
+		state.Capability.ReasoningEffortChange != "unsupported" || state.ReasoningConfigID != "" {
+		t.Fatalf("unmatched reasoning setting was advertised: %+v", state)
+	}
+	encoded, marshalErr := json.Marshal(state.Capability)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	if _, err := protocol.DecodeSettingsCapabilityPayload(encoded); err != nil {
+		t.Fatalf("protocol rejected degraded capability: %v", err)
+	}
+}
+
 func TestACPSettingsTrackerDoesNotInventMissingProviderControls(t *testing.T) {
 	tracker := newACPSettingsTracker(map[string]any{"configOptions": []any{
 		map[string]any{

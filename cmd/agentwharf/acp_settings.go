@@ -32,6 +32,7 @@ const (
 var acpSettingsIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
 var errACPSettingsCapabilityChanged = errors.New("acp settings capability changed before provider mutation")
 var errACPSettingsReadbackSuperseded = errors.New("acp settings readback was superseded by a newer provider update")
+var errACPSettingsEffectiveValueNotAdvertised = errors.New("effective value is not in the advertised options")
 
 type acpSettingsState struct {
 	Capability         protocol.SettingsCapabilityPayload
@@ -363,10 +364,17 @@ func acpSettingsStateFromConfigOptions(value any, policies ...acpSettingsPolicy)
 		}
 		reasoningEfforts, err = normalizedACPSettingsChoices(reasoningOption["options"], reasoningID, 16)
 		if err != nil {
-			return acpSettingsState{}, fmt.Errorf("acp reasoning settings: %w", err)
+			if !errors.Is(err, errACPSettingsEffectiveValueNotAdvertised) {
+				return acpSettingsState{}, fmt.Errorf("acp reasoning settings: %w", err)
+			}
+			// Providers may report a stale effective effort that is absent from
+			// their advertised choices. Keep the valid model and permission
+			// capability instead of discarding the entire settings catalog.
+			reasoningConfigID = ""
+		} else {
+			effectiveReasoningEffortID = stringPointer(reasoningID)
+			reasoningChange, reasoningReason = acpSettingsChangeMode(len(reasoningEfforts))
 		}
-		effectiveReasoningEffortID = stringPointer(reasoningID)
-		reasoningChange, reasoningReason = acpSettingsChangeMode(len(reasoningEfforts))
 	}
 	capability := protocol.SettingsCapabilityPayload{
 		SchemaVersion:                 protocol.SettingsCapabilitySchemaVersion,
@@ -471,7 +479,7 @@ func normalizedACPSettingsChoicesWithWireValuesAndScope(value any, currentID str
 	}
 	visit(value)
 	if _, found := choicesByID[currentID]; !found {
-		return nil, wireValues, errors.New("effective value is not in the advertised options")
+		return nil, wireValues, errACPSettingsEffectiveValueNotAdvertised
 	}
 	// Filter first so scoped choices outside the catalogue's sorted prefix survive the transport cap.
 	if scoped, applied := filterPiACPModelChoices(choicesByID, currentID, modelPatterns); applied {
