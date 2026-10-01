@@ -3080,7 +3080,15 @@ func providerProcessCommand(cfg wrapConfig, stdin io.Reader, stdout io.Writer, s
 // file-path-only for injected secrets.
 func providerChildEnvironment(cfg wrapConfig, parent []string) ([]string, error) {
 	if ownMachineProviderEnvironment(cfg) {
-		return localProviderEnvironment(cfg, parent), nil
+		env := localProviderEnvironment(cfg, parent)
+		if cfg.Provider == "codex" && environmentValue(env, "DEFAULT_AUTH_REQUEST") == "" &&
+			(environmentValue(env, "CODEX_API_KEY") != "" || environmentValue(env, "OPENAI_API_KEY") != "") {
+			// codex-acp does not infer API-key authentication from an inherited
+			// credential. Without this request session/new fails with
+			// "Authentication required" even though the key is present.
+			env = append(env, `DEFAULT_AUTH_REQUEST={"methodId":"api-key"}`)
+		}
+		return env, nil
 	}
 	if cfg.Provider == "pi" && cfg.SecretDir == "" {
 		env := make([]string, 0, 4)

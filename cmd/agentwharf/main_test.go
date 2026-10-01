@@ -3379,6 +3379,32 @@ func TestProviderChildEnvironmentRejectsShortDeepSeekCredential(t *testing.T) {
 	}
 }
 
+func TestProviderChildEnvironmentAddsCodexAPIKeyAuthForOwnMachine(t *testing.T) {
+	env, err := providerChildEnvironment(wrapConfig{
+		Provider:    "codex",
+		e2eeRuntime: &machineE2EERuntime{},
+	}, []string{"OPENAI_API_KEY=test-codex-api-key"})
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	if got := environmentValue(env, "DEFAULT_AUTH_REQUEST"); got != `{"methodId":"api-key"}` {
+		t.Fatalf("DEFAULT_AUTH_REQUEST = %q, want API-key auth request", got)
+	}
+}
+
+func TestProviderChildEnvironmentPreservesCodexAuthChoiceWithoutAPIKey(t *testing.T) {
+	env, err := providerChildEnvironment(wrapConfig{
+		Provider:    "codex",
+		e2eeRuntime: &machineE2EERuntime{},
+	}, []string{"DEFAULT_AUTH_REQUEST={\"methodId\":\"chat-gpt\"}"})
+	if err != nil {
+		t.Fatalf("providerChildEnvironment() error = %v", err)
+	}
+	if got := environmentValue(env, "DEFAULT_AUTH_REQUEST"); got != `{"methodId":"chat-gpt"}` {
+		t.Fatalf("DEFAULT_AUTH_REQUEST = %q, want existing auth request", got)
+	}
+}
+
 func TestProviderChildEnvironmentBuildsCodexResponsesConfig(t *testing.T) {
 	secretDir := t.TempDir()
 	apiKeyPath := filepath.Join(secretDir, "codex_api_key")
