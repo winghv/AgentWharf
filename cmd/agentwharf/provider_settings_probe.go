@@ -63,6 +63,12 @@ func runProviderSettingsProbe(ctx context.Context, args []string, stdout io.Writ
 	probeCtx, cancel := context.WithTimeout(ctx, providerSettingsProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, command.Path, command.Args...)
+	// A settings probe launches the provider CLI exactly like a Session does,
+	// so it needs the same console policy. On Windows the provider is an npm
+	// .cmd shim and its Node bridge are console apps: without this, refreshing
+	// model settings flashes a black console window on the machine for every
+	// provider, not just the one being refreshed.
+	hideProbeProcessWindow(cmd)
 	if command.ExactEnv {
 		cmd.Env = command.Env
 	} else {
