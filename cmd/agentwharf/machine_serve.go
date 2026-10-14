@@ -21,27 +21,34 @@ import (
 	"nhooyr.io/websocket"
 )
 
-const machineServeUsage = "usage: wharf serve --foreground [--poll-interval SECONDS] [--max-concurrent N] [--startup-smoke]"
+const machineServeUsage = "usage: wharf serve --foreground [--poll-interval SECONDS] [--claim-poll-interval SECONDS] [--max-concurrent N] [--startup-smoke]"
 
 const (
-	machineServeDefaultPollInterval   = 10 * time.Second
-	machineServeMinPollInterval       = time.Second
-	machineServeDefaultMaxConcurrent  = 2
-	machineServeSenderRetryInitial    = 2 * time.Second
-	machineServeSenderRetryMax        = 30 * time.Second
-	machineServeSenderAttemptWindow   = 10 * time.Second
-	machineServeAdapterRestartInitial = 2 * time.Second
-	machineServeAdapterRestartMax     = 30 * time.Second
-	machineServeAdapterRestartLimit   = 5
-	machineCredentialRefreshLeadTime  = 12 * time.Hour
+	machineServeDefaultPollInterval = 10 * time.Second
+	machineServeMinPollInterval     = time.Second
+	// Claim pickup runs on its own cadence because it is the only part of the
+	// poll loop a Task actually waits on. Everything else in the loop is
+	// maintenance an owner never blocks on, and running claims behind it added
+	// every one of those round trips to Task start latency.
+	machineServeDefaultClaimPollInterval = 2 * time.Second
+	machineServeMinClaimPollInterval     = time.Second
+	machineServeDefaultMaxConcurrent     = 2
+	machineServeSenderRetryInitial       = 2 * time.Second
+	machineServeSenderRetryMax           = 30 * time.Second
+	machineServeSenderAttemptWindow      = 10 * time.Second
+	machineServeAdapterRestartInitial    = 2 * time.Second
+	machineServeAdapterRestartMax        = 30 * time.Second
+	machineServeAdapterRestartLimit      = 5
+	machineCredentialRefreshLeadTime     = 12 * time.Hour
 )
 
 var errNoInteractiveState = errors.New("session never reached an interactive state")
 
 type machineServeConfig struct {
-	PollInterval  time.Duration
-	MaxConcurrent int
-	StartupSmoke  bool
+	PollInterval      time.Duration
+	ClaimPollInterval time.Duration
+	MaxConcurrent     int
+	StartupSmoke      bool
 }
 
 type machineServeLockedWriter struct {
@@ -178,8 +185,9 @@ type machineTokenRefreshEnvelope struct {
 
 func parseMachineServeConfig(args []string, stderr io.Writer) (machineServeConfig, error) {
 	cfg := machineServeConfig{
-		PollInterval:  machineServeDefaultPollInterval,
-		MaxConcurrent: machineServeDefaultMaxConcurrent,
+		PollInterval:      machineServeDefaultPollInterval,
+		ClaimPollInterval: machineServeDefaultClaimPollInterval,
+		MaxConcurrent:     machineServeDefaultMaxConcurrent,
 	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -193,6 +201,16 @@ func parseMachineServeConfig(args []string, stderr io.Writer) (machineServeConfi
 				return machineServeConfig{}, errors.New(machineServeUsage)
 			}
 			cfg.PollInterval = time.Duration(seconds) * time.Second
+		case "--claim-poll-interval":
+			i++
+			if i >= len(args) {
+				return machineServeConfig{}, errors.New(machineServeUsage)
+			}
+			seconds, err := strconv.Atoi(args[i])
+			if err != nil || seconds <= 0 {
+				return machineServeConfig{}, errors.New(machineServeUsage)
+			}
+			cfg.ClaimPollInterval = time.Duration(seconds) * time.Second
 		case "--max-concurrent":
 			i++
 			if i >= len(args) {
@@ -213,7 +231,10 @@ func parseMachineServeConfig(args []string, stderr io.Writer) (machineServeConfi
 		}
 	}
 	if cfg.PollInterval < machineServeMinPollInterval {
-		return machineServeConfig{}, errors.New("--poll-interval must be at least 5 seconds")
+		return machineServeConfig{}, fmt.Errorf("--poll-interval must be at least %s", machineServeMinPollInterval)
+	}
+	if cfg.ClaimPollInterval < machineServeMinClaimPollInterval {
+		return machineServeConfig{}, fmt.Errorf("--claim-poll-interval must be at least %s", machineServeMinClaimPollInterval)
 	}
 	return cfg, nil
 }
@@ -295,6 +316,52 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 			}, reportFailure)
 		}(handoff, reportFailure)
 	}
+
+	// Claim pickup gets its own fast loop. A Task waits on exactly this, and
+	// measured production pickup was 4.7s to 21.0s because the claim fetch sat
+	// behind the initialization, trust, credential and recovery round trips that
+	// fill a maintenance tick. The dedup guards below already make concurrent
+	// pickup safe, so this loop only removes waiting; it does not change what
+	// runs.
+	pickup := func() {
+		cred := credential
+		if fresh, loadErr := loadMachineCredential(); loadErr == nil {
+			cred = fresh
+		}
+		claims, _, err := listPendingMachineClaims(ctx, client, cred)
+		if err != nil {
+			// A stale or expired credential is refreshed by the maintenance
+			// loop; pickup simply waits for the next fast tick.
+			return
+		}
+		for _, claim := range claims {
+			if claim.ClaimID == "" || !claimActiveNow(claim) || !recoveryGuard.claim(claim.SessionID) {
+				continue
+			}
+			workers.Add(1)
+			go func(claim machinePendingClaim, machineCred machineCredential) {
+				defer workers.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				dispatchClaim(serveCtx, cfg, client, machineCred, claim, stdout, stderr, &adapters, recoveryGuard)
+			}(claim, cred)
+		}
+	}
+	claimLoop := time.NewTicker(cfg.ClaimPollInterval)
+	defer claimLoop.Stop()
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		pickup()
+		for {
+			select {
+			case <-serveCtx.Done():
+				return
+			case <-claimLoop.C:
+				pickup()
+			}
+		}
+	}()
 
 	poll := time.NewTicker(cfg.PollInterval)
 	defer poll.Stop()
