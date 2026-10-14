@@ -68,7 +68,22 @@ func LoadOrCreateIdentity(ctx context.Context, directory string) (LocalIdentity,
 		return identity, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
-		return LocalIdentity{}, fmt.Errorf("identity file open: %w", err)
+		// The file exists but this user cannot prove it is theirs: it was created
+		// by an elevated installer, copied from another profile, or has a
+		// link or reparse point on it. Failing here is unrecoverable without
+		// Administrator rights, because a standard user cannot take ownership of
+		// someone else's file -- the machine would simply never come up, and the
+		// only visible symptom was a failed Task far away from the cause.
+		//
+		// The containing directory is owned by this user, so the file can be
+		// renamed aside without elevation. Do exactly that and mint a fresh
+		// identity: an attacker who could plant such a file already had to break
+		// the owner-only DACL on a directory they do not own, and all this buys
+		// them is a forced identity rotation, not the private key.
+		if quarantineErr := quarantineForeignIdentity(identityPath); quarantineErr != nil {
+			return LocalIdentity{}, fmt.Errorf("identity file unusable (%v) and could not be replaced automatically (%v); remove %s or restore its ownership to this user, then restart wharf",
+				err, quarantineErr, identityPath)
+		}
 	}
 	identity, err := NewLocalIdentity()
 	if err != nil {
@@ -104,4 +119,17 @@ func LoadOrCreateIdentity(ctx context.Context, directory string) (LocalIdentity,
 		return LocalIdentity{}, err
 	}
 	return identity, nil
+}
+
+// quarantineForeignIdentity renames an identity file this user is not allowed to
+// open, keeping it for diagnosis and freeing the name for a fresh identity. It
+// deliberately does not read or copy the rejected file: the point is to stop
+// using it, and copying foreign-owned key material would defeat the check that
+// rejected it.
+func quarantineForeignIdentity(identityPath string) error {
+	quarantine := fmt.Sprintf("%s.rejected-%d", identityPath, time.Now().UTC().Unix())
+	if err := os.Rename(identityPath, quarantine); err != nil {
+		return err
+	}
+	return nil
 }
