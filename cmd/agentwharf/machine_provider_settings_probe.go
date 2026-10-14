@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -46,9 +47,16 @@ func pollMachineProviderSettingsProbe(ctx context.Context, client *http.Client, 
 			var capability json.RawMessage
 			if err := json.Unmarshal(output.Bytes(), &capability); err != nil {
 				payload["failed"] = true
+				payload["error"] = probeFailureReason("provider settings response was not valid JSON")
 			} else {
 				payload["capability"] = capability
 			}
+		} else {
+			// Report why the probe failed, not just that it did. "claude is not
+			// installed on this machine" and "the probe timed out" need different
+			// instructions, and without the reason the owner only ever saw a
+			// generic failure.
+			payload["error"] = probeFailureReason(probeErr.Error())
 		}
 		complete, err := cloudAPIEndpoint(credential.CloudAPIURL, "/provider-settings-probes/"+url.PathEscape(probe.ID)+"/complete")
 		if err != nil {
@@ -72,4 +80,20 @@ func machineSupportsSettingsProbe(provider string) bool {
 	default:
 		return false
 	}
+}
+
+// maxProbeFailureReasonLength matches the platform's stored bound. The reason is
+// truncated so a verbose spawn failure cannot be rejected by the column CHECK,
+// which would turn a reporting improvement into a failed probe completion.
+const maxProbeFailureReasonLength = 400
+
+// probeFailureReason flattens a local diagnostic to one bounded line. It is
+// built from the local spawn failure, so it carries the command name and the OS
+// error and never the provider's output or any credential.
+func probeFailureReason(raw string) string {
+	reason := strings.Join(strings.Fields(strings.TrimSpace(raw)), " ")
+	if len(reason) > maxProbeFailureReasonLength {
+		reason = strings.TrimSpace(reason[:maxProbeFailureReasonLength])
+	}
+	return reason
 }
