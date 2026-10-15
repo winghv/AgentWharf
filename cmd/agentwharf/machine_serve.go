@@ -258,6 +258,11 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 		}
 	}
 
+	// One reporter for the whole daemon: every loop and per-Session worker below
+	// reports through it, so the platform sees a single deduplicated ledger
+	// instead of one row per poll.
+	diagnostics := newMachineClientDiagnostics(client, credential)
+
 	sem := make(chan struct{}, cfg.MaxConcurrent)
 	var workers sync.WaitGroup
 	var adapters sync.WaitGroup
@@ -272,7 +277,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 
 	// Recover locally authorized session initialization before starting any
 	// persisted handoff. Relay failure never supplies fallback key authority.
-	if err := pollSessionInitializations(ctx, client, credential, false); err != nil {
+	if err := pollSessionInitializations(ctx, client, credential, false, diagnostics); err != nil {
 		_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted initialization poll unavailable")
 	}
 	if err := reportTrustedDevicesWithRuntime(ctx, client, credential); err != nil {
@@ -331,7 +336,11 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 		claims, _, err := listPendingMachineClaims(ctx, client, cred)
 		if err != nil {
 			// A stale or expired credential is refreshed by the maintenance
-			// loop; pickup simply waits for the next fast tick.
+			// loop; pickup simply waits for the next fast tick. The platform is
+			// told anyway, because "the machine is online but cannot see its
+			// work" is the failure support could not previously distinguish from
+			// an idle machine.
+			reportMachineClaimPickup(ctx, diagnostics, "list_unavailable")
 			return
 		}
 		for _, claim := range claims {
@@ -343,7 +352,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				defer workers.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				dispatchClaim(serveCtx, cfg, client, machineCred, claim, stdout, stderr, &adapters, recoveryGuard)
+				dispatchClaim(serveCtx, cfg, client, machineCred, claim, stdout, stderr, &adapters, recoveryGuard, diagnostics)
 			}(claim, cred)
 		}
 	}
@@ -374,7 +383,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	for {
 		// Use the last known trust value so initialization polling stays ahead of
 		// every other machine request; this iteration refreshes it below.
-		if err := pollSessionInitializations(ctx, client, credential, trustedTerminals); err != nil {
+		if err := pollSessionInitializations(ctx, client, credential, trustedTerminals, diagnostics); err != nil {
 			_, _ = fmt.Fprintln(stderr, "wharf machine serve: encrypted initialization poll unavailable")
 		}
 		trustedNow, trustErr := fetchTrustAccountTerminals(ctx, client, credential)
@@ -448,7 +457,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 				defer workers.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				dispatchClaim(serveCtx, cfg, client, machineCred, claim, stdout, stderr, &adapters, recoveryGuard)
+				dispatchClaim(serveCtx, cfg, client, machineCred, claim, stdout, stderr, &adapters, recoveryGuard, diagnostics)
 			}(claim, credential)
 		}
 		// Recover Sessions created by an older local `wharf claude` invocation or
@@ -519,8 +528,8 @@ func machineServePollRetryMessage(err error, interval time.Duration) string {
 }
 
 // dispatchClaim exchanges one pending auto claim and runs the dispatch.
-func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, claim machinePendingClaim, stdout, stderr io.Writer, adapters *sync.WaitGroup, recoveryGuard *machineRecoveryGuard) {
-	handoff, err := exchangeAutoMachineClaim(ctx, client, credential, claim)
+func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, claim machinePendingClaim, stdout, stderr io.Writer, adapters *sync.WaitGroup, recoveryGuard *machineRecoveryGuard, diagnostics *machineClientDiagnostics) {
+	handoff, err := exchangeAutoMachineClaimReporting(ctx, client, credential, claim, diagnostics)
 	if err != nil {
 		recoveryGuard.release(claim.SessionID)
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: exchange claim %s: %v\n", claim.ClaimID, err)
@@ -768,16 +777,27 @@ func reportMachineSessionStartFailure(ctx context.Context, client *http.Client, 
 // exchangeAutoMachineClaim consumes the claim with the machine bearer alone and
 // returns the session-scoped credentials plus the first instruction.
 func exchangeAutoMachineClaim(ctx context.Context, client *http.Client, credential machineCredential, claim machinePendingClaim) (*machineServeDispatch, error) {
+	return exchangeAutoMachineClaimReporting(ctx, client, credential, claim, nil)
+}
+
+// exchangeAutoMachineClaimReporting reports which half of the exchange failed.
+// A claim the machine was offered and could not take is a different incident
+// from a claim it never saw, and support could not tell them apart before.
+func exchangeAutoMachineClaimReporting(ctx context.Context, client *http.Client, credential machineCredential, claim machinePendingClaim, diagnostics *machineClientDiagnostics) (*machineServeDispatch, error) {
+	report := func(reason string) { reportMachineClaimExchange(ctx, diagnostics, claim.SessionID, reason) }
 	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machine-task-claims/"+url.PathEscape(claim.ClaimID)+"/exchange")
 	if err != nil {
+		report("claim_unavailable")
 		return nil, errors.New("claim unavailable")
 	}
 	status, body, err := postCloudAPIJSON(ctx, client, endpoint, credential.MachineToken, struct{}{})
 	if err != nil || status < http.StatusOK || status >= http.StatusMultipleChoices {
+		report("claim_unavailable")
 		return nil, errors.New("claim unavailable")
 	}
 	var response machineAutoExchangeResponse
 	if err := decodeCloudAPIJSON(body, &response); err != nil {
+		report("exchange_response_incomplete")
 		return nil, errors.New("claim unavailable")
 	}
 	data := response.Data
@@ -786,6 +806,7 @@ func exchangeAutoMachineClaim(ctx context.Context, client *http.Client, credenti
 		return nil, errors.New("claim exchange response is incomplete")
 	}
 	if data.WorkingDirectory != "" || data.ModelID != "" || data.ReasoningEffortID != "" || data.PermissionModeID != "" {
+		report("exchange_settings_unauthenticated")
 		return nil, errors.New("claim exchange contains unauthenticated launch settings")
 	}
 	if _, err := decodeEncryptedLaunchCarrier(data.EncryptedFirstInstruction); err != nil {
