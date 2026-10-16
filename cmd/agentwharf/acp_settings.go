@@ -955,6 +955,13 @@ func reconcileACPSettingsExecution(execution acpSettingsExecution, current acpSe
 // instead of failing the launch. The tracker is updated from the authoritative
 // set_config_option readback so the subsequently published capability reflects
 // the effective settings.
+//
+// Each mutation is planned from the provider's latest readback, never from a
+// snapshot taken before the previous mutation. A provider may reset one setting
+// as a side effect of another: switching model can drop the reasoning effort to
+// the new model's default. A value that already matched in the snapshot is
+// therefore not "done" -- deciding that once, up front, made an otherwise
+// reachable launch look like a readback mismatch and refused it forever.
 func applyACPLaunchSettings(ctx context.Context, tracker *acpSettingsTracker, providerSessionID string, stdin io.Writer, scanner *bufio.Scanner, settings wrapLaunchSettings, warn io.Writer) {
 	if tracker == nil || stdin == nil || scanner == nil || !settings.requested() {
 		return
@@ -962,53 +969,19 @@ func applyACPLaunchSettings(ctx context.Context, tracker *acpSettingsTracker, pr
 	ctx, cancel := context.WithTimeout(ctx, acpSettingsOperationTimeout)
 	defer cancel()
 
-	state, available := tracker.Current()
-	if !available {
-		warnLaunchSettingSkipped(warn, "settings", "", "provider capability unavailable")
-		return
-	}
-
-	type launchMutation struct {
-		kind     string
-		value    string
-		configID string
-	}
-	var mutations []launchMutation
-	request := func(kind, value, configID string, allowed, contains, matches bool) {
-		if value == "" {
-			return
-		}
-		if !allowed {
-			warnLaunchSettingSkipped(warn, kind, value, "provider_read_only")
-			return
-		}
-		if !contains {
-			warnLaunchSettingSkipped(warn, kind, value, "settings_unavailable")
-			return
-		}
-		if matches {
-			return
-		}
-		if configID == "" {
-			warnLaunchSettingSkipped(warn, kind, value, "settings_unavailable")
-			return
-		}
-		mutations = append(mutations, launchMutation{kind: kind, value: value, configID: configID})
-	}
-
-	request(acpModelCategory, settings.ModelID, state.ModelConfigID,
-		state.Capability.ModelChange == "allowed", settingsChoiceContains(state.Capability.Models, settings.ModelID),
-		settings.ModelID == state.Capability.EffectiveModelID)
-	request(acpReasoningCategory, settings.ReasoningEffortID, state.ReasoningConfigID,
-		state.Capability.ReasoningEffortChange == "allowed", settingsChoiceContains(state.Capability.ReasoningEfforts, settings.ReasoningEffortID),
-		state.Capability.EffectiveReasoningEffortID != nil && settings.ReasoningEffortID == *state.Capability.EffectiveReasoningEffortID)
-	request(acpPermissionCategory, settings.PermissionModeID, state.PermissionConfigID,
-		state.Capability.PermissionChange == "allowed", settingsChoiceContains(state.Capability.PermissionModes, settings.PermissionModeID),
-		settings.PermissionModeID == state.Capability.EffectivePermissionModeID)
-
 	var nextID int64
 	var sequence uint64
-	for _, mutation := range mutations {
+	attempts := make(map[string]int, 3)
+	for {
+		state, available := tracker.Current()
+		if !available {
+			warnLaunchSettingSkipped(warn, "settings", "", "provider capability unavailable")
+			return
+		}
+		mutation, ok := nextACPSettingsLaunchMutation(state, settings, attempts, warn)
+		if !ok {
+			return
+		}
 		if err := ctx.Err(); err != nil {
 			warnLaunchSettingSkipped(warn, mutation.kind, mutation.value, err.Error())
 			return
@@ -1033,6 +1006,77 @@ func applyACPLaunchSettings(ctx context.Context, tracker *acpSettingsTracker, pr
 			return
 		}
 	}
+}
+
+// acpSettingsLaunchMutation is one set_config_option call the launch still owes
+// the provider.
+type acpSettingsLaunchMutation struct {
+	kind     string
+	value    string
+	configID string
+}
+
+// acpSettingsLaunchRequest is one requested launch value judged against the
+// provider's latest advertised capability and effective readback.
+type acpSettingsLaunchRequest struct {
+	kind       string
+	value      string
+	configID   string
+	allowed    bool
+	advertised bool
+	effective  bool
+}
+
+// acpSettingsLaunchAttempts bounds how often one setting is re-applied. A
+// provider that silently normalizes a value it advertised (asking for an effort
+// it clamps back to its own default) must not turn the launch into a retry
+// storm; the readback check downstream is what reports that honestly.
+const acpSettingsLaunchAttempts = 2
+
+// nextACPSettingsLaunchMutation returns the first requested value the provider
+// is not currently reporting, and warns about the ones it cannot change. attempts
+// records what has already been applied so a value is retried only after the
+// provider moved something else out from under it.
+func nextACPSettingsLaunchMutation(state acpSettingsState, settings wrapLaunchSettings, attempts map[string]int, warn io.Writer) (acpSettingsLaunchMutation, bool) {
+	candidates := []acpSettingsLaunchRequest{
+		{
+			kind: acpModelCategory, value: settings.ModelID, configID: state.ModelConfigID,
+			allowed:    state.Capability.ModelChange == "allowed",
+			advertised: settingsChoiceContains(state.Capability.Models, settings.ModelID),
+			effective:  settings.ModelID == state.Capability.EffectiveModelID,
+		},
+		{
+			kind: acpReasoningCategory, value: settings.ReasoningEffortID, configID: state.ReasoningConfigID,
+			allowed:    state.Capability.ReasoningEffortChange == "allowed",
+			advertised: settingsChoiceContains(state.Capability.ReasoningEfforts, settings.ReasoningEffortID),
+			effective:  state.Capability.EffectiveReasoningEffortID != nil && settings.ReasoningEffortID == *state.Capability.EffectiveReasoningEffortID,
+		},
+		{
+			kind: acpPermissionCategory, value: settings.PermissionModeID, configID: state.PermissionConfigID,
+			allowed:    state.Capability.PermissionChange == "allowed",
+			advertised: settingsChoiceContains(state.Capability.PermissionModes, settings.PermissionModeID),
+			effective:  settings.PermissionModeID == state.Capability.EffectivePermissionModeID,
+		},
+	}
+	for _, candidate := range candidates {
+		if candidate.value == "" {
+			continue
+		}
+		if !candidate.allowed {
+			warnLaunchSettingSkipped(warn, candidate.kind, candidate.value, "provider_read_only")
+			continue
+		}
+		if !candidate.advertised || candidate.configID == "" {
+			warnLaunchSettingSkipped(warn, candidate.kind, candidate.value, "settings_unavailable")
+			continue
+		}
+		if candidate.effective || attempts[candidate.kind] >= acpSettingsLaunchAttempts {
+			continue
+		}
+		attempts[candidate.kind]++
+		return acpSettingsLaunchMutation{kind: candidate.kind, value: candidate.value, configID: candidate.configID}, true
+	}
+	return acpSettingsLaunchMutation{}, false
 }
 
 func warnLaunchSettingSkipped(warn io.Writer, kind, value, reason string) {

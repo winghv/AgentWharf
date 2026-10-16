@@ -38,7 +38,7 @@ func TestMachineRejectsForgedLaunchBeforeHubDial(t *testing.T) {
 	}
 	handoff := &machineServeDispatch{SessionID: "session", Provider: "claude-code", HubWSURL: hubURL, AdapterToken: "synthetic-adapter", EncryptedFirstInstruction: string(forged), AdapterExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339)}
 	var output, diagnostics bytes.Buffer
-	err = keepAdapterAlive(ctx, machineServeConfig{}, handoff, &output, &diagnostics, nil, nil)
+	err = keepAdapterAlive(ctx, machineServeConfig{}, handoff, &output, &diagnostics, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "encrypted launch configuration rejected") {
 		t.Fatalf("forged launch result: %v", err)
 	}

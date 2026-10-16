@@ -193,3 +193,33 @@ func TestMachineClientDiagnosticsIgnoreEmptyInput(t *testing.T) {
 	var missing *machineClientDiagnostics
 	missing.record(context.Background(), "claim_pickup", "list_unavailable", "")
 }
+
+// The four pre-claim stages stop at the claim boundary, so a machine that took a
+// claim and then refused to launch it reported nothing at all. The launch stage
+// is Session-scoped for the same reason delivery and exchange are: it describes
+// one Session's provider start, not the machine's polling loop.
+func TestMachineClientDiagnosticsReportAdapterLaunchPerSession(t *testing.T) {
+	t.Parallel()
+
+	server, reports := diagnosticTestServer(t)
+	diagnostics := newMachineClientDiagnostics(server.Client(), diagnosticTestCredential(server))
+
+	reportMachineAdapterLaunch(context.Background(), diagnostics, "", "launch_settings_readback_mismatch")
+	if recorded := reports(); len(recorded) != 0 {
+		t.Fatalf("machine-scoped launch report = %+v, want none", recorded)
+	}
+
+	reportMachineAdapterLaunch(context.Background(), diagnostics, "session_1", "launch_settings_readback_mismatch")
+	reportMachineAdapterLaunch(context.Background(), diagnostics, "session_2", "launch_settings_unavailable")
+	recorded := reports()
+	if len(recorded) != 2 {
+		t.Fatalf("launch reports = %d, want 2", len(recorded))
+	}
+	if recorded[0].Stage != diagnosticStageAdapterLaunch || recorded[0].SessionID != "session_1" ||
+		recorded[0].Reason != "launch_settings_readback_mismatch" {
+		t.Fatalf("launch report = %+v", recorded[0])
+	}
+	if recorded[1].SessionID != "session_2" || recorded[1].Reason != "launch_settings_unavailable" {
+		t.Fatalf("second launch report = %+v", recorded[1])
+	}
+}

@@ -22,7 +22,7 @@ func TestMachineDispatchCancelsSenderWhenRuntimeUnavailable(t *testing.T) {
 	var adapters sync.WaitGroup
 	done := make(chan struct{})
 	go func() {
-		dispatchOutcome(ctx, machineServeConfig{}, &machineServeDispatch{Provider: "claude-code", SessionID: "session", HubWSURL: "ws" + strings.TrimPrefix(server.URL, "http")}, &machineServeLockedWriter{Writer: &output}, &machineServeLockedWriter{Writer: &diagnostics}, &adapters, nil, nil)
+		dispatchOutcome(ctx, machineServeConfig{}, &machineServeDispatch{Provider: "claude-code", SessionID: "session", HubWSURL: "ws" + strings.TrimPrefix(server.URL, "http")}, &machineServeLockedWriter{Writer: &output}, &machineServeLockedWriter{Writer: &diagnostics}, &adapters, nil, nil, nil)
 		adapters.Wait()
 		close(done)
 	}()

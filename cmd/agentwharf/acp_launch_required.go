@@ -9,6 +9,33 @@ import (
 	"github.com/winghv/agentwharf/protocol"
 )
 
+// The three ways required launch settings can fail as a unit. They are sentinels
+// rather than inline errors because the caller has to tell them apart from a
+// crash: a provider that will not honour the settings cannot be fixed by
+// reconnecting, so the machine ends the Session and says why instead of
+// restarting the same launch forever.
+var (
+	errLaunchSettingsUnavailable      = errors.New("encrypted launch settings unavailable")
+	errLaunchSettingsRejected         = errors.New("encrypted launch settings rejected")
+	errLaunchSettingsReadbackMismatch = errors.New("encrypted launch settings readback mismatch")
+)
+
+// launchSettingsFailureReason maps a terminal launch-settings failure onto the
+// closed vocabulary the platform accepts. It never carries the requested value,
+// the provider's output or any path: the report names the class only.
+func launchSettingsFailureReason(err error) (reason string, terminal bool) {
+	switch {
+	case errors.Is(err, errLaunchSettingsUnavailable):
+		return "launch_settings_unavailable", true
+	case errors.Is(err, errLaunchSettingsRejected):
+		return "launch_settings_rejected", true
+	case errors.Is(err, errLaunchSettingsReadbackMismatch):
+		return "launch_settings_readback_mismatch", true
+	default:
+		return "", false
+	}
+}
+
 // Required launch settings fail as a unit if any requested choice is unavailable.
 // Provider readback must match every requested value before launch continues.
 func applyRequiredACPLaunchSettings(ctx context.Context, tracker *acpSettingsTracker, session string, stdin io.Writer, scanner *bufio.Scanner, settings wrapLaunchSettings) error {
@@ -16,11 +43,11 @@ func applyRequiredACPLaunchSettings(ctx context.Context, tracker *acpSettingsTra
 		return nil
 	}
 	if tracker == nil || stdin == nil || scanner == nil {
-		return errors.New("encrypted launch settings unavailable")
+		return errLaunchSettingsUnavailable
 	}
 	state, ok := tracker.Current()
 	if !ok {
-		return errors.New("encrypted launch settings unavailable")
+		return errLaunchSettingsUnavailable
 	}
 	change := protocol.SettingsChange{CapabilityFingerprint: state.Capability.Fingerprint}
 	if settings.ModelID != "" {
@@ -33,7 +60,7 @@ func applyRequiredACPLaunchSettings(ctx context.Context, tracker *acpSettingsTra
 		change.RequestedPermissionModeID = &settings.PermissionModeID
 	}
 	if validateACPSettingsChange(state, change) != "" {
-		return errors.New("encrypted launch settings rejected")
+		return errLaunchSettingsRejected
 	}
 	warnings := &discardLaunchWarnings{}
 	applyACPLaunchSettings(ctx, tracker, session, stdin, scanner, settings, warnings)
@@ -44,7 +71,7 @@ func applyRequiredACPLaunchSettings(ctx context.Context, tracker *acpSettingsTra
 	if !ok || (settings.ModelID != "" && actual.Capability.EffectiveModelID != settings.ModelID) ||
 		(settings.PermissionModeID != "" && actual.Capability.EffectivePermissionModeID != settings.PermissionModeID) ||
 		(settings.ReasoningEffortID != "" && (actual.Capability.EffectiveReasoningEffortID == nil || *actual.Capability.EffectiveReasoningEffortID != settings.ReasoningEffortID)) {
-		return errors.New("encrypted launch settings readback mismatch")
+		return errLaunchSettingsReadbackMismatch
 	}
 	return nil
 }

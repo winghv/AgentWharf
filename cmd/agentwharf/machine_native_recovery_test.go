@@ -51,7 +51,7 @@ func TestMachineRecoveryRetainsNativeSessionAcrossCredentialExpiry(t *testing.T)
 func TestRecoveryWithoutNativeIdentityNeverStartsProvider(t *testing.T) {
 	var logs bytes.Buffer
 	handoff := &machineServeDispatch{ClaimID: "recovery:session", SessionID: "session", Provider: "pi"}
-	err := keepAdapterAlive(context.Background(), machineServeConfig{}, handoff, &logs, &logs, nil, nil)
+	err := keepAdapterAlive(context.Background(), machineServeConfig{}, handoff, &logs, &logs, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "provider_session_resume_failed") {
 		t.Fatalf("missing identity must block before loading credentials or starting provider: %v", err)
 	}

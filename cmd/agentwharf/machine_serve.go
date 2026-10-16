@@ -312,13 +312,13 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 					recoveryGuard.release(handoff.SessionID)
 				}
 				startBackgroundAdapter(&adapters, func() {
-					keepAdapterAlive(serveCtx, cfg, &handoff, stdout, stderr, onDone, reportFailure)
+					keepAdapterAlive(serveCtx, cfg, &handoff, stdout, stderr, onDone, reportFailure, diagnostics)
 				})
 				return
 			}
 			dispatchOutcome(serveCtx, cfg, &handoff, stdout, stderr, &adapters, func() {
 				recoveryGuard.release(handoff.SessionID)
-			}, reportFailure)
+			}, reportFailure, diagnostics)
 		}(handoff, reportFailure)
 	}
 
@@ -489,7 +489,7 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 					})
 					dispatchRecovery(serveCtx, cfg, client, machineCred, session, stdout, stderr, &adapters, func() {
 						recoveryGuard.release(session.SessionID)
-					}, reportFailure)
+					}, reportFailure, diagnostics)
 				}(session, credential)
 			}
 		}
@@ -545,10 +545,10 @@ func dispatchClaim(ctx context.Context, cfg machineServeConfig, client *http.Cli
 	}
 	dispatchOutcome(ctx, cfg, handoff, stdout, stderr, adapters, func() {
 		recoveryGuard.release(claim.SessionID)
-	}, reportFailure)
+	}, reportFailure, diagnostics)
 }
 
-func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, adapters *sync.WaitGroup, onAdapterDone func(), reportFailure machineSessionFailureReporter) {
+func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, adapters *sync.WaitGroup, onAdapterDone func(), reportFailure machineSessionFailureReporter, diagnostics *machineClientDiagnostics) {
 	// Validate before starting the adapter so a missing local bridge can close
 	// the exchanged Session immediately instead of leaving it in `starting`.
 	if err := validateProviderCommand(serveWrapConfig(*handoff, cfg.StartupSmoke)); err != nil {
@@ -574,7 +574,7 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 	adapters.Add(1)
 	go func() {
 		defer adapters.Done()
-		if err := keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onAdapterDone, reportFailure); err != nil {
+		if err := keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onAdapterDone, reportFailure, diagnostics); err != nil {
 			cancelSender()
 		}
 	}()
@@ -596,10 +596,11 @@ func dispatchOutcome(ctx context.Context, cfg machineServeConfig, handoff *machi
 }
 
 // keepAdapterAlive re-runs the adapter until the daemon stops, the adapter
-// credential expires, or a bounded number of restarts is exhausted. A crash
-// (for example the machine slept and the provider or its Hub socket died) is
-// restarted with backoff; the first instruction is not re-sent.
-func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, onDone func(), reportFailure machineSessionFailureReporter) (result error) {
+// credential expires, a bounded number of restarts is exhausted, or the launch
+// fails in a way no retry can fix. A crash (for example the machine slept and
+// the provider or its Hub socket died) is restarted with backoff; the first
+// instruction is not re-sent.
+func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *machineServeDispatch, stdout, stderr io.Writer, onDone func(), reportFailure machineSessionFailureReporter, diagnostics *machineClientDiagnostics) (result error) {
 	result = errors.New("machine adapter unavailable")
 	if onDone != nil {
 		defer onDone()
@@ -690,6 +691,22 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 		case err := <-done:
 			if ctx.Err() != nil {
 				return
+			}
+			// A provider that will not honour the required launch settings cannot
+			// be fixed by reconnecting. Retrying it left the Session in `starting`
+			// for as long as the adapter credential lived -- and a fresh adapter
+			// heartbeat kept the archive path from ever treating it as stranded.
+			// End it once, with the bounded reason, and stop re-dispatching.
+			if reason, terminal := launchSettingsFailureReason(err); terminal {
+				reportMachineAdapterLaunch(ctx, diagnostics, handoff.SessionID, reason)
+				if reportFailure != nil {
+					if reportErr := reportFailure(ctx, handoff.SessionID, "provider_start_failed"); reportErr != nil {
+						_, _ = fmt.Fprintf(stderr, "wharf machine serve: report launch failure for %s: %v\n", handoff.SessionID, reportErr)
+					}
+				}
+				_ = removeMachineDispatch(handoff.ClaimID)
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s cannot honour the requested launch settings (%s); not retrying\n", handoff.SessionID, reason)
+				return err
 			}
 			if errors.Is(err, errProviderCommandNotFound) || errors.Is(err, errProviderConfigNotFound) || errors.Is(err, errProviderCredentialMissing) {
 				if reportFailure != nil {
@@ -959,7 +976,7 @@ func machineSessionHasLaunchEvidence(ctx context.Context, credential machineCred
 	return false
 }
 
-func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, session machineRecoverableSession, stdout, stderr io.Writer, adapters *sync.WaitGroup, onDone func(), reportFailure machineSessionFailureReporter) {
+func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.Client, credential machineCredential, session machineRecoverableSession, stdout, stderr io.Writer, adapters *sync.WaitGroup, onDone func(), reportFailure machineSessionFailureReporter, diagnostics *machineClientDiagnostics) {
 	handoff, err := recoverMachineSession(ctx, client, credential, session)
 	if err != nil {
 		if onDone != nil {
@@ -976,7 +993,7 @@ func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.
 		return
 	}
 	startBackgroundAdapter(adapters, func() {
-		keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onDone, reportFailure)
+		keepAdapterAlive(ctx, cfg, handoff, stdout, stderr, onDone, reportFailure, diagnostics)
 	})
 }
 

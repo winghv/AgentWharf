@@ -29,7 +29,22 @@ const (
 	diagnosticStageInitializationDelivery  = "initialization_delivery"
 	diagnosticStageClaimPickup             = "claim_pickup"
 	diagnosticStageClaimExchange           = "claim_exchange"
+	// diagnosticStageAdapterLaunch covers the provider launch itself, after the
+	// claim was already exchanged. The four stages above stop at the claim
+	// boundary, so a machine that took the claim and then refused to launch it --
+	// an unavailable provider capability, a settings request the provider will
+	// not accept, a readback that never matches -- was exactly the failure the
+	// platform still could not see.
+	diagnosticStageAdapterLaunch = "adapter_launch"
 )
+
+// diagnosticSessionStages must name a Session: they describe one Session's
+// delivery or launch and cannot be attributed to the machine as a whole.
+var diagnosticSessionStages = map[string]bool{
+	diagnosticStageInitializationDelivery: true,
+	diagnosticStageClaimExchange:          true,
+	diagnosticStageAdapterLaunch:          true,
+}
 
 // diagnosticReportInterval is how long the same failure is collapsed into one
 // report. Attempts are counted locally and sent with the next report, so a
@@ -128,10 +143,10 @@ func (d *machineClientDiagnostics) pruneLocked(now time.Time) {
 }
 
 func (d *machineClientDiagnostics) send(ctx context.Context, stage, reason, sessionID string, attempt int) {
-	if sessionID == "" && (stage == diagnosticStageInitializationDelivery || stage == diagnosticStageClaimExchange) {
+	if sessionID == "" && diagnosticSessionStages[stage] {
 		return
 	}
-	if sessionID != "" && (stage == diagnosticStageInitializationDiscovery || stage == diagnosticStageClaimPickup) {
+	if sessionID != "" && !diagnosticSessionStages[stage] {
 		return
 	}
 	endpoint, err := cloudAPIEndpoint(d.credential.CloudAPIURL, "/machines/"+url.PathEscape(d.credential.MachineID)+"/client-diagnostics")
@@ -207,5 +222,14 @@ func reportMachineClaimPickup(ctx context.Context, diagnostics *machineClientDia
 func reportMachineClaimExchange(ctx context.Context, diagnostics *machineClientDiagnostics, sessionID, reason string) {
 	if diagnostics != nil {
 		diagnostics.record(ctx, diagnosticStageClaimExchange, reason, sessionID)
+	}
+}
+
+// reportMachineAdapterLaunch records why this machine could not launch a claim
+// it had already taken. Reporting is an observation; ending the Session is a
+// separate, explicit step the caller takes with the same bounded reason.
+func reportMachineAdapterLaunch(ctx context.Context, diagnostics *machineClientDiagnostics, sessionID, reason string) {
+	if diagnostics != nil {
+		diagnostics.record(ctx, diagnosticStageAdapterLaunch, reason, sessionID)
 	}
 }
