@@ -193,9 +193,15 @@ func (q *Queries) FinalizeAttentionBackfill(ctx context.Context, arg FinalizeAtt
 }
 
 const resetAttentionForBackfill = `-- name: ResetAttentionForBackfill :one
-UPDATE session_attention_summaries SET state = 'starting', permission_id = NULL, permission_status = NULL, terminal_outcome = NULL, latest_change_seq = NULL, last_durable_event_at = NULL, last_client_command_at = NULL, blocker_kind = NULL, blocker_reason = NULL, blocker_expires_at = NULL, blocking_session_id = NULL, blocker_operation = NULL, summary_version = 0, projection_state = 'complete', updated_at = statement_timestamp() WHERE session_id = $1 RETURNING latest_seq
+UPDATE session_attention_summaries SET state = 'starting', permission_id = NULL, permission_status = NULL, terminal_outcome = NULL, latest_change_seq = NULL, last_durable_event_at = NULL, last_client_command_at = NULL, blocker_kind = NULL, blocker_reason = NULL, blocker_expires_at = NULL, blocking_session_id = NULL, blocker_operation = NULL, projection_state = 'complete', updated_at = statement_timestamp() WHERE session_id = $1 RETURNING latest_seq
 `
 
+// summary_version is deliberately NOT reset. It is a monotonic counter of
+// client-command ledger mutations, guarded by a trigger that rejects regression,
+// and resetting it to zero made the rebuild impossible for every Session that
+// had ever recorded a command: the very Sessions whose projection most needs
+// repairing. RestoreAttentionBackfillLedger raises it with GREATEST afterwards,
+// so leaving it alone keeps the rebuild monotonic and still re-derives it.
 func (q *Queries) ResetAttentionForBackfill(ctx context.Context, sessionID string) (int64, error) {
 	row := q.db.QueryRow(ctx, resetAttentionForBackfill, sessionID)
 	var latest_seq int64

@@ -219,7 +219,17 @@ func TestAttentionBackfillMarksMissingSummaryHighWaterGap(t *testing.T) {
 	assertAttentionBackfillSnapshot(t, postgres.New(pool), []string{"ses_backfill_missing_high_water"}, 1, store.AttentionProjectionIncomplete)
 }
 
-func TestAttentionBackfillClearsStaleLedger(t *testing.T) {
+// A rebuild re-derives the same ledger, so it clears the stale fields without
+// rewinding the version counter.
+//
+// The counter used to be reset to zero, and this test used to require it. That
+// is exactly what made the rebuild unusable: a trigger rejects regression, so
+// every Session that had ever recorded a client command refused to rebuild --
+// on production, 24 of 25 candidates, which is to say the Sessions whose stale
+// projection was corrupting their Run delivery decision. A consumer that sees
+// the version go backwards is also told the ledger moved backwards, which a
+// rebuild did not do.
+func TestAttentionBackfillClearsStaleLedgerWithoutRewindingTheVersion(t *testing.T) {
 	_, _, pool := newAttentionBackfillPool(t, nil)
 	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
 	insertHistoricalAttentionEvents(t, pool, "ses_backfill_stale_ledger", historicalAttentionEvent{1, "session.state", `{"state":"ready"}`, base})
@@ -233,8 +243,11 @@ VALUES ('ses_backfill_stale_ledger', 1, 'busy', 'queued', 'old', clock_timestamp
 		t.Fatalf("stale-ledger backfill: %v", err)
 	}
 	snapshot, err := postgres.New(pool).AttentionSnapshot(context.Background(), []string{"ses_backfill_stale_ledger"})
-	if err != nil || len(snapshot) != 1 || snapshot[0].Blocker != nil || snapshot[0].LastClientCommandAt != nil || snapshot[0].SummaryVersion != 0 {
+	if err != nil || len(snapshot) != 1 || snapshot[0].Blocker != nil || snapshot[0].LastClientCommandAt != nil {
 		t.Fatalf("stale ledger remained = %+v, %v", snapshot, err)
+	}
+	if snapshot[0].SummaryVersion < 7 {
+		t.Fatalf("summary_version = %d, want it never to move backwards from 7", snapshot[0].SummaryVersion)
 	}
 }
 
@@ -571,3 +584,64 @@ func (tracer *attentionBackfillTracer) TraceQueryStart(ctx context.Context, _ *p
 }
 
 func (*attentionBackfillTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// A Session that has ever recorded a client command carries a positive
+// summary_version, and a trigger rejects regression. The rebuild used to reset
+// that counter to zero, so it refused every such Session -- on production, 24 of
+// 25 candidates, which is to say it refused exactly the Sessions whose stale
+// projection was corrupting their Run delivery decision.
+//
+// The version is a monotonic counter, not a derived count, so a rebuild must
+// raise it rather than rewind it.
+func TestAttentionBackfillRebuildsASummaryThatRecordedClientCommands(t *testing.T) {
+	_, _, pool := newAttentionBackfillPool(t, nil)
+	attention := postgres.New(pool)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+
+	insertHistoricalAttentionEvents(t, pool, "ses_versioned",
+		historicalAttentionEvent{1, "session.run.capabilities", `{"interrupt_supported":true}`, base},
+		historicalAttentionEvent{2, "session.message", `{"role":"user"}`, base.Add(time.Second)},
+		historicalAttentionEvent{3, "session.state", `{"state":"ready"}`, base.Add(2 * time.Second)})
+	if _, err := pool.Exec(ctx, `
+INSERT INTO session_pending_commands (session_id, cmd_id, type, event_seq, status, expires_at)
+VALUES ('ses_versioned', 'cmd_versioned', 'session.send', 2, 'outcome_unknown', clock_timestamp() + interval '10 seconds')`); err != nil {
+		t.Fatalf("insert command: %v", err)
+	}
+	if _, err := attention.Append(ctx, "ses_versioned", []store.PendingEvent{
+		{Type: "session.message", Time: base.Add(3 * time.Second), Payload: []byte(`{"role":"agent"}`)},
+	}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+	// The ledger counter is raised by command activity, not by ordinary appends,
+	// so seed the shape it leaves behind: a summary whose version is already
+	// positive, which is what the regression trigger guards.
+	if _, err := pool.Exec(ctx, `UPDATE session_attention_summaries SET summary_version = 3 WHERE session_id = 'ses_versioned'`); err != nil {
+		t.Fatalf("seed summary version: %v", err)
+	}
+	var before int64
+	if err := pool.QueryRow(ctx, `SELECT summary_version FROM session_attention_summaries WHERE session_id = 'ses_versioned'`).Scan(&before); err != nil {
+		t.Fatalf("read summary version: %v", err)
+	}
+	if before <= 0 {
+		t.Fatalf("summary_version = %d, want a positive counter to protect", before)
+	}
+
+	if _, err := attention.BackfillAttentionBatch(ctx, postgres.AttentionBackfillCheckpoint{}, 10); err != nil {
+		t.Fatalf("rebuild a versioned summary: %v", err)
+	}
+
+	snapshot, err := attention.AttentionSnapshot(ctx, []string{"ses_versioned"})
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("snapshot = %+v, %v", snapshot, err)
+	}
+	if snapshot[0].StateOfProjection != store.AttentionProjectionComplete || snapshot[0].LatestSeq != 4 || snapshot[0].State != "ready" {
+		t.Fatalf("rebuilt summary = %+v, want the stream head complete", snapshot[0])
+	}
+	if snapshot[0].LastClientCommandAt == nil {
+		t.Fatalf("rebuilt summary lost its client activity: %+v", snapshot[0])
+	}
+	if int64(snapshot[0].SummaryVersion) < before {
+		t.Fatalf("summary_version regressed from %d to %d", before, snapshot[0].SummaryVersion)
+	}
+}
