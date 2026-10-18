@@ -373,17 +373,44 @@ FOR EACH ROW EXECUTE FUNCTION reject_backfill_ready_projection()
 	}
 }
 
-func TestAttentionBackfillMarksNonStatePrefixIncomplete(t *testing.T) {
+// A stream that opens with an event carrying no state is normal, not suspicious:
+// an Own Machine adapter publishes its capability proposal before any state, so
+// every real stream looks like this. The rebuild reads all of it, so it can say
+// what the state was, and claiming completeness is defensible.
+//
+// This used to assert the opposite. That rule could not detect loss -- a
+// state-bearing first event comes back either with a state or already flagged
+// unreadable -- and because the Control Plane refuses to rebase a stale projection
+// from an incomplete summary, it froze the projection for every Own Machine
+// Session on the platform.
+func TestAttentionBackfillAcceptsANonStatePrefix(t *testing.T) {
 	_, _, pool := newAttentionBackfillPool(t, nil)
 	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
 	insertHistoricalAttentionEvents(t, pool, "ses_backfill_non_state_first",
-		historicalAttentionEvent{1, "session.message", `{"role":"agent"}`, base},
-		historicalAttentionEvent{2, "session.state", `{"state":"ready"}`, base.Add(time.Second)})
+		historicalAttentionEvent{1, "session.run.capabilities", `{"interrupt_supported":true}`, base},
+		historicalAttentionEvent{2, "session.message", `{"role":"agent"}`, base.Add(time.Second)},
+		historicalAttentionEvent{3, "session.state", `{"state":"ready"}`, base.Add(2 * time.Second)})
 	result, err := postgres.New(pool).BackfillAttentionBatch(context.Background(), postgres.AttentionBackfillCheckpoint{}, 1)
-	if err != nil || result.Incomplete != 1 {
+	if err != nil || result.Incomplete != 0 {
 		t.Fatalf("non-state prefix backfill = %+v, %v", result, err)
 	}
-	assertAttentionBackfillSnapshot(t, postgres.New(pool), []string{"ses_backfill_non_state_first"}, 1, store.AttentionProjectionIncomplete)
+	assertAttentionBackfillSnapshot(t, postgres.New(pool), []string{"ses_backfill_non_state_first"}, 1, store.AttentionProjectionComplete)
+}
+
+// Completeness still has to mean something: a state-bearing event the projection
+// cannot read is real loss of trust, and the rebuild must say so rather than
+// certify a summary it could not derive.
+func TestAttentionBackfillMarksAnUnreadableStateEventIncomplete(t *testing.T) {
+	_, _, pool := newAttentionBackfillPool(t, nil)
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	insertHistoricalAttentionEvents(t, pool, "ses_backfill_unreadable_state",
+		historicalAttentionEvent{1, "session.state", `{"state":"unknown"}`, base},
+		historicalAttentionEvent{2, "session.message", `{"role":"agent"}`, base.Add(time.Second)})
+	result, err := postgres.New(pool).BackfillAttentionBatch(context.Background(), postgres.AttentionBackfillCheckpoint{}, 1)
+	if err != nil || result.Incomplete != 1 {
+		t.Fatalf("unreadable state backfill = %+v, %v", result, err)
+	}
+	assertAttentionBackfillSnapshot(t, postgres.New(pool), []string{"ses_backfill_unreadable_state"}, 1, store.AttentionProjectionIncomplete)
 }
 
 func TestAttentionBackfillCreatesSummaryForDeletedHistory(t *testing.T) {

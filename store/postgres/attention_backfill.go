@@ -107,6 +107,25 @@ func (s *Store) BackfillAttentionBatch(ctx context.Context, checkpoint Attention
 	return result, nil
 }
 
+// Rebuild refusals are typed so an operator can be told which class of problem
+// stopped a repair. Counting refusals without a class is what left the first
+// production pass undiagnosable: twenty-five rebuilds failed and the report could
+// not say why. The classes are deliberately few and closed -- an operator needs
+// to know which repair to plan, not what a driver said.
+var (
+	// ErrAttentionRebuildUnreadableEvent means an event in the stream could not
+	// be projected: a mixed stream, a malformed carrier, or an event type whose
+	// payload the projection rejects. The rebuild refuses atomically rather than
+	// writing a summary it cannot justify.
+	ErrAttentionRebuildUnreadableEvent = errors.New("attention rebuild could not read a durable event")
+	// ErrAttentionRebuildStreamBusy means the Session's event stream could not be
+	// locked, so a rebuild would race the Adapter. Retrying later is correct.
+	ErrAttentionRebuildStreamBusy = errors.New("attention rebuild could not lock the session event stream")
+	// ErrAttentionRebuildUnavailable means the Store could not read or write the
+	// durable state the rebuild depends on.
+	ErrAttentionRebuildUnavailable = errors.New("attention rebuild durable state unavailable")
+)
+
 // BackfillEncryptedAttentionSession rebuilds a known encrypted-only stream.
 // The caller must resolve mode from durable policy, never from payload shape.
 // Mixed or malformed streams fail atomically instead of using legacy fallback.
@@ -124,20 +143,20 @@ func (s *Store) backfillAttentionSession(ctx context.Context, sessionID string) 
 func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID string, encrypted bool) (bool, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return false, fmt.Errorf("begin attention backfill: %w", err)
+		return false, fmt.Errorf("%w: %v", ErrAttentionRebuildUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	queries := db.New(tx)
 	if err := queries.LockSessionEventStream(ctx, advisoryLockKey(sessionID)); err != nil {
-		return false, fmt.Errorf("lock attention backfill stream: %w", err)
+		return false, fmt.Errorf("%w: stream lock: %v", ErrAttentionRebuildStreamBusy, err)
 	}
 	ledger, err := queries.BackfillAttentionLedger(ctx, sessionID)
 	if err != nil {
-		return false, fmt.Errorf("select attention client activity: %w", err)
+		return false, fmt.Errorf("%w: client activity: %v", ErrAttentionRebuildUnavailable, err)
 	}
 	existingLatestSeq, err := queries.ResetAttentionForBackfill(ctx, sessionID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return false, fmt.Errorf("reset attention projection: %w", err)
+		return false, fmt.Errorf("%w: reset projection: %v", ErrAttentionRebuildUnavailable, err)
 	}
 	hadExistingSummary := err == nil
 	incomplete := false
@@ -148,7 +167,7 @@ func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID stri
 			SessionID: sessionID, AfterSeq: afterSeq, EventLimit: attentionBackfillEventPageSize,
 		})
 		if queryErr != nil {
-			return false, fmt.Errorf("select attention backfill events: %w", queryErr)
+			return false, fmt.Errorf("%w: read events: %v", ErrAttentionRebuildUnavailable, queryErr)
 		}
 		if len(rows) == 0 {
 			break
@@ -156,11 +175,19 @@ func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID stri
 		for _, row := range rows {
 			projection, err := eventProjection(store.PendingEvent{Type: row.Type, Time: row.CreatedAt.Time, Payload: row.Payload}, encrypted)
 			if err != nil {
-				return false, errors.New("invalid encrypted attention event")
+				return false, fmt.Errorf("%w: %v", ErrAttentionRebuildUnreadableEvent, err)
 			}
-			if eventCount == 0 && projection.state == nil {
-				projection.projectionIncomplete = true
-			}
+			// Whether the stream is trustworthy comes from each event's own
+			// projection, not from where it happened to sit in the stream.
+			//
+			// An earlier rule marked a rebuild incomplete whenever its first
+			// event carried no state. That was wrong twice over: an Own Machine
+			// adapter publishes its capability proposal before any state, so
+			// every real stream opens with an event that legitimately has none,
+			// and a state-bearing first event can only come back stateless already
+			// flagged. The rule therefore never detected loss -- it only refused to
+			// ever call a summary complete, which is what froze the Control Plane
+			// projection in the first place.
 			if projection.projectionIncomplete {
 				incomplete = true
 			}
@@ -171,7 +198,7 @@ func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID stri
 				LatestChangeSeq: latestAttentionChangeSeq(row.Seq, projection.state), EventTime: pgtype.Timestamptz{Time: row.CreatedAt.Time, Valid: true},
 				ProjectionIncomplete: projection.projectionIncomplete,
 			}); err != nil {
-				return false, fmt.Errorf("project attention backfill event %d: %w", row.Seq, err)
+				return false, fmt.Errorf("%w: project event %d: %v", ErrAttentionRebuildUnavailable, row.Seq, err)
 			}
 			afterSeq = row.Seq
 			eventCount++
@@ -180,7 +207,7 @@ func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID stri
 	attachment, attachmentErr := queries.BackfillAttentionAttachment(ctx, sessionID)
 	hasAttachment := attachmentErr == nil
 	if attachmentErr != nil && !errors.Is(attachmentErr, pgx.ErrNoRows) {
-		return false, fmt.Errorf("select attention attachment: %w", attachmentErr)
+		return false, fmt.Errorf("%w: read attachment: %v", ErrAttentionRebuildUnavailable, attachmentErr)
 	}
 	ledgerVersion := ledger.CommandCount + ledger.OutcomeUnknownCount
 	if hasAttachment {
@@ -188,14 +215,14 @@ func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID stri
 	}
 	historyState, err := queries.SessionEventHistoryState(ctx, sessionID)
 	if err != nil {
-		return false, fmt.Errorf("select attention backfill history state: %w", err)
+		return false, fmt.Errorf("%w: read history state: %v", ErrAttentionRebuildUnavailable, err)
 	}
 	if eventCount == 0 {
 		if err := queries.EnsureAttentionBackfillSummary(ctx, db.EnsureAttentionBackfillSummaryParams{
 			SessionID: sessionID, LatestSeq: historyState.LatestSeq, SummaryVersion: ledgerVersion,
 			LastClientCommandAt: ledger.LastClientCommandAt,
 		}); err != nil {
-			return false, fmt.Errorf("ensure incomplete attention summary: %w", err)
+			return false, fmt.Errorf("%w: ensure summary: %v", ErrAttentionRebuildUnavailable, err)
 		}
 		incomplete = incomplete || historyState.RetentionGap || hasAttachment
 	}
@@ -203,7 +230,7 @@ func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID stri
 		SessionID: sessionID, SummaryVersion: ledgerVersion,
 		LastClientCommandAt: ledger.LastClientCommandAt, HasOutcomeUnknown: ledger.OutcomeUnknownCount > 0,
 	}); err != nil {
-		return false, fmt.Errorf("restore attention ledger: %w", err)
+		return false, fmt.Errorf("%w: restore ledger: %v", ErrAttentionRebuildUnavailable, err)
 	}
 	if hasAttachment {
 		blockerKind, blockerOperation := pgtype.Text{}, pgtype.Text{}
@@ -233,7 +260,7 @@ func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID stri
 			SessionID: sessionID, BlockerKind: blockerKind, BlockerReason: blockerReason,
 			BlockerExpiresAt: blockerExpiresAt, BlockingSessionID: blockingSessionID, BlockerOperation: blockerOperation,
 		}); err != nil {
-			return false, fmt.Errorf("restore attention attachment: %w", err)
+			return false, fmt.Errorf("%w: restore attachment: %v", ErrAttentionRebuildUnavailable, err)
 		}
 		incomplete = true
 	}
@@ -242,23 +269,23 @@ func (s *Store) backfillAttentionSessionMode(ctx context.Context, sessionID stri
 	incomplete = incomplete || historyState.RetentionGap || highWaterMismatch || sequenceMismatch
 	streamState, err := queries.BackfillAttentionStream(ctx, sessionID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return false, fmt.Errorf("select attention stream: %w", err)
+		return false, fmt.Errorf("%w: read stream: %v", ErrAttentionRebuildUnavailable, err)
 	}
 	if err == nil {
 		if err := queries.RestoreAttentionBackfillActivity(ctx, db.RestoreAttentionBackfillActivityParams{
 			SessionID: sessionID, LastDurableEventAt: streamState.UpdatedAt,
 		}); err != nil {
-			return false, fmt.Errorf("restore attention Store-clock activity: %w", err)
+			return false, fmt.Errorf("%w: restore activity: %v", ErrAttentionRebuildUnavailable, err)
 		}
 	}
 	if err := queries.FinalizeAttentionBackfill(ctx, db.FinalizeAttentionBackfillParams{
 		SessionID: sessionID, RetentionGap: historyState.RetentionGap || highWaterMismatch || sequenceMismatch,
 		ProjectionIncomplete: incomplete,
 	}); err != nil {
-		return false, fmt.Errorf("finalize attention backfill: %w", err)
+		return false, fmt.Errorf("%w: finalize: %v", ErrAttentionRebuildUnavailable, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("commit attention backfill: %w", err)
+		return false, fmt.Errorf("%w: commit: %v", ErrAttentionRebuildUnavailable, err)
 	}
 	return incomplete, nil
 }
