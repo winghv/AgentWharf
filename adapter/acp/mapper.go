@@ -366,13 +366,17 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 	if !isUpdate || status == "pending" || status == "in_progress" || status == "start" {
 		input := objectOrNil(firstAny(update, "rawInput", "raw_input", "input"))
 		name := firstString(update, "name", "kind", "title")
-		events := []protocol.Event{m.event("session.tool_call", map[string]any{
+		payload := map[string]any{
 			"tool_call_id": toolCallID,
 			"phase":        "start",
 			"name":         name,
 			"input":        input,
 			"result":       nil,
-		})}
+		}
+		if diffs := acpDiffs(update); len(diffs) > 0 {
+			payload["diffs"] = diffs
+		}
+		events := []protocol.Event{m.event("session.tool_call", payload)}
 		m.activeToolCallIDs[toolCallID] = struct{}{}
 		if isACPAskUserQuestion(name) {
 			events = append(events, m.event("permission.request", map[string]any{
@@ -400,7 +404,19 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 
 	delete(m.activeToolCallIDs, toolCallID)
 	preview, truncated := toolOutputPreview(firstAny(update, "rawOutput", "raw_output", "result", "content"))
-	return []protocol.Event{m.toolCallResultEventWithOutput(toolCallID, resultStatus, preview, truncated, firstString(update, "name", "kind", "title"))}
+	event := m.toolCallResultEventWithOutput(toolCallID, resultStatus, preview, truncated, firstString(update, "name", "kind", "title"))
+	// A provider may attach the change it made to the terminal frame instead of
+	// the start frame, so both carry `diffs`.
+	if diffs := acpDiffs(update); len(diffs) > 0 {
+		var payload map[string]any
+		if json.Unmarshal(event.Payload, &payload) == nil {
+			payload["diffs"] = diffs
+			if encoded, err := json.Marshal(payload); err == nil {
+				event.Payload = encoded
+			}
+		}
+	}
+	return []protocol.Event{event}
 }
 
 func (m *Mapper) finishActiveToolCalls(output string) []protocol.Event {
@@ -928,6 +944,96 @@ func updateText(value map[string]any) string {
 		return firstString(content, "text", "chunk")
 	}
 	return ""
+}
+
+// ── ACP file diffs ───────────────────────────────────────────────────────────
+//
+// An editing tool reports what it changed as a `diff` block inside the tool
+// call's `content`: a host path plus the replaced and inserted text. Bridges
+// send one for every Write and Edit, so without this the workbench showed "Edit
+// file" and nothing else.
+//
+// `old_text`/`new_text` are NOT necessarily whole files: the Claude bridge
+// sends the search/replace fragments for an Edit and the entire new file for a
+// Write. The payload therefore carries the change as given and says so, rather
+// than claiming to be a file body.
+//
+// `Diff.path` is an absolute host path. Only the base name crosses the Adapter
+// boundary (L0: host paths are reduced at the boundary, never forwarded); a
+// durable transcript would otherwise carry the tenant's account name and
+// directory layout to every reader and every replay.
+const (
+	maxToolCallDiffs       = 8
+	maxDiffTextBytes       = 8 * 1024
+	maxDiffSideTotalBytes  = 24 * 1024
+	maxDiffBaseNameRuneLen = 128
+)
+
+func acpDiffs(update map[string]any) []map[string]any {
+	raw, ok := firstAny(update, "content").([]any)
+	if !ok {
+		return nil
+	}
+	diffs := make([]map[string]any, 0, maxToolCallDiffs)
+	budget := maxDiffSideTotalBytes
+	for _, item := range raw {
+		block, ok := item.(map[string]any)
+		if !ok || firstString(block, "type") != "diff" {
+			continue
+		}
+		if len(diffs) >= maxToolCallDiffs {
+			break
+		}
+		name := reducedFileName(firstString(block, "path"))
+		if name == "" {
+			// Without a name the change cannot be attributed to a file, and an
+			// empty card helps nobody.
+			continue
+		}
+		if budget <= 0 {
+			// Stop rather than emit empty cards for changes that no longer fit.
+			break
+		}
+		diff := map[string]any{"path_base": truncateRunes(name, maxDiffBaseNameRuneLen)}
+		// Split the remaining budget so the inserted side survives: an Edit that
+		// only showed what it removed would be worse than no card at all.
+		oldLimit := budget / 2
+		if oldLimit > maxDiffTextBytes {
+			oldLimit = maxDiffTextBytes
+		}
+		oldText, oldTruncated := boundText(strings.TrimRight(stringFromAny(block["oldText"]), "\n"), oldLimit)
+		if oldText != "" {
+			diff["old_text"] = oldText
+		}
+		if oldTruncated {
+			diff["old_text_truncated"] = true
+		}
+		newLimit := budget - len(oldText)
+		if newLimit > maxDiffTextBytes {
+			newLimit = maxDiffTextBytes
+		}
+		newText, newTruncated := boundText(strings.TrimRight(stringFromAny(block["newText"]), "\n"), newLimit)
+		if newText != "" {
+			diff["new_text"] = newText
+		}
+		if newTruncated {
+			diff["new_text_truncated"] = true
+		}
+		budget -= len(oldText) + len(newText)
+		diffs = append(diffs, diff)
+	}
+	if len(diffs) == 0 {
+		return nil
+	}
+	return diffs
+}
+
+func truncateRunes(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
 }
 
 // ── ACP plans ───────────────────────────────────────────────────────────────
