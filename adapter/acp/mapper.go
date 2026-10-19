@@ -281,6 +281,12 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		payload["kind"] = "available_commands_update"
 		payload["provider_session_id"] = providerSessionID
 		return []protocol.Event{m.event("agent.activity", payload)}
+	case "plan":
+		return m.planEvents(update, providerSessionID, nil)
+	case "plan_update":
+		return m.planUpdateEvents(update, providerSessionID)
+	case "plan_removed":
+		return m.planRemovedEvents(update, providerSessionID)
 	case "usage_update":
 		payload := copyWithout(update, "type", "subtype", "kind", "sessionUpdate")
 		payload["kind"] = "usage_update"
@@ -922,6 +928,184 @@ func updateText(value map[string]any) string {
 		return firstString(content, "text", "chunk")
 	}
 	return ""
+}
+
+// ── ACP plans ───────────────────────────────────────────────────────────────
+//
+// ACP reports the agent's execution plan as whole-state updates: `plan`
+// carries the complete entry list and the client replaces whatever it had, and
+// the experimental `plan_update` / `plan_removed` pair does the same for a
+// plan identified by id. The Adapter therefore emits one replace-semantics
+// `agent.activity` frame per update and never tries to accumulate or reorder
+// entries: the provider owns plan semantics (L0 P3) and the client keeps the
+// newest frame.
+//
+// Both bridges in the deployed image are covered: claude-agent-acp sends
+// structured `entries`, codex-acp sends a markdown document under `plan_update`.
+const (
+	// A plan frame shares the 64 KiB event budget with the envelope, so the
+	// entry list is bounded before marshalling instead of being split: a split
+	// plan would be read by clients as two different plans.
+	maxPlanEntries        = 48
+	maxPlanEntryTextBytes = 512
+	maxPlanMarkdownBytes  = 16 * 1024
+)
+
+func (m *Mapper) planEvents(update map[string]any, providerSessionID string, plan map[string]any) []protocol.Event {
+	source := update
+	if plan != nil {
+		source = plan
+	}
+	payload := map[string]any{
+		"kind":                "plan",
+		"provider_session_id": providerSessionID,
+	}
+	if id := planIdentifier(source); id != "" {
+		payload["plan_id"] = id
+	}
+	switch {
+	case source["entries"] != nil:
+		entries, truncated := normalizePlanEntries(source["entries"])
+		if len(entries) == 0 && !truncated {
+			return nil
+		}
+		payload["entries"] = entries
+		if truncated {
+			payload["truncated"] = true
+		}
+	case firstString(source, "content") != "":
+		markdown, truncated := boundText(firstString(source, "content"), maxPlanMarkdownBytes)
+		if markdown == "" {
+			return nil
+		}
+		payload["markdown"] = markdown
+		if truncated {
+			payload["truncated"] = true
+		}
+	case firstString(source, "uri") != "":
+		// A file-backed plan is a host path. Only the file name crosses the
+		// Adapter boundary (L0: host paths are reduced, never forwarded).
+		payload["file_name"] = reducedFileName(firstString(source, "uri"))
+		if payload["file_name"] == "" {
+			return nil
+		}
+	default:
+		return nil
+	}
+	return []protocol.Event{m.event("agent.activity", payload)}
+}
+
+// planUpdateEvents normalizes the experimental `plan_update` shapes. Unknown
+// content types are ignored like any other unrecognized ACP update rather than
+// being guessed at.
+func (m *Mapper) planUpdateEvents(update map[string]any, providerSessionID string) []protocol.Event {
+	plan := objectField(update, "plan")
+	if plan == nil {
+		return nil
+	}
+	switch firstString(plan, "type") {
+	case "items":
+		return m.planEvents(update, providerSessionID, plan)
+	case "markdown":
+		return m.planEvents(update, providerSessionID, plan)
+	case "file":
+		return m.planEvents(update, providerSessionID, plan)
+	default:
+		return nil
+	}
+}
+
+func (m *Mapper) planRemovedEvents(update map[string]any, providerSessionID string) []protocol.Event {
+	payload := map[string]any{
+		"kind":                "plan_removed",
+		"provider_session_id": providerSessionID,
+	}
+	if id := planIdentifier(update); id != "" {
+		payload["plan_id"] = id
+	}
+	return []protocol.Event{m.event("agent.activity", payload)}
+}
+
+// planIdentifier reads the plan id. Codex emits `planId` where the ACP schema
+// spells it `id`, so both are accepted; an empty id means "the current plan".
+func planIdentifier(value map[string]any) string {
+	return firstString(value, "id", "plan_id", "planId")
+}
+
+func normalizePlanEntries(value any) ([]map[string]string, bool) {
+	list, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	entries := make([]map[string]string, 0, min(len(list), maxPlanEntries))
+	truncated := false
+	for _, item := range list {
+		if len(entries) >= maxPlanEntries {
+			truncated = true
+			break
+		}
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, _ := boundText(strings.TrimSpace(stringFromAny(entry["content"])), maxPlanEntryTextBytes)
+		if content == "" {
+			continue
+		}
+		// Status and priority keep the provider's own vocabulary so the
+		// Adapter never invents execution semantics it does not own.
+		entries = append(entries, map[string]string{
+			"content":  content,
+			"status":   boundedIdentifier(stringFromAny(entry["status"])),
+			"priority": boundedIdentifier(stringFromAny(entry["priority"])),
+		})
+	}
+	return entries, truncated
+}
+
+// reducedFileName keeps only the last path segment of a plan document
+// reference, whether it arrives as a path or as a file:// URI.
+func reducedFileName(reference string) string {
+	trimmed := strings.TrimSpace(reference)
+	if trimmed == "" {
+		return ""
+	}
+	if index := strings.Index(trimmed, "://"); index >= 0 {
+		trimmed = trimmed[index+3:]
+	}
+	trimmed = strings.TrimRight(strings.ReplaceAll(trimmed, "\\", "/"), "/")
+	if index := strings.LastIndex(trimmed, "/"); index >= 0 {
+		trimmed = trimmed[index+1:]
+	}
+	name, truncated := boundText(trimmed, maxPlanEntryTextBytes)
+	if truncated {
+		return ""
+	}
+	return name
+}
+
+func boundedIdentifier(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) > 64 {
+		return ""
+	}
+	return trimmed
+}
+
+// boundText truncates on a rune boundary so a plan frame can never split a
+// multi-byte character, and reports whether anything was dropped.
+func boundText(value string, limit int) (string, bool) {
+	if value == "" || limit <= 0 {
+		return "", value != ""
+	}
+	if len(value) <= limit {
+		return value, false
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut], true
 }
 
 func copyWithout(value map[string]any, keys ...string) map[string]any {
