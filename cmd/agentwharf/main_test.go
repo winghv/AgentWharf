@@ -3155,8 +3155,12 @@ func TestParseWrapConfigDefaultsBridgeCommandFromProvider(t *testing.T) {
 	if len(explicit.ProviderCommand) != 1 || explicit.ProviderCommand[0] != "my-bridge" {
 		t.Fatalf("explicit provider command = %v, want my-bridge untouched", explicit.ProviderCommand)
 	}
-	if explicit.ForceHeadless {
-		t.Fatal("explicit bridge command must not set ForceHeadless")
+	// An explicit bridge command does not make `wrap` interactive: it is the
+	// adapter entry point, and only `wharf <agent>` in a real user terminal may
+	// run the official CLI. The earlier expectation here (ForceHeadless false)
+	// was what let a sandbox with a /dev/null stdin take the TUI path.
+	if !explicit.ForceHeadless {
+		t.Fatal("wrap must stay headless even with an explicit bridge command")
 	}
 }
 

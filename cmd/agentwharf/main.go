@@ -42,6 +42,7 @@ import (
 	"github.com/winghv/agentwharf/store"
 	"github.com/winghv/agentwharf/store/postgres"
 	"github.com/winghv/agentwharf/store/sqlite"
+	"golang.org/x/term"
 	"nhooyr.io/websocket"
 )
 
@@ -656,6 +657,12 @@ func parseWrapConfig(args []string, stderr io.Writer) (wrapConfig, error) {
 		cfg.ProviderCommand = defaultProviderCommand(cfg.Agent)
 		cfg.ForceHeadless = providerBridgeRequired(cfg.Provider)
 	}
+	// `wrap` is the adapter entry point: the platform, the own-machine daemon,
+	// and the sandbox entry point all launch it, and none of them wants an
+	// interactive TUI. Only `wharf <agent>` in a real user terminal may take
+	// that path. This is set after the provider resolution above, which
+	// otherwise overwrites it.
+	cfg.ForceHeadless = true
 	return normalizeWrapConfig(cfg)
 }
 
@@ -1059,6 +1066,20 @@ func isLoopbackURL(raw string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// stdinIsTerminal reports whether stdin is a real terminal.
+//
+// A character device is not enough: a sandbox runs the adapter with its stdin
+// closed onto /dev/null, and /dev/null is a character device. Treating it as a
+// terminal made every cloud VM Session run the interactive TUI instead of the
+// ACP bridge.
+func stdinIsTerminal(stdin io.Reader) bool {
+	file, ok := stdin.(*os.File)
+	if !ok {
+		return false
+	}
+	return term.IsTerminal(int(file.Fd()))
+}
+
 func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io.Writer) (wrapConfig, error) {
 	cfg, err := normalizeWrapConfig(cfg)
 	if err != nil {
@@ -1071,16 +1092,16 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	if pairOutput != nil {
 		cfg.Stderr = pairOutput
 	}
-	// An explicitly supplied character-device stdin means a real terminal: run
-	// the official claude/codex CLI and mirror its transcript to the Hub. The
+	// An explicitly supplied terminal means a real user terminal: run the
+	// official claude/codex CLI and mirror its transcript to the Hub. The
 	// nil-stdin default (and pipes) stay headless, and smoke/pair-only never
 	// enter the interactive path.
-	terminal := false
-	if file, ok := stdin.(*os.File); ok {
-		if info, err := file.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
-			terminal = true
-		}
-	}
+	//
+	// The check must be a real terminal, not merely a character device: a
+	// sandbox runs the adapter with its stdin closed onto /dev/null, and
+	// /dev/null is a character device. Treating it as a terminal made every
+	// cloud VM Session run the interactive TUI instead of the ACP bridge.
+	terminal := stdinIsTerminal(stdin)
 	if explicitStdin && !cfg.ForceHeadless && !cfg.StartupSmoke && !cfg.PairOnly && terminal {
 		cfg.Interactive = true
 		cfg.Stdin = stdin
