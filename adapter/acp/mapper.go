@@ -376,6 +376,9 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 		if diffs := acpDiffs(update); len(diffs) > 0 {
 			payload["diffs"] = diffs
 		}
+		if title := firstString(update, "title"); title != "" {
+			payload["title"] = title
+		}
 		events := []protocol.Event{m.event("session.tool_call", payload)}
 		m.activeToolCallIDs[toolCallID] = struct{}{}
 		if isACPAskUserQuestion(name) {
@@ -398,6 +401,13 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 		resultStatus = "error"
 	case "cancelled", "canceled":
 		resultStatus = "cancelled"
+	case "":
+		// An ACP `tool_call_update` may arrive with no status at all: it
+		// enriches the call rather than ending it. The Claude bridge sends
+		// the tool's real input, title and file diff that way, once the
+		// streamed tool_use block carries its input. Dropping these frames
+		// lost every diff the provider reported.
+		return m.toolCallEnrichmentEvents(update, toolCallID)
 	default:
 		return nil
 	}
@@ -417,6 +427,36 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 		}
 	}
 	return []protocol.Event{event}
+}
+
+// toolCallEnrichmentEvents publishes what a status-less `tool_call_update`
+// adds to a tool call that is already on screen.
+//
+// The enrichment is a second `phase=start` frame for the same tool_call_id
+// carrying the richer payload, so the durable stream keeps one logical tool
+// call with a growing description instead of a separate row. A frame that
+// adds nothing is ignored rather than emitted as an empty duplicate.
+func (m *Mapper) toolCallEnrichmentEvents(update map[string]any, toolCallID string) []protocol.Event {
+	diffs := acpDiffs(update)
+	title := firstString(update, "title")
+	input := objectOrNil(firstAny(update, "rawInput", "raw_input", "input"))
+	if len(diffs) == 0 && title == "" && input == nil {
+		return nil
+	}
+	payload := map[string]any{
+		"tool_call_id": toolCallID,
+		"phase":        "start",
+		"name":         firstString(update, "name", "kind", "title"),
+		"input":        input,
+		"result":       nil,
+	}
+	if title != "" {
+		payload["title"] = title
+	}
+	if len(diffs) > 0 {
+		payload["diffs"] = diffs
+	}
+	return []protocol.Event{m.event("session.tool_call", payload)}
 }
 
 func (m *Mapper) finishActiveToolCalls(output string) []protocol.Event {
