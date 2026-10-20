@@ -218,3 +218,22 @@ func TestMapperLeavesNonEditingToolCallsUnchanged(t *testing.T) {
 		t.Fatalf("payload = %+v", payload)
 	}
 }
+
+// A provider can report a change it cannot describe: codex sends a diff block
+// with no text on either side when the edit arrives as a patch without any
+// +/- lines. Publishing it would render an empty change card, which reads as
+// a broken card rather than as "no textual change".
+func TestMapperDropsDiffsWithoutText(t *testing.T) {
+	t.Parallel()
+
+	events, err := diffMapper(t).MapLine([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"Editing files","kind":"edit","status":"in_progress","content":[{"type":"diff","path":"/workspace/plan-demo.txt","oldText":null,"newText":""}]}}}`))
+	if err != nil {
+		t.Fatalf("MapLine() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want the tool call itself", len(events))
+	}
+	if _, present := payloadMap(t, events[0])["diffs"]; present {
+		t.Fatalf("a diff without text must not reach the payload: %+v", payloadMap(t, events[0]))
+	}
+}

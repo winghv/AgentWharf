@@ -1059,6 +1059,13 @@ func acpDiffs(update map[string]any) []map[string]any {
 		if newTruncated {
 			diff["new_text_truncated"] = true
 		}
+		// A diff with no text on either side carries nothing: the provider
+		// reported a change it could not describe (codex sends one of these
+		// when the edit arrives as a patch without +/- lines). Publishing it
+		// would render an empty change card, which reads as a broken card.
+		if oldText == "" && newText == "" {
+			continue
+		}
 		budget -= len(oldText) + len(newText)
 		diffs = append(diffs, diff)
 	}
