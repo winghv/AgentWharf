@@ -281,6 +281,15 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		payload["kind"] = "available_commands_update"
 		payload["provider_session_id"] = providerSessionID
 		return []protocol.Event{m.event("agent.activity", payload)}
+	case "config_option_update":
+		// The provider's own session options, including the collaboration mode
+		// a command like /plan switches. Without them a client cannot say
+		// whether the switch is on, and a switch that reads as a command is a
+		// trap: the second press turns the mode off.
+		payload := copyWithout(update, "type", "subtype", "kind", "sessionUpdate")
+		payload["kind"] = "config_option_update"
+		payload["provider_session_id"] = providerSessionID
+		return []protocol.Event{m.event("agent.activity", payload)}
 	case "plan":
 		return m.planEvents(update, providerSessionID, nil)
 	case "plan_update":
