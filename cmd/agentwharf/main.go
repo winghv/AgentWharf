@@ -2379,6 +2379,14 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 		cancel()
 		return err
 	}
+
+	// The provider's answer carries the session options, so the client learns
+	// whether a switch such as /plan is on before it presses it. The ready
+	// event comes first: it is the Session's "I am usable" signal, and the
+	// capabilities follow it.
+	if err := publishACPSessionOptions(writeFrame, cfg.SessionID, sessionResult, cfg.ProtocolVersion); err != nil {
+		return fmt.Errorf("publish acp session options: %w", err)
+	}
 	if cfg.StartupSmoke {
 		if readyProposalID == "" {
 			stopProviderSupervisor(supervisor)

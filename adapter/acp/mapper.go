@@ -270,6 +270,26 @@ func (m *Mapper) mapSessionPermissionRequest(raw map[string]any, providerSession
 	return append(events, m.permissionRequestEvent(source, requestID, providerSessionID)...)
 }
 
+// MapProviderSessionStart reads the provider's answer to session/new or
+// session/load.
+//
+// The answer carries the provider's session options, including the
+// collaboration mode a command like /plan switches. Without them the switch's
+// state is unknown until the first press, and a first press on an unknown
+// switch is a coin flip: the session may already be in plan mode, and the
+// command would turn it off.
+func (m *Mapper) MapProviderSessionStart(result map[string]any) []protocol.Event {
+	if len(result) == 0 {
+		return nil
+	}
+	options := providerOptionList(result)
+	if len(options) == 0 {
+		return nil
+	}
+	m.providerOptions = options
+	return m.providerCommandsEvent("")
+}
+
 // providerCommandList reads the commands the provider reports.
 func providerCommandList(payload map[string]any) []map[string]any {
 	for _, field := range []string{"commands", "available_commands", "availableCommands"} {

@@ -1177,3 +1177,39 @@ func compactJSON(value json.RawMessage) string {
 	}
 	return "invalid_error"
 }
+
+// publishACPSessionOptions publishes the session options the provider reports
+// when the Session starts.
+//
+// The provider announces its commands and its options separately, and both
+// announcements are ephemeral. A client that opens the Session afterwards
+// would find neither, so the options are published as a durable snapshot
+// beside the commands.
+func publishACPSessionOptions(writeFrame func(protocol.Frame) error, sessionID string, sessionResult map[string]any, protocolVersion int) error {
+	if writeFrame == nil || sessionID == "" || len(sessionResult) == 0 {
+		return nil
+	}
+	options, ok := sessionResult["configOptions"].([]any)
+	if !ok || len(options) == 0 {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]any{"config_options": options})
+	if err != nil {
+		return fmt.Errorf("marshal acp session options: %w", err)
+	}
+	event := &protocol.Event{
+		Type:      "session.commands",
+		SessionID: sessionID,
+		Time:      time.Now().UTC().UnixMilli(),
+		Payload:   payload,
+	}
+	// A v2 durable event is a proposal, and only a v2 event may carry a
+	// proposal id. A v1 event is batched by the Hub instead.
+	if protocolVersion == protocol.ProtocolVersionV2 {
+		event.ProposalID, err = randomToken()
+		if err != nil {
+			return fmt.Errorf("propose acp session options: %w", err)
+		}
+	}
+	return writeFrame(event)
+}
