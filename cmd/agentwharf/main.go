@@ -2278,6 +2278,11 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 				"writeTextFile": true,
 			},
 			"terminal": false,
+			// The plan capability tells the bridge that this client can carry
+			// a plan. Without it the bridge downgrades a provider's plan to
+			// plain agent prose, and the plan never reaches the workbench as a
+			// plan.
+			"plan": map[string]any{},
 			// Codex uses this negotiated extension for provider notices and
 			// failures. Without it, older bridges encode notices as Agent prose.
 			"_meta": map[string]any{
