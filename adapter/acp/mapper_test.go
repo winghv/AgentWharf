@@ -315,8 +315,10 @@ func TestMapperSupportsLiveACPCamelCaseSessionUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MapReader() error = %v", err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("events = %+v, want two events", events)
+	// The ephemeral announcement, the durable snapshot of the same commands,
+	// and the message.
+	if len(events) != 3 {
+		t.Fatalf("events = %+v, want three events", events)
 	}
 
 	assertEvent(t, events[0], "agent.activity")
@@ -325,8 +327,18 @@ func TestMapperSupportsLiveACPCamelCaseSessionUpdate(t *testing.T) {
 		t.Fatalf("activity payload = %+v", activity)
 	}
 
-	assertEvent(t, events[1], "session.message")
-	message := payloadMap(t, events[1])
+	assertEvent(t, events[1], "session.commands")
+	snapshot := payloadMap(t, events[1])
+	commands, ok := snapshot["commands"].([]any)
+	if !ok || len(commands) != 1 {
+		t.Fatalf("snapshot commands = %#v", snapshot["commands"])
+	}
+	if commands[0].(map[string]any)["name"] != "verify" {
+		t.Fatalf("snapshot command = %+v", commands[0])
+	}
+
+	assertEvent(t, events[2], "session.message")
+	message := payloadMap(t, events[2])
 	if message["message_id"] != "resp_1" {
 		t.Fatalf("message payload = %+v", message)
 	}

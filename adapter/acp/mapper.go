@@ -43,6 +43,12 @@ type Mapper struct {
 	nextMessageID     uint64
 	providerSessionID string
 	activeToolCallIDs map[string]struct{}
+	// The provider's commands and session options arrive as separate frames.
+	// They are kept so the Adapter can publish them as one durable snapshot:
+	// a client that opens the Session later must still learn which commands
+	// the provider offers and whether a switch is on.
+	providerCommands []map[string]any
+	providerOptions  []map[string]any
 }
 
 func NewMapper(cfg Config) (*Mapper, error) {
@@ -264,6 +270,69 @@ func (m *Mapper) mapSessionPermissionRequest(raw map[string]any, providerSession
 	return append(events, m.permissionRequestEvent(source, requestID, providerSessionID)...)
 }
 
+// providerCommandList reads the commands the provider reports.
+func providerCommandList(payload map[string]any) []map[string]any {
+	for _, field := range []string{"commands", "available_commands", "availableCommands"} {
+		items, ok := payload[field].([]any)
+		if !ok {
+			continue
+		}
+		commands := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			command, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			commands = append(commands, command)
+		}
+		return commands
+	}
+	return nil
+}
+
+// providerOptionList reads the session options the provider reports.
+func providerOptionList(payload map[string]any) []map[string]any {
+	for _, field := range []string{"config_options", "configOptions"} {
+		items, ok := payload[field].([]any)
+		if !ok {
+			continue
+		}
+		options := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			option, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			options = append(options, option)
+		}
+		return options
+	}
+	return nil
+}
+
+// providerCommandsEvent publishes the provider's commands and session options
+// as one durable snapshot.
+//
+// The provider announces both when the Session starts, and both frames are
+// ephemeral. A client that opens the Session afterwards would otherwise find
+// no commands at all, and a switch whose state nobody can read is a trap: the
+// second press turns the mode off.
+func (m *Mapper) providerCommandsEvent(providerSessionID string) []protocol.Event {
+	if len(m.providerCommands) == 0 && len(m.providerOptions) == 0 {
+		return nil
+	}
+	payload := map[string]any{
+		"provider_session_id": providerSessionID,
+	}
+	if len(m.providerCommands) > 0 {
+		payload["commands"] = m.providerCommands
+	}
+	if len(m.providerOptions) > 0 {
+		payload["config_options"] = m.providerOptions
+	}
+	return []protocol.Event{m.event("session.commands", payload)}
+}
+
 func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []protocol.Event {
 	switch frameName(update) {
 	case "settings_capabilities", "settings_capability_update", "settings/update":
@@ -280,7 +349,8 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		payload := copyWithout(update, "type", "subtype", "kind", "sessionUpdate")
 		payload["kind"] = "available_commands_update"
 		payload["provider_session_id"] = providerSessionID
-		return []protocol.Event{m.event("agent.activity", payload)}
+		m.providerCommands = providerCommandList(payload)
+		return append([]protocol.Event{m.event("agent.activity", payload)}, m.providerCommandsEvent(providerSessionID)...)
 	case "config_option_update":
 		// The provider's own session options, including the collaboration mode
 		// a command like /plan switches. Without them a client cannot say
@@ -289,7 +359,8 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		payload := copyWithout(update, "type", "subtype", "kind", "sessionUpdate")
 		payload["kind"] = "config_option_update"
 		payload["provider_session_id"] = providerSessionID
-		return []protocol.Event{m.event("agent.activity", payload)}
+		m.providerOptions = providerOptionList(payload)
+		return append([]protocol.Event{m.event("agent.activity", payload)}, m.providerCommandsEvent(providerSessionID)...)
 	case "plan":
 		return m.planEvents(update, providerSessionID, nil)
 	case "plan_update":
