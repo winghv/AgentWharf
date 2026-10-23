@@ -2597,13 +2597,12 @@ func (a *providerStartAdmission) ConfirmProcessStarted(ctx context.Context, atte
 
 func (a *providerStartAdmission) nextPrepare(ctx context.Context, direct bool) (*protocol.ProviderStartPrepare, error) {
 	if direct {
-		frame, err := a.read(ctx)
+		prepare, err := awaitProviderStartFrame(ctx, a.read, func(frame protocol.Frame) (*protocol.ProviderStartPrepare, bool) {
+			typed, ok := frame.(*protocol.ProviderStartPrepare)
+			return typed, ok
+		})
 		if err != nil {
 			return nil, err
-		}
-		prepare, ok := frame.(*protocol.ProviderStartPrepare)
-		if !ok {
-			return nil, errors.New("provider start preparation rejected")
 		}
 		return prepare, nil
 	}
@@ -2617,13 +2616,12 @@ func (a *providerStartAdmission) nextPrepare(ctx context.Context, direct bool) (
 
 func (a *providerStartAdmission) nextAck(ctx context.Context, direct bool) (*protocol.ProviderStartAck, error) {
 	if direct {
-		frame, err := a.read(ctx)
+		ack, err := awaitProviderStartFrame(ctx, a.read, func(frame protocol.Frame) (*protocol.ProviderStartAck, bool) {
+			typed, ok := frame.(*protocol.ProviderStartAck)
+			return typed, ok
+		})
 		if err != nil {
 			return nil, err
-		}
-		ack, ok := frame.(*protocol.ProviderStartAck)
-		if !ok {
-			return nil, errors.New("provider start admission rejected")
 		}
 		return ack, nil
 	}
@@ -2632,6 +2630,35 @@ func (a *providerStartAdmission) nextAck(ctx context.Context, direct bool) (*pro
 		return ack, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+// awaitProviderStartFrame reads until the wanted provider-start frame arrives.
+//
+// The first admission exchange owns the socket reader directly, and the Hub
+// answers every durable event the Adapter published with a receipt on that
+// same socket. The Adapter publishes the discovered provider commands before it
+// asks for the Provider start, so the first frame after the request is that
+// event's receipt -- not the preparation. Treating the receipt as the answer
+// rejected every preparation, and the Session never started.
+//
+// A frame that is not the wanted one is therefore skipped rather than
+// rejected. An error frame still fails: the Hub refused the Adapter for a
+// reason, and waiting for a preparation that will never come would only hide
+// it.
+func awaitProviderStartFrame[T any](ctx context.Context, read func(context.Context) (protocol.Frame, error), match func(protocol.Frame) (T, bool)) (T, error) {
+	var empty T
+	for {
+		frame, err := read(ctx)
+		if err != nil {
+			return empty, err
+		}
+		if _, ok := frame.(*protocol.Error); ok {
+			return empty, errors.New("provider start lifecycle frame rejected")
+		}
+		if typed, ok := match(frame); ok {
+			return typed, nil
+		}
 	}
 }
 
