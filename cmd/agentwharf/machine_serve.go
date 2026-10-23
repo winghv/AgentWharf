@@ -329,9 +329,14 @@ func runMachineServe(ctx context.Context, cfg machineServeConfig, stdout, stderr
 	// pickup safe, so this loop only removes waiting; it does not change what
 	// runs.
 	pickup := func() {
-		cred := credential
-		if fresh, loadErr := loadMachineCredential(); loadErr == nil {
-			cred = fresh
+		// This closure runs on the claim loop, concurrently with the poll loop
+		// that refreshes the shared credential. Read the credential from its
+		// owner (the credential file) instead of the shared variable; a stale
+		// in-memory value is not needed for pickup and racing on it is not safe.
+		cred, loadErr := loadMachineCredential()
+		if loadErr != nil {
+			reportMachineClaimPickup(ctx, diagnostics, "credential_unavailable")
+			return
 		}
 		claims, _, err := listPendingMachineClaims(ctx, client, cred)
 		if err != nil {
