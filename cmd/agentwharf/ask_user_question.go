@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/winghv/agentwharf/protocol"
 )
@@ -74,7 +75,7 @@ func askUserQuestionKeystrokes(questions []askUserQuestion, answers map[string]s
 		for i := 0; i < index; i++ {
 			out = append(out, down...)
 		}
-		out = append(out, '')
+		out = append(out, '\r')
 	}
 	return out
 }
@@ -86,23 +87,36 @@ func transcriptToolResultEvent(sessionID, toolCallID, name string, content []byt
 	if isError {
 		status = "error"
 	}
-	payload := map[string]any{
-		"tool_call_id": toolCallID,
-		"phase":        "result",
-		"input":        nil,
-		"result": map[string]any{
-			"status":         status,
-			"output_preview": string(content),
-			"truncated":      false,
-		},
+	preview, truncated, outputBytes := boundedTranscriptPreview(content)
+	for {
+		payload := map[string]any{
+			"tool_call_id": toolCallID,
+			"phase":        "result",
+			"input":        nil,
+			"result": map[string]any{
+				"status":         status,
+				"output_preview": preview,
+				"truncated":      truncated,
+				"output_bytes":   outputBytes,
+			},
+		}
+		// The transcript result frame omits the name so the client merge keeps
+		// the start frame's name; an explicit name (ACP path) is preserved.
+		if name != "" {
+			payload["name"] = name
+		}
+		encoded, _ := json.Marshal(payload)
+		event := protocol.Event{Type: "session.tool_call", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: encoded}
+		if len(encoded) <= protocol.MaxEventPayloadBytes || preview == "" {
+			return event
+		}
+		limit := len(preview) / 2
+		for limit > 0 && !utf8.ValidString(preview[:limit]) {
+			limit--
+		}
+		preview = preview[:limit]
+		truncated = true
 	}
-	// The transcript result frame omits the name so the client merge keeps the
-	// start frame's name; an explicit name (ACP path) is preserved when present.
-	if name != "" {
-		payload["name"] = name
-	}
-	encoded, _ := json.Marshal(payload)
-	return protocol.Event{Type: "session.tool_call", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: encoded}
 }
 
 // transcriptQuestionPermissionRequest builds the permission.request event that

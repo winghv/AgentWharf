@@ -117,7 +117,7 @@ func TestTranslatorTruncatesLargeToolResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTranslator() error = %v", err)
 	}
-	largeOutput := strings.Repeat("x", 5000)
+	largeOutput := strings.Repeat("x", 40000)
 	encoded, err := json.Marshal(map[string]any{
 		"type": "user",
 		"message": map[string]any{
@@ -144,8 +144,11 @@ func TestTranslatorTruncatesLargeToolResults(t *testing.T) {
 	if result["truncated"] != true {
 		t.Fatalf("tool result = %+v, want truncated", result)
 	}
-	if got := len(result["output_preview"].(string)); got != 4096 {
-		t.Fatalf("output_preview length = %d, want 4096", got)
+	if got := len(result["output_preview"].(string)); got != 32768 {
+		t.Fatalf("output_preview length = %d, want 32768", got)
+	}
+	if result["output_bytes"] != float64(40000) {
+		t.Fatalf("output_bytes = %v, want 40000", result["output_bytes"])
 	}
 }
 

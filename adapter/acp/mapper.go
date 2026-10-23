@@ -24,7 +24,7 @@ var (
 )
 
 const (
-	maxToolOutputPreviewBytes = 4096
+	maxToolOutputPreviewBytes = 32 * 1024
 	// Leave room for the protocol envelope within Hub's 64 KiB WebSocket limit.
 	maxMessagePayloadBytes = protocol.MaxEventPayloadBytes - 4*1024
 	maxTextChunkBytes      = 8 * 1024
@@ -426,7 +426,7 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		if messageID == "" {
 			messageID = m.nextMessageIDValue()
 		}
-		return m.messageEvents(messageID, text, providerSessionID)
+		return m.messageEventsWithExtra(messageID, text, providerSessionID, acpMessageExtra(update))
 	case "tool_use", "tool_call":
 		return m.toolCallEvents(update, false)
 	case "tool_call_update", "tool_result":
@@ -479,7 +479,7 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 		if title := firstString(update, "title"); title != "" {
 			payload["title"] = title
 		}
-		events := []protocol.Event{m.event("session.tool_call", payload)}
+		events := []protocol.Event{m.boundedToolEvent(payload)}
 		m.activeToolCallIDs[toolCallID] = struct{}{}
 		if isACPAskUserQuestion(name) {
 			events = append(events, m.event("permission.request", map[string]any{
@@ -513,8 +513,12 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 	}
 
 	delete(m.activeToolCallIDs, toolCallID)
-	preview, truncated := toolOutputPreview(firstAny(update, "rawOutput", "raw_output", "result", "content"))
-	event := m.toolCallResultEventWithOutput(toolCallID, resultStatus, preview, truncated, firstString(update, "name", "kind", "title"))
+	outputValue := firstAny(update, "rawOutput", "raw_output", "result", "content")
+	if text, ok := acpToolOutputText(outputValue); ok {
+		outputValue = text
+	}
+	preview, truncated, outputBytes := toolOutputPreview(outputValue)
+	event := m.toolCallResultEventWithOutput(toolCallID, resultStatus, preview, truncated, outputBytes, firstString(update, "name", "kind", "title"))
 	// A provider may attach the change it made to the terminal frame instead of
 	// the start frame, so both carry `diffs`.
 	if diffs := acpDiffs(update); len(diffs) > 0 {
@@ -556,7 +560,7 @@ func (m *Mapper) toolCallEnrichmentEvents(update map[string]any, toolCallID stri
 	if len(diffs) > 0 {
 		payload["diffs"] = diffs
 	}
-	return []protocol.Event{m.event("session.tool_call", payload)}
+	return []protocol.Event{m.boundedToolEvent(payload)}
 }
 
 func (m *Mapper) finishActiveToolCalls(output string) []protocol.Event {
@@ -577,46 +581,112 @@ func (m *Mapper) finishActiveToolCalls(output string) []protocol.Event {
 }
 
 func (m *Mapper) toolCallResultEvent(toolCallID, status, output string) protocol.Event {
-	return m.toolCallResultEventWithOutput(toolCallID, status, output, false, "")
+	return m.toolCallResultEventWithOutput(toolCallID, status, output, false, len(output), "")
 }
 
-func (m *Mapper) toolCallResultEventWithOutput(toolCallID, status, output string, truncated bool, name string) protocol.Event {
-	payload := map[string]any{
-		"tool_call_id": toolCallID,
-		"phase":        "result",
-		"input":        nil,
-		"result": map[string]any{
-			"status":         status,
-			"output_preview": output,
-			"truncated":      truncated,
-		},
+func (m *Mapper) toolCallResultEventWithOutput(toolCallID, status, output string, truncated bool, outputBytes int, name string) protocol.Event {
+	for {
+		payload := map[string]any{
+			"tool_call_id": toolCallID,
+			"phase":        "result",
+			"input":        nil,
+			"result": map[string]any{
+				"status":         status,
+				"output_preview": output,
+				"truncated":      truncated,
+				"output_bytes":   outputBytes,
+			},
+		}
+		if name != "" {
+			payload["name"] = name
+		}
+		event := m.event("session.tool_call", payload)
+		// JSON escaping can expand a 32 KiB preview (for example HTML or
+		// ampersand-heavy output) past the 64 KiB frame limit. Bound the
+		// marshalled event, not just the source string.
+		if len(event.Payload) <= protocol.MaxEventPayloadBytes || output == "" {
+			return event
+		}
+		limit := len(output) / 2
+		for limit > 0 && !utf8.ValidString(output[:limit]) {
+			limit--
+		}
+		output = output[:limit]
+		truncated = true
 	}
-	if name != "" {
-		payload["name"] = name
-	}
-	return m.event("session.tool_call", payload)
 }
 
-func toolOutputPreview(value any) (string, bool) {
-	if value == nil {
+// acpToolOutputText joins text content blocks into readable output. ACP
+// bridges commonly send `content: [{type:"content", content:{type:"text",
+// text:"..."}}]`; JSON-encoding that array showed the protocol wrapper instead
+// of the command output the user was reading.
+func acpToolOutputText(value any) (string, bool) {
+	blocks, ok := value.([]any)
+	if !ok {
 		return "", false
+	}
+	parts := make([]string, 0, len(blocks))
+	for _, item := range blocks {
+		block, _ := item.(map[string]any)
+		if block == nil {
+			continue
+		}
+		kind := firstString(block, "type", "kind")
+		switch kind {
+		case "text", "content":
+			if text := firstString(block, "text", "content"); text != "" {
+				parts = append(parts, text)
+				continue
+			}
+			if nested := objectField(block, "content"); nested != nil {
+				if text := firstString(nested, "text", "content"); text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+	return strings.Join(parts, "\n"), true
+}
+
+// boundedToolEvent drops advisory diffs when their JSON escaping would push
+// the start/enrichment frame past the Hub limit. The tool call itself remains
+// valid without them.
+func (m *Mapper) boundedToolEvent(payload map[string]any) protocol.Event {
+	event := m.event("session.tool_call", payload)
+	if len(event.Payload) <= protocol.MaxEventPayloadBytes {
+		return event
+	}
+	if _, ok := payload["diffs"]; ok {
+		delete(payload, "diffs")
+		event = m.event("session.tool_call", payload)
+	}
+	return event
+}
+
+func toolOutputPreview(value any) (string, bool, int) {
+	if value == nil {
+		return "", false, 0
 	}
 	preview, ok := value.(string)
 	if !ok {
 		encoded, err := json.Marshal(value)
 		if err != nil {
-			return "", false
+			return "", false, 0
 		}
 		preview = string(encoded)
 	}
-	if len(preview) <= maxToolOutputPreviewBytes {
-		return preview, false
+	outputBytes := len(preview)
+	if outputBytes <= maxToolOutputPreviewBytes {
+		return preview, false, outputBytes
 	}
 	limit := maxToolOutputPreviewBytes
 	for limit > 0 && !utf8.ValidString(preview[:limit]) {
 		limit--
 	}
-	return preview[:limit], true
+	return preview[:limit], true, outputBytes
 }
 
 func (m *Mapper) settingsCapabilityEvent(raw map[string]any) *protocol.Event {
@@ -845,7 +915,81 @@ func (m *Mapper) stateEvent(state string, providerSessionID string, metadata map
 	})
 }
 
+// acpMessageExtra carries the optional model and token evidence an ACP
+// bridge may attach to a text chunk. The fields are additive; a bridge that
+// reports none leaves the message exactly as before.
+func acpMessageExtra(update map[string]any) map[string]any {
+	extra := map[string]any{}
+	source := update
+	if meta := objectField(update, "_meta"); meta != nil {
+		source = mergeObjectMaps(update, meta)
+	}
+	if model := firstString(source, "model", "model_id", "modelId"); model != "" {
+		extra["model"] = model
+	}
+	if parent := firstString(source, "parent_tool_call_id", "parentToolCallId", "parent_tool_use_id", "parentToolUseId"); parent != "" {
+		extra["parent_tool_call_id"] = parent
+	}
+	if sidechain, ok := source["is_sidechain"].(bool); ok && sidechain {
+		extra["is_sidechain"] = true
+	}
+	if sidechain, ok := source["isSidechain"].(bool); ok && sidechain {
+		extra["is_sidechain"] = true
+	}
+	usage := objectField(source, "usage")
+	if usage == nil {
+		return extra
+	}
+	trimmed := map[string]any{}
+	for _, key := range []string{"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"} {
+		if value, ok := numberFromAny(usage[key]); ok && value >= 0 {
+			trimmed[key] = value
+		}
+	}
+	if len(trimmed) > 0 {
+		extra["usage"] = trimmed
+	}
+	return extra
+}
+
+func mergeObjectMaps(base, overlay map[string]any) map[string]any {
+	merged := make(map[string]any, len(base)+len(overlay))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range overlay {
+		merged[key] = value
+	}
+	return merged
+}
+
+func numberFromAny(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		if typed >= 0 {
+			return int64(typed), true
+		}
+	case json.Number:
+		if parsed, err := typed.Int64(); err == nil && parsed >= 0 {
+			return parsed, true
+		}
+	case int64:
+		if typed >= 0 {
+			return typed, true
+		}
+	case int:
+		if typed >= 0 {
+			return int64(typed), true
+		}
+	}
+	return 0, false
+}
+
 func (m *Mapper) messageEvent(messageID, text, providerSessionID string) protocol.Event {
+	return m.messageEventWithExtra(messageID, text, providerSessionID, nil)
+}
+
+func (m *Mapper) messageEventWithExtra(messageID, text, providerSessionID string, extra map[string]any) protocol.Event {
 	payload := map[string]any{
 		"message_id": messageID,
 		"role":       "agent",
@@ -856,6 +1000,11 @@ func (m *Mapper) messageEvent(messageID, text, providerSessionID string) protoco
 	}
 	if providerSessionID != "" {
 		payload["provider_session_id"] = providerSessionID
+	}
+	for key, value := range extra {
+		if value != nil {
+			payload[key] = value
+		}
 	}
 	return m.event("session.message", payload)
 }
@@ -874,8 +1023,12 @@ func (m *Mapper) event(eventType string, payload map[string]any) protocol.Event 
 }
 
 func (m *Mapper) messageEvents(messageID, text, providerSessionID string) []protocol.Event {
+	return m.messageEventsWithExtra(messageID, text, providerSessionID, nil)
+}
+
+func (m *Mapper) messageEventsWithExtra(messageID, text, providerSessionID string, extra map[string]any) []protocol.Event {
 	return splitMessageEvents(text, maxMessagePayloadBytes, func(part string) protocol.Event {
-		return m.messageEvent(messageID, part, providerSessionID)
+		return m.messageEventWithExtra(messageID, part, providerSessionID, extra)
 	})
 }
 
@@ -1100,7 +1253,7 @@ func updateText(value map[string]any) string {
 //
 // `Diff.path` is an absolute host path. Only the base name crosses the Adapter
 // boundary (L0: host paths are reduced at the boundary, never forwarded); a
-// durable transcript would otherwise carry the tenant's account name and
+// durable transcript would otherwise carry the user's account name and
 // directory layout to every reader and every replay.
 const (
 	maxToolCallDiffs       = 8

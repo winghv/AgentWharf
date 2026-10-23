@@ -7,8 +7,8 @@ import (
 
 // A sandbox runs the adapter with its stdin closed onto /dev/null. /dev/null
 // is a character device, so a "is it a character device" check made every cloud
-// VM Session take the interactive official-CLI path instead of the ACP
-// bridge: Claude Code's first-run onboarding then blocked the VM and the
+// sandbox Session take the interactive official-CLI path instead of the ACP
+// bridge: Claude Code's first-run onboarding then blocked the sandbox and the
 // health marker never appeared.
 func TestNonTerminalStdinDoesNotSelectTheInteractivePath(t *testing.T) {
 	t.Parallel()

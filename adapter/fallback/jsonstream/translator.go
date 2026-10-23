@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/winghv/agentwharf/protocol"
 )
@@ -18,7 +20,7 @@ var (
 	ErrInvalidStreamEvent = errors.New("invalid jsonstream event")
 )
 
-const maxOutputPreviewBytes = 4096
+const maxOutputPreviewBytes = 32 * 1024
 
 type Config struct {
 	SessionID string
@@ -188,18 +190,32 @@ func (t *Translator) translateUser(raw map[string]any) ([]protocol.Event, error)
 		if stringField(block, "type") != "tool_result" {
 			continue
 		}
-		preview, truncated := outputPreview(block["content"])
-		out = append(out, t.event("session.tool_call", map[string]any{
-			"tool_call_id": firstString(block, "tool_use_id", "id", "tool_call_id"),
-			"phase":        "result",
-			"name":         stringField(block, "name"),
-			"input":        nil,
-			"result": map[string]any{
-				"status":         "ok",
-				"output_preview": preview,
-				"truncated":      truncated,
-			},
-		}))
+		preview, truncated, outputBytes := outputPreview(block["content"])
+		for {
+			event := t.event("session.tool_call", map[string]any{
+				"tool_call_id": firstString(block, "tool_use_id", "id", "tool_call_id"),
+				"phase":        "result",
+				"name":         stringField(block, "name"),
+				"input":        nil,
+				"result": map[string]any{
+					"status":         "ok",
+					"output_preview": preview,
+					"truncated":      truncated,
+					"output_bytes":   outputBytes,
+				},
+			})
+			if len(event.Payload) <= protocol.MaxEventPayloadBytes || preview == "" {
+				out = append(out, event)
+				break
+			}
+			// JSON escaping can expand the preview; bound the marshalled event.
+			limit := len(preview) / 2
+			for limit > 0 && !utf8.ValidString(preview[:limit]) {
+				limit--
+			}
+			preview = preview[:limit]
+			truncated = true
+		}
 	}
 	return out, nil
 }
@@ -299,29 +315,57 @@ func contains(values []string, needle string) bool {
 	return false
 }
 
-func outputPreview(value any) (string, bool) {
+func outputPreview(value any) (string, bool, int) {
 	var preview string
 	switch typed := value.(type) {
 	case string:
 		preview = typed
 	case []any:
-		encoded, err := json.Marshal(typed)
-		if err != nil {
-			return "", false
+		preview = joinTextBlocks(typed)
+		if preview == "" {
+			encoded, err := json.Marshal(typed)
+			if err != nil {
+				return "", false, 0
+			}
+			preview = string(encoded)
 		}
-		preview = string(encoded)
 	default:
 		if value == nil {
-			return "", false
+			return "", false, 0
 		}
 		encoded, err := json.Marshal(value)
 		if err != nil {
-			return "", false
+			return "", false, 0
 		}
 		preview = string(encoded)
 	}
-	if len(preview) <= maxOutputPreviewBytes {
-		return preview, false
+	outputBytes := len(preview)
+	if outputBytes <= maxOutputPreviewBytes {
+		return preview, false, outputBytes
 	}
-	return preview[:maxOutputPreviewBytes], true
+	limit := maxOutputPreviewBytes
+	for limit > 0 && !utf8.ValidString(preview[:limit]) {
+		limit--
+	}
+	return preview[:limit], true, outputBytes
+}
+
+func joinTextBlocks(blocks []any) string {
+	parts := make([]string, 0, len(blocks))
+	for _, item := range blocks {
+		block, _ := item.(map[string]any)
+		if block == nil {
+			continue
+		}
+		if text := firstString(block, "text"); text != "" {
+			parts = append(parts, text)
+			continue
+		}
+		if nested, ok := block["content"].(map[string]any); ok {
+			if text := firstString(nested, "text"); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }

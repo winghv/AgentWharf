@@ -533,6 +533,10 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 		}
 	}
 
+	coalescer := newProviderEventCoalescer(func(event protocol.Event) error {
+		return writeFrame(&event)
+	})
+	defer coalescer.Close()
 	cursor := transcriptTailCursor{}
 	seen := make(map[string]struct{})
 	for {
@@ -587,11 +591,15 @@ func mirrorTranscript(ctx context.Context, cfg wrapConfig, provider agentProvide
 			events = appendOfficialTurnStateEvents(cfg, provider, events)
 			for _, event := range events {
 				cacheAskUserQuestionEvent(questions, &event)
-				if err := writeFrame(&event); err != nil {
+				if err := coalescer.Push(event); err != nil {
 					file.Close()
 					return err
 				}
 			}
+		}
+		if err := coalescer.Flush(); err != nil {
+			file.Close()
+			return err
 		}
 		file.Close()
 		cursor, err = transcriptTailCursorAt(path, cursor.offset)
@@ -780,17 +788,35 @@ func alreadyMirroredTranscriptLine(seen map[string]struct{}, line []byte) bool {
 }
 
 func transcriptMessageEvent(sessionID, messageID, role, text string) protocol.Event {
-	payload, _ := json.Marshal(map[string]any{
+	return transcriptMessageEventWithExtra(sessionID, messageID, role, text, nil)
+}
+
+// transcriptMessageEventWithExtra keeps provider evidence that belongs to the
+// same durable row (model, token usage, sidechain identity) inside the message
+// payload instead of inventing a second event type. Unknown extra fields are
+// simply ignored by older clients.
+func transcriptMessageEventWithExtra(sessionID, messageID, role, text string, extra map[string]any) protocol.Event {
+	payload := map[string]any{
 		"message_id": messageID,
 		"role":       role,
 		"content":    []map[string]string{{"kind": "text", "text": text}},
-	})
-	return protocol.Event{Type: "session.message", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload}
+	}
+	for key, value := range extra {
+		if value != nil {
+			payload[key] = value
+		}
+	}
+	encoded, _ := json.Marshal(payload)
+	return protocol.Event{Type: "session.message", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: encoded}
 }
 
 func transcriptMessageEvents(sessionID, messageID, role, text string) []protocol.Event {
+	return transcriptMessageEventsWithExtra(sessionID, messageID, role, text, nil)
+}
+
+func transcriptMessageEventsWithExtra(sessionID, messageID, role, text string, extra map[string]any) []protocol.Event {
 	return splitTranscriptMessageEvents(text, protocol.MaxEventPayloadBytes-4*1024, func(part string) protocol.Event {
-		return transcriptMessageEvent(sessionID, messageID, role, part)
+		return transcriptMessageEventWithExtra(sessionID, messageID, role, part, extra)
 	})
 }
 
@@ -828,14 +854,44 @@ func transcriptUTF8PrefixEnd(text string, end int) int {
 	return end
 }
 
+const maxTranscriptToolPreviewBytes = 32 * 1024
+
+// boundedTranscriptPreview keeps the transcript mirror's tool output under the
+// same 32 KiB ceiling as the ACP mapper. The event budget is 64 KiB; a path or
+// JSON envelope must still fit beside the preview.
+func boundedTranscriptPreview(content []byte) (string, bool, int) {
+	text := string(content)
+	if len(text) <= maxTranscriptToolPreviewBytes {
+		return text, false, len(text)
+	}
+	limit := transcriptUTF8PrefixEnd(text, maxTranscriptToolPreviewBytes)
+	return text[:limit], true, len(text)
+}
+
 func transcriptToolCallEvent(sessionID, toolCallID, phase, name string, input []byte) protocol.Event {
-	payload, _ := json.Marshal(map[string]any{
+	return transcriptToolCallEventWithExtra(sessionID, toolCallID, phase, name, input, nil)
+}
+
+func transcriptToolCallEventWithExtra(sessionID, toolCallID, phase, name string, input []byte, extra map[string]any) protocol.Event {
+	payload := map[string]any{
 		"tool_call_id": toolCallID,
 		"phase":        phase,
 		"name":         name,
 		"input":        json.RawMessage(input),
-	})
-	return protocol.Event{Type: "session.tool_call", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: payload}
+	}
+	for key, value := range extra {
+		if value != nil {
+			payload[key] = value
+		}
+	}
+	encoded, _ := json.Marshal(payload)
+	if len(encoded) > protocol.MaxEventPayloadBytes {
+		// A diff is advisory detail; drop it rather than let a pathologically
+		// escaped change push the tool frame past the Hub limit.
+		delete(payload, "diffs")
+		encoded, _ = json.Marshal(payload)
+	}
+	return protocol.Event{Type: "session.tool_call", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: encoded}
 }
 
 // publishOfficialSettingsCapability publishes a read-only settings capability

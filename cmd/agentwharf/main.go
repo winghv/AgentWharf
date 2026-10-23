@@ -1070,7 +1070,7 @@ func isLoopbackURL(raw string) bool {
 //
 // A character device is not enough: a sandbox runs the adapter with its stdin
 // closed onto /dev/null, and /dev/null is a character device. Treating it as a
-// terminal made every cloud VM Session run the interactive TUI instead of the
+// terminal made every cloud sandbox Session run the interactive TUI instead of the
 // ACP bridge.
 func stdinIsTerminal(stdin io.Reader) bool {
 	file, ok := stdin.(*os.File)
@@ -1100,7 +1100,7 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 	// The check must be a real terminal, not merely a character device: a
 	// sandbox runs the adapter with its stdin closed onto /dev/null, and
 	// /dev/null is a character device. Treating it as a terminal made every
-	// cloud VM Session run the interactive TUI instead of the ACP bridge.
+	// cloud sandbox Session run the interactive TUI instead of the ACP bridge.
 	terminal := stdinIsTerminal(stdin)
 	if explicitStdin && !cfg.ForceHeadless && !cfg.StartupSmoke && !cfg.PairOnly && terminal {
 		cfg.Interactive = true
@@ -1206,6 +1206,9 @@ func runWrap(ctx context.Context, cfg wrapConfig, stdin io.Reader, pairOutput io
 		}
 		connection := newHubConnection(cfg, conn, ack.ConnectionAuthority)
 		defer connection.close()
+		if err := publishDiscoveredCommands(ctx, cfg, masker, connection.write); err != nil {
+			return cfg, fmt.Errorf("publish discovered commands: %w", err)
+		}
 		if cfg.Interactive {
 			// Real terminal: run the official claude/codex CLI directly and mirror
 			// its transcript to the Hub instead of the headless ACP bridge.
@@ -3498,6 +3501,8 @@ func streamProviderOutput(ctx context.Context, cfg wrapConfig, stdout io.Reader,
 	if err != nil {
 		return err
 	}
+	coalescer := newProviderEventCoalescer(send)
+	defer coalescer.Close()
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -3512,18 +3517,22 @@ func streamProviderOutput(ctx context.Context, cfg wrapConfig, stdout io.Reader,
 			return err
 		}
 		for _, event := range events {
-			if err := send(event); err != nil {
+			if err := coalescer.Push(event); err != nil {
 				return fmt.Errorf("send provider event %s: %w", event.Type, err)
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		_ = coalescer.Flush()
 		if mapper != nil {
 			if finalizeErr := sendFinalACPEvents(mapper, send, "provider stdout failed"); finalizeErr != nil {
 				return finalizeErr
 			}
 		}
 		return fmt.Errorf("scan provider stdout: %w", err)
+	}
+	if err := coalescer.Flush(); err != nil {
+		return err
 	}
 	if mapper != nil {
 		if err := sendFinalACPEvents(mapper, send, "provider output closed unexpectedly"); err != nil {
@@ -3624,6 +3633,8 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 	if err != nil {
 		return err
 	}
+	coalescer := newProviderEventCoalescer(send)
+	defer coalescer.Close()
 	var sourceSequence uint64
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -3644,16 +3655,20 @@ func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio
 			return err
 		}
 		for _, event := range events {
-			if err := send(event); err != nil {
+			if err := coalescer.Push(event); err != nil {
 				return fmt.Errorf("send acp provider event %s: %w", event.Type, err)
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		_ = coalescer.Flush()
 		if finalizeErr := sendFinalACPEvents(mapper, send, "provider stdout failed"); finalizeErr != nil {
 			return finalizeErr
 		}
 		return fmt.Errorf("scan acp provider stdout: %w", err)
+	}
+	if err := coalescer.Flush(); err != nil {
+		return err
 	}
 	if err := sendFinalACPEvents(mapper, send, "provider output closed unexpectedly"); err != nil {
 		return err

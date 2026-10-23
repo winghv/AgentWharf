@@ -540,7 +540,7 @@ func TestMapperMapsACPToolCallFailureAndBoundsOutputPreview(t *testing.T) {
 		t.Fatalf("NewMapper() error = %v", err)
 	}
 
-	longOutput := strings.Repeat("界", 2000)
+	longOutput := strings.Repeat("界", 12000)
 	line, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "session/update",
@@ -571,8 +571,11 @@ func TestMapperMapsACPToolCallFailureAndBoundsOutputPreview(t *testing.T) {
 	}
 	resultBody := result["result"].(map[string]any)
 	preview := resultBody["output_preview"].(string)
-	if resultBody["status"] != "error" || resultBody["truncated"] != true || len(preview) > 4096 || !utf8.ValidString(preview) {
+	if resultBody["status"] != "error" || resultBody["truncated"] != true || len(preview) > 32768 || !utf8.ValidString(preview) {
 		t.Fatalf("bounded result body = status=%v truncated=%v bytes=%d valid_utf8=%v", resultBody["status"], resultBody["truncated"], len(preview), utf8.ValidString(preview))
+	}
+	if resultBody["output_bytes"] != float64(36000) {
+		t.Fatalf("output_bytes = %v, want original byte count 36000", resultBody["output_bytes"])
 	}
 }
 
@@ -641,4 +644,70 @@ func payloadMap(t *testing.T, ev protocol.Event) map[string]any {
 		t.Fatalf("payload unmarshal error = %v; payload=%s", err, string(ev.Payload))
 	}
 	return out
+}
+
+func TestMapperCarriesMessageEvidenceAndJoinsToolContent(t *testing.T) {
+	t.Parallel()
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := mapper.MapLine([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","text":"hello","model":"claude-sonnet-4","usage":{"input_tokens":12,"output_tokens":3}}}}`))
+	if err != nil || len(events) != 1 {
+		t.Fatalf("message events = %+v, %v", events, err)
+	}
+	payload := payloadMap(t, events[0])
+	if payload["model"] != "claude-sonnet-4" {
+		t.Fatalf("message model = %v", payload["model"])
+	}
+	usage, _ := payload["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(12) || usage["output_tokens"] != float64(3) {
+		t.Fatalf("message usage = %+v", usage)
+	}
+
+	events, err = mapper.MapLine([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool_1","kind":"execute","status":"completed","content":[{"type":"content","content":{"type":"text","text":"first line"}},{"type":"text","text":"second line"}]}}}`))
+	if err != nil || len(events) != 1 {
+		t.Fatalf("tool events = %+v, %v", events, err)
+	}
+	toolPayload := payloadMap(t, events[0])
+	result, _ := toolPayload["result"].(map[string]any)
+	if result["output_preview"] != "first line\nsecond line" {
+		t.Fatalf("output_preview = %q, want joined text", result["output_preview"])
+	}
+}
+
+func TestMapperBoundsEncodedToolResultAfterJSONEscaping(t *testing.T) {
+	t.Parallel()
+	mapper, err := acp.NewMapper(acp.Config{SessionID: "ses_1", Provider: "claude-code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]any{
+			"sessionId": "acp_ses_1",
+			"update": map[string]any{
+				"sessionUpdate": "tool_call_update",
+				"toolCallId":    "call_amp",
+				"kind":          "execute",
+				"status":        "completed",
+				"content":       strings.Repeat("&", 20_000),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := mapper.MapLine(line)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("MapLine = %+v, %v", events, err)
+	}
+	if len(events[0].Payload) > protocol.MaxEventPayloadBytes {
+		t.Fatalf("payload = %d bytes, want <= %d", len(events[0].Payload), protocol.MaxEventPayloadBytes)
+	}
+	result := payloadMap(t, events[0])["result"].(map[string]any)
+	if result["truncated"] != true {
+		t.Fatalf("result = %+v, want truncated", result)
+	}
 }

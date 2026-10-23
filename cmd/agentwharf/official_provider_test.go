@@ -140,8 +140,18 @@ func TestTranslateTranscriptTurnCompletion(t *testing.T) {
 }
 
 func TestTranslateTranscriptSkipsInternalEntries(t *testing.T) {
+	events, err := claudeProvider{}.translateLine("ses_1", transcriptJSON(t, map[string]any{"type": "summary", "summary": "x", "leafUuid": "u1"}))
+	if err != nil || len(events) != 1 || events[0].Type != "agent.activity" {
+		t.Fatalf("summary translateLine = %+v, %v", events, err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["kind"] != "compaction" || payload["text"] != "x" || payload["phase"] != "done" {
+		t.Fatalf("summary payload = %+v", payload)
+	}
 	for _, value := range []map[string]any{
-		{"type": "summary", "summary": "x", "leafUuid": "u1"},
 		{"type": "system", "uuid": "u1"},
 	} {
 		events, err := claudeProvider{}.translateLine("ses_1", transcriptJSON(t, value))

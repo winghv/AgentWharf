@@ -78,7 +78,7 @@ func TestMapperReducesDiffPathToBaseName(t *testing.T) {
 	t.Parallel()
 
 	payload := mapToolLine(t, diffMapper(t), `{"sessionUpdate":"tool_call","toolCallId":"call_3","title":"Edit","kind":"edit","status":"pending","content":[
-		{"type":"diff","path":"file:///home/tenant/Projects/secret-client/src/main.rs","oldText":"a","newText":"b"}
+		{"type":"diff","path":"file:///home/user/Projects/secret-client/src/main.rs","oldText":"a","newText":"b"}
 	]}`)
 
 	first := payload["diffs"].([]any)[0].(map[string]any)
@@ -89,7 +89,7 @@ func TestMapperReducesDiffPathToBaseName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal diffs: %v", err)
 	}
-	for _, leak := range []string{"/home/tenant", "Projects", "secret-client"} {
+	for _, leak := range []string{"/home/user", "Projects", "secret-client"} {
 		if strings.Contains(string(encoded), leak) {
 			t.Fatalf("diffs leaked %q: %s", leak, encoded)
 		}
