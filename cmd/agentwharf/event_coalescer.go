@@ -163,11 +163,6 @@ func sameCoalescibleMessage(left, right protocol.Event) bool {
 	return leftProvider == "" || rightProvider == "" || leftProvider == rightProvider
 }
 
-type coalescedContentPart struct {
-	Kind string `json:"kind"`
-	Text string `json:"text,omitempty"`
-}
-
 func mergeCoalescedMessage(left, right protocol.Event) (protocol.Event, bool) {
 	var leftPayload, rightPayload map[string]any
 	if json.Unmarshal(left.Payload, &leftPayload) != nil || json.Unmarshal(right.Payload, &rightPayload) != nil {

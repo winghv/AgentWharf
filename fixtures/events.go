@@ -13,10 +13,7 @@ import (
 // other user-controlled values.
 var EventCountFixtures = []int{1_000, 10_000, 100_000}
 
-func EventCountFixture(sessionID string, count int) []store.PendingEvent {
-	if sessionID == "" {
-		sessionID = "fixture-session"
-	}
+func EventCountFixture(_ string, count int) []store.PendingEvent {
 	if count < 0 {
 		count = 0
 	}

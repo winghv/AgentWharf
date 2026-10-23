@@ -1022,10 +1022,6 @@ func (m *Mapper) event(eventType string, payload map[string]any) protocol.Event 
 	}
 }
 
-func (m *Mapper) messageEvents(messageID, text, providerSessionID string) []protocol.Event {
-	return m.messageEventsWithExtra(messageID, text, providerSessionID, nil)
-}
-
 func (m *Mapper) messageEventsWithExtra(messageID, text, providerSessionID string, extra map[string]any) []protocol.Event {
 	return splitMessageEvents(text, maxMessagePayloadBytes, func(part string) protocol.Event {
 		return m.messageEventWithExtra(messageID, part, providerSessionID, extra)

@@ -641,7 +641,8 @@ func appendOfficialTurnStateEvents(cfg wrapConfig, provider agentProvider, event
 	}
 	state := ""
 	for _, event := range events {
-		if event.Type == "session.message" {
+		switch event.Type {
+		case "session.message":
 			var payload struct {
 				Role string `json:"role"`
 			}
@@ -653,7 +654,7 @@ func appendOfficialTurnStateEvents(cfg wrapConfig, provider agentProvider, event
 					state = "ready"
 				}
 			}
-		} else if event.Type == "agent.activity" {
+		case "agent.activity":
 			var payload struct {
 				Kind string `json:"kind"`
 			}
@@ -785,10 +786,6 @@ func alreadyMirroredTranscriptLine(seen map[string]struct{}, line []byte) bool {
 	}
 	seen[id] = struct{}{}
 	return false
-}
-
-func transcriptMessageEvent(sessionID, messageID, role, text string) protocol.Event {
-	return transcriptMessageEventWithExtra(sessionID, messageID, role, text, nil)
 }
 
 // transcriptMessageEventWithExtra keeps provider evidence that belongs to the
