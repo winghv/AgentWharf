@@ -30,17 +30,16 @@ func validateRequiredReplayEvent(event store.Event, session string) error {
 	}
 	// Internal lifecycle events (state/capabilities/outcome) may be Store-generated
 	// plaintext records with no content (for example a recovered reservation
-	// outcome). They must replay so the client sees no sequence gap; content
-	// events still require a sealed carrier.
+	// outcome, or a session the platform ended). They must replay so the client
+	// sees no sequence gap; content events still require a sealed carrier.
 	if internalLifecycleEvent(event.Type) {
 		if _, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "event", event.Type, ""); err == nil {
 			return nil
 		}
-		var plain map[string]json.RawMessage
-		if json.Unmarshal(event.Payload, &plain) == nil {
-			return nil
+		if err := validatePlaintextLifecycleProjection(event.Type, event.Payload); err != nil {
+			return err
 		}
-		return errors.New("invalid encrypted event history")
+		return nil
 	}
 	_, err := protocol.DecodeEncryptedPacketCarrier(event.Payload, "event", event.Type, "")
 	if err != nil {
@@ -49,8 +48,53 @@ func validateRequiredReplayEvent(event store.Event, session string) error {
 	return nil
 }
 
+// validatePlaintextLifecycleProjection checks that a plaintext lifecycle record
+// carries only the fields that type may carry.
+//
+// The Hub is zero-knowledge: it never learns what a session said. But a
+// lifecycle record the platform itself wrote -- a session it ended, a machine
+// it revoked -- has no content, only a state, and it must still replay. A
+// client therefore learns the state, which is exactly what the state says.
+//
+// The shape is still closed. A plaintext record may not smuggle a field the
+// type never defines, and every value it does define is checked against the
+// same vocabulary the sealed projection uses. A content event stays sealed.
+func validatePlaintextLifecycleProjection(eventType string, payload []byte) error {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(payload, &fields) != nil {
+		return errors.New("invalid encrypted event history")
+	}
+	switch eventType {
+	case "session.state":
+		for name := range fields {
+			switch name {
+			case "state", "reason":
+			default:
+				return errors.New("invalid encrypted event history")
+			}
+		}
+		var state struct {
+			State string `json:"state"`
+		}
+		if json.Unmarshal(payload, &state) != nil || state.State == "" {
+			return errors.New("invalid encrypted event history")
+		}
+		return nil
+	default:
+		// The run-control outcome has its own strict projection validator.
+		if eventType == "session.run.outcome" {
+			return protocol.ValidateRunControlOutcomeProjection(payload)
+		}
+		return errors.New("invalid encrypted event history")
+	}
+}
+
 func internalLifecycleEvent(eventType string) bool {
-	// Only the Store-generated recovery outcome is plaintext today; state and
-	// capability events for a required Session stay sealed.
-	return eventType == "session.run.outcome"
+	// Store-generated records with no content: the recovered run-control
+	// outcome, and the session state the platform writes when it ends a
+	// Session or revokes a machine. Both must replay, because a client that
+	// cannot read a session's own terminal state cannot tell an ended session
+	// from a broken one. Everything else -- every content event, and every
+	// capability the provider published -- stays sealed.
+	return eventType == "session.run.outcome" || eventType == "session.state"
 }

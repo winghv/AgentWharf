@@ -94,15 +94,37 @@ func TestEncryptedRunControlOutcomeMapping(t *testing.T) {
 	}
 }
 
-func TestRequiredReplayAllowsOnlyTheStoreRecoveryOutcomeAsPlaintext(t *testing.T) {
+func TestRequiredReplayAllowsStoreLifecycleRecordsAsPlaintext(t *testing.T) {
 	event := store.Event{SessionID: "session", Seq: 1, Type: "session.run.outcome", Payload: []byte(`{"cmd_id":"cmd","operation":"stop","outcome":"outcome_unknown","completion_state":null,"reason_code":"recovery_unconfirmed"}`)}
 	if err := validateRequiredReplayEvent(event, "session"); err != nil {
 		t.Fatalf("plaintext recovery outcome rejected: %v", err)
 	}
+	// The platform writes a plaintext session.state when it ends a Session or
+	// revokes a machine. It carries no content, only a state, and it must
+	// replay: a client that cannot read a session's own terminal state cannot
+	// tell an ended session from a broken one.
 	event.Type = "session.state"
-	event.Payload = []byte(`{"state":"ready"}`)
+	event.Payload = []byte(`{"state":"ended","reason":"machine_revoked"}`)
+	if err := validateRequiredReplayEvent(event, "session"); err != nil {
+		t.Fatalf("plaintext session state rejected: %v", err)
+	}
+}
+
+func TestRequiredReplayRejectsAPlaintextStateWithAnUnknownField(t *testing.T) {
+	// The allowance is a closed shape. A plaintext lifecycle record may not
+	// carry a field the type never defines, so content cannot ride along.
+	event := store.Event{SessionID: "session", Seq: 1, Type: "session.state", Payload: []byte(`{"state":"ended","text":"the session content"}`)}
 	if err := validateRequiredReplayEvent(event, "session"); err == nil {
-		t.Fatal("plaintext session state accepted")
+		t.Fatal("plaintext session state with an unknown field accepted")
+	}
+}
+
+func TestRequiredReplayStillRejectsAPlaintextContentEvent(t *testing.T) {
+	// Only the lifecycle records are allowed to be plaintext. A message is
+	// content, and content stays sealed.
+	event := store.Event{SessionID: "session", Seq: 1, Type: "session.message", Payload: []byte(`{"role":"agent","content":"hello"}`)}
+	if err := validateRequiredReplayEvent(event, "session"); err == nil {
+		t.Fatal("plaintext session message accepted")
 	}
 }
 

@@ -163,13 +163,36 @@ func validateEncryptedProjection(contentType string, data []byte) error {
 	return nil
 }
 
+// ValidateRunControlOutcomeProjection accepts the minimal run-control lifecycle
+// fields. operation and outcome are required; completion_state and reason_code
+// are present only for their respective outcomes.
+//
+// It is exported so the Hub's required-replay boundary can check a plaintext
+// run-control outcome against the same closed vocabulary the sealed projection
+// uses. A field that is present but null counts as absent, because the
+// recovery path writes it that way.
+func ValidateRunControlOutcomeProjection(data []byte) error {
+	fields, err := strictObject(data)
+	if err != nil {
+		return ErrEncryptedPacket
+	}
+	nullable := make(map[string]json.RawMessage, len(fields))
+	for name, raw := range fields {
+		if string(raw) == "null" {
+			continue
+		}
+		nullable[name] = raw
+	}
+	return validateRunControlOutcomeProjection(nullable)
+}
+
 // validateRunControlOutcomeProjection accepts the minimal run-control lifecycle
 // fields. operation and outcome are required; completion_state and reason_code
 // are present only for their respective outcomes.
 func validateRunControlOutcomeProjection(fields map[string]json.RawMessage) error {
 	for name := range fields {
 		switch name {
-		case "operation", "outcome", "completion_state", "reason_code", "command_id":
+		case "operation", "outcome", "completion_state", "reason_code", "command_id", "cmd_id":
 		default:
 			return ErrEncryptedPacket
 		}
@@ -215,9 +238,17 @@ func validateRunControlOutcomeProjection(fields map[string]json.RawMessage) erro
 	if hasReason && !validProtocolIdentifier(reason) {
 		return ErrEncryptedPacket
 	}
+	// The Adapter writes the command id as cmd_id; the sealed projection names
+	// it command_id. Both spellings are the same field.
 	commandID, hasCommand, err := read("command_id")
 	if err != nil {
 		return ErrEncryptedPacket
+	}
+	if !hasCommand {
+		commandID, hasCommand, err = read("cmd_id")
+		if err != nil {
+			return ErrEncryptedPacket
+		}
 	}
 	if hasCommand && !validProtocolIdentifier(commandID) {
 		return ErrEncryptedPacket
