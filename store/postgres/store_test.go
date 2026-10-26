@@ -265,6 +265,61 @@ func TestAttentionSnapshotProjectsDurableEvents(t *testing.T) {
 	}
 }
 
+// The terminal outcome used to latch: once a Session ended, the outcome that
+// described its end stayed forever. A Session the platform reopened -- moved
+// back to 'recovering', with the Adapter's terminal fence cleared -- is live
+// again, but the latched outcome kept it looking terminal to every reader.
+//
+// The effect was not cosmetic. The Hub unsubscribes a client from a Session
+// whose outcome is set, so a reopened Session stopped delivering live updates
+// to the console, and the warm-attach guard barred it.
+func TestAttentionSnapshotClearsTheTerminalOutcomeWhenASessionIsReopened(t *testing.T) {
+	dsn := testDSN(t)
+	schemaName := fmt.Sprintf("agentwharf_attention_reopen_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
+	setupSchema(t, dsn, schemaName)
+	t.Cleanup(func() { dropSchema(t, dsn, schemaName) })
+
+	pool := openPool(t, dsn, schemaName, nil)
+	t.Cleanup(pool.Close)
+	resetSchema(t, pool)
+	events := postgres.New(pool)
+	at := time.Now().UTC().Add(-time.Second).Truncate(time.Microsecond)
+
+	if _, err := events.Append(context.Background(), "ses_reopen_1", []store.PendingEvent{
+		{Type: "session.state", Time: at, Payload: []byte(`{"state":"ready"}`)},
+		{Type: "session.state", Time: at.Add(time.Millisecond), Payload: []byte(`{"state":"ended","reason":"user_stop"}`)},
+	}); err != nil {
+		t.Fatalf("append the terminal events: %v", err)
+	}
+	snapshot, err := events.AttentionSnapshot(context.Background(), []string{"ses_reopen_1"})
+	if err != nil {
+		t.Fatalf("attention snapshot: %v", err)
+	}
+	if len(snapshot) != 1 || snapshot[0].TerminalOutcome == nil || *snapshot[0].TerminalOutcome != "ended" {
+		t.Fatalf("terminal summary = %+v, want the ended outcome", snapshot)
+	}
+
+	// The reopen: the Session is live again.
+	if _, err := events.Append(context.Background(), "ses_reopen_1", []store.PendingEvent{
+		{Type: "session.state", Time: at.Add(2 * time.Millisecond), Payload: []byte(`{"state":"recovering"}`)},
+	}); err != nil {
+		t.Fatalf("append the reopen event: %v", err)
+	}
+	snapshot, err = events.AttentionSnapshot(context.Background(), []string{"ses_reopen_1"})
+	if err != nil {
+		t.Fatalf("attention snapshot after the reopen: %v", err)
+	}
+	if len(snapshot) != 1 {
+		t.Fatalf("attention snapshot length = %d, want 1", len(snapshot))
+	}
+	if snapshot[0].TerminalOutcome != nil {
+		t.Fatalf("terminal outcome = %q after the reopen, want none: a reopened Session is live", *snapshot[0].TerminalOutcome)
+	}
+	if snapshot[0].State != "recovering" {
+		t.Fatalf("state = %q after the reopen, want recovering", snapshot[0].State)
+	}
+}
+
 func TestAttentionSnapshotProjectsClientCommandLedger(t *testing.T) {
 	harness := newPostgresCommandHarness(t, "agentwharf_attention_command", nil)
 	request := store.PendingCommandRequest{CommandID: "cmd_attention", Type: "session.send", ExpiresAt: time.Now().Add(10 * time.Second)}

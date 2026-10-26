@@ -178,6 +178,42 @@ func TestAttentionSummaryStoreContract(t *testing.T) {
 	var _ store.AttentionSummaryStore = (*sqlite.Store)(nil)
 }
 
+// The terminal outcome used to latch: once a Session ended, the outcome that
+// described its end stayed forever, so a Session the platform reopened still
+// looked terminal to every reader.
+func TestAttentionSnapshotClearsTheTerminalOutcomeWhenASessionIsReopened(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "attention-reopen.db")
+	attention := openStore(t, path)
+	ctx := context.Background()
+
+	if _, err := attention.Append(ctx, "ses_reopen_1", []store.PendingEvent{
+		{Type: "session.state", Time: testTime(1), Payload: []byte(`{"state":"ready"}`)},
+		{Type: "session.state", Time: testTime(2), Payload: []byte(`{"state":"ended","reason":"user_stop"}`)},
+	}); err != nil {
+		t.Fatalf("append the terminal events: %v", err)
+	}
+	snapshot, err := attention.AttentionSnapshot(ctx, []string{"ses_reopen_1"})
+	if err != nil || len(snapshot) != 1 || snapshot[0].TerminalOutcome == nil || *snapshot[0].TerminalOutcome != "ended" {
+		t.Fatalf("terminal snapshot = %+v, %v", snapshot, err)
+	}
+
+	if _, err := attention.Append(ctx, "ses_reopen_1", []store.PendingEvent{
+		{Type: "session.state", Time: testTime(3), Payload: []byte(`{"state":"recovering"}`)},
+	}); err != nil {
+		t.Fatalf("append the reopen event: %v", err)
+	}
+	snapshot, err = attention.AttentionSnapshot(ctx, []string{"ses_reopen_1"})
+	if err != nil || len(snapshot) != 1 {
+		t.Fatalf("snapshot after the reopen = %+v, %v", snapshot, err)
+	}
+	if snapshot[0].TerminalOutcome != nil {
+		t.Fatalf("terminal outcome = %q after the reopen, want none: a reopened Session is live", *snapshot[0].TerminalOutcome)
+	}
+	if snapshot[0].State != "recovering" {
+		t.Fatalf("state = %q after the reopen, want recovering", snapshot[0].State)
+	}
+}
+
 func TestAttentionSummaryPageIsReadOnlyAndKeysetBounded(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "attention-page.db")
 	attention := openStore(t, path)

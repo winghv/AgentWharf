@@ -181,7 +181,19 @@ SET latest_seq = EXCLUDED.latest_seq,
         WHEN session_attention_summaries.permission_id = $11::TEXT THEN NULL
         ELSE session_attention_summaries.permission_status
     END,
-    terminal_outcome = COALESCE(session_attention_summaries.terminal_outcome, $5::TEXT),
+    terminal_outcome = CASE
+        -- The terminal outcome follows the Session's own state. A Session that
+        -- is reopened -- the platform moved it back to 'recovering' and cleared
+        -- the Adapter's terminal fence -- is live again, so the outcome that
+        -- described its previous end no longer describes it. Latching the
+        -- outcome would leave the Session looking terminal to every reader
+        -- including the Hub, which unsubscribes a client from a Session whose
+        -- outcome is set.
+        WHEN $3::TEXT IN ('ended', 'error')
+            THEN COALESCE($5::TEXT, $3::TEXT)
+        WHEN $3::TEXT IS NOT NULL THEN NULL
+        ELSE session_attention_summaries.terminal_outcome
+    END,
     latest_change_seq = COALESCE(EXCLUDED.latest_change_seq, session_attention_summaries.latest_change_seq),
     last_durable_event_at = EXCLUDED.last_durable_event_at,
     unmappable_event = session_attention_summaries.unmappable_event OR $9::BOOLEAN,

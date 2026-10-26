@@ -364,7 +364,21 @@ func projectSQLiteAttentionEvent(ctx context.Context, tx *sql.Tx, sessionID stri
 			summary.Permission = nil
 		}
 	}
-	if summary.TerminalOutcome == nil && projection.terminalOutcome != nil {
+	// The terminal outcome follows the Session's own state. A Session that is
+	// reopened -- the platform moved it back to 'recovering' and cleared the
+	// Adapter's terminal fence -- is live again, so the outcome that described
+	// its previous end no longer describes it. Latching the outcome would
+	// leave the Session looking terminal to every reader.
+	if projection.stateObserved && projection.state != nil {
+		if *projection.state == "ended" || *projection.state == "error" {
+			if summary.TerminalOutcome == nil && projection.terminalOutcome != nil {
+				outcome := *projection.terminalOutcome
+				summary.TerminalOutcome = &outcome
+			}
+		} else {
+			summary.TerminalOutcome = nil
+		}
+	} else if summary.TerminalOutcome == nil && projection.terminalOutcome != nil {
 		outcome := *projection.terminalOutcome
 		summary.TerminalOutcome = &outcome
 	}
