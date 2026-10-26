@@ -369,13 +369,19 @@ func projectSQLiteAttentionEvent(ctx context.Context, tx *sql.Tx, sessionID stri
 	// Adapter's terminal fence -- is live again, so the outcome that described
 	// its previous end no longer describes it. Latching the outcome would
 	// leave the Session looking terminal to every reader.
+	//
+	// This store owns its own projection -- it has no Session row to consult
+	// -- so the projected state is the authority: a terminal state names the
+	// outcome, and any other state clears it.
 	if projection.stateObserved && projection.state != nil {
-		if *projection.state == "ended" || *projection.state == "error" {
-			if summary.TerminalOutcome == nil && projection.terminalOutcome != nil {
-				outcome := *projection.terminalOutcome
-				summary.TerminalOutcome = &outcome
+		switch *projection.state {
+		case "ended", "error":
+			outcome := *projection.state
+			if projection.terminalOutcome != nil {
+				outcome = *projection.terminalOutcome
 			}
-		} else {
+			summary.TerminalOutcome = &outcome
+		default:
 			summary.TerminalOutcome = nil
 		}
 	} else if summary.TerminalOutcome == nil && projection.terminalOutcome != nil {

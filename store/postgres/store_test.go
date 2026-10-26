@@ -273,6 +273,10 @@ func TestAttentionSnapshotProjectsDurableEvents(t *testing.T) {
 // The effect was not cosmetic. The Hub unsubscribes a client from a Session
 // whose outcome is set, so a reopened Session stopped delivering live updates
 // to the console, and the warm-attach guard barred it.
+//
+// The rule keys off the Session row, not the last event. A reopened Session's
+// next durable event is usually a capability event rather than a
+// session.state, so an event-driven rule never sees the reopen at all.
 func TestAttentionSnapshotClearsTheTerminalOutcomeWhenASessionIsReopened(t *testing.T) {
 	dsn := testDSN(t)
 	schemaName := fmt.Sprintf("agentwharf_attention_reopen_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
@@ -283,15 +287,20 @@ func TestAttentionSnapshotClearsTheTerminalOutcomeWhenASessionIsReopened(t *test
 	t.Cleanup(pool.Close)
 	resetSchema(t, pool)
 	events := postgres.New(pool)
+	ctx := context.Background()
 	at := time.Now().UTC().Add(-time.Second).Truncate(time.Microsecond)
 
-	if _, err := events.Append(context.Background(), "ses_reopen_1", []store.PendingEvent{
+	if _, err := pool.Exec(ctx, `INSERT INTO agent_sessions (id, provider, status, started_at, ended_at)
+VALUES ('ses_reopen_1', 'claude-code', 'ended', clock_timestamp(), clock_timestamp())`); err != nil {
+		t.Fatalf("seed the ended session: %v", err)
+	}
+	if _, err := events.Append(ctx, "ses_reopen_1", []store.PendingEvent{
 		{Type: "session.state", Time: at, Payload: []byte(`{"state":"ready"}`)},
 		{Type: "session.state", Time: at.Add(time.Millisecond), Payload: []byte(`{"state":"ended","reason":"user_stop"}`)},
 	}); err != nil {
 		t.Fatalf("append the terminal events: %v", err)
 	}
-	snapshot, err := events.AttentionSnapshot(context.Background(), []string{"ses_reopen_1"})
+	snapshot, err := events.AttentionSnapshot(ctx, []string{"ses_reopen_1"})
 	if err != nil {
 		t.Fatalf("attention snapshot: %v", err)
 	}
@@ -299,13 +308,17 @@ func TestAttentionSnapshotClearsTheTerminalOutcomeWhenASessionIsReopened(t *test
 		t.Fatalf("terminal summary = %+v, want the ended outcome", snapshot)
 	}
 
-	// The reopen: the Session is live again.
-	if _, err := events.Append(context.Background(), "ses_reopen_1", []store.PendingEvent{
+	// The reopen: the platform moved the Session out of the terminal set and
+	// recorded the transition.
+	if _, err := pool.Exec(ctx, `UPDATE agent_sessions SET status = 'recovering', ended_at = NULL WHERE id = 'ses_reopen_1'`); err != nil {
+		t.Fatalf("reopen the session row: %v", err)
+	}
+	if _, err := events.Append(ctx, "ses_reopen_1", []store.PendingEvent{
 		{Type: "session.state", Time: at.Add(2 * time.Millisecond), Payload: []byte(`{"state":"recovering"}`)},
 	}); err != nil {
 		t.Fatalf("append the reopen event: %v", err)
 	}
-	snapshot, err = events.AttentionSnapshot(context.Background(), []string{"ses_reopen_1"})
+	snapshot, err = events.AttentionSnapshot(ctx, []string{"ses_reopen_1"})
 	if err != nil {
 		t.Fatalf("attention snapshot after the reopen: %v", err)
 	}
@@ -317,6 +330,24 @@ func TestAttentionSnapshotClearsTheTerminalOutcomeWhenASessionIsReopened(t *test
 	}
 	if snapshot[0].State != "recovering" {
 		t.Fatalf("state = %q after the reopen, want recovering", snapshot[0].State)
+	}
+
+	// A capability event -- what a reopened Session actually publishes next --
+	// must clear the outcome too, because the Session row is the authority.
+	if _, err := pool.Exec(ctx, `UPDATE agent_sessions SET status = 'ended', ended_at = clock_timestamp() WHERE id = 'ses_reopen_1'`); err != nil {
+		t.Fatalf("end the session row again: %v", err)
+	}
+	if _, err := events.Append(ctx, "ses_reopen_1", []store.PendingEvent{
+		{Type: "session.run.capabilities", Time: at.Add(3 * time.Millisecond), Payload: []byte(`{"type":"session.run.capabilities"}`)},
+	}); err != nil {
+		t.Fatalf("append the capability event: %v", err)
+	}
+	snapshot, err = events.AttentionSnapshot(ctx, []string{"ses_reopen_1"})
+	if err != nil {
+		t.Fatalf("attention snapshot after the capability event: %v", err)
+	}
+	if snapshot[0].TerminalOutcome == nil || *snapshot[0].TerminalOutcome != "ended" {
+		t.Fatalf("terminal outcome = %+v, want the ended outcome to be recorded again", snapshot[0].TerminalOutcome)
 	}
 }
 

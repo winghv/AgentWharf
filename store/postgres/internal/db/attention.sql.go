@@ -182,17 +182,30 @@ SET latest_seq = EXCLUDED.latest_seq,
         ELSE session_attention_summaries.permission_status
     END,
     terminal_outcome = CASE
-        -- The terminal outcome follows the Session's own state. A Session that
-        -- is reopened -- the platform moved it back to 'recovering' and cleared
-        -- the Adapter's terminal fence -- is live again, so the outcome that
-        -- described its previous end no longer describes it. Latching the
-        -- outcome would leave the Session looking terminal to every reader
-        -- including the Hub, which unsubscribes a client from a Session whose
-        -- outcome is set.
-        WHEN $3::TEXT IN ('ended', 'error')
-            THEN COALESCE($5::TEXT, $3::TEXT)
-        WHEN $3::TEXT IS NOT NULL THEN NULL
-        ELSE session_attention_summaries.terminal_outcome
+        -- The terminal outcome follows the Session's own state, not the last
+        -- event's. A Session that is reopened -- the platform moved it back to
+        -- 'recovering' and cleared the Adapter's terminal fence -- is live
+        -- again, so the outcome that described its previous end no longer
+        -- describes it. Latching the outcome would leave the Session looking
+        -- terminal to every reader including the Hub, which unsubscribes a
+        -- client from a Session whose outcome is set.
+        --
+        -- The Session row is the authority here, not the event: a reopened
+        -- Session's next durable event is usually a capability event, not a
+        -- session.state, so an event-driven rule would never see the reopen.
+        -- The row also names the outcome, because a Session can end without
+        -- the Store observing the terminal event that ended it.
+        WHEN EXISTS (
+            SELECT 1 FROM agent_sessions AS session
+            WHERE session.id = session_attention_summaries.session_id
+              AND (session.status IN ('ended', 'error') OR session.ended_at IS NOT NULL)
+        ) THEN COALESCE(
+            session_attention_summaries.terminal_outcome,
+            $5::TEXT,
+            (SELECT session.status FROM agent_sessions AS session
+             WHERE session.id = session_attention_summaries.session_id)
+        )
+        ELSE NULL
     END,
     latest_change_seq = COALESCE(EXCLUDED.latest_change_seq, session_attention_summaries.latest_change_seq),
     last_durable_event_at = EXCLUDED.last_durable_event_at,
