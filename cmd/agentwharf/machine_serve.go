@@ -44,6 +44,12 @@ const (
 
 var errNoInteractiveState = errors.New("session never reached an interactive state")
 
+// errProviderSessionNotResumable reports a resumed Session whose provider could
+// not come back. The Session is already live again on the platform, so leaving
+// it in 'recovering' would advertise a conversation that will never answer;
+// the recovery path ends it with the same reason the platform reports.
+var errProviderSessionNotResumable = errors.New("provider_session_resume_failed")
+
 type machineServeConfig struct {
 	PollInterval      time.Duration
 	ClaimPollInterval time.Duration
@@ -612,7 +618,13 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 	}
 	if isMachineRecoveryDispatch(*handoff) && handoff.ProviderSessionID == "" {
 		_, _ = fmt.Fprintln(stderr, "wharf machine serve: provider_session_resume_failed: original provider session id is missing")
-		return errors.New("provider_session_resume_failed")
+		if reportFailure != nil {
+			// The Session is live on the platform, so nothing else will end it.
+			if err := reportFailure(ctx, handoff.SessionID, errProviderSessionNotResumable.Error()); err != nil {
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: report resume failure for %s: %v\n", handoff.SessionID, err)
+			}
+		}
+		return errProviderSessionNotResumable
 	}
 	adapterCfg := serveWrapConfig(*handoff, cfg.StartupSmoke)
 	var endpointRuntime *machineE2EERuntime
@@ -908,12 +920,12 @@ func recoverMachineSession(ctx context.Context, client *http.Client, credential 
 			continue
 		}
 		if providerSessionID != "" && providerSessionID != prior.ProviderSessionID {
-			return nil, errors.New("provider_session_resume_failed: conflicting native session identities")
+			return nil, fmt.Errorf("%w: conflicting native session identities", errProviderSessionNotResumable)
 		}
 		providerSessionID = prior.ProviderSessionID
 	}
 	if providerSessionID == "" {
-		return nil, errors.New("provider_session_resume_failed: original provider session id is missing")
+		return nil, fmt.Errorf("%w: original provider session id is missing", errProviderSessionNotResumable)
 	}
 	endpoint, err := cloudAPIEndpoint(credential.CloudAPIURL, "/machine-sessions/"+url.PathEscape(session.SessionID)+"/recover")
 	if err != nil {
@@ -988,6 +1000,14 @@ func dispatchRecovery(ctx context.Context, cfg machineServeConfig, client *http.
 			onDone()
 		}
 		_, _ = fmt.Fprintf(stderr, "wharf machine serve: recover session %s: %v\n", session.SessionID, err)
+		// A Session the platform has already reopened is live, so nobody else
+		// will end it. Reporting the failure is what returns it to a terminal
+		// state instead of leaving it 'recovering' forever.
+		if errors.Is(err, errProviderSessionNotResumable) && reportFailure != nil {
+			if reportErr := reportFailure(ctx, session.SessionID, errProviderSessionNotResumable.Error()); reportErr != nil {
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: report resume failure for %s: %v\n", session.SessionID, reportErr)
+			}
+		}
 		return
 	}
 	if err := saveMachineDispatch(*handoff); err != nil {

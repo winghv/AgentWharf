@@ -2321,6 +2321,33 @@ func (s *Store) RecoverAdapterCredential(ctx context.Context, sessionID string, 
 	return adapterConnection(db.SessionAdapterConnection(row)), nil
 }
 
+// ReopenAdapterConnection clears the terminal fence on a Session's Adapter
+// connection so the Adapter may attach to the Session again.
+//
+// A terminal Session fences its Adapter connection, so every later Adapter
+// effect on it is refused -- including the credential recovery that would let
+// the Adapter come back and resume the provider's native session. The fence is
+// right for a Session the user stopped and wrong for one the user asked to
+// continue, so an explicit reopen removes it.
+//
+// The reopen grants no authority of its own. The Adapter credential is still
+// issued by the machine bearer through the recovery path, and the Session row
+// must already have left the terminal set, so a fenced connection cannot be
+// revived on its own.
+func (s *Store) ReopenAdapterConnection(ctx context.Context, sessionID string) error {
+	if !validConnectionID(sessionID) {
+		return errors.New("adapter connection reopen session ID is invalid")
+	}
+	queries, err := s.adapterConnectionQueries()
+	if err != nil {
+		return err
+	}
+	if _, err := queries.ReopenAdapterConnection(ctx, sessionID); err != nil {
+		return fmt.Errorf("reopen adapter connection: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) TerminateAdapterConnectionBeforeHello(ctx context.Context, sessionID string, termination store.AdapterConnectionPreHelloTermination) (store.AdapterConnection, error) {
 	if !validConnectionID(sessionID) || termination.ExpectedActiveCredentialGeneration < 1 {
 		return store.AdapterConnection{}, errors.New("invalid pre-hello adapter connection termination")

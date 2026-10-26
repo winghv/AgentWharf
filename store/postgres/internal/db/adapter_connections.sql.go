@@ -442,6 +442,36 @@ func (q *Queries) RefreshAdapterCredentialBeforeHello(ctx context.Context, arg R
 	return i, err
 }
 
+const reopenAdapterConnection = `-- name: ReopenAdapterConnection :execrows
+UPDATE session_adapter_connections
+SET revoked_at = NULL,
+    terminal_at = NULL,
+    updated_at = clock_timestamp()
+WHERE session_id = $1
+  AND terminal_at IS NOT NULL
+`
+
+// Clear the terminal fence on a Session's Adapter connection so the Adapter may
+// attach to the Session again.
+//
+// A terminal Session fences its Adapter connection: the credential is revoked
+// and the connection is marked terminal, so every later Adapter effect on that
+// Session is refused -- including a fresh credential. That fence is right for a
+// Session the user stopped, but it also made a terminated Session permanently
+// dead, because the Adapter could never come back to resume the provider's
+// native session.
+//
+// An explicit reopen clears the fence. It grants no authority of its own: the
+// Adapter credential is still re-issued by the machine bearer through the
+// recovery path, and the reopen only removes the refusal.
+func (q *Queries) ReopenAdapterConnection(ctx context.Context, sessionID string) (int64, error) {
+	result, err := q.db.Exec(ctx, reopenAdapterConnection, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const terminateAdapterConnectionBeforeHello = `-- name: TerminateAdapterConnectionBeforeHello :one
 WITH locked AS MATERIALIZED (
   SELECT connection.session_id, connection.connection_epoch, connection.accepted_fence, connection.active_credential_generation, connection.credential_generation_high_watermark, connection.active_credential_expires_at, connection.pending_credential_generation, connection.pending_credential_expires_at, connection.prior_recovery_credential_generation, connection.rotation_id, connection.revoked_at, connection.terminal_at, connection.created_at, connection.updated_at FROM session_adapter_connections connection

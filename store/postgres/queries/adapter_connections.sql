@@ -190,3 +190,24 @@ WHERE session_id = sqlc.arg(session_id)
   AND revoked_at IS NULL
   AND terminal_at IS NULL
 RETURNING *;
+
+-- name: ReopenAdapterConnection :execrows
+-- Clear the terminal fence on a Session's Adapter connection so the Adapter may
+-- attach to the Session again.
+--
+-- A terminal Session fences its Adapter connection: the credential is revoked
+-- and the connection is marked terminal, so every later Adapter effect on that
+-- Session is refused -- including a fresh credential. That fence is right for a
+-- Session the user stopped, but it also made a terminated Session permanently
+-- dead, because the Adapter could never come back to resume the provider's
+-- native session.
+--
+-- An explicit reopen clears the fence. It grants no authority of its own: the
+-- Adapter credential is still re-issued by the machine bearer through the
+-- recovery path, and the reopen only removes the refusal.
+UPDATE session_adapter_connections
+SET revoked_at = NULL,
+    terminal_at = NULL,
+    updated_at = clock_timestamp()
+WHERE session_id = sqlc.arg(session_id)
+  AND terminal_at IS NOT NULL;
