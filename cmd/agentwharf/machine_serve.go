@@ -709,46 +709,12 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 			if ctx.Err() != nil {
 				return
 			}
-			// A provider that will not honour the required launch settings cannot
-			// be fixed by reconnecting. Retrying it left the Session in `starting`
-			// for as long as the adapter credential lived -- and a fresh adapter
-			// heartbeat kept the archive path from ever treating it as stranded.
-			// End it once, with the bounded reason, and stop re-dispatching.
-			if reason, terminal := launchSettingsFailureReason(err); terminal {
-				reportMachineAdapterLaunch(ctx, diagnostics, handoff.SessionID, reason)
-				if reportFailure != nil {
-					if reportErr := reportFailure(ctx, handoff.SessionID, "provider_start_failed"); reportErr != nil {
-						_, _ = fmt.Fprintf(stderr, "wharf machine serve: report launch failure for %s: %v\n", handoff.SessionID, reportErr)
-					}
-				}
-				_ = removeMachineDispatch(handoff.ClaimID)
-				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s cannot honour the requested launch settings (%s); not retrying\n", handoff.SessionID, reason)
-				return err
+			outcome, restart := classifyAdapterFailure(ctx, handoff, err, restarts, stderr, reportFailure, diagnostics, cfg.StartupSmoke)
+			if outcome != nil {
+				return outcome
 			}
-			if errors.Is(err, errProviderCommandNotFound) || errors.Is(err, errProviderConfigNotFound) || errors.Is(err, errProviderCredentialMissing) {
-				if reportFailure != nil {
-					if reportErr := reportFailure(ctx, handoff.SessionID, providerStartFailureReason(err)); reportErr != nil {
-						_, _ = fmt.Fprintf(stderr, "wharf machine serve: report provider start failure for %s: %v\n", handoff.SessionID, reportErr)
-					}
-				}
-				if handoff.ProviderSessionID == "" {
-					_ = removeMachineDispatch(handoff.ClaimID)
-				}
-				return
-			}
-			if cfg.StartupSmoke {
-				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended: %v\n", handoff.SessionID, err)
-				return err
-			}
-			credentialAlive := dispatchCredentialAlive(*handoff)
-			if !machineServeAdapterShouldRestart(err, credentialAlive, restarts) {
-				if err == nil {
-					_ = removeMachineDispatch(handoff.ClaimID)
-					_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended normally; not restarting\n", handoff.SessionID)
-					return nil
-				}
-				_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended (%v); giving up (restarts=%d)\n", handoff.SessionID, err, restarts)
-				return
+			if !restart {
+				return nil
 			}
 			restarts++
 			_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended (%v); restarting in %s\n", handoff.SessionID, err, delay)
@@ -764,8 +730,122 @@ func keepAdapterAlive(ctx context.Context, cfg machineServeConfig, handoff *mach
 	}
 }
 
+// classifyAdapterFailure decides what an adapter failure means for the
+// Session it belonged to.
+//
+// The returned error is non-nil when the adapter loop must stop. The boolean
+// says whether the adapter may be restarted; a false one means the loop
+// returned normally.
+//
+// Every branch that ends the Session reports it to the platform first. The
+// machine is the only party that can end a Session the platform considers
+// live, because the machine holds the provider: the platform's own lifecycle
+// never touches a Session it believes is running. A branch that ended the
+// adapter without reporting left the Session in a live state with nothing
+// behind it, which is how a Session whose provider could not be resumed stayed
+// in 'recovering' forever.
+func classifyAdapterFailure(ctx context.Context, handoff *machineServeDispatch, err error, restarts int, stderr io.Writer, reportFailure machineSessionFailureReporter, diagnostics *machineClientDiagnostics, startupSmoke bool) (error, bool) {
+	// A provider that will not honour the required launch settings cannot be
+	// fixed by reconnecting. Retrying it left the Session in `starting` for as
+	// long as the adapter credential lived -- and a fresh adapter heartbeat
+	// kept the archive path from ever treating it as stranded. End it once,
+	// with the bounded reason, and stop re-dispatching.
+	if reason, terminal := launchSettingsFailureReason(err); terminal {
+		reportMachineAdapterLaunch(ctx, diagnostics, handoff.SessionID, reason)
+		if reportFailure != nil {
+			if reportErr := reportFailure(ctx, handoff.SessionID, "provider_start_failed"); reportErr != nil {
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: report launch failure for %s: %v\n", handoff.SessionID, reportErr)
+			}
+		}
+		_ = removeMachineDispatch(handoff.ClaimID)
+		_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s cannot honour the requested launch settings (%s); not retrying\n", handoff.SessionID, reason)
+		return err, false
+	}
+	if errors.Is(err, errProviderCommandNotFound) || errors.Is(err, errProviderConfigNotFound) || errors.Is(err, errProviderCredentialMissing) {
+		if reportFailure != nil {
+			if reportErr := reportFailure(ctx, handoff.SessionID, providerStartFailureReason(err)); reportErr != nil {
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: report provider start failure for %s: %v\n", handoff.SessionID, reportErr)
+			}
+		}
+		if handoff.ProviderSessionID == "" {
+			_ = removeMachineDispatch(handoff.ClaimID)
+		}
+		return nil, false
+	}
+	// A provider that cannot load its native transcript cannot be fixed by
+	// reconnecting: the transcript either exists on disk or it does not, and a
+	// new connection does not change that. Retrying it burned the whole
+	// restart budget on a Session that could never answer. Report it once,
+	// with the reason the platform understands, and stop.
+	if errors.Is(err, errProviderSessionNotResumable) {
+		if reportFailure != nil {
+			if reportErr := reportFailure(ctx, handoff.SessionID, errProviderSessionNotResumable.Error()); reportErr != nil {
+				_, _ = fmt.Fprintf(stderr, "wharf machine serve: report resume failure for %s: %v\n", handoff.SessionID, reportErr)
+			}
+		}
+		_ = removeMachineDispatch(handoff.ClaimID)
+		_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s could not load its provider transcript (%v); not retrying\n", handoff.SessionID, err)
+		return err, false
+	}
+	if startupSmoke {
+		_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended: %v\n", handoff.SessionID, err)
+		return err, false
+	}
+	credentialAlive := dispatchCredentialAlive(*handoff)
+	if !machineServeAdapterShouldRestart(err, credentialAlive, restarts) {
+		if err == nil {
+			_ = removeMachineDispatch(handoff.ClaimID)
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended normally; not restarting\n", handoff.SessionID)
+			return nil, false
+		}
+		reportExhaustedAdapter(ctx, handoff, err, restarts, stderr, reportFailure)
+		return nil, false
+	}
+	return nil, true
+}
+
 func machineServeAdapterShouldRestart(err error, credentialAlive bool, restarts int) bool {
 	return err != nil && credentialAlive && restarts < machineServeAdapterRestartLimit
+}
+
+// reportExhaustedAdapter tells the platform that an adapter will not come
+// back.
+//
+// The adapter is not coming back. The machine is the only party that knows
+// this, and the machine is the only party that can end a Session the platform
+// considers live: the platform's own lifecycle never touches a Session it
+// believes is running, because the machine holds the provider.
+//
+// Reporting was missing here, so a Session whose provider could not be
+// resumed stayed in 'recovering' forever. The console showed a conversation
+// that was reconnecting and would never answer, and the Continue button
+// reopened it into the same state, because the report that should have ended
+// it was never sent.
+//
+// The report has to carry a reason the platform accepts, so a resume failure
+// keeps its own and anything else is a provider that did not come up.
+func reportExhaustedAdapter(ctx context.Context, handoff *machineServeDispatch, err error, restarts int, stderr io.Writer, reportFailure machineSessionFailureReporter) {
+	if reportFailure != nil {
+		if reportErr := reportFailure(ctx, handoff.SessionID, machineAdapterFailureReason(err)); reportErr != nil {
+			_, _ = fmt.Fprintf(stderr, "wharf machine serve: report adapter failure for %s: %v\n", handoff.SessionID, reportErr)
+		}
+	}
+	_ = removeMachineDispatch(handoff.ClaimID)
+	_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended (%v); giving up (restarts=%d)\n", handoff.SessionID, err, restarts)
+}
+
+// machineAdapterFailureReason maps an adapter failure to a reason the platform
+// accepts on the machine-failure endpoint.
+//
+// A provider that cannot load its native transcript keeps its own reason,
+// because that is the one the platform and the console already understand.
+// Every other failure is a provider that did not come up, which is what
+// 'provider_start_failed' means.
+func machineAdapterFailureReason(err error) string {
+	if errors.Is(err, errProviderSessionNotResumable) {
+		return errProviderSessionNotResumable.Error()
+	}
+	return "provider_start_failed"
 }
 
 type encryptedAdapterError struct{ cause error }

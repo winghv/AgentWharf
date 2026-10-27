@@ -2311,32 +2311,10 @@ func runWrapACPProvider(ctx context.Context, cfg wrapConfig, connection *hubConn
 		cancel()
 		return err
 	}
-	sessionMethod := "session/new"
-	sessionParams := map[string]any{"cwd": cwd, "mcpServers": []any{}}
-	if strings.TrimSpace(cfg.ProviderSessionID) != "" {
-		sessionMethod = "session/load"
-		sessionParams["sessionId"] = cfg.ProviderSessionID
-	}
-	if err := writeACPRequest(stdinWriter, 2, sessionMethod, sessionParams); err != nil {
+	providerSessionID, sessionResult, err := establishACPSession(runCtx, scanner, stdinWriter, cwd, cfg.ProviderSessionID)
+	if err != nil {
 		cancel()
 		return err
-	}
-	sessionResult, err := readACPResponse(runCtx, scanner, 2)
-	if err != nil {
-		if sessionMethod != "session/load" {
-			cancel()
-			return err
-		}
-		// Recovery must preserve the provider's native history. A fresh context
-		// under the same Hub Session would make its transcript misleading.
-		cancel()
-		return errors.New("provider_session_resume_failed: original provider session could not be loaded; refusing to create a new context")
-	}
-	providerSessionID := stringFieldFromAny(sessionResult["sessionId"])
-	if sessionMethod == "session/load" {
-		// ACP LoadSessionResponse does not allocate or return a session ID.
-		// Successful load restores precisely the ID supplied in the request.
-		providerSessionID = cfg.ProviderSessionID
 	}
 	if providerSessionID == "" {
 		cancel()
@@ -4112,6 +4090,47 @@ func writeACPResult(stdin io.Writer, id any, result map[string]any) error {
 		return fmt.Errorf("write acp response %v: %w", id, err)
 	}
 	return nil
+}
+
+// establishACPSession opens the provider's session for this adapter.
+//
+// With a provider session id it loads that native session; without one it
+// creates a new one. A load that fails is reported as
+// errProviderSessionNotResumable, and the provider's own error is kept.
+//
+// Two things depend on that. A recovery must preserve the provider's native
+// history -- a fresh context under the same Hub Session would make its
+// transcript misleading -- so a failed load must not fall back to a new
+// session. And the failure must be distinguishable from a provider that is
+// merely busy or misconfigured: a missing native transcript is not repairable
+// by retrying, so the daemon must end the Session rather than reconnect to it
+// until its restart budget runs out.
+//
+// The provider's own message is kept for the same reason. It says which
+// failure this was, and it is what support reads.
+func establishACPSession(ctx context.Context, scanner *bufio.Scanner, stdin io.Writer, cwd string, providerSessionID string) (string, map[string]any, error) {
+	sessionMethod := "session/new"
+	sessionParams := map[string]any{"cwd": cwd, "mcpServers": []any{}}
+	if strings.TrimSpace(providerSessionID) != "" {
+		sessionMethod = "session/load"
+		sessionParams["sessionId"] = providerSessionID
+	}
+	if err := writeACPRequest(stdin, 2, sessionMethod, sessionParams); err != nil {
+		return "", nil, err
+	}
+	sessionResult, err := readACPResponse(ctx, scanner, 2)
+	if err != nil {
+		if sessionMethod != "session/load" {
+			return "", nil, err
+		}
+		return "", nil, fmt.Errorf("%w: %w", errProviderSessionNotResumable, err)
+	}
+	if sessionMethod == "session/load" {
+		// ACP LoadSessionResponse does not allocate or return a session ID.
+		// Successful load restores precisely the ID supplied in the request.
+		return providerSessionID, sessionResult, nil
+	}
+	return stringFieldFromAny(sessionResult["sessionId"]), sessionResult, nil
 }
 
 func readACPResponse(ctx context.Context, scanner *bufio.Scanner, id int64) (map[string]any, error) {
