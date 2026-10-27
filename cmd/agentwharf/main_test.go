@@ -3995,19 +3995,20 @@ func runWrapACPRecoveryProviderHelper() {
 	if load["method"] != "session/load" || params["sessionId"] != "acp_ses_existing" {
 		os.Exit(61)
 	}
-	if mode == "fallback" {
+	switch mode {
+	case "fallback":
 		writeACPError(load["id"], -32601, "session/load unsupported")
 		fresh := readACPRequest(scanner)
 		if fresh["method"] != "session/new" {
 			os.Exit(62)
 		}
 		writeACPResponse(fresh["id"], map[string]any{"sessionId": "acp_ses_fresh"})
-	} else if mode == "unloadable" || mode == "load-only" {
+	case "unloadable", "load-only":
 		// This is the failure pi-acp returns when the provider's native
 		// transcript is gone: the session id it is asked to load is unknown.
 		writeACPError(load["id"], -32602, "Invalid params")
 		os.Exit(63)
-	} else {
+	default:
 		// ACP LoadSessionResponse carries modes/models, not a new session ID.
 		writeACPResponse(load["id"], map[string]any{})
 	}
