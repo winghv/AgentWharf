@@ -824,13 +824,21 @@ func machineServeAdapterShouldRestart(err error, credentialAlive bool, restarts 
 //
 // The report has to carry a reason the platform accepts, so a resume failure
 // keeps its own and anything else is a provider that did not come up.
+//
+// The dispatch file is kept. It holds the provider's opaque native session id,
+// which is the only pointer to a transcript that is still on disk, and the
+// reason the adapter ran out of restarts is often transient -- a Hub that
+// could not be reached, a credential the platform had already rotated. Deleting
+// the file would turn a Session that can still be resumed into one that cannot,
+// which is the opposite of what this branch is for. Only a failure that proves
+// the transcript is unreachable removes it, and that is decided by its own
+// branch above.
 func reportExhaustedAdapter(ctx context.Context, handoff *machineServeDispatch, err error, restarts int, stderr io.Writer, reportFailure machineSessionFailureReporter) {
 	if reportFailure != nil {
 		if reportErr := reportFailure(ctx, handoff.SessionID, machineAdapterFailureReason(err)); reportErr != nil {
 			_, _ = fmt.Fprintf(stderr, "wharf machine serve: report adapter failure for %s: %v\n", handoff.SessionID, reportErr)
 		}
 	}
-	_ = removeMachineDispatch(handoff.ClaimID)
 	_, _ = fmt.Fprintf(stderr, "wharf machine serve: adapter for %s ended (%v); giving up (restarts=%d)\n", handoff.SessionID, err, restarts)
 }
 

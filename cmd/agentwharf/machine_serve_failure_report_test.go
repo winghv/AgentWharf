@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -137,6 +138,46 @@ func TestMachineAdapterFailureReasonIsAlwaysAcceptedByThePlatform(t *testing.T) 
 	}
 	if reason := machineAdapterFailureReason(fmt.Errorf("wrapped: %w", errProviderSessionNotResumable)); reason != "provider_session_resume_failed" {
 		t.Fatalf("machineAdapterFailureReason() = %q, want provider_session_resume_failed", reason)
+	}
+}
+
+// An adapter that ran out of restarts must keep its dispatch file.
+//
+// The file holds the provider's opaque native session id, which is the only
+// pointer to a transcript that is still on disk. The reason the restarts ran
+// out is often transient -- a Hub that could not be reached, a credential the
+// platform had already rotated -- so deleting the file turns a Session that
+// can still be resumed into one that cannot. That is the opposite of what the
+// branch is for: it reports the failure so the Session can be ended, not so
+// the conversation can be forgotten.
+func TestAnExhaustedAdapterKeepsItsDispatchFile(t *testing.T) {
+	credentialDir := t.TempDir()
+	t.Setenv("AGENTWHARF_MACHINE_CREDENTIAL_FILE", filepath.Join(credentialDir, "machine.json"))
+
+	handoff := &machineServeDispatch{
+		ClaimID:           "recovery:ses_keep_dispatch",
+		SessionID:         "ses_keep_dispatch",
+		Provider:          "pi",
+		HubWSURL:          "wss://hub.example/hub",
+		AdapterToken:      "adapter-token",
+		AdapterExpiresAt:  time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		ProviderSessionID: "native-session",
+	}
+	if err := saveMachineDispatch(*handoff); err != nil {
+		t.Fatalf("save dispatch: %v", err)
+	}
+
+	var logs bytes.Buffer
+	reportFailure := machineSessionFailureReporter(func(context.Context, string, string) error { return nil })
+	reportExhaustedAdapter(context.Background(), handoff, errors.New("hub heartbeat timed out"),
+		machineServeAdapterRestartLimit, &logs, reportFailure)
+
+	dispatches, err := loadMachineDispatches()
+	if err != nil {
+		t.Fatalf("load dispatches: %v", err)
+	}
+	if len(dispatches) != 1 || dispatches[0].ProviderSessionID != "native-session" {
+		t.Fatalf("the dispatch file was removed; a resumable Session lost its provider pointer: %+v", dispatches)
 	}
 }
 
