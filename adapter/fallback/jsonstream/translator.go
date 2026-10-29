@@ -23,15 +23,17 @@ var (
 const maxOutputPreviewBytes = 32 * 1024
 
 type Config struct {
-	SessionID string
-	Provider  string
-	Now       func() time.Time
+	SessionID       string
+	Provider        string
+	Now             func() time.Time
+	MaxPayloadBytes int
 }
 
 type Translator struct {
-	sessionID string
-	provider  string
-	now       func() time.Time
+	sessionID       string
+	provider        string
+	now             func() time.Time
+	maxPayloadBytes int
 }
 
 func NewTranslator(cfg Config) (*Translator, error) {
@@ -45,10 +47,15 @@ func NewTranslator(cfg Config) (*Translator, error) {
 	if now == nil {
 		now = time.Now
 	}
+	maxPayloadBytes := cfg.MaxPayloadBytes
+	if maxPayloadBytes <= 0 || maxPayloadBytes > protocol.MaxEventPayloadBytes {
+		maxPayloadBytes = protocol.MaxEventPayloadBytes
+	}
 	return &Translator{
-		sessionID: cfg.SessionID,
-		provider:  cfg.Provider,
-		now:       now,
+		sessionID:       cfg.SessionID,
+		provider:        cfg.Provider,
+		now:             now,
+		maxPayloadBytes: maxPayloadBytes,
 	}, nil
 }
 
@@ -134,16 +141,38 @@ func (t *Translator) translateAssistant(raw map[string]any) ([]protocol.Event, e
 		out          []protocol.Event
 		messageParts []map[string]any
 	)
+	messageID := firstString(message, "id", "message_id")
 	flushMessage := func() {
 		if len(messageParts) == 0 {
 			return
 		}
-		out = append(out, t.event("session.message", map[string]any{
-			"message_id": firstString(message, "id", "message_id"),
-			"role":       "agent",
-			"content":    messageParts,
-		}))
+		parts := messageParts
 		messageParts = nil
+		event := t.event("session.message", map[string]any{
+			"message_id": messageID,
+			"role":       "agent",
+			"content":    parts,
+		})
+		if len(event.Payload) <= t.maxPayloadBytes {
+			out = append(out, event)
+			return
+		}
+		texts := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if text, _ := part["text"].(string); text != "" {
+				texts = append(texts, text)
+			}
+		}
+		out = append(out, splitBoundedEvents(strings.Join(texts, "\n"), t.maxPayloadBytes, func(chunk string) protocol.Event {
+			return t.event("session.message", map[string]any{
+				"message_id": messageID,
+				"role":       "agent",
+				"content": []map[string]any{{
+					"kind": "text",
+					"text": chunk,
+				}},
+			})
+		})...)
 	}
 	for _, block := range contentBlocks(message) {
 		switch stringField(block, "type") {
@@ -151,10 +180,20 @@ func (t *Translator) translateAssistant(raw map[string]any) ([]protocol.Event, e
 			flushMessage()
 			text := firstString(block, "thinking", "text")
 			if text != "" {
-				out = append(out, t.event("agent.activity", map[string]any{
+				event := t.event("agent.activity", map[string]any{
 					"kind": "thinking",
 					"text": text,
-				}))
+				})
+				if len(event.Payload) <= t.maxPayloadBytes {
+					out = append(out, event)
+				} else {
+					out = append(out, splitBoundedEvents(text, t.maxPayloadBytes, func(chunk string) protocol.Event {
+						return t.event("agent.activity", map[string]any{
+							"kind": "thinking",
+							"text": chunk,
+						})
+					})...)
+				}
 			}
 		case "text":
 			text := stringField(block, "text")
@@ -166,13 +205,11 @@ func (t *Translator) translateAssistant(raw map[string]any) ([]protocol.Event, e
 			}
 		case "tool_use":
 			flushMessage()
-			out = append(out, t.event("session.tool_call", map[string]any{
-				"tool_call_id": firstString(block, "id", "tool_call_id"),
-				"phase":        "start",
-				"name":         stringField(block, "name"),
-				"input":        objectOrNil(block["input"]),
-				"result":       nil,
-			}))
+			out = append(out, t.boundedToolStartEvent(
+				firstString(block, "id", "tool_call_id"),
+				stringField(block, "name"),
+				objectOrNil(block["input"]),
+			))
 		}
 	}
 	flushMessage()
@@ -204,11 +241,11 @@ func (t *Translator) translateUser(raw map[string]any) ([]protocol.Event, error)
 					"output_bytes":   outputBytes,
 				},
 			})
-			if len(event.Payload) <= protocol.MaxEventPayloadBytes || preview == "" {
+			if len(event.Payload) <= t.maxPayloadBytes || preview == "" {
 				out = append(out, event)
 				break
 			}
-			// JSON escaping can expand the preview; bound the marshalled event.
+			// JSON escaping or encrypted packet budgets can bound the marshalled event.
 			limit := len(preview) / 2
 			for limit > 0 && !utf8.ValidString(preview[:limit]) {
 				limit--
@@ -368,4 +405,70 @@ func joinTextBlocks(blocks []any) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+func (t *Translator) boundedToolStartEvent(toolCallID, name string, input any) protocol.Event {
+	payload := map[string]any{
+		"tool_call_id": toolCallID,
+		"phase":        "start",
+		"name":         name,
+		"input":        input,
+		"result":       nil,
+	}
+	event := t.event("session.tool_call", payload)
+	if len(event.Payload) <= t.maxPayloadBytes {
+		return event
+	}
+	if inputMap, ok := input.(map[string]any); ok {
+		compact := map[string]any{"_truncated": true}
+		for _, key := range []string{"path", "file_path", "filePath", "command", "cmd", "query", "pattern", "description", "url"} {
+			if val, exists := inputMap[key]; exists && val != nil {
+				if text, isStr := val.(string); isStr {
+					end := utf8PrefixEnd(text, 512)
+					compact[key] = text[:end]
+				}
+			}
+		}
+		payload["input"] = compact
+		event = t.event("session.tool_call", payload)
+		if len(event.Payload) <= t.maxPayloadBytes {
+			return event
+		}
+	}
+	payload["input"] = map[string]any{"_truncated": true}
+	return t.event("session.tool_call", payload)
+}
+
+func splitBoundedEvents(text string, maxPayloadBytes int, makeEvent func(string) protocol.Event) []protocol.Event {
+	if text == "" || maxPayloadBytes < 1 {
+		return nil
+	}
+	remaining := text
+	var out []protocol.Event
+	for len(remaining) > 0 {
+		end := len(remaining)
+		if end > 8*1024 {
+			end = 8 * 1024
+		}
+		end = utf8PrefixEnd(remaining, end)
+		if end == 0 {
+			end = 1
+		}
+		for end > 1 && len(makeEvent(remaining[:end]).Payload) > maxPayloadBytes {
+			end = utf8PrefixEnd(remaining, end/2)
+		}
+		out = append(out, makeEvent(remaining[:end]))
+		remaining = remaining[end:]
+	}
+	return out
+}
+
+func utf8PrefixEnd(text string, end int) int {
+	if end >= len(text) {
+		return len(text)
+	}
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return end
 }

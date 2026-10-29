@@ -167,6 +167,61 @@ func TestTranslatorRejectsInvalidConfigAndJSON(t *testing.T) {
 	}
 }
 
+func TestTranslatorHonorsConfiguredMaxPayloadBytes(t *testing.T) {
+	t.Parallel()
+
+	const budget = 31 * 1024
+	translator, err := jsonstream.NewTranslator(jsonstream.Config{
+		SessionID:       "ses_1",
+		Provider:        "claude-code",
+		MaxPayloadBytes: budget,
+	})
+	if err != nil {
+		t.Fatalf("NewTranslator() error = %v", err)
+	}
+
+	assistantLine, err := json.Marshal(map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"id": "msg_big",
+			"content": []map[string]any{
+				{"type": "thinking", "thinking": strings.Repeat("thought ", 5000)},
+				{"type": "text", "text": strings.Repeat("reply ", 6000)},
+				{"type": "tool_use", "id": "tool_big", "name": "Write", "input": map[string]any{"file_path": "src/Big.java", "content": strings.Repeat("x", 45000)}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userLine, err := json.Marshal(map[string]any{
+		"type": "user",
+		"message": map[string]any{
+			"content": []map[string]any{{
+				"type":        "tool_result",
+				"tool_use_id": "tool_big",
+				"content":     strings.Repeat("y", 40000),
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := translator.TranslateReader(context.Background(), strings.NewReader(string(assistantLine)+"\n"+string(userLine)+"\n"))
+	if err != nil {
+		t.Fatalf("TranslateReader() error = %v", err)
+	}
+	if len(events) < 4 {
+		t.Fatalf("events = %d, want thinking, message, tool start, and tool result", len(events))
+	}
+	for index, event := range events {
+		if len(event.Payload) > budget {
+			t.Fatalf("event[%d] (%s) payload = %d bytes, exceeds budget %d", index, event.Type, len(event.Payload), budget)
+		}
+	}
+}
+
 func assertEvent(t *testing.T, ev protocol.Event, typ string, sessionID string, durable bool) {
 	t.Helper()
 	if ev.Type != typ || ev.SessionID != sessionID || ev.Durable() != durable || ev.Time != 1700000000123 {

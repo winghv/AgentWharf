@@ -237,3 +237,102 @@ func TestMapperDropsDiffsWithoutText(t *testing.T) {
 		t.Fatalf("a diff without text must not reach the payload: %+v", payloadMap(t, events[0]))
 	}
 }
+
+// pi-acp omits rawOutput when it attaches a structured diff to the completed
+// update. Falling back to update["content"] serialized the raw diff block —
+// including the unreduced host path — into output_preview and bloated the frame.
+func TestMapperResultDiffOnlyContentDoesNotLeakHostPathOrDuplicatePreview(t *testing.T) {
+	t.Parallel()
+
+	mapper := diffMapper(t)
+	oldCode := strings.Repeat("old line\n", 1800)
+	newCode := strings.Repeat("new line\n", 2400)
+	events, err := mapper.MapReader(context.Background(), strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"call_pi_1","title":"write","kind":"edit","status":"in_progress"}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_pi_1","status":"completed","content":[{"type":"diff","path":"/Users/alice/projects/SqlIntOverflowUtils.java","oldText":` + mustJSONString(t, oldCode) + `,"newText":` + mustJSONString(t, newCode) + `}]}}}`,
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("MapReader() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want start and result", len(events))
+	}
+	if strings.Contains(string(events[1].Payload), "/Users/alice") {
+		t.Fatalf("host path leaked into result payload: %s", string(events[1].Payload))
+	}
+	resultPayload := payloadMap(t, events[1])
+	resultObj, _ := resultPayload["result"].(map[string]any)
+	if preview, _ := resultObj["output_preview"].(string); preview != "" {
+		t.Fatalf("diff-only content must not serialize into output_preview, got %d bytes", len(preview))
+	}
+	diffs, ok := resultPayload["diffs"].([]any)
+	if !ok || len(diffs) != 1 {
+		t.Fatalf("diffs = %#v, want 1 diff", resultPayload["diffs"])
+	}
+	firstDiff, _ := diffs[0].(map[string]any)
+	if firstDiff["path_base"] != "SqlIntOverflowUtils.java" {
+		t.Fatalf("path_base = %v, want SqlIntOverflowUtils.java", firstDiff["path_base"])
+	}
+}
+
+func TestMapperHonorsConfiguredMaxPayloadBytes(t *testing.T) {
+	t.Parallel()
+
+	const budget = 31 * 1024
+	mapper, err := acp.NewMapper(acp.Config{
+		SessionID:       "ses_1",
+		Provider:        "pi",
+		MaxPayloadBytes: budget,
+		Now: func() time.Time {
+			return time.UnixMilli(1700000000456)
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewMapper() error = %v", err)
+	}
+
+	largeFile := strings.Repeat("public final class SqlIntOverflowUtils {}\n", 1100)
+	largeOutput := strings.Repeat("build output line with & escaping\n", 1400)
+	largeMessage := strings.Repeat("assistant prose chunk & detail ", 1500)
+
+	events, err := mapper.MapReader(context.Background(), strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"tool_call","toolCallId":"call_budget_1","title":"write src/SqlIntOverflowUtils.java","kind":"edit","status":"in_progress","rawInput":{"path":"src/SqlIntOverflowUtils.java","content":` + mustJSONString(t, largeFile) + `},"content":[{"type":"diff","path":"/workspace/src/SqlIntOverflowUtils.java","oldText":null,"newText":` + mustJSONString(t, largeFile) + `}]}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_budget_1","status":"completed","rawOutput":` + mustJSONString(t, largeOutput) + `,"content":[{"type":"diff","path":"/workspace/src/SqlIntOverflowUtils.java","oldText":"old","newText":` + mustJSONString(t, largeFile) + `}]}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"acp_ses_1","update":{"sessionUpdate":"agent_message_chunk","text":` + mustJSONString(t, largeMessage) + `}}}`,
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("MapReader() error = %v", err)
+	}
+	if len(events) < 3 {
+		t.Fatalf("events = %d, want start, result, and message chunks", len(events))
+	}
+	for index, event := range events {
+		if len(event.Payload) > budget {
+			t.Fatalf("event[%d] (%s) payload = %d bytes, exceeds budget %d", index, event.Type, len(event.Payload), budget)
+		}
+	}
+
+	startPayload := payloadMap(t, events[0])
+	startInput, _ := startPayload["input"].(map[string]any)
+	if startInput["_truncated"] != true || startInput["path"] != "src/SqlIntOverflowUtils.java" {
+		t.Fatalf("compacted start input = %+v", startInput)
+	}
+	if diffs, ok := startPayload["diffs"].([]any); !ok || len(diffs) != 1 {
+		t.Fatalf("compacting rawInput should preserve start diffs, got %#v", startPayload["diffs"])
+	}
+
+	resultPayload := payloadMap(t, events[1])
+	resultObj, _ := resultPayload["result"].(map[string]any)
+	if resultObj["truncated"] != true {
+		t.Fatalf("result should report truncated output: %+v", resultObj)
+	}
+}
+
+func mustJSONString(t *testing.T, value string) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal string: %v", err)
+	}
+	return string(encoded)
+}

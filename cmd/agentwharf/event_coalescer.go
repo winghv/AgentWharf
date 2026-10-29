@@ -20,7 +20,9 @@ import (
 // paused provider never leaves text buffered indefinitely.
 const (
 	providerMessageCoalesceWindow = 100 * time.Millisecond
-	providerMessageCoalesceBytes  = 32 * 1024
+	// Keep coalesced messages safely within both Hub's 64 KiB frame limit and
+	// E2EE's 32 KiB packet plaintext ceiling.
+	providerMessageCoalesceBytes = 28 * 1024
 )
 
 type providerEventCoalescer struct {

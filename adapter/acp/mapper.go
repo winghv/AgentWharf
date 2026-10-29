@@ -26,20 +26,24 @@ var (
 const (
 	maxToolOutputPreviewBytes = 32 * 1024
 	// Leave room for the protocol envelope within Hub's 64 KiB WebSocket limit.
-	maxMessagePayloadBytes = protocol.MaxEventPayloadBytes - 4*1024
-	maxTextChunkBytes      = 8 * 1024
+	maxMessagePayloadBytes    = protocol.MaxEventPayloadBytes - 4*1024
+	maxTextChunkBytes         = 8 * 1024
+	maxCompactToolInputBytes  = 2 * 1024
+	maxCompactToolStringBytes = 512
 )
 
 type Config struct {
-	SessionID string
-	Provider  string
-	Now       func() time.Time
+	SessionID       string
+	Provider        string
+	Now             func() time.Time
+	MaxPayloadBytes int
 }
 
 type Mapper struct {
 	sessionID         string
 	provider          string
 	now               func() time.Time
+	maxPayloadBytes   int
 	nextMessageID     uint64
 	providerSessionID string
 	activeToolCallIDs map[string]struct{}
@@ -62,12 +66,28 @@ func NewMapper(cfg Config) (*Mapper, error) {
 	if now == nil {
 		now = time.Now
 	}
+	maxPayloadBytes := cfg.MaxPayloadBytes
+	if maxPayloadBytes <= 0 || maxPayloadBytes > protocol.MaxEventPayloadBytes {
+		maxPayloadBytes = protocol.MaxEventPayloadBytes
+	}
 	return &Mapper{
 		sessionID:         cfg.SessionID,
 		provider:          cfg.Provider,
 		now:               now,
+		maxPayloadBytes:   maxPayloadBytes,
 		activeToolCallIDs: make(map[string]struct{}),
 	}, nil
+}
+
+func (m *Mapper) messagePayloadBudget() int {
+	const headroom = 2 * 1024
+	if m.maxPayloadBytes == protocol.MaxEventPayloadBytes {
+		return maxMessagePayloadBytes
+	}
+	if m.maxPayloadBytes > headroom {
+		return m.maxPayloadBytes - headroom
+	}
+	return m.maxPayloadBytes
 }
 
 func (m *Mapper) MapReader(ctx context.Context, r io.Reader) ([]protocol.Event, error) {
@@ -397,7 +417,7 @@ func (m *Mapper) mapUpdate(update map[string]any, providerSessionID string) []pr
 		if text == "" {
 			return nil
 		}
-		return splitMessageEvents(text, maxMessagePayloadBytes, func(part string) protocol.Event {
+		return splitMessageEvents(text, m.messagePayloadBudget(), func(part string) protocol.Event {
 			return m.event("agent.activity", map[string]any{
 				"kind":                "thinking",
 				"text":                part,
@@ -513,24 +533,52 @@ func (m *Mapper) toolCallEvents(update map[string]any, isUpdate bool) []protocol
 	}
 
 	delete(m.activeToolCallIDs, toolCallID)
-	outputValue := firstAny(update, "rawOutput", "raw_output", "result", "content")
-	if text, ok := acpToolOutputText(outputValue); ok {
-		outputValue = text
-	}
+	outputValue := acpToolOutputValue(update)
 	preview, truncated, outputBytes := toolOutputPreview(outputValue)
-	event := m.toolCallResultEventWithOutput(toolCallID, resultStatus, preview, truncated, outputBytes, firstString(update, "name", "kind", "title"))
 	// A provider may attach the change it made to the terminal frame instead of
-	// the start frame, so both carry `diffs`.
-	if diffs := acpDiffs(update); len(diffs) > 0 {
-		var payload map[string]any
-		if json.Unmarshal(event.Payload, &payload) == nil {
-			payload["diffs"] = diffs
-			if encoded, err := json.Marshal(payload); err == nil {
-				event.Payload = encoded
-			}
+	// the start frame, so both carry `diffs` and share the payload budget.
+	event := m.toolCallResultEventWithDetails(
+		toolCallID,
+		resultStatus,
+		preview,
+		truncated,
+		outputBytes,
+		firstString(update, "name", "kind", "title"),
+		acpDiffs(update),
+	)
+	return []protocol.Event{event}
+}
+
+// acpToolOutputValue selects readable tool output without dumping non-text ACP
+// content blocks (such as `diff`, whose `path` is an unreduced host path) into
+// `output_preview`.
+func acpToolOutputValue(update map[string]any) any {
+	for _, key := range []string{"rawOutput", "raw_output", "result"} {
+		value, ok := update[key]
+		if !ok || value == nil {
+			continue
+		}
+		if text, ok := acpToolOutputText(value); ok {
+			return text
+		}
+		return value
+	}
+	content, ok := update["content"]
+	if !ok || content == nil {
+		return nil
+	}
+	if blocks, isArray := content.([]any); isArray {
+		if text, ok := acpToolOutputText(blocks); ok {
+			return text
+		}
+		return nil
+	}
+	if object, isMap := content.(map[string]any); isMap {
+		if text := firstString(object, "text", "content"); text != "" {
+			return text
 		}
 	}
-	return []protocol.Event{event}
+	return content
 }
 
 // toolCallEnrichmentEvents publishes what a status-less `tool_call_update`
@@ -581,10 +629,10 @@ func (m *Mapper) finishActiveToolCalls(output string) []protocol.Event {
 }
 
 func (m *Mapper) toolCallResultEvent(toolCallID, status, output string) protocol.Event {
-	return m.toolCallResultEventWithOutput(toolCallID, status, output, false, len(output), "")
+	return m.toolCallResultEventWithDetails(toolCallID, status, output, false, len(output), "", nil)
 }
 
-func (m *Mapper) toolCallResultEventWithOutput(toolCallID, status, output string, truncated bool, outputBytes int, name string) protocol.Event {
+func (m *Mapper) toolCallResultEventWithDetails(toolCallID, status, output string, truncated bool, outputBytes int, name string, diffs []map[string]any) protocol.Event {
 	for {
 		payload := map[string]any{
 			"tool_call_id": toolCallID,
@@ -600,19 +648,42 @@ func (m *Mapper) toolCallResultEventWithOutput(toolCallID, status, output string
 		if name != "" {
 			payload["name"] = name
 		}
+		if len(diffs) > 0 {
+			payload["diffs"] = diffs
+		}
 		event := m.event("session.tool_call", payload)
-		// JSON escaping can expand a 32 KiB preview (for example HTML or
-		// ampersand-heavy output) past the 64 KiB frame limit. Bound the
-		// marshalled event, not just the source string.
-		if len(event.Payload) <= protocol.MaxEventPayloadBytes || output == "" {
+		// JSON escaping or an encrypted packet budget can bound the marshalled
+		// event more tightly than the raw preview string. Shrink output first,
+		// then advisory diffs.
+		if len(event.Payload) <= m.maxPayloadBytes {
 			return event
 		}
-		limit := len(output) / 2
-		for limit > 0 && !utf8.ValidString(output[:limit]) {
-			limit--
+		if output != "" {
+			limit := len(output) / 2
+			for limit > 0 && !utf8.ValidString(output[:limit]) {
+				limit--
+			}
+			output = output[:limit]
+			truncated = true
+			continue
 		}
-		output = output[:limit]
-		truncated = true
+		if len(diffs) > 1 {
+			diffs = diffs[:len(diffs)-1]
+			continue
+		}
+		if len(diffs) == 1 {
+			if shrunk, ok := shrinkDiffEntry(diffs[0]); ok {
+				diffs = []map[string]any{shrunk}
+				continue
+			}
+			diffs = nil
+			continue
+		}
+		if name != "" && len(name) > 256 {
+			name = truncateRunes(name, 128)
+			continue
+		}
+		return event
 	}
 }
 
@@ -651,19 +722,125 @@ func acpToolOutputText(value any) (string, bool) {
 	return strings.Join(parts, "\n"), true
 }
 
-// boundedToolEvent drops advisory diffs when their JSON escaping would push
-// the start/enrichment frame past the Hub limit. The tool call itself remains
-// valid without them.
+// boundedToolEvent keeps start/enrichment frames within the configured payload
+// budget. Oversized raw inputs (such as full-file `write` bodies) are compacted
+// before advisory diffs are shrunk so change cards survive whenever they fit.
 func (m *Mapper) boundedToolEvent(payload map[string]any) protocol.Event {
 	event := m.event("session.tool_call", payload)
-	if len(event.Payload) <= protocol.MaxEventPayloadBytes {
+	if len(event.Payload) <= m.maxPayloadBytes {
 		return event
 	}
-	if _, ok := payload["diffs"]; ok {
-		delete(payload, "diffs")
-		event = m.event("session.tool_call", payload)
+	if input, ok := payload["input"].(map[string]any); ok && len(input) > 0 {
+		if encodedInput, err := json.Marshal(input); err != nil || len(encodedInput) > maxCompactToolInputBytes {
+			payload["input"] = compactToolInput(input)
+			event = m.event("session.tool_call", payload)
+			if len(event.Payload) <= m.maxPayloadBytes {
+				return event
+			}
+		}
 	}
-	return event
+	if diffs, ok := payload["diffs"].([]map[string]any); ok && len(diffs) > 0 {
+		for len(event.Payload) > m.maxPayloadBytes && len(diffs) > 0 {
+			if len(diffs) > 1 {
+				diffs = diffs[:len(diffs)-1]
+				payload["diffs"] = diffs
+			} else if shrunk, ok := shrinkDiffEntry(diffs[0]); ok {
+				diffs = []map[string]any{shrunk}
+				payload["diffs"] = diffs
+			} else {
+				diffs = nil
+				delete(payload, "diffs")
+			}
+			event = m.event("session.tool_call", payload)
+		}
+		if len(event.Payload) <= m.maxPayloadBytes {
+			return event
+		}
+	}
+	delete(payload, "diffs")
+	if payload["input"] != nil {
+		payload["input"] = map[string]any{"_truncated": true}
+	}
+	if title, ok := payload["title"].(string); ok && len(title) > 256 {
+		payload["title"] = truncateRunes(title, 128)
+	}
+	if name, ok := payload["name"].(string); ok && len(name) > 256 {
+		payload["name"] = truncateRunes(name, 128)
+	}
+	return m.event("session.tool_call", payload)
+}
+
+var compactToolInputAllowlist = []string{
+	"path",
+	"file_path",
+	"filePath",
+	"target_file",
+	"command",
+	"cmd",
+	"query",
+	"pattern",
+	"prompt",
+	"description",
+	"url",
+	"uri",
+	"action",
+	"risk_level",
+	"summary",
+	"run_in_background",
+	"runInBackground",
+	"offset",
+	"limit",
+	"timeout",
+}
+
+func compactToolInput(input map[string]any) map[string]any {
+	compact := map[string]any{"_truncated": true}
+	for _, key := range compactToolInputAllowlist {
+		value, ok := input[key]
+		if !ok || value == nil {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			bounded, _ := boundText(typed, maxCompactToolStringBytes)
+			compact[key] = bounded
+		case bool, float64, int, int64, json.Number:
+			compact[key] = typed
+		}
+	}
+	return compact
+}
+
+func shrinkDiffEntry(entry map[string]any) (map[string]any, bool) {
+	oldText, _ := entry["old_text"].(string)
+	newText, _ := entry["new_text"].(string)
+	if len(oldText) <= 64 && len(newText) <= 64 {
+		return nil, false
+	}
+	shrunk := make(map[string]any, len(entry)+2)
+	for key, value := range entry {
+		shrunk[key] = value
+	}
+	delete(shrunk, "old_text")
+	delete(shrunk, "new_text")
+	if len(oldText) > 0 {
+		nextOld, _ := boundText(oldText, len(oldText)/2)
+		if nextOld != "" {
+			shrunk["old_text"] = nextOld
+		}
+		shrunk["old_text_truncated"] = true
+	}
+	if len(newText) > 0 {
+		nextNew, _ := boundText(newText, len(newText)/2)
+		if nextNew != "" {
+			shrunk["new_text"] = nextNew
+		}
+		shrunk["new_text_truncated"] = true
+	}
+	if shrunk["old_text"] == nil && shrunk["new_text"] == nil {
+		return nil, false
+	}
+	return shrunk, true
 }
 
 func toolOutputPreview(value any) (string, bool, int) {
@@ -896,7 +1073,7 @@ func (m *Mapper) permissionToolCallEvent(source map[string]any, requestID string
 		input["options"] = options
 	}
 	m.activeToolCallIDs[toolCallID] = struct{}{}
-	return m.event("session.tool_call", map[string]any{
+	return m.boundedToolEvent(map[string]any{
 		"tool_call_id": toolCallID,
 		"phase":        "start",
 		"name":         name,
@@ -1023,7 +1200,7 @@ func (m *Mapper) event(eventType string, payload map[string]any) protocol.Event 
 }
 
 func (m *Mapper) messageEventsWithExtra(messageID, text, providerSessionID string, extra map[string]any) []protocol.Event {
-	return splitMessageEvents(text, maxMessagePayloadBytes, func(part string) protocol.Event {
+	return splitMessageEvents(text, m.messagePayloadBudget(), func(part string) protocol.Event {
 		return m.messageEventWithExtra(messageID, part, providerSessionID, extra)
 	})
 }
@@ -1394,7 +1571,25 @@ func (m *Mapper) planEvents(update map[string]any, providerSessionID string, pla
 	default:
 		return nil
 	}
-	return []protocol.Event{m.event("agent.activity", payload)}
+	event := m.event("agent.activity", payload)
+	for len(event.Payload) > m.maxPayloadBytes {
+		if entries, ok := payload["entries"].([]map[string]string); ok && len(entries) > 0 {
+			entries = entries[:len(entries)-1]
+			payload["entries"] = entries
+			payload["truncated"] = true
+			event = m.event("agent.activity", payload)
+			continue
+		}
+		if markdown, ok := payload["markdown"].(string); ok && markdown != "" {
+			markdown, _ = boundText(markdown, len(markdown)/2)
+			payload["markdown"] = markdown
+			payload["truncated"] = true
+			event = m.event("agent.activity", payload)
+			continue
+		}
+		break
+	}
+	return []protocol.Event{event}
 }
 
 // planUpdateEvents normalizes the experimental `plan_update` shapes. Unknown

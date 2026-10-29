@@ -812,7 +812,7 @@ func transcriptMessageEvents(sessionID, messageID, role, text string) []protocol
 }
 
 func transcriptMessageEventsWithExtra(sessionID, messageID, role, text string, extra map[string]any) []protocol.Event {
-	return splitTranscriptMessageEvents(text, protocol.MaxEventPayloadBytes-4*1024, func(part string) protocol.Event {
+	return splitTranscriptMessageEvents(text, encryptedEventPayloadBudget-2*1024, func(part string) protocol.Event {
 		return transcriptMessageEventWithExtra(sessionID, messageID, role, part, extra)
 	})
 }
@@ -851,11 +851,11 @@ func transcriptUTF8PrefixEnd(text string, end int) int {
 	return end
 }
 
-const maxTranscriptToolPreviewBytes = 32 * 1024
+const maxTranscriptToolPreviewBytes = 24 * 1024
 
-// boundedTranscriptPreview keeps the transcript mirror's tool output under the
-// same 32 KiB ceiling as the ACP mapper. The event budget is 64 KiB; a path or
-// JSON envelope must still fit beside the preview.
+// boundedTranscriptPreview keeps the transcript mirror's tool output under a
+// ceiling that fits beside JSON envelope fields in both plaintext and E2EE
+// sessions.
 func boundedTranscriptPreview(content []byte) (string, bool, int) {
 	text := string(content)
 	if len(text) <= maxTranscriptToolPreviewBytes {
@@ -882,13 +882,42 @@ func transcriptToolCallEventWithExtra(sessionID, toolCallID, phase, name string,
 		}
 	}
 	encoded, _ := json.Marshal(payload)
-	if len(encoded) > protocol.MaxEventPayloadBytes {
-		// A diff is advisory detail; drop it rather than let a pathologically
-		// escaped change push the tool frame past the Hub limit.
+	if len(encoded) > encryptedEventPayloadBudget {
+		// Compact oversized tool input (for example full-file Write bodies)
+		// before dropping advisory diffs so change cards survive when they fit.
+		if compacted, ok := compactTranscriptToolInput(input); ok {
+			payload["input"] = compacted
+			encoded, _ = json.Marshal(payload)
+		}
+	}
+	if len(encoded) > encryptedEventPayloadBudget {
 		delete(payload, "diffs")
 		encoded, _ = json.Marshal(payload)
 	}
+	if len(encoded) > encryptedEventPayloadBudget && len(input) > 0 {
+		payload["input"] = map[string]any{"_truncated": true}
+		encoded, _ = json.Marshal(payload)
+	}
 	return protocol.Event{Type: "session.tool_call", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: encoded}
+}
+
+func compactTranscriptToolInput(input []byte) (map[string]any, bool) {
+	if len(input) <= 2*1024 {
+		return nil, false
+	}
+	var parsed map[string]any
+	if json.Unmarshal(input, &parsed) != nil || len(parsed) == 0 {
+		return map[string]any{"_truncated": true}, true
+	}
+	compact := map[string]any{"_truncated": true}
+	for _, key := range []string{"path", "file_path", "filePath", "command", "cmd", "query", "pattern", "description", "url"} {
+		if val, ok := parsed[key]; ok && val != nil {
+			if text, isStr := val.(string); isStr {
+				compact[key] = text[:transcriptUTF8PrefixEnd(text, 512)]
+			}
+		}
+	}
+	return compact, true
 }
 
 // publishOfficialSettingsCapability publishes a read-only settings capability

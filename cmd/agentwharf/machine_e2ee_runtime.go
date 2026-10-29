@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -10,6 +11,136 @@ import (
 	"github.com/winghv/agentwharf/experimental/e2ee"
 	"github.com/winghv/agentwharf/protocol"
 )
+
+// encryptedEventPayloadBudget leaves headroom for SealPacket's
+// `{"public":{...},"payload":...}` wrapper inside e2ee.MaxContentBytes (32 KiB).
+const encryptedEventPayloadBudget = e2ee.MaxContentBytes - 1024
+
+func eventPayloadBudget(cfg wrapConfig) int {
+	if cfg.ContentMode == protocol.ContentModeRequired {
+		return encryptedEventPayloadBudget
+	}
+	return protocol.MaxEventPayloadBytes
+}
+
+// boundEncryptedEventPayload guarantees that post-masking expansion or rare
+// large metadata frames cannot exceed the 32 KiB E2EE plaintext ceiling and
+// fail SealEventWire after consuming a durable seal slot. It never mutates the
+// caller's slice and preserves all public routing projections.
+func boundEncryptedEventPayload(eventType string, payload json.RawMessage) json.RawMessage {
+	if len(payload) <= encryptedEventPayloadBudget {
+		return payload
+	}
+	var fields map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&fields); err != nil || fields == nil {
+		return payload
+	}
+	encode := func(value map[string]any) (json.RawMessage, bool) {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return payload, false
+		}
+		return encoded, len(encoded) <= encryptedEventPayloadBudget
+	}
+
+	switch eventType {
+	case "session.tool_call":
+		delete(fields, "diffs")
+		if encoded, ok := encode(fields); ok {
+			return encoded
+		}
+		if result, ok := fields["result"].(map[string]any); ok {
+			preview, _ := result["output_preview"].(string)
+			for preview != "" {
+				preview = preview[:transcriptUTF8PrefixEnd(preview, len(preview)/2)]
+				result["output_preview"] = preview
+				result["truncated"] = true
+				if encoded, ok := encode(fields); ok {
+					return encoded
+				}
+			}
+		}
+		if fields["input"] != nil {
+			fields["input"] = map[string]any{"_truncated": true}
+		}
+		if title, ok := fields["title"].(string); ok && len(title) > 256 {
+			fields["title"] = title[:transcriptUTF8PrefixEnd(title, 256)]
+		}
+		if encoded, err := json.Marshal(fields); err == nil {
+			return encoded
+		}
+	case "session.message":
+		if items, ok := fields["content"].([]any); ok {
+			for index, item := range items {
+				block, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				text, _ := block["text"].(string)
+				for text != "" {
+					text = text[:transcriptUTF8PrefixEnd(text, len(text)/2)]
+					block["text"] = text
+					items[index] = block
+					if encoded, fits := encode(fields); fits {
+						return encoded
+					}
+				}
+			}
+		}
+	case "agent.activity":
+		for _, textKey := range []string{"text", "markdown"} {
+			text, _ := fields[textKey].(string)
+			for text != "" {
+				text = text[:transcriptUTF8PrefixEnd(text, len(text)/2)]
+				fields[textKey] = text
+				if textKey == "markdown" {
+					fields["truncated"] = true
+				}
+				if encoded, fits := encode(fields); fits {
+					return encoded
+				}
+			}
+		}
+		minimal := map[string]any{"truncated": true}
+		for _, key := range []string{"kind", "provider_session_id", "phase", "plan_id", "warning_id", "category"} {
+			if value, ok := fields[key]; ok {
+				minimal[key] = value
+			}
+		}
+		if encoded, err := json.Marshal(minimal); err == nil {
+			return encoded
+		}
+	case "session.state":
+		fields["metadata"] = map[string]any{"truncated": true}
+		if encoded, err := json.Marshal(fields); err == nil {
+			return encoded
+		}
+	case "permission.request":
+		if summary, ok := fields["summary"].(string); ok && len(summary) > 1024 {
+			fields["summary"] = summary[:transcriptUTF8PrefixEnd(summary, 1024)]
+		}
+		if encoded, ok := encode(fields); ok {
+			return encoded
+		}
+		fields["detail"] = map[string]any{"truncated": true}
+		if encoded, err := json.Marshal(fields); err == nil {
+			return encoded
+		}
+	case "session.commands":
+		if commands, ok := fields["commands"].([]any); ok {
+			for len(commands) > 0 {
+				commands = commands[:len(commands)-1]
+				fields["commands"] = commands
+				if encoded, fits := encode(fields); fits {
+					return encoded
+				}
+			}
+		}
+	}
+	return payload
+}
 
 // A single runtime owns the endpoint execution lane. Opening storage grants no
 // session access: authenticated local membership initialization is separate.

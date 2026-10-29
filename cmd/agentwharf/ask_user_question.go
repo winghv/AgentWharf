@@ -107,7 +107,7 @@ func transcriptToolResultEvent(sessionID, toolCallID, name string, content []byt
 		}
 		encoded, _ := json.Marshal(payload)
 		event := protocol.Event{Type: "session.tool_call", SessionID: sessionID, Time: time.Now().UTC().UnixMilli(), Payload: encoded}
-		if len(encoded) <= protocol.MaxEventPayloadBytes || preview == "" {
+		if len(encoded) <= encryptedEventPayloadBudget || preview == "" {
 			return event
 		}
 		limit := len(preview) / 2

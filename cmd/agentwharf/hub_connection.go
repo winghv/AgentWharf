@@ -266,7 +266,8 @@ func (c *hubConnection) prepareEvent(ctx context.Context, original *protocol.Eve
 		if err != nil {
 			return nil, errors.New("generate encrypted event identity")
 		}
-		payload, err := c.cfg.e2eeRuntime.sealEvent(ctx, event.SessionID, messageID, event.Type, event.Payload)
+		boundedPayload := boundEncryptedEventPayload(event.Type, event.Payload)
+		payload, err := c.cfg.e2eeRuntime.sealEvent(ctx, event.SessionID, messageID, event.Type, boundedPayload)
 		if err != nil {
 			return nil, err
 		}

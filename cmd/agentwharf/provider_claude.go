@@ -167,7 +167,7 @@ func claudeMessageExtra(raw, message map[string]any) map[string]any {
 }
 
 func claudeThinkingEvents(sessionID, turnID, text string, extra map[string]any) []protocol.Event {
-	return splitTranscriptMessageEvents(text, protocol.MaxEventPayloadBytes-4*1024, func(part string) protocol.Event {
+	return splitTranscriptMessageEvents(text, encryptedEventPayloadBudget-2*1024, func(part string) protocol.Event {
 		payload := map[string]any{
 			"kind":                "thinking",
 			"text":                part,

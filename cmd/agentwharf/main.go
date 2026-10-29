@@ -3465,11 +3465,13 @@ func maskEvent(masker *core.EventMasker, event protocol.Event) (protocol.Event, 
 }
 
 func translateWrapInput(ctx context.Context, cfg wrapConfig, stdin io.Reader) ([]protocol.Event, error) {
+	budget := eventPayloadBudget(cfg)
 	switch cfg.Format {
 	case "jsonstream":
 		translator, err := jsonstream.NewTranslator(jsonstream.Config{
-			SessionID: cfg.SessionID,
-			Provider:  cfg.Provider,
+			SessionID:       cfg.SessionID,
+			Provider:        cfg.Provider,
+			MaxPayloadBytes: budget,
 		})
 		if err != nil {
 			return nil, err
@@ -3477,8 +3479,9 @@ func translateWrapInput(ctx context.Context, cfg wrapConfig, stdin io.Reader) ([
 		return translator.TranslateReader(ctx, stdin)
 	case "acp":
 		mapper, err := acp.NewMapper(acp.Config{
-			SessionID: cfg.SessionID,
-			Provider:  cfg.Provider,
+			SessionID:       cfg.SessionID,
+			Provider:        cfg.Provider,
+			MaxPayloadBytes: budget,
 		})
 		if err != nil {
 			return nil, err
@@ -3492,14 +3495,15 @@ func translateWrapInput(ctx context.Context, cfg wrapConfig, stdin io.Reader) ([
 func streamProviderOutput(ctx context.Context, cfg wrapConfig, stdout io.Reader, send func(protocol.Event) error) error {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	budget := eventPayloadBudget(cfg)
 	var mapper *acp.Mapper
 	var translator *jsonstream.Translator
 	var err error
 	switch cfg.Format {
 	case "acp":
-		mapper, err = acp.NewMapper(acp.Config{SessionID: cfg.SessionID, Provider: cfg.Provider})
+		mapper, err = acp.NewMapper(acp.Config{SessionID: cfg.SessionID, Provider: cfg.Provider, MaxPayloadBytes: budget})
 	case "jsonstream":
-		translator, err = jsonstream.NewTranslator(jsonstream.Config{SessionID: cfg.SessionID, Provider: cfg.Provider})
+		translator, err = jsonstream.NewTranslator(jsonstream.Config{SessionID: cfg.SessionID, Provider: cfg.Provider, MaxPayloadBytes: budget})
 	default:
 		err = fmt.Errorf("unsupported wrap format %q", cfg.Format)
 	}
@@ -3634,7 +3638,11 @@ type acpPendingPermission struct {
 }
 
 func streamACPProviderOutput(ctx context.Context, cfg wrapConfig, scanner *bufio.Scanner, responses *acpResponseRouter, observe func([]byte, uint64) error, send func(protocol.Event) error) error {
-	mapper, err := acp.NewMapper(acp.Config{SessionID: cfg.SessionID, Provider: cfg.Provider})
+	mapper, err := acp.NewMapper(acp.Config{
+		SessionID:       cfg.SessionID,
+		Provider:        cfg.Provider,
+		MaxPayloadBytes: eventPayloadBudget(cfg),
+	})
 	if err != nil {
 		return err
 	}
@@ -4402,6 +4410,9 @@ func writeCLIProtocolFrame(ctx context.Context, conn *websocket.Conn, frame prot
 }
 
 func readCLIProtocolFrame(ctx context.Context, conn *websocket.Conn) (protocol.Frame, error) {
+	// Align nhooyr.io/websocket's default 32 KiB read limit with the protocol's
+	// 64 KiB frame limit (for example base64-encoded 32 KiB E2EE carriers).
+	conn.SetReadLimit(protocol.MaxWebSocketFrameBytes)
 	typ, data, err := conn.Read(ctx)
 	if err != nil {
 		return nil, err
